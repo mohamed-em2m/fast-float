@@ -1,0 +1,11 @@
+__pycache__/
+.DS_Store
+
+results/
+experiments/
+tmp/
+*.pth
+*.pt
+wav2vec2-base-960h/
+wav2vec-english-speech-emotion-recognition/
+results/
