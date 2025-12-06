@@ -24,9 +24,7 @@ pip install IPython==9.8.0
 pip install huggingface-hub==1.2.1
 pip install ngrok==1.6.0 pyngrok==7.5.0 gdown==5.2.0
 pip install brotli==1.2.0
-pip install av==14.0.0
-pip install aiortc==1.13.0
-pip install nest_asyncio
+pip install nest_asyncio==1.6.0
 
 echo "=== Running checkpoint download script ==="
 chmod +x download_checkpoints.sh
