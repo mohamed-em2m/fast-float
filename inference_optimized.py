@@ -300,8 +300,6 @@ class OptimizedInferenceAgent:
         2. Ensure tensor is fully on CPU before FFmpeg access
         3. Add delay for NVENC encoder initialization
         """
-
-        
         start_time = time.time()
 
         # Sanity: ffmpeg present
