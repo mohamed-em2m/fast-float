@@ -7,7 +7,7 @@ sudo apt-get update -y
 echo "=== Installing system dependencies ==="
 sudo apt-get install -y python3.10 python3.10-distutils python3.10-venv ffmpeg git
 
-echo "=== Ensuring uv is installed ==="
+echo "=== Installing uv ==="
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 
