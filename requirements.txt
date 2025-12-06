@@ -53,7 +53,7 @@ pydantic==2.7.0
 pydantic-settings==2.1.0
 matplotlib_inline==0.1.7
 IPython==8.36.0
-huggingface-hub==1.2.1
+huggingface-hub<1.0,>=0.14.1
 ngrok==1.4.0
 pyngrok==7.5.0
 gdown==5.2.0
