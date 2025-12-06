@@ -1053,7 +1053,7 @@ async def health():
         }
     }
 if __name__ == "__main__":
-if __name__ == "__main__":
+
     import asyncio
     from hypercorn.asyncio import serve
     from hypercorn.config import Config
