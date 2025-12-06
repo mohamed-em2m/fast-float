@@ -1053,6 +1053,7 @@ async def health():
         }
     }
 if __name__ == "__main__":
+if __name__ == "__main__":
     import asyncio
     from hypercorn.asyncio import serve
     from hypercorn.config import Config
@@ -1060,5 +1061,7 @@ if __name__ == "__main__":
     config = Config()
     config.bind = [f"0.0.0.0:{PORT}"]
     config.loglevel = "info"
+    config.startup_timeout = 60  # increase if your app is slow to start
 
     asyncio.run(serve(app, config))
+
