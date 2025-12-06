@@ -1,6 +1,5 @@
 import os 
 import json
-import vertexai
 
 # Determine the project root directory, assuming this script is in src/utils
 # The path is constructed by going up two directories from this file's location.

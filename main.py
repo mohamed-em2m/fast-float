@@ -37,7 +37,7 @@ import torch
 
 # Your inference module
 from inference_optimized import OptimizedInferenceAgent, InferenceOptions
-from .initialize_env import initialize_environment
+from initialize_env import initialize_environment
 initialize_environment()
 # ============================================================================
 # GPU UTILITY FUNCTIONS (Safe - no CUDA initialization issues)
@@ -1052,4 +1052,13 @@ async def health():
             "average_fps": round(performance_stats['average_fps'], 2)
         }
     }
+if __name__ == "__main__":
+    import asyncio
+    from hypercorn.asyncio import serve
+    from hypercorn.config import Config
 
+    config = Config()
+    config.bind = [f"0.0.0.0:{PORT}"]
+    config.loglevel = "info"
+
+    asyncio.run(serve(app, config))
