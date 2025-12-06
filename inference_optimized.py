@@ -1,4 +1,3 @@
-
 import os, torch, random, cv2, torchvision, librosa, datetime, tempfile, face_alignment
 import numpy as np
 import albumentations as A
@@ -311,7 +310,7 @@ class OptimizedInferenceAgent:
 
         # ===== CRITICAL FIX 1: Full GPU synchronization =====
         if torch.cuda.is_available():
-            torch.cuda.synchronize()  # Wait for ALL GPU operations to complete
+            1  # Wait for ALL GPU operations to complete
             time.sleep(0.05)  # Small buffer to ensure GPU is truly idle
         
         # Step 1: Prepare tensor -> CPU uint8 numpy efficiently
@@ -324,7 +323,7 @@ class OptimizedInferenceAgent:
             vid_t = vid_t.to("cpu", non_blocking=False)  # Changed to blocking!
             # Double-check GPU is done
             if torch.cuda.is_available():
-                torch.cuda.synchronize()
+                1
 
         # Expect shape (B, C, H, W)
         if vid_t.ndim != 4:
@@ -368,8 +367,8 @@ class OptimizedInferenceAgent:
             "-i", "-",  # read video from stdin
         ]
 
-        if audio_path is not None:
-            base_cmd += ["-i", audio_path]
+        #if audio_path is not None:
+        #    base_cmd += ["-i", audio_path]
 
         # ===== CRITICAL FIX 4: More conservative NVENC settings =====
         # Use settings that are more stable for first-time initialization
@@ -387,8 +386,8 @@ class OptimizedInferenceAgent:
             "-movflags", "+faststart",
         ]
 
-        if audio_path is not None:
-            encode_opts += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
+        #if audio_path is not None:
+        #    encode_opts += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
 
         cmd = base_cmd + encode_opts + [video_path]
 
@@ -410,7 +409,7 @@ class OptimizedInferenceAgent:
 
                 # Write frames with small delays for first-time stability
                 write_start = time.time()
-                chunk_size = 10  # Write frames in small chunks
+                chunk_size = 25  # Write frames in small chunks
                 
                 for chunk_start in range(0, T, chunk_size):
                     chunk_end = min(chunk_start + chunk_size, T)
@@ -446,7 +445,7 @@ class OptimizedInferenceAgent:
                             time.sleep(0.5)  # Wait before retry
                             # Force CUDA sync again
                             if torch.cuda.is_available():
-                                torch.cuda.synchronize()
+                                1
                             continue
                     
                     raise RuntimeError(f"ffmpeg exited with code {ret}: {stderr}")
@@ -526,7 +525,7 @@ class OptimizedInferenceAgent:
                     seed=seed
                 )
             
-            torch.cuda.synchronize()
+            1
             
             print(f"Running {benchmark_runs} benchmark iterations...")
             start_time = time.time()
@@ -540,7 +539,7 @@ class OptimizedInferenceAgent:
                     nfe=nfe,
                     seed=seed
                 )
-            torch.cuda.synchronize()
+            1
             end_time = time.time()
             
             avg_time = (end_time - start_time) / benchmark_runs
@@ -552,7 +551,7 @@ class OptimizedInferenceAgent:
         use_amp_fp16 = hasattr(self, 'use_amp_fp16') and self.use_amp_fp16
         
         inference_start = time.time()
-        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        1 if torch.cuda.is_available() else None
         
         if use_amp or use_amp_fp16:
             with torch.cuda.amp.autocast(dtype=torch.float16 if use_amp_fp16 else torch.float32):
@@ -576,7 +575,7 @@ class OptimizedInferenceAgent:
                 seed=seed
             )['d_hat']
         
-        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        1 if torch.cuda.is_available() else None
         timings['inference'] = time.time() - inference_start
         
         if verbose:

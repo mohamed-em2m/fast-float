@@ -859,62 +859,95 @@ async def startup_event():
     agent = OptimizedInferenceAgent(opt)
     logger.info("✅ Model loaded successfully")
     
-    # ===== CRITICAL FIX: CUDA + NVENC WARMUP =====
-    logger.info("🔥 Warming up CUDA context and NVENC encoder...")
+    # ===== MODEL WARMUP WITH REAL INFERENCE =====
+    logger.info("🔥 Warming up model with real inference (empty audio)...")
+    warmup_start = time.time()
+    
     try:
-        # Create dummy data for warmup
-        dummy_audio = torch.randn(1, 16000).to(opt.rank)  # 1 second of audio
-        dummy_image = torch.randn(1, 3, TARGET_IMAGE_SIZE, TARGET_IMAGE_SIZE).to(opt.rank)
+        # Create minimal test files
+        warmup_audio_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+        warmup_video_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
         
-        # Warmup CUDA context with actual model inference
-        with torch.no_grad():
-            # This initializes CUDA properly
-            _ = agent.G.encode_image_into_latent(dummy_image)
-            torch.cuda.synchronize()  # Wait for GPU to finish
+        # Generate 0.5 seconds of silent audio (minimal but valid)
+        silent_audio = np.zeros(8000, dtype=np.float32)  # 0.5 sec at 16kHz
+        sf.write(warmup_audio_path, silent_audio, 16000)
         
-        logger.info("   ✓ CUDA context initialized")
+        # Use default image
+        warmup_image_path = DEFAULT_IMAGE_PATH
         
-        # Now warmup NVENC encoder with a small test video
+        logger.info("   Running warmup inference...")
+        
+        # Run actual model inference
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            executor,
+            _run_inference_blocking,
+            warmup_video_path,
+            warmup_image_path,
+            warmup_audio_path,
+            {
+                "a_cfg_scale": 2.0,
+                "r_cfg_scale": 1.0,
+                "e_cfg_scale": 1.0,
+                "emotion": "S2E",
+                "nfe": 10,
+                "no_crop": False,
+                "seed": 25
+            }
+        )
+        
+        warmup_time = time.time() - warmup_start
+        logger.info(f"   ✓ Warmup inference complete ({warmup_time:.2f}s)")
+        
+        # Verify output was created
+        if os.path.exists(warmup_video_path):
+            file_size = os.path.getsize(warmup_video_path) / 1024
+            logger.info(f"   ✓ Warmup video generated: {file_size:.1f}KB")
+        
+        # Cleanup warmup files
+        for f in [warmup_audio_path, warmup_video_path]:
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except:
+                pass
+        
+        logger.info("✅ Model warmup complete - ready for production traffic")
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Model warmup failed (non-critical): {e}")
+        logger.warning("   First request may be slower than usual")
+    
+    # ===== NVENC ENCODER WARMUP (Lightweight) =====
+    logger.info("🎬 Testing NVENC encoder...")
+    try:
         warmup_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-        warmup_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
         
-        # Create minimal test video (just 1 frame)
+        # Create single test frame
         test_frame = np.zeros((TARGET_IMAGE_SIZE, TARGET_IMAGE_SIZE, 3), dtype=np.uint8)
         
-        # Write minimal audio
-        import soundfile as sf
-        sf.write(warmup_audio, np.zeros(16000, dtype=np.float32), 16000)
-        
-        # Test NVENC encoder
         cmd = [
-            "ffmpeg", "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "rawvideo", "-vcodec", "rawvideo",
             "-pix_fmt", "rgb24", "-s", f"{TARGET_IMAGE_SIZE}x{TARGET_IMAGE_SIZE}",
             "-r", "25", "-i", "-",
-            "-i", warmup_audio,
             "-c:v", video_optimizer.selected_encoder,
             "-preset", "p1", "-frames:v", "1",
-            "-c:a", "aac", "-b:a", "64k",
-            warmup_video
+            "-f", "null", "-"  # Don't save, just test encoding
         ]
         
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, 
                                stderr=subprocess.PIPE)
         proc.stdin.write(test_frame.tobytes())
         proc.stdin.close()
-        proc.wait(timeout=10)
+        proc.wait(timeout=5)
         
-        # Cleanup
-        for f in [warmup_video, warmup_audio]:
-            if os.path.exists(f):
-                os.remove(f)
-        
-        logger.info("   ✓ NVENC encoder initialized")
-        logger.info("✅ Warmup complete - ready for production traffic")
+        logger.info("   ✓ NVENC encoder ready")
         
     except Exception as e:
-        logger.warning(f"⚠️ Warmup failed (non-critical): {e}")
+        logger.warning(f"⚠️ NVENC warmup failed (non-critical): {e}")
     
-    # ===== END WARMUP FIX =====
+    # ===== END WARMUP =====
     
     logger.info("🌐 Starting ngrok tunnel...")
     try:
@@ -923,11 +956,13 @@ async def startup_event():
         logger.info("📺 NVENC-Optimized API Ready!")
         logger.info(f"🌐 Public URL: {public_url}")
         logger.info(f"🎬 Encoder: {video_optimizer.encoder_type}")
+        logger.info(f"⚡ Warmup time: {warmup_time:.2f}s")
         logger.info("="*70)
         
     except Exception as e:
         logger.error(f"⚠️ Ngrok Error: {e}")
         public_url = f"http://localhost:{PORT}"
+
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup"""
