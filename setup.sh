@@ -26,7 +26,7 @@ chmod +x download_checkpoints.sh
 ./download_checkpoints.sh
 
 echo "=== Downloading test image ==="
-gdown "https://drive.google.com/uc?id=1E7atbSqYSgCHsH0V_oGtEN5imn2G-vxy" -O img.jpg
+#gdown "https://drive.google.com/uc?id=1E7atbSqYSgCHsH0V_oGtEN5imn2G-vxy" -O img.jpg
 
 echo "=== Creating results directory ==="
 mkdir -p results

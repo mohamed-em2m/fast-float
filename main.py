@@ -37,7 +37,8 @@ import torch
 
 # Your inference module
 from inference_optimized import OptimizedInferenceAgent, InferenceOptions
-
+from .initialize_env import initialize_environment
+initialize_environment()
 # ============================================================================
 # GPU UTILITY FUNCTIONS (Safe - no CUDA initialization issues)
 # ============================================================================
@@ -237,6 +238,7 @@ os.environ["NGROK_AUTHTOKEN"] = "2yjRvpvFWHwJS0JC95ghnpBeZf0_5aLxWWF5pWK6LtVafzX
 agent = None
 opt = None
 public_url = None
+public_backup_url = None
 pcs = set()
 active_streams = {}
 request_semaphore = None
@@ -823,7 +825,7 @@ async def generate_video(request_data: Dict, request_id: str) -> Tuple[str, Dict
 @app.on_event("startup")
 async def startup_event():
     """Initialize model, NVENC encoder, and ngrok"""
-    global agent, opt, public_url, request_semaphore, video_optimizer, executor, inference_lock
+    global agent, opt, public_url, request_semaphore, video_optimizer, executor, inference_lock,public_backup_url
     
     request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     inference_lock = asyncio.Lock()
@@ -951,7 +953,9 @@ async def startup_event():
     
     logger.info("🌐 Starting ngrok tunnel...")
     try:
-        public_url = "https://ai.him-world.com"    
+        public_url = os.environ.get("AVATER_PUBLIC_URL") 
+        public_backup_url = os.environ.get("BACKUP_AVATER_PUBLIC_URL")   
+  
         logger.info("="*70)
         logger.info("📺 NVENC-Optimized API Ready!")
         logger.info(f"🌐 Public URL: {public_url}")
@@ -997,6 +1001,7 @@ async def generate(request: GenerationRequest):
                 "status": "success",
                 "request_id": request_id,
                 "download_url": f"{public_url}/download/{request_id}",
+                "download_backup":f"{public_backup_url}/download/{request_id}",
                 "stream_url": f"{public_url}/stream/{request_id}",
                 "video_path": video_path,
                 "file_size_mb": round(os.path.getsize(video_path) / 1024 / 1024, 2),
@@ -1047,14 +1052,4 @@ async def health():
             "average_fps": round(performance_stats['average_fps'], 2)
         }
     }
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=PORT,
-        log_level="info"
-    )
 
