@@ -514,10 +514,10 @@ class GenerationRequest(BaseModel):
     image_base64: Optional[str] = None
     image_format: Optional[str] = "jpg"
     emotion: str = "S2E"
-    nfe: int = 10
+    nfe: int = 100
     seed: int = 25
-    a_cfg_scale: float = 2.0
-    r_cfg_scale: float = 1.0
+    a_cfg_scale: float = 1.0
+    r_cfg_scale: float = 3.0
     e_cfg_scale: float = 1.0
     no_crop: bool = False
     compress: bool = True
