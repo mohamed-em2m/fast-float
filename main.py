@@ -177,7 +177,7 @@ logging.getLogger('urllib3').setLevel(logging.WARNING)
 logging.getLogger('asyncio').setLevel(logging.WARNING)
 
 # --- Configuration ---
-DEFAULT_IMAGE_PATH = "img.jpg"
+DEFAULT_IMAGE_PATH = "./images/img.jpg"
 RESULTS_DIR = "./results"
 MAX_CONCURRENT_REQUESTS = 10
 PORT = 8000
