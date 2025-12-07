@@ -179,7 +179,7 @@ logging.getLogger('asyncio').setLevel(logging.WARNING)
 # --- Configuration ---
 DEFAULT_IMAGE_PATH = "./images/img.jpg"
 RESULTS_DIR = "./results"
-MAX_CONCURRENT_REQUESTS = 10
+MAX_CONCURRENT_REQUESTS = 20
 PORT = 8000
 TARGET_IMAGE_SIZE = 256
 STUN_SERVERS = [
@@ -747,7 +747,6 @@ async def generate_video(request_data: Dict, request_id: str) -> Tuple[str, Dict
             temp_files.append(image_path_temp)
             
             image_path = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg").name
-            resize_image_to_256(image_path_temp, image_path)
             temp_files.append(image_path)
         else:
             if not os.path.exists(DEFAULT_IMAGE_PATH):
@@ -853,7 +852,11 @@ async def startup_event():
     opt.no_crop = False
     opt.optimization_mode = OPTIMIZATION_MODE
     opt.use_fp16 = USE_FP16
-    
+    opt.fps=20
+    opt.input_size=TARGET_IMAGE_SIZE
+    opt.n_diff_steps=100
+    opt.diff_schedule="cosine"
+    opt.diffusion_mode="sample"
     sys.argv = original_argv
     os.makedirs(opt.res_dir, exist_ok=True)
     
