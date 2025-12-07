@@ -513,7 +513,7 @@ class OptimizedInferenceAgent:
             
             print("Warming up...")
             for _ in range(warmup_runs):
-                _ = self.G_opt.inference_streaming(
+                _ = self.G_opt.inference(
                     data=data,
                     a_cfg_scale=a_cfg_scale,
                     r_cfg_scale=r_cfg_scale,
@@ -528,7 +528,7 @@ class OptimizedInferenceAgent:
             print(f"Running {benchmark_runs} benchmark iterations...")
             start_time = time.time()
             for _ in range(benchmark_runs):
-                _ = self.G_opt.inference_streaming(
+                _ = self.G_opt.inference(
                     data=data,
                     a_cfg_scale=a_cfg_scale,
                     r_cfg_scale=r_cfg_scale,
@@ -553,7 +553,7 @@ class OptimizedInferenceAgent:
         
         if use_amp or use_amp_fp16:
             with torch.cuda.amp.autocast(dtype=torch.float16 if use_amp_fp16 else torch.float32):
-                d_hat = self.G_opt.inference_streaming(
+                d_hat = self.G_opt.inference(
                     data=data,
                     a_cfg_scale=a_cfg_scale,
                     r_cfg_scale=r_cfg_scale,
@@ -563,7 +563,7 @@ class OptimizedInferenceAgent:
                     seed=seed
                 )['d_hat']
         else:
-            d_hat = self.G_opt.inference_streaming(
+            d_hat = self.G_opt.inference(
                 data=data,
                 a_cfg_scale=a_cfg_scale,
                 r_cfg_scale=r_cfg_scale,

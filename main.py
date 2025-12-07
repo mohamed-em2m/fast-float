@@ -179,7 +179,7 @@ logging.getLogger('asyncio').setLevel(logging.WARNING)
 # --- Configuration ---
 DEFAULT_IMAGE_PATH = "./images/img.jpg"
 RESULTS_DIR = "./results"
-MAX_CONCURRENT_REQUESTS = 20
+MAX_CONCURRENT_REQUESTS = 10
 PORT = 8000
 TARGET_IMAGE_SIZE = 256
 STUN_SERVERS = [
@@ -243,9 +243,7 @@ pcs = set()
 active_streams = {}
 request_semaphore = None
 queue_counter = 0
-MAX_CONCURRENT_REQUESTS = 5
-
-executor = ThreadPoolExecutor(max_workers=5)
+executor = ThreadPoolExecutor(max_workers=14)
 video_optimizer = None
 
 # Performance tracking
@@ -516,10 +514,10 @@ class GenerationRequest(BaseModel):
     image_base64: Optional[str] = None
     image_format: Optional[str] = "jpg"
     emotion: str = "S2E"
-    nfe: int = 100
+    nfe: int = 10
     seed: int = 25
-    a_cfg_scale: float = 1.0
-    r_cfg_scale: float = 3.0
+    a_cfg_scale: float = 2.0
+    r_cfg_scale: float = 1.0
     e_cfg_scale: float = 1.0
     no_crop: bool = False
     compress: bool = True
@@ -1075,4 +1073,3 @@ if __name__ == "__main__":
     config.startup_timeout = 60  # increase if your app is slow to start
 
     asyncio.run(serve(app, config))
-

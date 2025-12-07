@@ -46,7 +46,7 @@ class BaseOptions():
 		parser.add_argument('--num_heads', default=8, type=int)
 		parser.add_argument('--mlp_ratio', default=4.0, type=float)
 		parser.add_argument('--no_learned_pe', action='store_true')
-		parser.add_argument('--num_prev_frames', type=int, default=10)
+		parser.add_argument('--num_prev_frames', type=int, default=3)
 		parser.add_argument('--max_grad_norm', default=1, type=float, help='max grad norm for training transformers')
 
 		parser.add_argument('--ode_atol', default=1e-5, type=float)
@@ -63,7 +63,7 @@ class BaseOptions():
 							help='reference classifier-free guidance (vector field) scale')        
 
 		# option for Diffusion (ablation)
-		parser.add_argument('--n_diff_steps', type=int, default=500, help='number of diffusion steps')
+		parser.add_argument('--n_diff_steps', type=int, default=100, help='number of diffusion steps')
 		parser.add_argument('--diff_schedule', type=str, default='cosine', choices=['linear', 'cosine', 'quadratic', 'sigmoid'])
 		parser.add_argument('--diffusion_mode', type=str, default='sample', choices=['sample', 'noise'])
 		return parser
