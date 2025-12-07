@@ -179,7 +179,7 @@ logging.getLogger('asyncio').setLevel(logging.WARNING)
 # --- Configuration ---
 DEFAULT_IMAGE_PATH = "./images/img.jpg"
 RESULTS_DIR = "./results"
-MAX_CONCURRENT_REQUESTS = 10
+MAX_CONCURRENT_REQUESTS = 20
 PORT = 8000
 TARGET_IMAGE_SIZE = 256
 STUN_SERVERS = [
@@ -243,7 +243,9 @@ pcs = set()
 active_streams = {}
 request_semaphore = None
 queue_counter = 0
-executor = ThreadPoolExecutor(max_workers=14)
+MAX_CONCURRENT_REQUESTS = 5
+
+executor = ThreadPoolExecutor(max_workers=5)
 video_optimizer = None
 
 # Performance tracking

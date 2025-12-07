@@ -10,12 +10,7 @@ try:
 except ImportError:
     print("uvloop not installed. Using default CPython event loop (which is also highly optimized).")
     pass # If uvloop isn't installed, we stick with the default
-# Determine the project root directory, assuming this script is in src/utils
-# The path is constructed by going up two directories from this file's location.
-# __file__ -> /path/to/project/src/utils/initialize_env.py
-# os.path.dirname(__file__) -> /path/to/project/src/utils
-# os.path.join(..., '..') -> /path/to/project/src
-# os.path.join(..., '..', '..') -> /path/to/project
+
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 def set_env_variables(path):
