@@ -179,7 +179,7 @@ logging.getLogger('asyncio').setLevel(logging.WARNING)
 # --- Configuration ---
 DEFAULT_IMAGE_PATH = "./images/img.jpg"
 RESULTS_DIR = "./results"
-MAX_CONCURRENT_REQUESTS = 20
+MAX_CONCURRENT_REQUESTS = 10
 PORT = 8000
 TARGET_IMAGE_SIZE = 256
 STUN_SERVERS = [
@@ -537,26 +537,33 @@ def ensure_default_image():
 
 
 def resize_image_to_256(image_path: str, output_path: str = None) -> str:
-    """Resize image to 256x256"""
+    """
+    Keep the original image size (no resizing).
+    Converts to RGB if needed and saves as JPEG.
+    """
     try:
         if output_path is None:
             output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg").name
-        
+
         img = Image.open(image_path)
-        
+
+        # Fix alpha transparency by pasting on white background
         if img.mode == 'RGBA':
             background = Image.new('RGB', img.size, (255, 255, 255))
             background.paste(img, mask=img.split()[3])
             img = background
+
+        # Convert other modes to RGB
         elif img.mode != 'RGB':
             img = img.convert('RGB')
-        
-        img_resized = img.resize((TARGET_IMAGE_SIZE, TARGET_IMAGE_SIZE), Image.Resampling.LANCZOS)
-        img_resized.save(output_path, 'JPEG', quality=95)
-        
+
+        # Save WITHOUT resizing
+        img.save(output_path, 'JPEG', quality=95)
+
         return output_path
+
     except Exception as e:
-        logger.error(f"Failed to resize image: {e}")
+        logger.error(f"Failed to process image: {e}")
         raise
 
 
@@ -747,6 +754,7 @@ async def generate_video(request_data: Dict, request_id: str) -> Tuple[str, Dict
             temp_files.append(image_path_temp)
             
             image_path = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg").name
+            resize_image_to_256(image_path_temp, image_path)
             temp_files.append(image_path)
         else:
             if not os.path.exists(DEFAULT_IMAGE_PATH):
@@ -852,8 +860,6 @@ async def startup_event():
     opt.no_crop = False
     opt.optimization_mode = OPTIMIZATION_MODE
     opt.use_fp16 = USE_FP16
-    opt.fps=20
-    opt.input_size=TARGET_IMAGE_SIZE
     opt.n_diff_steps=100
     opt.diff_schedule="cosine"
     opt.diffusion_mode="sample"
