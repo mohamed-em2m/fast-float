@@ -393,15 +393,20 @@ class ToFlow(nn.Module):
         self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))
 
     def forward(self, input, style, feat, skip=None):
+        batch_size = input.size(0)
+        h, w = input.size(2), input.size(3)
+        device = input.device
+        dtype = input.dtype
+        
         out = self.conv(input, style)
         out = out + self.bias
 
-        # warping
-        xs = np.linspace(-1, 1, input.size(2))
-        xs = np.meshgrid(xs, xs)
-        xs = np.stack(xs, 2)
-
-        xs = torch.tensor(xs, requires_grad=False).float().unsqueeze(0).repeat(input.size(0), 1, 1, 1).cuda()
+        # Create sampling grid on the same device and dtype as input
+        xs = torch.linspace(-1, 1, h, device=device, dtype=dtype)
+        ys = torch.linspace(-1, 1, w, device=device, dtype=dtype)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
+        xs = torch.stack([grid_x, grid_y], dim=2)  # [h, w, 2]
+        xs = xs.unsqueeze(0).expand(batch_size, -1, -1, -1)  # [batch, h, w, 2]
 
         if skip is not None:
             skip = self.upsample(skip)
@@ -409,7 +414,7 @@ class ToFlow(nn.Module):
 
         sampler = torch.tanh(out[:, 0:2, :, :])
         mask = torch.sigmoid(out[:, 2:3, :, :])
-        flow = sampler.permute(0, 2, 3, 1) + xs     # B x h x w 2 
+        flow = sampler.permute(0, 2, 3, 1) + xs  # [batch, h, w, 2]
         feat_warp = F.grid_sample(feat, flow, align_corners=False) * mask
 
         return feat_warp, feat_warp + input * (1.0 - mask), out, flow
@@ -525,7 +530,7 @@ class Synthesis(nn.Module):
 
         return img, flow
 
-    def synthesis(self, wa, feats):
+    def synthesis(self, wa, alpha, feats):
         bs = wa.shape[0]
 
         if alpha is not None:
