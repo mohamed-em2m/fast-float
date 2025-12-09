@@ -1,5 +1,103 @@
+import json
+import base64
+import tempfile
+import datetime
+import asyncio
+import io
+import logging
+import time
+from pathlib import Path
+from typing import Optional, Dict, Tuple
+import uuid
+import subprocess
+import gc
+from concurrent.futures import ThreadPoolExecutor
+import traceback
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, StreamingResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from pydantic import BaseModel, Field
+
+# WebRTC
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+from aiortc.contrib.media import MediaPlayer
+from av import VideoFrame
+
+# Standard libraries
+import cv2
+import numpy as np
+from PIL import Image
+from pydub import AudioSegment
+import soundfile as sf
+from scipy import signal
+
+# PyTorch (after environment setup)
+import torch
+
+# Your inference module
+from inference_optimized import OptimizedInferenceAgent, InferenceOptions
 from initialize_env import initialize_environment
 initialize_environment()
+# ============================================================================
+# GPU UTILITY FUNCTIONS (Safe - no CUDA initialization issues)
+# ============================================================================
+
+def get_gpu_info():
+    """Get GPU information safely"""
+    if not torch.cuda.is_available():
+        return {"status": "no_gpu"}
+    
+    gpu_name = torch.cuda.get_device_name(0)
+    props = torch.cuda.get_device_properties(0)
+    total_memory_gb = props.total_memory / 1024**3
+    memory_fraction = float(os.environ.get('PYTORCH_CUDA_MEMORY_FRACTION', '1.0'))
+    
+    return {
+        "name": gpu_name,
+        "total_memory_gb": round(total_memory_gb, 2),
+        "memory_limit_gb": round(total_memory_gb * memory_fraction, 2),
+        "memory_fraction": memory_fraction
+    }
+
+def clear_gpu_memory():
+    """Aggressively clear GPU memory"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        gc.collect()
+
+def get_current_gpu_memory():
+    """Get current GPU memory usage"""
+    if not torch.cuda.is_available():
+        return None
+    
+    allocated_gb = torch.cuda.memory_allocated(0) / 1024**3
+    reserved_gb = torch.cuda.memory_reserved(0) / 1024**3
+    total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    
+    return {
+        "allocated_gb": round(allocated_gb, 2),
+        "reserved_gb": round(reserved_gb, 2),
+        "total_gb": round(total_gb, 2),
+        "usage_percent": round((allocated_gb / total_gb) * 100, 1)
+    }
+
+def print_gpu_status():
+    """Print GPU status"""
+    info = get_gpu_info()
+    mem = get_current_gpu_memory()
+    
+    if info.get("status") == "no_gpu":
+        logger.warning("⚠️ No GPU available")
+        return
+    
+    logger.info(f"🎮 GPU: {info['name']}")
+    logger.info(f"   Total: {info['total_memory_gb']}GB | Limit: {info['memory_limit_gb']}GB")
+    
+    if mem:
+        logger.info(f"   Current: {mem['allocated_gb']}GB ({mem['usage_percent']}%) | Reserved: {mem['reserved_gb']}GB")
+
 import os
 import json
 import base64
@@ -9,24 +107,37 @@ import asyncio
 import io
 import logging
 import time
-from typing import Optional, Dict, Tuple, List, Union
+from pathlib import Path
+from typing import Optional, Dict, Tuple
 import uuid
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
+
+# WebRTC
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
+from aiortc.contrib.media import MediaPlayer
+from av import VideoFrame
 import cv2
 import numpy as np
 from PIL import Image
+import torch
 # Audio processing
 from pydub import AudioSegment
 import soundfile as sf
+from scipy import signal
+
+# Ngrok
+
+# Import OPTIMIZED inference components
 from inference_optimized import OptimizedInferenceAgent, InferenceOptions
 
+# --- Logging Configuration ---
 class ColoredFormatter(logging.Formatter):
     """Custom formatter with colors and better structure"""
     
@@ -71,27 +182,45 @@ RESULTS_DIR = "./results"
 MAX_CONCURRENT_REQUESTS = 10
 PORT = 8000
 TARGET_IMAGE_SIZE = 256
+STUN_SERVERS = [
+    "stun:stun.l.google.com:19302",
+    "stun:stun1.l.google.com:19302",
+    "stun:stun2.l.google.com:19302"
+]
 
 # Model optimization settings
 OPTIMIZATION_MODE = "all"
 USE_FP16 = True
 COMPRESS_RESPONSES = True
 
-app = FastAPI(title="FLOAT WebRTC API - NVENC Optimized", version="5.2.0")
+app = FastAPI(title="FLOAT WebRTC API - NVENC Optimized", version="5.1.0")
+# Standard libraries
+import cv2
+import numpy as np
+from PIL import Image
+from pydub import AudioSegment
+import soundfile as sf
+from scipy import signal
+
+# PyTorch (after environment setup)
+import torch
+
+# Your inference module
+from inference_optimized import OptimizedInferenceAgent, InferenceOptions
+
+# ... [Keep all GPU utility functions and other code] ...
 
 # Global variables
 agent = None
 opt = None
 public_url = None
-public_backup_url = None
 pcs = set()
 active_streams = {}
 request_semaphore = None
 queue_counter = 0
-executor = ThreadPoolExecutor(max_workers=14)
+executor = ThreadPoolExecutor(max_workers=15)  # Single worker for sequential execution
 video_optimizer = None
 inference_lock = None  # Will be initialized in startup
-
 if COMPRESS_RESPONSES:
     app.add_middleware(GZipMiddleware, minimum_size=1000)
 
@@ -104,6 +233,18 @@ app.add_middleware(
 )
 
 os.environ["NGROK_AUTHTOKEN"] = "2yjRvpvFWHwJS0JC95ghnpBeZf0_5aLxWWF5pWK6LtVafzXyN"
+
+# Global variables
+agent = None
+opt = None
+public_url = None
+public_backup_url = None
+pcs = set()
+active_streams = {}
+request_semaphore = None
+queue_counter = 0
+executor = ThreadPoolExecutor(max_workers=14)
+video_optimizer = None
 
 # Performance tracking
 performance_stats = {
@@ -126,6 +267,7 @@ class VideoSaveOptimizer:
         logger.info(f"🎬 Video Encoder: {self.encoder_type}")
     
     def _check_nvidia_gpu(self):
+        """Check if NVIDIA GPU is available"""
         try:
             result = subprocess.run(
                 ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
@@ -136,12 +278,30 @@ class VideoSaveOptimizer:
             if result.returncode == 0 and result.stdout.strip():
                 gpu_name = result.stdout.strip()
                 logger.info(f"🎮 NVIDIA GPU detected: {gpu_name}")
+                
+                # Check NVENC capability
+                result2 = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=encoder.h264", "--format=csv,noheader"],
+                    capture_output=True,
+                    text=True,
+                    timeout=3
+                )
+                if result2.returncode == 0:
+                    logger.info(f"   NVENC support: {result2.stdout.strip()}")
                 return True
+            else:
+                logger.warning("⚠️ No NVIDIA GPU detected (nvidia-smi returned no output)")
+                return False
+        except FileNotFoundError:
+            logger.warning("⚠️ nvidia-smi not found - NVIDIA drivers may not be installed")
             return False
-        except:
+        except Exception as e:
+            logger.warning(f"⚠️ GPU check failed: {e}")
             return False
     
     def _detect_best_encoder(self) -> bool:
+        """Auto-detect best available encoder (NVENC > QSV > VideoToolbox > CPU)"""
+        
         gpu_encoders = [
             ("h264_nvenc", "NVENC (NVIDIA GPU)"),
             ("hevc_nvenc", "NVENC HEVC (NVIDIA GPU)"),
@@ -151,27 +311,200 @@ class VideoSaveOptimizer:
         ]
         
         try:
-            result = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True, timeout=3)
-            encoders_output = result.stdout
+            # First check if ffmpeg is available
+            result = subprocess.run(
+                ["ffmpeg", "-version"],
+                capture_output=True,
+                text=True,
+                timeout=3
+            )
             
+            if result.returncode != 0:
+                logger.error("❌ FFmpeg not found!")
+                self.encoder_type = "libx264 (CPU - fallback)"
+                self.selected_encoder = "libx264"
+                return False
+            
+            logger.info(f"📹 FFmpeg version: {result.stdout.split('version')[1].split()[0] if 'version' in result.stdout else 'unknown'}")
+            
+            # Get available encoders
+            result = subprocess.run(
+                ["ffmpeg", "-hide_banner", "-encoders"],
+                capture_output=True,
+                text=True,
+                timeout=3
+            )
+            
+            encoders_output = result.stdout
+            logger.info("🔍 Checking available GPU encoders...")
+            
+            # Try GPU encoders first
             for encoder, name in gpu_encoders:
                 if encoder in encoders_output:
-                    self.encoder_type = name
-                    self.selected_encoder = encoder
-                    return True
+                    logger.info(f"   ✓ Found {encoder} in encoders list")
+                    if self._test_encoder(encoder):
+                        logger.info(f"   ✓ {encoder} test PASSED")
+                        self.encoder_type = name
+                        self.selected_encoder = encoder
+                        return True
+                    else:
+                        logger.warning(f"   ✗ {encoder} test FAILED (encoder exists but can't encode)")
+                else:
+                    logger.debug(f"   ✗ {encoder} not available")
             
-            self.encoder_type = "libx264 (CPU - ultrafast)"
-            self.selected_encoder = "libx264"
-            return True
+            # Fallback to CPU
+            logger.warning("⚠️ No working GPU encoder found, falling back to CPU")
+            if "libx264" in encoders_output:
+                self.encoder_type = "libx264 (CPU - ultrafast)"
+                self.selected_encoder = "libx264"
+                return True
             
-        except:
+            logger.error("❌ No suitable video encoder found!")
+            return False
+            
+        except FileNotFoundError:
+            logger.error("❌ FFmpeg not installed or not in PATH!")
             self.encoder_type = "libx264 (CPU - fallback)"
             self.selected_encoder = "libx264"
             return False
-
+        except Exception as e:
+            logger.error(f"❌ Encoder detection failed: {e}")
+            self.encoder_type = "libx264 (CPU - fallback)"
+            self.selected_encoder = "libx264"
+            return False
+    
+    def _test_encoder(self, encoder: str) -> bool:
+        """Test if encoder actually works"""
+        try:
+            logger.info(f"      🧪 Testing {encoder}...")
+            
+            test_cmd = [
+                "ffmpeg", "-y",
+                "-f", "lavfi",
+                "-i", "color=c=black:s=256x256:d=0.04",  # 1 frame at 25fps
+                "-c:v", encoder,
+                "-frames:v", "1",
+                "-f", "null",
+                "-"
+            ]
+            
+            # Use capture_output=True OR stdout/stderr separately, not both
+            result = subprocess.run(
+                test_cmd,
+                capture_output=True,  # This captures both stdout and stderr
+                timeout=10
+            )
+            
+            if result.returncode == 0:
+                logger.info(f"      ✅ {encoder} working!")
+                return True
+            else:
+                error_output = result.stderr.decode() if result.stderr else "Unknown error"
+                # Show first meaningful error line
+                error_lines = [line for line in error_output.split('\n') if 'error' in line.lower() or 'failed' in line.lower()]
+                error_msg = error_lines[0] if error_lines else error_output[:200]
+                logger.warning(f"      ❌ {encoder} failed: {error_msg}")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            logger.warning(f"      ⏱️ {encoder} test timeout")
+            return False
+        except Exception as e:
+            logger.warning(f"      ❌ {encoder} test error: {e}")
+            return False
+    
+    def save_video_optimized(
+        self,
+        input_path: str,
+        output_path: str,
+        fps: int = 25,
+        quality: str = "fast",
+        resolution: Tuple[int, int] = (256, 256)
+    ) -> Tuple[bool, float, str]:
+        start_time = time.time()
+        width, height = resolution
+    
+        # tmp location (prefer tmpfs to avoid disk I/O)
+        tmp_dir = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else tempfile.gettempdir()
+        tmp_out = os.path.join(tmp_dir, f"tmp_opt_{uuid.uuid4().hex}.mp4")
+    
+        # Decide NVENC usage
+        use_gpu = bool(self.selected_encoder and "nvenc" in (self.selected_encoder or ""))
+    
+        if use_gpu:
+            # GPU-accelerated pipeline: decode -> hwupload -> scale_cuda -> encode (NVENC)
+            # -hwaccel cuda & -hwaccel_output_format cuda request hardware decode path, if available.
+            cmd = [
+                "ffmpeg", "-y",
+                "-hide_banner", "-loglevel", "error",
+                "-hwaccel", "cuda",
+                "-hwaccel_output_format", "cuda",
+                "-i", input_path,
+                "-vf", f"hwupload_cuda,scale_cuda={width}:{height}:interp_algo=linear,fps={fps}",
+                "-c:v", "h264_nvenc",
+                "-preset", "p1",                # p1 = fastest
+                "-rc", "constqp",              # minimal rate control overhead
+                "-qp", "28",                   # quality/size tradeoff (lower = better quality, slower)
+                "-profile:v", "baseline",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "64k",
+                "-movflags", "+faststart",
+                tmp_out
+            ]
+            encoder_label = "h264_nvenc_p1"
+        else:
+            # CPU fallback: fastest libx264 settings
+            cmd = [
+                "ffmpeg", "-y",
+                "-hide_banner", "-loglevel", "error",
+                "-i", input_path,
+                "-vf", f"scale={width}:{height}:flags=bilinear,fps={fps}",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-crf", "30",
+                "-threads", "0",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "64k",
+                "-movflags", "+faststart",
+                tmp_out
+            ]
+            encoder_label = "libx264_ultrafast"
+    
+        try:
+            proc = subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=120)
+            elapsed = time.time() - start_time
+    
+            # Move tmp_out to final output path (atomic)
+            try:
+                os.replace(tmp_out, output_path)
+            except Exception:
+                # fallback copy
+                import shutil
+                shutil.copy(tmp_out, output_path)
+                os.remove(tmp_out)
+    
+            return True, elapsed, encoder_label
+    
+        except subprocess.CalledProcessError as e:
+            err = e.stderr or ""
+            # If NVENC failed, try CPU fallback once
+            if use_gpu:
+                logger.warning(f"⚠️ NVENC encode failed: {err.splitlines()[:5]} -- retrying with CPU fallback")
+                self.selected_encoder = "libx264"
+                return self.save_video_optimized(input_path, output_path, fps, quality, resolution)
+            logger.error(f"❌ Encoding failed: {err}")
+            return False, time.time() - start_time, "failed"
+    
+        except subprocess.TimeoutExpired:
+            logger.error("❌ Encoding timeout")
+            return False, time.time() - start_time, "timeout"
+    
+        except Exception as e:
+            logger.error(f"❌ Unexpected error during encoding: {e}")
+            return False, time.time() - start_time, "error"    
+    
 # --- Data Models ---
-
-# Single Request Model
 class GenerationRequest(BaseModel):
     audio_base64: str
     audio_format: str = "pcm"
@@ -190,58 +523,55 @@ class GenerationRequest(BaseModel):
     compress: bool = True
     quality: str = "balanced"
 
-# Batch Request Models
-class BatchItem(BaseModel):
-    id: str  # Unique ID for the client to track this specific item
-    audio_base64: str
-    image_base64: Optional[str] = None
-
-class BatchGenerationRequest(BaseModel):
-    items: List[BatchItem]
-    # Shared settings for the whole batch
-    audio_format: str = "pcm"
-    sample_rate: int = 16000
-    channels: int = 1
-    sample_width: int = 2
-    image_format: str = "jpg"
-    emotion: str = "S2E"
-    nfe: int = 10
-    seed: int = 25
-    a_cfg_scale: float = 2.0
-    r_cfg_scale: float = 1.0
-    e_cfg_scale: float = 1.0
-    no_crop: bool = False
-    batch_size: Optional[int] = None # Helper for the inference engine
-
 
 # --- Utility Functions ---
 def ensure_default_image():
+    """Create default 256x256 image if not exists"""
     if not os.path.exists(DEFAULT_IMAGE_PATH):
+        logger.warning(f"Default image not found, creating placeholder")
         img = np.zeros((TARGET_IMAGE_SIZE, TARGET_IMAGE_SIZE, 3), dtype=np.uint8)
         cv2.putText(img, "Default", (TARGET_IMAGE_SIZE//4, TARGET_IMAGE_SIZE//2), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         cv2.imwrite(DEFAULT_IMAGE_PATH, img)
+        logger.info(f"Created default {TARGET_IMAGE_SIZE}x{TARGET_IMAGE_SIZE} image")
+
 
 def resize_image_to_256(image_path: str, output_path: str = None) -> str:
+    """
+    Keep the original image size (no resizing).
+    Converts to RGB if needed and saves as JPEG.
+    """
     try:
         if output_path is None:
             output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg").name
+
         img = Image.open(image_path)
+
+        # Fix alpha transparency by pasting on white background
         if img.mode == 'RGBA':
             background = Image.new('RGB', img.size, (255, 255, 255))
             background.paste(img, mask=img.split()[3])
             img = background
+
+        # Convert other modes to RGB
         elif img.mode != 'RGB':
             img = img.convert('RGB')
+
+        # Save WITHOUT resizing
         img.save(output_path, 'JPEG', quality=95)
+
         return output_path
+
     except Exception as e:
         logger.error(f"Failed to process image: {e}")
         raise
 
+
 def convert_pcm_to_wav(pcm_data: bytes, sample_rate: int = 16000, 
                        channels: int = 1, sample_width: int = 2) -> bytes:
+    """Convert PCM to WAV with proper validation"""
     try:
+        # Determine dtype based on sample width
         if sample_width == 1:
             dtype = np.uint8
             max_val = 128.0
@@ -250,67 +580,127 @@ def convert_pcm_to_wav(pcm_data: bytes, sample_rate: int = 16000,
             dtype = np.int16
             max_val = 32768.0
             offset = 0
+        elif sample_width == 4:
+            dtype = np.int32
+            max_val = 2147483648.0
+            offset = 0
         else:
             dtype = np.int16
             max_val = 32768.0
             offset = 0
         
+        # Convert PCM bytes to numpy array
         audio_array = np.frombuffer(pcm_data, dtype=dtype)
-        if len(audio_array) == 0: raise ValueError("Empty audio data")
         
-        if channels > 1 and len(audio_array) % channels != 0:
-            audio_array = audio_array[:len(audio_array) - (len(audio_array) % channels)]
+        if len(audio_array) == 0:
+            raise ValueError("Empty audio data")
+        
+        # Reshape for channels if needed
+        if channels > 1:
+            if len(audio_array) % channels != 0:
+                # Trim to nearest multiple
+                audio_array = audio_array[:len(audio_array) - (len(audio_array) % channels)]
             audio_array = audio_array.reshape(-1, channels)
         
+        # Convert to float32 normalized to [-1, 1]
         if dtype == np.uint8:
             audio_float = (audio_array.astype(np.float32) - offset) / max_val
         else:
             audio_float = audio_array.astype(np.float32) / max_val
         
+        # Ensure valid range
         audio_float = np.clip(audio_float, -1.0, 1.0)
         
+        # Write to WAV using soundfile
         wav_buffer = io.BytesIO()
         sf.write(wav_buffer, audio_float, sample_rate, format='WAV', subtype='PCM_16')
         wav_buffer.seek(0)
-        return wav_buffer.read()
+        wav_bytes = wav_buffer.read()
+        
+        # Validate WAV file
+        if len(wav_bytes) < 44:
+            raise ValueError(f"Generated WAV too small: {len(wav_bytes)} bytes")
+        
+        # Verify it can be read back
+        test_buffer = io.BytesIO(wav_bytes)
+        test_data, test_sr = sf.read(test_buffer)
+        logger.debug(f"WAV validation: {len(test_data)} samples at {test_sr}Hz")
+        
+        return wav_bytes
+        
     except Exception as e:
         logger.error(f"PCM to WAV conversion failed: {e}")
         raise
+
 
 def process_audio_format(audio_content: str, ext: str, 
                         sample_rate: int = 16000,
                         channels: int = 1, 
                         sample_width: int = 2) -> bytes:
+    """Process audio and convert to WAV with robust validation"""
     try:
         audio_bytes = base64.b64decode(audio_content)
         ext = ext.lower().lstrip('.')
         
+        logger.debug(f"Processing audio: format={ext}, size={len(audio_bytes)} bytes, sr={sample_rate}, ch={channels}")
+        
+        # Always treat input as PCM/raw and convert to proper WAV
         if ext in ['pcm', 'raw', 'wav']:
+            # Treat all as raw PCM data and convert
+            logger.info(f"Converting {ext} to WAV format")
             wav_bytes = convert_pcm_to_wav(audio_bytes, sample_rate, channels, sample_width)
+            
         else:
+            # Use pydub for other formats
             try:
+                logger.debug(f"Using pydub for {ext} format")
                 audio_segment = AudioSegment.from_file(io.BytesIO(audio_bytes), format=ext)
-                if audio_segment.channels > 1: audio_segment = audio_segment.set_channels(1)
-                if audio_segment.frame_rate != sample_rate: audio_segment = audio_segment.set_frame_rate(sample_rate)
+                
+                # Convert to mono
+                if audio_segment.channels > 1:
+                    audio_segment = audio_segment.set_channels(1)
+                
+                # Set sample rate
+                if audio_segment.frame_rate != sample_rate:
+                    audio_segment = audio_segment.set_frame_rate(sample_rate)
+                
+                # Export as WAV
                 wav_buffer = io.BytesIO()
                 audio_segment.export(wav_buffer, format='wav')
                 wav_buffer.seek(0)
                 wav_bytes = wav_buffer.read()
-            except:
+                
+            except Exception as e:
+                logger.error(f"Pydub conversion failed: {e}, trying PCM fallback")
                 wav_bytes = convert_pcm_to_wav(audio_bytes, sample_rate, channels, sample_width)
+        
+        # Final validation
+        if len(wav_bytes) < 44:
+            raise ValueError(f"Generated WAV file too small: {len(wav_bytes)} bytes")
+        
+        # Verify WAV header
+        if wav_bytes[:4] != b'RIFF' or wav_bytes[8:12] != b'WAVE':
+            raise ValueError("Invalid WAV file header")
+        
+        # Test read with soundfile
+        try:
+            test_buffer = io.BytesIO(wav_bytes)
+            test_data, test_sr = sf.read(test_buffer)
+            logger.info(f"✓ Audio processed: {len(test_data)} samples at {test_sr}Hz ({len(wav_bytes)} bytes)")
+        except Exception as e:
+            raise ValueError(f"Generated WAV validation failed: {e}")
+        
         return wav_bytes
+        
     except Exception as e:
-        logger.error(f"Audio processing failed: {e}")
+        logger.error(f"Audio processing failed: {e}", exc_info=True)
         raise
-
-# --- Inference Wrappers ---
-
 def _run_inference_blocking(video_path_raw, image_path, audio_path, request_data):
-    """Synchronous wrapper for single inference"""
+    """Synchronous wrapper for optimized inference - uses global agent"""
     return agent.run_inference(
-        res_video_paths=[video_path_raw],
-        ref_paths=[image_path],
-        audio_paths=[audio_path],
+        res_video_path=video_path_raw,
+        ref_path=image_path,
+        audio_path=audio_path,
         a_cfg_scale=request_data.get("a_cfg_scale", 2.0),
         r_cfg_scale=request_data.get("r_cfg_scale", 1.0),
         e_cfg_scale=request_data.get("e_cfg_scale", 1.0),
@@ -319,227 +709,302 @@ def _run_inference_blocking(video_path_raw, image_path, audio_path, request_data
         no_crop=request_data.get("no_crop", False),
         seed=request_data.get("seed", 25),
         verbose=True
-    )[0]
-
-def _run_batch_inference_blocking(res_paths, ref_paths, aud_paths, request_data: BatchGenerationRequest):
-    """Synchronous wrapper for BATCH inference"""
-    return agent.run_inference(
-        res_video_paths=res_paths,
-        ref_paths=ref_paths,
-        audio_paths=aud_paths,
-        a_cfg_scale=request_data.a_cfg_scale,
-        r_cfg_scale=request_data.r_cfg_scale,
-        e_cfg_scale=request_data.e_cfg_scale,
-        emo=request_data.emotion,
-        nfe=request_data.nfe,
-        no_crop=request_data.no_crop,
-        seed=request_data.seed,
-        verbose=True,
-        batch_size=request_data.batch_size
     )
-
 async def generate_video(request_data: Dict, request_id: str) -> Tuple[str, Dict]:
-    """Single video generation"""
+    """Generate video"""
     global inference_lock
+    
     temp_files = []
-    total_start = time.time()
+    total_start_time = time.time()
     timings = {}
     
     try:
         loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+    
+    try:
+        logger.info(f"[{request_id}] 🚀 Starting video generation")
         
-        # Audio
+        # Audio processing
         preprocess_start = time.time()
+        
         wav_bytes = process_audio_format(
-            request_data["audio_base64"], request_data.get("audio_format", "pcm"),
-            request_data.get("sample_rate", 16000), request_data.get("channels", 1), request_data.get("sample_width", 2)
+            request_data["audio_base64"],
+            request_data.get("audio_format", "pcm"),
+            request_data.get("sample_rate", 16000),
+            request_data.get("channels", 1),
+            request_data.get("sample_width", 2)
         )
+        
         audio_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
-        with open(audio_path, 'wb') as f: f.write(wav_bytes)
+        with open(audio_path, 'wb') as f:
+            f.write(wav_bytes)
         temp_files.append(audio_path)
         
-        # Image
+        # Image processing
         if request_data.get("image_base64"):
             image_bytes = base64.b64decode(request_data["image_base64"])
-            image_path_temp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{request_data.get('image_format', 'jpg')}").name
-            with open(image_path_temp, 'wb') as f: f.write(image_bytes)
+            image_path_temp = tempfile.NamedTemporaryFile(
+                delete=False, 
+                suffix=f".{request_data.get('image_format', 'jpg')}"
+            ).name
+            with open(image_path_temp, 'wb') as f:
+                f.write(image_bytes)
             temp_files.append(image_path_temp)
+            
             image_path = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg").name
             resize_image_to_256(image_path_temp, image_path)
             temp_files.append(image_path)
         else:
-            if not os.path.exists(DEFAULT_IMAGE_PATH): ensure_default_image()
+            if not os.path.exists(DEFAULT_IMAGE_PATH):
+                ensure_default_image()
             image_path = DEFAULT_IMAGE_PATH
-            
+        
         timings['preprocess'] = time.time() - preprocess_start
         
         # Inference
-        video_path_final = os.path.join(opt.res_dir, f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{request_id}.mp4")
+        video_path_final = os.path.join(
+            opt.res_dir,
+            f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{request_id}.mp4"
+        )
+        
         inference_start = time.time()
         
+        # Acquire lock to ensure only one inference runs at a time
         async with inference_lock:
             output_path = await loop.run_in_executor(
-                executor, _run_inference_blocking, video_path_final, image_path, audio_path, request_data
+                executor,
+                _run_inference_blocking,
+                video_path_final,
+                image_path,
+                audio_path,
+                request_data
             )
         
         timings['inference'] = time.time() - inference_start
-        timings['total'] = time.time() - total_start
+        timings['total'] = time.time() - total_start_time
         timings['fps'] = 1.0 / timings['inference'] if timings['inference'] > 0 else 0
         
+        # Update stats
         performance_stats['total_requests'] += 1
         performance_stats['total_inference_time'] += timings['inference']
+        performance_stats['total_preprocess_time'] += timings['preprocess']
+        
         if performance_stats['total_inference_time'] > 0:
             performance_stats['average_fps'] = performance_stats['total_requests'] / performance_stats['total_inference_time']
-            
+        
+        # Cleanup temp files
+        for temp_file in temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except Exception as cleanup_error:
+                logger.debug(f"[{request_id}] Cleanup warning: {cleanup_error}")
+        
+        # Verify final output exists
+        if not os.path.exists(output_path):
+            raise FileNotFoundError(f"Final video not found at {output_path}")
+        
+        file_size = os.path.getsize(output_path) / 1024 / 1024
+        
+        logger.info(
+            f"[{request_id}] ✅ Complete: {timings['total']:.2f}s "
+            f"(prep: {timings['preprocess']:.2f}s, inf: {timings['inference']:.2f}s) | "
+            f"{file_size:.2f}MB"
+        )
+        
         return output_path, timings
         
     except Exception as e:
-        raise e
-    finally:
-        for f in temp_files:
-            if os.path.exists(f): os.remove(f)
-
-async def generate_video_batch(request_data: BatchGenerationRequest, batch_id: str) -> Tuple[List[Dict], Dict]:
-    """Batch video generation"""
-    global inference_lock
-    temp_files = []
-    total_start = time.time()
-    timings = {}
-    
-    try:
-        loop = asyncio.get_running_loop()
-        preprocess_start = time.time()
+        logger.error(f"[{request_id}] ❌ Generation failed: {str(e)}", exc_info=True)
         
-        ref_paths = []
-        audio_paths = []
-        res_paths = []
-        item_ids = []
-        
-        # Preprocess all items in the batch
-        for i, item in enumerate(request_data.items):
-            item_id = item.id
-            
-            # Audio
-            wav_bytes = process_audio_format(
-                item.audio_base64, request_data.audio_format,
-                request_data.sample_rate, request_data.channels, request_data.sample_width
-            )
-            aud_p = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{i}.wav").name
-            with open(aud_p, 'wb') as f: f.write(wav_bytes)
-            audio_paths.append(aud_p)
-            temp_files.append(aud_p)
-            
-            # Image
-            if item.image_base64:
-                img_bytes = base64.b64decode(item.image_base64)
-                img_t = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{i}.{request_data.image_format}").name
-                with open(img_t, 'wb') as f: f.write(img_bytes)
-                temp_files.append(img_t)
-                
-                img_p = tempfile.NamedTemporaryFile(delete=False, suffix=f"_{i}.jpg").name
-                resize_image_to_256(img_t, img_p)
-                ref_paths.append(img_p)
-                temp_files.append(img_p)
-            else:
-                if not os.path.exists(DEFAULT_IMAGE_PATH): ensure_default_image()
-                ref_paths.append(DEFAULT_IMAGE_PATH)
-            
-            # Output path
-            safe_id = "".join([c for c in item_id if c.isalnum() or c in ['_','-']])
-            out_p = os.path.join(opt.res_dir, f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{batch_id}_{safe_id}.mp4")
-            res_paths.append(out_p)
-            item_ids.append(item_id)
-            
-        timings['preprocess'] = time.time() - preprocess_start
-        
-        # Run Batch Inference
-        inference_start = time.time()
-        async with inference_lock:
-            completed_paths = await loop.run_in_executor(
-                executor, _run_batch_inference_blocking, res_paths, ref_paths, audio_paths, request_data
-            )
-            
-        timings['inference'] = time.time() - inference_start
-        timings['total'] = time.time() - total_start
-        timings['fps'] = len(completed_paths) / timings['inference'] if timings['inference'] > 0 else 0
-        
-        # Structure results
-        results = []
-        for idx, path in enumerate(completed_paths):
-            results.append({
-                "id": item_ids[idx],
-                "path": path,
-                "file_size_mb": round(os.path.getsize(path) / 1024 / 1024, 2) if os.path.exists(path) else 0
-            })
-            
-        return results, timings
-        
-    except Exception as e:
-        logger.error(f"Batch failed: {e}")
-        raise
-    finally:
-        for f in temp_files:
+        # Cleanup all temp files on error
+        for temp_file in temp_files:
             try:
-                if os.path.exists(f): os.remove(f)
-            except: pass
-
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except:
+                pass
+        
+        raise
 # --- FastAPI Event Handlers ---
 @app.on_event("startup")
 async def startup_event():
-    global agent, opt, public_url, request_semaphore, video_optimizer, executor, inference_lock, public_backup_url
+    """Initialize model, NVENC encoder, and ngrok"""
+    global agent, opt, public_url, request_semaphore, video_optimizer, executor, inference_lock,public_backup_url
     
     request_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     inference_lock = asyncio.Lock()
+    
+    logger.info("="*70)
+    logger.info("🚀 Starting FLOAT WebRTC API - NVENC Optimized v5.1.0")
+    logger.info(f"⚡ Optimization: {OPTIMIZATION_MODE} | FP16: {USE_FP16}")
+    logger.info(f"📐 Target resolution: {TARGET_IMAGE_SIZE}x{TARGET_IMAGE_SIZE}")
+    
+    # Initialize NVENC optimizer
     video_optimizer = VideoSaveOptimizer()
+    logger.info(f"🎬 Video Encoder: {video_optimizer.encoder_type}")
+    logger.info("="*70)
+    
     ensure_default_image()
     
     import sys
     original_argv = sys.argv.copy()
     sys.argv = [sys.argv[0]]
+    
     opt = InferenceOptions().parse()
     opt.rank = 0
     opt.ngpus = 1
     opt.res_dir = RESULTS_DIR
+    opt.no_crop = False
     opt.optimization_mode = OPTIMIZATION_MODE
     opt.use_fp16 = USE_FP16
+    opt.n_diff_steps=100
+    opt.diff_schedule="cosine"
+    opt.diffusion_mode="sample"
     sys.argv = original_argv
     os.makedirs(opt.res_dir, exist_ok=True)
     
-    logger.info("🤖 Loading FLOAT model...")
+    logger.info(f"🤖 Loading FLOAT model with {OPTIMIZATION_MODE} optimization...")
     agent = OptimizedInferenceAgent(opt)
+    logger.info("✅ Model loaded successfully")
     
-    # Warmup
-    logger.info("🔥 Warming up model...")
+    # ===== MODEL WARMUP WITH REAL INFERENCE =====
+    logger.info("🔥 Warming up model with real inference (empty audio)...")
+    warmup_start = time.time()
+    
     try:
-        warmup_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
-        warmup_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-        sf.write(warmup_audio, np.zeros(8000), 16000)
+        # Create minimal test files
+        warmup_audio_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+        warmup_video_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
         
-        await asyncio.get_event_loop().run_in_executor(
-            executor, _run_inference_blocking, warmup_video, DEFAULT_IMAGE_PATH, warmup_audio, {}
+        # Generate 0.5 seconds of silent audio (minimal but valid)
+        silent_audio = np.zeros(8000, dtype=np.float32)  # 0.5 sec at 16kHz
+        sf.write(warmup_audio_path, silent_audio, 16000)
+        
+        # Use default image
+        warmup_image_path = DEFAULT_IMAGE_PATH
+        
+        logger.info("   Running warmup inference...")
+        
+        # Run actual model inference
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            executor,
+            _run_inference_blocking,
+            warmup_video_path,
+            warmup_image_path,
+            warmup_audio_path,
+            {
+                "a_cfg_scale": 2.0,
+                "r_cfg_scale": 1.0,
+                "e_cfg_scale": 1.0,
+                "emotion": "S2E",
+                "nfe": 10,
+                "no_crop": False,
+                "seed": 25
+            }
         )
-        logger.info("✅ Warmup complete")
+        
+        warmup_time = time.time() - warmup_start
+        logger.info(f"   ✓ Warmup inference complete ({warmup_time:.2f}s)")
+        
+        # Verify output was created
+        if os.path.exists(warmup_video_path):
+            file_size = os.path.getsize(warmup_video_path) / 1024
+            logger.info(f"   ✓ Warmup video generated: {file_size:.1f}KB")
+        
+        # Cleanup warmup files
+        for f in [warmup_audio_path, warmup_video_path]:
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+            except:
+                pass
+        
+        logger.info("✅ Model warmup complete - ready for production traffic")
+        
     except Exception as e:
-        logger.warning(f"⚠️ Warmup error: {e}")
+        logger.warning(f"⚠️ Model warmup failed (non-critical): {e}")
+        logger.warning("   First request may be slower than usual")
+    
+    # ===== NVENC ENCODER WARMUP (Lightweight) =====
+    logger.info("🎬 Testing NVENC encoder...")
+    try:
+        warmup_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+        
+        # Create single test frame
+        test_frame = np.zeros((TARGET_IMAGE_SIZE, TARGET_IMAGE_SIZE, 3), dtype=np.uint8)
+        
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "rawvideo", "-vcodec", "rawvideo",
+            "-pix_fmt", "rgb24", "-s", f"{TARGET_IMAGE_SIZE}x{TARGET_IMAGE_SIZE}",
+            "-r", "25", "-i", "-",
+            "-c:v", video_optimizer.selected_encoder,
+            "-preset", "p1", "-frames:v", "1",
+            "-f", "null", "-"  # Don't save, just test encoding
+        ]
+        
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, 
+                               stderr=subprocess.PIPE)
+        proc.stdin.write(test_frame.tobytes())
+        proc.stdin.close()
+        proc.wait(timeout=5)
+        
+        logger.info("   ✓ NVENC encoder ready")
+        
+    except Exception as e:
+        logger.warning(f"⚠️ NVENC warmup failed (non-critical): {e}")
+    
+    # ===== END WARMUP =====
+    
+    logger.info("🌐 Starting ngrok tunnel...")
+    warmup_start = time.time()
 
-    public_url = os.environ.get("AVATER_PUBLIC_URL", f"http://localhost:{PORT}") 
-    public_backup_url = os.environ.get("BACKUP_AVATER_PUBLIC_URL", public_url)
+    try:
+        public_url = os.environ.get("AVATER_PUBLIC_URL") 
+        public_backup_url = os.environ.get("BACKUP_AVATER_PUBLIC_URL")   
+        warmup_time = time.time() - warmup_start
+
+        logger.info("="*70)
+        logger.info("📺 NVENC-Optimized API Ready!")
+        logger.info(f"🌐 Public URL: {public_url}")
+        logger.info(f"🎬 Encoder: {video_optimizer.encoder_type}")
+        logger.info(f"⚡ Warmup time: {warmup_time:.2f}s")
+        logger.info("="*70)
+        
+    except Exception as e:
+        logger.error(f" {e} {traceback.format_exc()}")
+        public_url = f"http://localhost:{PORT}"
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    """Cleanup"""
     logger.info("🛑 Shutting down...")
+    
+    coros = [pc.close() for pc in pcs]
+    await asyncio.gather(*coros, return_exceptions=True)
+    pcs.clear()
+    
     executor.shutdown(wait=False)
+    
+
 
 # --- API Endpoints ---
 @app.post("/generate")
 async def generate(request: GenerationRequest):
-    """Generate single video"""
-    if agent is None: raise HTTPException(status_code=503, detail="Model not loaded")
-    global queue_counter
+    """Generate video with NVENC optimization"""
+    if agent is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    global request_semaphore, queue_counter
     
     async with request_semaphore:
         queue_counter += 1
         request_id = f"req_{queue_counter}_{uuid.uuid4().hex[:8]}"
+        
         try:
             video_path, timings = await generate_video(request.dict(), request_id)
             active_streams[request_id] = video_path
@@ -548,76 +1013,66 @@ async def generate(request: GenerationRequest):
                 "status": "success",
                 "request_id": request_id,
                 "download_url": f"{public_url}/download/{request_id}",
-                "download_backup": f"{public_backup_url}/download/{request_id}",
+                "download_backup":f"{public_backup_url}/download/{request_id}",
+                "stream_url": f"{public_url}/stream/{request_id}",
                 "video_path": video_path,
-                "performance": timings
+                "file_size_mb": round(os.path.getsize(video_path) / 1024 / 1024, 2),
+                "resolution": f"{TARGET_IMAGE_SIZE}x{TARGET_IMAGE_SIZE}",
+                "encoder": video_optimizer.encoder_type,
+                "performance": {
+                    "preprocess_time": round(timings['preprocess'], 3),
+                    "inference_time": round(timings['inference'], 3),
+                    "total_time": round(timings['total'], 3),
+                    "fps": round(timings['fps'], 2)
+                }
             }
         except Exception as e:
             logger.error(f"[{request_id}] Failed: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/generate/batch")
-async def generate_batch(request: BatchGenerationRequest):
-    """Generate multiple videos in a batch"""
-    if agent is None: raise HTTPException(status_code=503, detail="Model not loaded")
-    global queue_counter
-    
-    async with request_semaphore:
-        queue_counter += 1
-        batch_id = f"batch_{queue_counter}_{uuid.uuid4().hex[:8]}"
-        
-        logger.info(f"[{batch_id}] 🚀 Starting batch generation for {len(request.items)} items")
-        
-        try:
-            results, timings = await generate_video_batch(request, batch_id)
-            
-            response_items = []
-            for item in results:
-                # Use item ID from client or internal ID
-                res_id = item['id']
-                # We can store the path using the ID as key, or generate a specific download key
-                # Here we use the ID provided by the client combined with batch ID to ensure uniqueness in stream map
-                stream_key = f"{batch_id}_{res_id}"
-                active_streams[stream_key] = item['path']
-                
-                response_items.append({
-                    "id": res_id,
-                    "status": "success",
-                    "download_url": f"{public_url}/download/{stream_key}",
-                    "download_backup": f"{public_backup_url}/download/{stream_key}",
-                    "file_size_mb": item['file_size_mb']
-                })
-
-            return {
-                "status": "success",
-                "batch_id": batch_id,
-                "results": response_items,
-                "performance": {
-                    "total_time": round(timings['total'], 3),
-                    "preprocess_time": round(timings['preprocess'], 3),
-                    "inference_time": round(timings['inference'], 3),
-                    "fps_effective": round(timings['fps'], 2)
-                }
-            }
-        except Exception as e:
-            logger.error(f"[{batch_id}] Batch Failed: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/download/{request_id}")
 async def download_video(request_id: str):
-    if request_id not in active_streams: raise HTTPException(status_code=404, detail="Video not found")
-    path = active_streams[request_id]
-    if not os.path.exists(path): raise HTTPException(status_code=404, detail="File lost")
-    return FileResponse(path, media_type="video/mp4", filename=f"{request_id}.mp4")
+    """Download generated video"""
+    if request_id not in active_streams:
+        raise HTTPException(status_code=404, detail="Video not found")
+    
+    video_path = active_streams[request_id]
+    if not os.path.exists(video_path):
+        raise HTTPException(status_code=404, detail="Video file not found")
+    
+    return FileResponse(
+        video_path,
+        media_type="video/mp4",
+        filename=f"{request_id}.mp4"
+    )
+
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "model_loaded": agent is not None, "performance": performance_stats}
-
+    """Health check with performance stats"""
+    return {
+        "status": "healthy",
+        "model_loaded": agent is not None,
+        "encoder": video_optimizer.encoder_type if video_optimizer else "unknown",
+        "active_streams": len(active_streams),
+        "performance_stats": {
+            "total_requests": performance_stats['total_requests'],
+            "avg_inference_time": round(
+                performance_stats['total_inference_time'] / max(performance_stats['total_requests'], 1), 3
+            ),
+            "average_fps": round(performance_stats['average_fps'], 2)
+        }
+    }
 if __name__ == "__main__":
+
     import asyncio
     from hypercorn.asyncio import serve
     from hypercorn.config import Config
+
     config = Config()
     config.bind = [f"0.0.0.0:{PORT}"]
+    config.loglevel = "info"
+    config.startup_timeout = 60  # increase if your app is slow to start
+
     asyncio.run(serve(app, config))
