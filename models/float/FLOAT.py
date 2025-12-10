@@ -30,7 +30,7 @@ class FLOAT(BaseModel):
 		# condition encoders
 		self.audio_encoder 		= AudioEncoder(opt)
 		self.emotion_encoder	= Audio2Emotion(opt)
-		self.decode_semaphore=asyncio.Semaphore(100)
+		self.decode_semaphore=asyncio.Semaphore(10)
 		# FMT; Flow Matchingssss Transformer
 		self.fmt = FlowMatchingTransformer(opt)
 		
