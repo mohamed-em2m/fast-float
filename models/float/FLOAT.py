@@ -152,7 +152,6 @@ class FLOAT(BaseModel):
 								for sample_idx in range(samples_len):
 									yield s_r_d_t[:,sample_idx]
 
-
 	@torch.no_grad()
 	def inference(self, data: dict, a_cfg_scale=None, r_cfg_scale=None, 
 				e_cfg_scale=None, emo=None, nfe=10, seed=None) -> dict:
@@ -199,7 +198,7 @@ class FLOAT(BaseModel):
 						out_tensor = out_tensor.to(device=self.opt.rank, non_blocking=True)
 
 					# keep pair for later synchronization/stack
-					decode_results.append((out_tensor, self.stream))
+					decode_results.append((out_tensor, self.stream_decode))
 
 			# now wait for each stream to finish and move outputs to the current/default stream
 			stacked_list = []
