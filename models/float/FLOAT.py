@@ -177,7 +177,7 @@ class FLOAT(BaseModel):
 		try:
 			# Start decoding frames as they arrive (streaming + parallel)
 			decode_tasks = []
-			async for frame_latent in self.sample(data, a_cfg_scale=a_cfg_scale, 
+			for frame_latent in self.sample(data, a_cfg_scale=a_cfg_scale, 
 											r_cfg_scale=r_cfg_scale,
 											e_cfg_scale=e_cfg_scale, 
 											emo=emo, nfe=nfe, seed=seed, s_r=s_r):
