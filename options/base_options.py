@@ -46,7 +46,7 @@ class BaseOptions():
 		parser.add_argument('--num_heads', default=8, type=int)
 		parser.add_argument('--mlp_ratio', default=4.0, type=float)
 		parser.add_argument('--no_learned_pe', action='store_true')
-		parser.add_argument('--num_prev_frames', type=int, default=3)
+		parser.add_argument('--num_prev_frames', type=int, default=10)
 		parser.add_argument('--max_grad_norm', default=1, type=float, help='max grad norm for training transformers')
 
 		parser.add_argument('--ode_atol', default=1e-5, type=float)
