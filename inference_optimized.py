@@ -407,7 +407,7 @@ class OptimizedInferenceAgent:
 
                 # Write frames with small delays for first-time stability
                 write_start = time.time()
-                chunk_size = 25  # Write frames in small chunks
+                chunk_size = 1000  # Write frames in small chunks
                 
                 for chunk_start in range(0, T, chunk_size):
                     chunk_end = min(chunk_start + chunk_size, T)
@@ -513,7 +513,7 @@ class OptimizedInferenceAgent:
             
             print("Warming up...")
             for _ in range(warmup_runs):
-                _ = asyncio.run(self.G_opt.inference(
+                _ = self.G_opt.inference(
                     data=data,
                     a_cfg_scale=a_cfg_scale,
                     r_cfg_scale=r_cfg_scale,
@@ -521,14 +521,14 @@ class OptimizedInferenceAgent:
                     emo=emo,
                     nfe=nfe,
                     seed=seed
-                ))
+                )
             
             1
             
             print(f"Running {benchmark_runs} benchmark iterations...")
             start_time = time.time()
             for _ in range(benchmark_runs):
-                _ = asyncio.run(self.G_opt.inference(
+                _ =self.G_opt.inference(
                     data=data,
                     a_cfg_scale=a_cfg_scale,
                     r_cfg_scale=r_cfg_scale,
@@ -536,8 +536,8 @@ class OptimizedInferenceAgent:
                     emo=emo,
                     nfe=nfe,
                     seed=seed
-                ))
-            1
+                )
+            
             end_time = time.time()
             
             avg_time = (end_time - start_time) / benchmark_runs
@@ -553,7 +553,7 @@ class OptimizedInferenceAgent:
         
         if use_amp or use_amp_fp16:
             with torch.cuda.amp.autocast(dtype=torch.float16 if use_amp_fp16 else torch.float32):
-                d_hat = asyncio.run(self.G_opt.inference(
+                d_hat = self.G_opt.inference(
                     data=data,
                     a_cfg_scale=a_cfg_scale,
                     r_cfg_scale=r_cfg_scale,
@@ -561,9 +561,9 @@ class OptimizedInferenceAgent:
                     emo=emo,
                     nfe=nfe,
                     seed=seed
-                ))['d_hat']
+                )['d_hat']
         else:
-            d_hat = asyncio.run(self.G_opt.inference(
+            d_hat = self.G_opt.inference(
                 data=data,
                 a_cfg_scale=a_cfg_scale,
                 r_cfg_scale=r_cfg_scale,
@@ -571,7 +571,7 @@ class OptimizedInferenceAgent:
                 emo=emo,
                 nfe=nfe,
                 seed=seed
-            ))['d_hat']
+            )['d_hat']
         
         1 if torch.cuda.is_available() else None
         timings['inference'] = time.time() - inference_start
