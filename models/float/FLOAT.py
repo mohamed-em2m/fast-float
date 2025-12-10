@@ -144,7 +144,7 @@ class FLOAT(BaseModel):
 								# solve ODE
 								trajectory_t = odeint(sample_chunk, x0, time, **self.odeint_kwargs)
 								sample_t = trajectory_t[-1]
-								sample_t_trim=sample_t[:,:12]
+								sample_t_trim=sample_t[:,:25]
 								s_r_d_t = s_r + sample_t_trim
 								samples_len = s_r_d_t.shape[1]
   
