@@ -82,74 +82,75 @@ class FLOAT(BaseModel):
 		seed: int = None,
 		s_r=None
 	) -> torch.Tensor:
-	  with torch.cuda.stream(self.stream_encode):
-		r_s, a = data['r_s'], data['a']
-		B = a.shape[0]
+	    with torch.cuda.stream(self.stream_encode):
+							r_s, a = data['r_s'], data['a']
+							B = a.shape[0]
 
-		# make time 
-		time = torch.linspace(0, 1, self.opt.nfe, device=self.opt.rank)
-		
-		# encoding audio first with whole audio
-		a = a.to(self.opt.rank)
-		T = math.ceil(a.shape[-1] * self.opt.fps / self.opt.sampling_rate)
-		wa = self.audio_encoder.inference(a, seq_len=T)
+							# make time 
+							time = torch.linspace(0, 1, self.opt.nfe, device=self.opt.rank)
+							
+							# encoding audio first with whole audio
+							a = a.to(self.opt.rank)
+							T = math.ceil(a.shape[-1] * self.opt.fps / self.opt.sampling_rate)
+							wa = self.audio_encoder.inference(a, seq_len=T)
 
-		# encoding emotion first
-		emo_idx = self.emotion_encoder.label2id.get(str(emo).lower(), None)
-		if emo_idx is None:
-			we = self.emotion_encoder.predict_emotion(a).unsqueeze(1)
-		else:
-			we = F.one_hot(torch.tensor(emo_idx, device = a.device), num_classes = self.opt.dim_e).unsqueeze(0).unsqueeze(0)
+							# encoding emotion first
+							emo_idx = self.emotion_encoder.label2id.get(str(emo).lower(), None)
+							if emo_idx is None:
+								we = self.emotion_encoder.predict_emotion(a).unsqueeze(1)
+							else:
+								we = F.one_hot(torch.tensor(emo_idx, device = a.device), num_classes = self.opt.dim_e).unsqueeze(0).unsqueeze(0)
 
-		sample = []
-		# sampleing chunk by chunk
-		for t in range(0, int(math.ceil(T / self.num_frames_for_clip))):
-			if self.opt.fix_noise_seed:
-				seed = self.opt.seed if seed is None else seed	
-				g = torch.Generator(self.opt.rank)
-				g.manual_seed(seed)
-				x0 = torch.randn(B, self.num_frames_for_clip, self.opt.dim_w, device = self.opt.rank, generator = g)
-			else:
-				x0 = torch.randn(B, self.num_frames_for_clip, self.opt.dim_w, device = self.opt.rank)
+							sample = []
+							# sampleing chunk by chunk
+							for t in range(0, int(math.ceil(T / self.num_frames_for_clip))):
+								if self.opt.fix_noise_seed:
+									seed = self.opt.seed if seed is None else seed	
+									g = torch.Generator(self.opt.rank)
+									g.manual_seed(seed)
+									x0 = torch.randn(B, self.num_frames_for_clip, self.opt.dim_w, device = self.opt.rank, generator = g)
+								else:
+									x0 = torch.randn(B, self.num_frames_for_clip, self.opt.dim_w, device = self.opt.rank)
 
-			if t == 0: # should define the previous
-				prev_x_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_w).to(self.opt.rank)
-				prev_wa_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_w).to(self.opt.rank)
-			else:
-				prev_x_t = sample_t[:, -self.num_prev_frames:]
-				prev_wa_t = wa_t[:, -self.num_prev_frames:]
-			
-			wa_t = wa[:, t * self.num_frames_for_clip: (t+1)*self.num_frames_for_clip]
+								if t == 0: # should define the previous
+									prev_x_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_w).to(self.opt.rank)
+									prev_wa_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_w).to(self.opt.rank)
+								else:
+									prev_x_t = sample_t[:, -self.num_prev_frames:]
+									prev_wa_t = wa_t[:, -self.num_prev_frames:]
+								
+								wa_t = wa[:, t * self.num_frames_for_clip: (t+1)*self.num_frames_for_clip]
 
-			if wa_t.shape[1] < self.num_frames_for_clip: # padding by replicate
-				wa_t = F.pad(wa_t, (0, 0, 0, self.num_frames_for_clip - wa_t.shape[1]), mode='replicate')
+								if wa_t.shape[1] < self.num_frames_for_clip: # padding by replicate
+									wa_t = F.pad(wa_t, (0, 0, 0, self.num_frames_for_clip - wa_t.shape[1]), mode='replicate')
 
-			def sample_chunk(tt, zt):
-				out = self.fmt.forward_with_cfv(
-						t 			= tt.unsqueeze(0),
-						x 			= zt,
-						wa 			= wa_t, 			 
-						wr 			= r_s,
-						we 			= we, 
-						prev_x 		= prev_x_t, 	
-						prev_wa 	= prev_wa_t,
-						a_cfg_scale = a_cfg_scale,
-						r_cfg_scale = r_cfg_scale,
-						e_cfg_scale = e_cfg_scale
-						)
+								def sample_chunk(tt, zt):
+									out = self.fmt.forward_with_cfv(
+											t 			= tt.unsqueeze(0),
+											x 			= zt,
+											wa 			= wa_t, 			 
+											wr 			= r_s,
+											we 			= we, 
+											prev_x 		= prev_x_t, 	
+											prev_wa 	= prev_wa_t,
+											a_cfg_scale = a_cfg_scale,
+											r_cfg_scale = r_cfg_scale,
+											e_cfg_scale = e_cfg_scale
+											)
 
-				out_current = out[:, self.num_prev_frames:]
-				return out_current
+									out_current = out[:, self.num_prev_frames:]
+									return out_current
 
-			# solve ODE
-			trajectory_t = odeint(sample_chunk, x0, time, **self.odeint_kwargs)
-			sample_t = trajectory_t[-1]
-			T_ = sample_t.shape[1]
-			s_r_d_t = s_r + sample_t[:,:12]  
-			print(s_r_d_t.shape)
-			# Yield frame by frame for streaming
-			for t in range(T_):
-				yield s_r_d_t[:,t]
+								# solve ODE
+								trajectory_t = odeint(sample_chunk, x0, time, **self.odeint_kwargs)
+								sample_t = trajectory_t[-1]
+								sample_t_trim=sample_t[:,:12]
+								s_r_d_t = s_r + sample_t_trim
+								samples_len = s_r_d_t.shape[1]
+  
+								# Yield frame by frame for streaming
+								for sample_idx in range(samples_len):
+									yield s_r_d_t[:,sample_idx]
 
 
 	@torch.no_grad()
