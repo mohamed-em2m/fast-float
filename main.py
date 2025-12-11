@@ -1,4 +1,6 @@
 import json
+import torch
+torch.backends.cudnn.benchmark = True
 import base64
 import tempfile
 import datetime

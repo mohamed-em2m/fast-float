@@ -1,4 +1,5 @@
 import os, torch, random, cv2, torchvision, librosa, datetime, tempfile, face_alignment
+torch.backends.cudnn.benchmark = True
 import numpy as np
 import albumentations as A
 import albumentations.pytorch.transforms as A_pytorch
@@ -18,6 +19,7 @@ import numpy as np
 import time
 import shutil
 import os
+
 logger = logging.getLogger(__name__)
 import asyncio
 def setup_logger(name: str = __name__, level: int = logging.INFO) -> logging.Logger:
@@ -324,7 +326,7 @@ class OptimizedInferenceAgent:
         if torch.is_floating_point(vid):
             vid_uint8_gpu = (vid.clamp(-1.0, 1.0) * 127.5 + 127.5).to(torch.uint8)
         else:
-            vid_uint8_gpu = vid.to(torch.uint8).cpu()
+            vid_uint8_gpu = vid.to(torch.uint8)
 
         # 3: allocate pinned CPU buffer and copy asynchronously
         vid_pinned_cpu =vid_uint8_gpu
@@ -334,7 +336,7 @@ class OptimizedInferenceAgent:
             torch.cuda.synchronize()   # cheap if everything else already done
 
         # 5: now safe to get numpy
-        vid_np = vid_pinned_cpu.numpy()
+        vid_np = vid_pinned_cpu.cpu().numpy()
 
         T, H, W, C = vid_np.shape
         
