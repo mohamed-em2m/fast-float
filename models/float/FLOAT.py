@@ -102,8 +102,10 @@ class FLOAT(BaseModel):
 								we = F.one_hot(torch.tensor(emo_idx, device = a.device), num_classes = self.opt.dim_e).unsqueeze(0).unsqueeze(0)
 
 							sample = []
+							decoded_length=0
 							# sampleing chunk by chunk
 							for t in range(0, int(math.ceil(T / self.num_frames_for_clip))):
+
 								if self.opt.fix_noise_seed:
 									seed = self.opt.seed if seed is None else seed	
 									g = torch.Generator(self.opt.rank)
@@ -111,11 +113,12 @@ class FLOAT(BaseModel):
 									x0 = torch.randn(B, self.num_frames_for_clip, self.opt.dim_w, device = self.opt.rank, generator = g)
 								else:
 									x0 = torch.randn(B, self.num_frames_for_clip, self.opt.dim_w, device = self.opt.rank)
-
+							
 								if t == 0: # should define the previous
 									prev_x_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_w).to(self.opt.rank)
 									prev_wa_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_w).to(self.opt.rank)
-								else:
+								else:								
+
 									prev_x_t = sample_t[:, -self.num_prev_frames:]
 									prev_wa_t = wa_t[:, -self.num_prev_frames:]
 								
@@ -144,10 +147,12 @@ class FLOAT(BaseModel):
 								# solve ODE
 								trajectory_t = odeint(sample_chunk, x0, time, **self.odeint_kwargs)
 								sample_t = trajectory_t[-1]
-								sample_t_trim=sample_t[:,:25]
+								sample_t_trim=sample_t
 								s_r_d_t = s_r + sample_t_trim
 								samples_len = s_r_d_t.shape[1]
-  
+								decoded_length +=samples_len
+								if decoded_length>=T:
+									sample_t_trim= sample_t_trim[:,:decoded_length-T]
 								# Yield frame by frame for streaming
 								for sample_idx in range(samples_len):
 									yield s_r_d_t[:,sample_idx]
