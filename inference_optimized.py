@@ -313,31 +313,31 @@ class OptimizedInferenceAgent:
         
         # Step 1: Prepare tensor -> CPU uint8 numpy efficiently
         t0 = time.time()
-        vid_t = vid_target_recon.detach()
+# vid_target_recon: (T, C, H, W), float in [-1,1], on CUDA
+        vid = vid_target_recon.detach()
 
-        # ===== CRITICAL FIX 2: Blocking CPU transfer =====
-        if vid_t.is_cuda:
-            # Use blocking transfer to ensure tensor is fully on CPU
-            vid_t = vid_t.to("cpu", non_blocking=False)  # Changed to blocking!
-            # Double-check GPU is done
-            if torch.cuda.is_available():
-                1
+        # 1: permute & make contiguous on GPU (do heavy ops on GPU)
+        if vid.is_cuda:
+            vid = vid.permute(0, 2, 3, 1).contiguous()  # (T, H, W, C) on GPU
 
-        # Expect shape (B, C, H, W)
-        if vid_t.ndim != 4:
-            raise ValueError("vid_target_recon must be a 4D tensor (T, C, H, W)")
-
-        # Permute to (T, H, W, C) and ensure contiguous
-        vid_t = vid_t.permute(0, 2, 3, 1).contiguous()
-
-        # Convert float in [-1,1] => uint8 [0,255]
-        if torch.is_floating_point(vid_t):
-            vid_t = (vid_t.clamp(-1.0, 1.0) * 127.5 + 127.5).to(torch.uint8)
+        # 2: convert to uint8 on GPU (reduces transfer size 4x vs float32)
+        print("vid is floating" ,torch.is_floating_point(vid) )
+        if torch.is_floating_point(vid):
+            vid_uint8_gpu = (vid.clamp(-1.0, 1.0) * 127.5 + 127.5).to(torch.uint8)
         else:
-            vid_t = vid_t.to(torch.uint8)
+            vid_uint8_gpu = vid.to(torch.uint8)
 
-        # Convert to numpy (this should be instant now since tensor is on CPU)
-        vid_np = vid_t.numpy()
+        # 3: allocate pinned CPU buffer and copy asynchronously
+        vid_pinned_cpu = torch.empty_like(vid_uint8_gpu, device='cpu', pin_memory=True)
+        vid_pinned_cpu.copy_(vid_uint8_gpu, non_blocking=True)
+
+        # 4: ensure transfer finished before numpy()/ffmpeg usage
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()   # cheap if everything else already done
+
+        # 5: now safe to get numpy
+        vid_np = vid_pinned_cpu.numpy()
+
         T, H, W, C = vid_np.shape
         
         # ===== CRITICAL FIX 3: Verify numpy array is valid =====
@@ -402,7 +402,7 @@ class OptimizedInferenceAgent:
                     stdin=subprocess.PIPE,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
-                    bufsize=65536  # 64KB buffer for smoother writes
+                    bufsize=6553600 # 64KB buffer for smoother writes
                 )
 
                 # Write frames with small delays for first-time stability
