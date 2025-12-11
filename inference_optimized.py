@@ -291,7 +291,7 @@ class OptimizedInferenceAgent:
     
 # Replace the save_video method in inference_optimized.py
 
-    def save_video(self, vid_target_recon: "torch.Tensor", video_path: str, audio_path: str) -> str:
+    def save_video(self, vid: "torch.Tensor", video_path: str, audio_path: str) -> str:
         """
         Save video with proper CUDA synchronization to prevent corruption.
         
@@ -314,7 +314,6 @@ class OptimizedInferenceAgent:
         # Step 1: Prepare tensor -> CPU uint8 numpy efficiently
         t0 = time.time()
 # vid_target_recon: (T, C, H, W), float in [-1,1], on CUDA
-        vid = vid_target_recon.detach()
 
         # 1: permute & make contiguous on GPU (do heavy ops on GPU)
         if vid.is_cuda:
@@ -325,11 +324,10 @@ class OptimizedInferenceAgent:
         if torch.is_floating_point(vid):
             vid_uint8_gpu = (vid.clamp(-1.0, 1.0) * 127.5 + 127.5).to(torch.uint8)
         else:
-            vid_uint8_gpu = vid.to(torch.uint8)
+            vid_uint8_gpu = vid.to(torch.uint8).cpu()
 
         # 3: allocate pinned CPU buffer and copy asynchronously
-        vid_pinned_cpu = torch.empty_like(vid_uint8_gpu, device='cpu', pin_memory=True)
-        vid_pinned_cpu.copy_(vid_uint8_gpu, non_blocking=True)
+        vid_pinned_cpu =vid_uint8_gpu
 
         # 4: ensure transfer finished before numpy()/ffmpeg usage
         if torch.cuda.is_available():

@@ -21,7 +21,7 @@ except ImportError:
     print("⚠️ Local inference not available. API mode only.")
 
 class GradioAPIInterface:
-    def __init__(self, api_url: str = "https://colab.him-world.com", use_local: bool = False): # Fixed: init -> __init__
+    def __init__(self, api_url: str = "https://ai.him-world.com", use_local: bool = False): # Fixed: init -> __init__
         self.api_url = api_url.rstrip('/')
         self.use_local = use_local and LOCAL_MODE_AVAILABLE
 
@@ -439,7 +439,7 @@ class GradioAPIInterface:
 
     
 
-def create_interface(api_url: str = "https://colab.him-world.com", use_local: bool = False):
+def create_interface(api_url: str = "https://ai.him-world.com", use_local: bool = False):
     """Create Gradio interface with API support"""
     
     interface = GradioAPIInterface(api_url=api_url, use_local=use_local) # Fixed: Indentation
@@ -627,8 +627,8 @@ def parse_args():
     
     parser = argparse.ArgumentParser(description='FLOAT Gradio Interface') # Fixed: Indentation
 
-    parser.add_argument('--api_url', type=str, default='https://colab.him-world.com',
-                        help='API URL (default: https://colab.him-world.com')
+    parser.add_argument('--api_url', type=str, default='https://ai.him-world.com',
+                        help='API URL (default: https://ai.him-world.com')
     parser.add_argument('--use_local', action='store_true',
                         help='Use local inference instead of API')
     parser.add_argument('--port', type=int, default=7860,
