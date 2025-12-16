@@ -535,17 +535,16 @@ class FLOAT(BaseModel,StreamingVideoSaver):
                     sample_t_trim = sample_t
                 
                 samples_len = sample_t_trim.shape[1]
-                
+                decoded_length+=samples_len
                 # Add reference and yield frame by frame
                 s_r_d_t = s_r + sample_t_trim
                 
                 # Yield frame by frame for streaming
-                for sample_idx in range(samples_len):
-                    yield s_r_d_t[:, sample_idx]
-                    decoded_length += 1
+                print("shape of sample_t before squeeze",s_r_d_t.shape)
+                
+                yield s_r_d_t.squeeze(0)
+                print("shape of sample_t after squeeze",s_r_d_t.squeeze(0).shape)
 
-                    if decoded_length >= T:
-                        break
                 # Stop if we've reached the target length
                 if decoded_length >= T:
                     break
@@ -578,58 +577,57 @@ class FLOAT(BaseModel,StreamingVideoSaver):
                                             emo=emo, nfe=nfe, seed=seed, s_r=s_r):
                 # create and keep a reference to the stream
                 # launch decode on that stream
+
                 with torch.cuda.stream(self.stream_decode):
                     # IMPORTANT: decode_latent_into_image must perform CUDA ops only,
                     # and must NOT move tensors to CPU / PIL or call .item() etc.
-                    out = self.decode_latent_into_image(s_r=s_r, s_r_feats=s_r_feats, r_d=frame_latent)
-                    # out should be a torch.Tensor located on GPU (e.g. [B, C, H, W])
-                    # If decode returns (tensor, other) adapt accordingly.
-                    if isinstance(out, tuple) or isinstance(out, list):
-                        # assume primary tensor is first element
-                        out_tensor = out[0]
-                    else:
-                        out_tensor = out
+                    try:
+                        out = self.decode_latent_into_image(s_r=s_r, s_r_feats=s_r_feats, r_d=frame_latent)
+                        # out should be a torch.Tensor located on GPU (e.g. [B, C, H, W])
+                        # If decode returns (tensor, other) adapt accordingly.
+                        if isinstance(out, tuple) or isinstance(out, list):
+                            # assume primary tensor is first element
+                            out_tensor = out[0]
+                        else:
+                            out_tensor = out
 
-                    # ensure it's a CUDA tensor
-                    if not out_tensor.is_cuda:
-                        # If your decode runs on CPU, you lose streaming benefits. Move to GPU (non-blocking)
-                        out_tensor = out_tensor.to(device=self.opt.rank, non_blocking=True)
+                        # ensure it's a CUDA tensor
+                        if not out_tensor.is_cuda:
+                            # If your decode runs on CPU, you lose streaming benefits. Move to GPU (non-blocking)
+                            out_tensor = out_tensor.to(device=self.opt.rank, non_blocking=True)
 
-                    # keep pair for later synchronization/stack
-                    decode_results.append((out_tensor, self.stream_decode))
+                        # keep pair for later synchronization/stack
+                        decode_results.append((out_tensor, self.stream_decode))
+                    except Exception as e:
+                        print(f"Error: {e}\n{traceback.format_exc()}")
+                        raise 
 
             # now wait for each stream to finish and move outputs to the current/default stream
             stacked_list = []
             cur = torch.cuda.current_stream(device=self.opt.rank)
             for out_tensor, stream in decode_results:
                 # make sure default stream waits for worker stream before we touch `out_tensor`
-                # either synchronize the worker stream, or use wait_stream
-                # Option A: wait on current stream (non-blocking) then clone to ensure safety:
                 cur.wait_stream(stream)
-                # Optionally clone to default stream so subsequent ops are on default stream:
-                out_on_default = out_tensor.clone()  # clone schedules kernel on current/default stream
+                # Clone to default stream
+                out_on_default = out_tensor.clone()  # shape: [T, C, H, W]
+                print("shape of out_on_default", out_on_default.shape)
                 stacked_list.append(out_on_default)
 
-            # By now all clones are scheduled on the current stream; synchronize if you need CPU result
-            # torch.cuda.synchronize(device=self.opt.rank)  # optional full sync
+            # Concatenate along temporal dimension (dim=0): [T_total, C, H, W]
+            d_hat = torch.cat(stacked_list, dim=0)  # [156, 3, 512, 512] in your example
 
-            # expected shape: [B, C, H, W] for each frame -> stack into [B, T, C, H, W]
-            d_hat = torch.stack(stacked_list, dim=1)  # [B, T, C, H, W]
 
             # If you really need [B, T, H, W, C], permute:
-            # d_hat = d_hat.permute(0, 1, 3, 4, 2)  # to [B, T, H, W, C]
-
+            print("d_hat",d_hat.shape)
             # if B==1 and you want remove batch dim:
-            if d_hat.shape[0] == 1:
-                d_hat = d_hat.squeeze(0)
-
+            if d_hat.shape[1] == 1:
+                d_hat = d_hat.squeeze(1)
+        
             return {'d_hat': d_hat}
 
         except Exception as e:
             print(f"Error: {e}\n{traceback.format_exc()}")
             raise
-
-
 
 @dataclass
 class FrameData:
