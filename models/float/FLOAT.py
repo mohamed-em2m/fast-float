@@ -581,7 +581,7 @@ class FLOAT(BaseModel,StreamingVideoSaver):
                 with torch.cuda.stream(self.stream_decode):
                     # IMPORTANT: decode_latent_into_image must perform CUDA ops only,
                     # and must NOT move tensors to CPU / PIL or call .item() etc.
-                    out = self.decode_latent_into_image(s_r=s_r, s_r_feats=s_r_feats, r_d=frame_latent,proc=proc)
+                    out = self.decode_latent_into_image(s_r=s_r, s_r_feats=s_r_feats, r_d=frame_latent)
                     # out should be a torch.Tensor located on GPU (e.g. [B, C, H, W])
                     # If decode returns (tensor, other) adapt accordingly.
                     if isinstance(out, tuple) or isinstance(out, list):

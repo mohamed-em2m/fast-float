@@ -620,7 +620,7 @@ class Synthesis(nn.Module):
 
         return img, flow
 
-    def synthesis(self, wa, feats):
+    def synthesis(self, wa,alpha, feats):
         bs = wa.shape[0]
 
         if alpha is not None:
