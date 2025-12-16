@@ -98,7 +98,7 @@ class StreamingVideoSaver:
         fps = int(getattr(self.opt, "fps", 25))
         
         # Create queue for producer-consumer pattern
-        # Size = 10 means buffer up to 10 frames ahead
+        # Size = 10 means buffer up to 10 frames aheadStreamingVideoSaver._start_ffmpeg_process
         frame_queue = queue.Queue(maxsize=10)
         
         # Shared state
@@ -554,7 +554,6 @@ class FLOAT(BaseModel,StreamingVideoSaver):
     def inference(self, data: dict, a_cfg_scale=None, r_cfg_scale=None, 
                 e_cfg_scale=None, emo=None, nfe=10, seed=None) -> dict:
         s, a = data['s'], data['a']
-        proc=self._start_ffmpeg_process()
         s_r, r_s_lambda, s_r_feats = self.encode_image_into_latent(s.to(self.opt.rank))
 
         if 's_r' in data:
