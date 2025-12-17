@@ -270,9 +270,7 @@ class OptimizedInferenceAgent:
                 try:
                     self.G_opt = torch.compile(
                         self.G,
-                        mode='max-autotune',
-                        fullgraph=False
-                    )
+                        mode='max-autotune'                    )
                     print("✓ All optimizations applied")
                 except Exception as e:
                     print(f"! torch.compile failed: {e}")

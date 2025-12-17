@@ -460,26 +460,28 @@ class ToFlow(nn.Module):
         mask = torch.sigmoid(out[:, 2:3, :, :])
         flow = sampler.permute(0, 2, 3, 1) + grid  # B x h x w x 2
 
-        print("shape of inputes in styledecoder feat,flow,mask",
-            feat.shape, flow.shape, mask.shape)
 
         # --- Ensure batch sizes match for grid_sample ---
-        if feat.shape[0] != flow.shape[0]:
+        if feat.shape[0] != batch_size:
             if feat.shape[0] == 1:
-                # Repeat feat to match flow batch size
-                feat = feat.repeat(flow.shape[0], 1, 1, 1)
+                # Expand instead of repeat (more efficient, no memory copy)
+                feat = feat.expand(batch_size, -1, -1, -1)
             else:
                 raise ValueError(
-                    f"Batch mismatch: feat batch={feat.shape[0]}, flow batch={flow.shape[0]}"
+                    f"Batch mismatch: feat batch={feat.shape[0]}, flow batch={batch_size}"
                 )
-
+        
+        # Mask batch check (optimized)
+        if mask.shape[0] != batch_size:
+            raise ValueError(
+                f"Mask batch mismatch: mask batch={mask.shape[0]}, feat batch={batch_size}"
+            )
         # Optional: ensure mask batch matches too
         if mask.shape[0] != feat.shape[0]:
             raise ValueError(
                 f"Mask batch mismatch: mask batch={mask.shape[0]}, feat batch={feat.shape[0]}"
             )
-        print("shape of inputes in styledecoder after reapeat feat,flow,mask",
-            feat.shape, flow.shape, mask.shape)
+
         # --- Warp features ---
         feat_warp = F.grid_sample(
             feat,

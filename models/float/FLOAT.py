@@ -543,11 +543,11 @@ class FLOAT(BaseModel,StreamingVideoSaver):
                 #print("shape of sample_t before squeeze",s_r_d_t.shape)
                 
                 s_r_d_t_squeezed = s_r_d_t.squeeze(0)  # [T, C, H, W]
-                T = s_r_d_t_squeezed.shape[0]
+                T_ = s_r_d_t_squeezed.shape[0]
 
                 # Divide into 3 parts
-                part_size = T // 3
-                remainder = T % 3
+                part_size = T_ // 3
+                remainder = T_ % 3
 
                 # Split points
                 split1 = part_size + (1 if remainder > 0 else 0)
