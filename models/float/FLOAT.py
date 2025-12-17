@@ -533,17 +533,31 @@ class FLOAT(BaseModel,StreamingVideoSaver):
                     sample_t_trim = sample_t[:, :frames_remaining]
                 else:
                     sample_t_trim = sample_t
-                
+                #sample_t_trim = sample_t
                 samples_len = sample_t_trim.shape[1]
                 decoded_length+=samples_len
                 # Add reference and yield frame by frame
                 s_r_d_t = s_r + sample_t_trim
                 
                 # Yield frame by frame for streaming
-                print("shape of sample_t before squeeze",s_r_d_t.shape)
+                #print("shape of sample_t before squeeze",s_r_d_t.shape)
                 
-                yield s_r_d_t.squeeze(0)
-                print("shape of sample_t after squeeze",s_r_d_t.squeeze(0).shape)
+                s_r_d_t_squeezed = s_r_d_t.squeeze(0)  # [T, C, H, W]
+                T = s_r_d_t_squeezed.shape[0]
+
+                # Divide into 3 parts
+                part_size = T // 3
+                remainder = T % 3
+
+                # Split points
+                split1 = part_size + (1 if remainder > 0 else 0)
+                split2 = split1 + part_size + (1 if remainder > 1 else 0)
+
+                # Yield each part
+                yield s_r_d_t_squeezed[:split1]      # Part 1
+                yield s_r_d_t_squeezed[split1:split2]  # Part 2
+                yield s_r_d_t_squeezed[split2:]      # Part 3    
+                #print("shape of sample_t after squeeze",s_r_d_t.squeeze(0).shape)
 
                 # Stop if we've reached the target length
                 if decoded_length >= T:
@@ -569,6 +583,8 @@ class FLOAT(BaseModel,StreamingVideoSaver):
             # list of (tensor_on_gpu, stream)
             decode_results = []
 
+            #s_r_feats = [f.expand(50, -1, -1, -1) for f in s_r_feats]
+
             # If sample yields lazily, we will create per-frame streams and decode on them.
             for frame_latent in self.sample(data,
                                             a_cfg_scale=a_cfg_scale,
@@ -577,8 +593,8 @@ class FLOAT(BaseModel,StreamingVideoSaver):
                                             emo=emo, nfe=nfe, seed=seed, s_r=s_r):
                 # create and keep a reference to the stream
                 # launch decode on that stream
+                 with torch.cuda.stream(self.stream_decode):
 
-                with torch.cuda.stream(self.stream_decode):
                     # IMPORTANT: decode_latent_into_image must perform CUDA ops only,
                     # and must NOT move tensors to CPU / PIL or call .item() etc.
                     try:
