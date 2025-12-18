@@ -405,6 +405,7 @@ class FLOAT(BaseModel,StreamingVideoSaver):
     def __init__(self, opt):
         super().__init__()
         self.opt = opt
+        self.stream_decode_2 = torch.cuda.Stream(device=self.opt.rank)  # device optional
         self.stream_decode = torch.cuda.Stream(device=self.opt.rank)  # device optional
         self.stream_encode= torch.cuda.Stream(device=self.opt.rank)  # device optional
 
@@ -428,7 +429,6 @@ class FLOAT(BaseModel,StreamingVideoSaver):
             'rtol': self.opt.ode_rtol,
             'method': self.opt.torchdiffeq_ode_method
         }
-    stream = torch.cuda.Stream()
     ######## Motion Encoder - Decoder ########
     @torch.no_grad()
     def encode_image_into_latent(self, x: torch.Tensor) -> list:

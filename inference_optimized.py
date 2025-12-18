@@ -289,57 +289,52 @@ class OptimizedInferenceAgent:
             self.use_amp_fp16 = True
             print("✓ FP16 will be applied via autocast during inference")
     
-# Replace the save_video method in inference_optimized.py
 
     def save_video(self, vid: "torch.Tensor", video_path: str, audio_path: str) -> str:
+        """
+        Save video with proper CUDA synchronization to prevent corruption.
+        
+        Key fixes:
+        1. Fixed missing torch.cuda.synchronize() calls
+        2. Better error handling for FFmpeg stderr
+        3. Simplified retry logic
+        4. Early detection of FFmpeg errors
+        """
         try: 
-            """
-            Save video with proper CUDA synchronization to prevent corruption.
-            
-            CRITICAL FIXES:
-            1. Explicit GPU synchronization before tensor operations
-            2. Ensure tensor is fully on CPU before FFmpeg access
-            3. Add delay for NVENC encoder initialization
-            """
             start_time = time.time()
 
             # Sanity: ffmpeg present
             if shutil.which("ffmpeg") is None:
                 raise RuntimeError("ffmpeg not found in PATH")
 
-            # ===== CRITICAL FIX 1: Full GPU synchronization =====
+            # ===== FIX 1: Proper GPU synchronization =====
             if torch.cuda.is_available():
-                1  # Wait for ALL GPU operations to complete
-                time.sleep(0.05)  # Small buffer to ensure GPU is truly idle
+                torch.cuda.synchronize()  # FIXED: was just "1"
+                time.sleep(0.05)
             
             # Step 1: Prepare tensor -> CPU uint8 numpy efficiently
             t0 = time.time()
-    # vid_target_recon: (T, C, H, W), float in [-1,1], on CUDA
 
-            # 1: permute & make contiguous on GPU (do heavy ops on GPU)
+            # 1: permute & make contiguous on GPU
             if vid.is_cuda:
-                vid = vid.permute(0, 2, 3, 1).contiguous()  # (T, H, W, C) on GPU
+                vid = vid.permute(0, 2, 3, 1).contiguous()  # (T, H, W, C)
 
-            # 2: convert to uint8 on GPU (reduces transfer size 4x vs float32)
-            print("vid is floating" ,torch.is_floating_point(vid) )
+            # 2: convert to uint8 on GPU
+            print("vid is floating:", torch.is_floating_point(vid))
             if torch.is_floating_point(vid):
                 vid_uint8_gpu = (vid.clamp(-1.0, 1.0) * 127.5 + 127.5).to(torch.uint8)
             else:
                 vid_uint8_gpu = vid.to(torch.uint8)
 
-            # 3: allocate pinned CPU buffer and copy asynchronously
-            vid_pinned_cpu =vid_uint8_gpu
-
-            # 4: ensure transfer finished before numpy()/ffmpeg usage
+            # 3: move to CPU with synchronization
             if torch.cuda.is_available():
-                torch.cuda.synchronize()   # cheap if everything else already done
+                torch.cuda.synchronize()  # FIXED: ensure GPU work is done
 
-            # 5: now safe to get numpy
-            vid_np = vid_pinned_cpu.cpu().numpy()
+            vid_np = vid_uint8_gpu.cpu().numpy()
 
             T, H, W, C = vid_np.shape
             
-            # ===== CRITICAL FIX 3: Verify numpy array is valid =====
+            # Verify numpy array is valid
             if not vid_np.flags['C_CONTIGUOUS']:
                 vid_np = np.ascontiguousarray(vid_np)
             
@@ -364,88 +359,92 @@ class OptimizedInferenceAgent:
                 "-i", "-",  # read video from stdin
             ]
 
-            #if audio_path is not None:
-            #    base_cmd += ["-i", audio_path]
-
-            # ===== CRITICAL FIX 4: More conservative NVENC settings =====
-            # Use settings that are more stable for first-time initialization
+            # More conservative NVENC settings
             vcodec = "h264_nvenc"
             encode_opts = [
                 "-c:v", vcodec,
-                "-preset", "p1",           # Fastest preset
+                "-preset", "p1",
                 "-tune", "hq",
-                "-rc", "constqp",          # Constant QP for stability
+                "-rc", "constqp",
                 "-qp", "23",
-                "-delay", "0",             # Minimize encoder latency
-                "-no-scenecut", "1",       # Disable scene detection for consistency
-                "-forced-idr", "1",        # Force IDR frames
+                "-delay", "0",
+                "-no-scenecut", "1",
+                "-forced-idr", "1",
                 "-pix_fmt", "yuv420p",
                 "-movflags", "+faststart",
             ]
 
-            #if audio_path is not None:
-            #    encode_opts += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
-
             cmd = base_cmd + encode_opts + [video_path]
 
-            # ===== CRITICAL FIX 5: Better error handling and retry logic =====
+            # ===== FIX 2: Better error handling =====
             encode_start = time.time()
-            proc = None
             max_retries = 2
-            retry_count = 0
             
-            while retry_count < max_retries:
+            for retry_count in range(max_retries):
+                proc = None
                 try:
                     proc = subprocess.Popen(
                         cmd,
                         stdin=subprocess.PIPE,
-                        stdout=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,  # Capture stdout too
                         stderr=subprocess.PIPE,
-                        bufsize=6553600 # 64KB buffer for smoother writes
+                        bufsize=65536
                     )
 
-                    # Write frames with small delays for first-time stability
-                    write_start = time.time()
-                    chunk_size = 1000  # Write frames in small chunks
+                    # ===== FIX 3: Monitor stderr in separate thread =====
+                    stderr_lines = []
+                    def read_stderr():
+                        for line in proc.stderr:
+                            line_str = line.decode(errors="ignore")
+                            stderr_lines.append(line_str)
+                            if "error" in line_str.lower() or "failed" in line_str.lower():
+                                logger.warning(f"FFmpeg stderr: {line_str.strip()}")
                     
-                    for chunk_start in range(0, T, chunk_size):
-                        chunk_end = min(chunk_start + chunk_size, T)
+                    import threading
+                    stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+                    stderr_thread.start()
+
+                    # Write frames
+                    write_start = time.time()
+                    
+                    for i in range(T):
+                        frame = vid_np[i]
+                        frame_bytes = frame.tobytes()
                         
-                        for i in range(chunk_start, chunk_end):
-                            frame = vid_np[i]
-                            frame_bytes = frame.tobytes()
-                            
-                            # Write with error checking
-                            try:
-                                proc.stdin.write(frame_bytes)
-                            except BrokenPipeError:
-                                logger.error("FFmpeg pipe broken during write")
-                                raise
+                        try:
+                            proc.stdin.write(frame_bytes)
+                        except BrokenPipeError:
+                            # FFmpeg died - check why
+                            proc.wait(timeout=5)
+                            stderr_thread.join(timeout=1)
+                            full_stderr = "".join(stderr_lines)
+                            logger.error(f"❌ FFmpeg died at frame {i}/{T}")
+                            logger.error(f"FFmpeg stderr:\n{full_stderr[-1000:]}")  # Last 1000 chars
+                            raise RuntimeError(f"FFmpeg broken pipe at frame {i}: {full_stderr[-500:]}")
                         
-                        # Small delay between chunks on first request (helps NVENC stabilize)
-                        if retry_count == 0 and chunk_start == 0:
-                            time.sleep(0.01)
+                        # Flush periodically
+                        if i % 100 == 0:
+                            proc.stdin.flush()
                     
                     proc.stdin.close()
 
-                    # Wait with timeout
+                    # Wait for completion
                     ret = proc.wait(timeout=300)
+                    stderr_thread.join(timeout=2)
+                    full_stderr = "".join(stderr_lines)
                     
                     if ret != 0:
-                        stderr = proc.stderr.read().decode(errors="ignore")
-                        
-                        # Check if this is an NVENC initialization error
-                        if "CUDA_ERROR" in stderr or "initialization error" in stderr:
-                            retry_count += 1
-                            if retry_count < max_retries:
-                                logger.warning(f"⚠️ NVENC init error, retry {retry_count}/{max_retries}")
-                                time.sleep(0.5)  # Wait before retry
-                                # Force CUDA sync again
+                        # Check if NVENC initialization error
+                        if "CUDA_ERROR" in full_stderr or "initialization error" in full_stderr:
+                            if retry_count < max_retries - 1:
+                                logger.warning(f"⚠️ NVENC init error, retry {retry_count + 1}/{max_retries}")
+                                time.sleep(0.5)
                                 if torch.cuda.is_available():
-                                    1
+                                    torch.cuda.synchronize()
                                 continue
                         
-                        raise RuntimeError(f"ffmpeg exited with code {ret}: {stderr}")
+                        logger.error(f"FFmpeg stderr:\n{full_stderr[-1000:]}")
+                        raise RuntimeError(f"ffmpeg exited with code {ret}")
 
                     encode_time = time.time() - encode_start
                     logger.info(f"✅ Direct FFmpeg encode: {encode_time:.3f}s")
@@ -454,32 +453,31 @@ class OptimizedInferenceAgent:
                 except subprocess.TimeoutExpired:
                     if proc:
                         proc.kill()
+                    logger.error("❌ FFmpeg encoding timeout")
+                    if retry_count < max_retries - 1:
+                        continue
                     raise RuntimeError("FFmpeg encoding timeout")
                     
                 except Exception as e:
-                    if proc:
-                        try:
-                            proc.kill()
-                            stderr = proc.stderr.read().decode(errors="ignore")
-                            logger.error(f"FFmpeg stderr:\n{stderr[:500]}")
-                        except:
-                            pass
+                    if proc and proc.poll() is None:
+                        proc.kill()
                     
-                    retry_count += 1
-                    if retry_count >= max_retries:
-                        logger.error(f"❌ Encoding failed after {max_retries} retries: {e}")
-                        raise
+                    if retry_count < max_retries - 1:
+                        logger.warning(f"⚠️ Encoding attempt {retry_count + 1} failed, retrying...")
+                        time.sleep(0.5)
+                        continue
                     
-                    logger.warning(f"⚠️ Encoding attempt {retry_count} failed, retrying...")
-                    time.sleep(0.5)
+                    logger.error(f"❌ Encoding failed after {max_retries} retries: {e}")
+                    raise
 
             total_time = time.time() - start_time
             logger.info(f"✅ Total save: {total_time:.3f}s -> {video_path}")
             return video_path
+            
         except Exception as e:
-            print(f"Error: {e}\n{traceback.format_exc()}")
+            logger.error(f"Error: {e}\n{traceback.format_exc()}")
             raise
-    
+        
     @torch.no_grad()
     def run_inference(
         self,
