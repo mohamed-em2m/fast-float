@@ -670,6 +670,7 @@ class Synthesis(nn.Module):
                 )
                 skip = to_rgb(out_warp, skip)
             
+            
             i += 2
         
         img = skip

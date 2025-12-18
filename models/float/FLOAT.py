@@ -546,17 +546,16 @@ class FLOAT(BaseModel,StreamingVideoSaver):
                 T_ = s_r_d_t_squeezed.shape[0]
 
                 # Divide into 3 parts
-                part_size = T_ // 3
-                remainder = T_ % 3
+                part_size = T_ // 2
+                remainder = T_ % 2
 
                 # Split points
                 split1 = part_size + (1 if remainder > 0 else 0)
                 split2 = split1 + part_size + (1 if remainder > 1 else 0)
 
                 # Yield each part
-                yield s_r_d_t_squeezed[:split1]      # Part 1
-                yield s_r_d_t_squeezed[split1:split2]  # Part 2
-                yield s_r_d_t_squeezed[split2:]      # Part 3    
+                yield s_r_d_t_squeezed
+
                 #print("shape of sample_t after squeeze",s_r_d_t.squeeze(0).shape)
 
                 # Stop if we've reached the target length
@@ -626,7 +625,6 @@ class FLOAT(BaseModel,StreamingVideoSaver):
                 cur.wait_stream(stream)
                 # Clone to default stream
                 out_on_default = out_tensor.clone()  # shape: [T, C, H, W]
-                print("shape of out_on_default", out_on_default.shape)
                 stacked_list.append(out_on_default)
 
             # Concatenate along temporal dimension (dim=0): [T_total, C, H, W]
