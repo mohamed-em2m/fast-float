@@ -5,6 +5,7 @@ FLOAT - Gradio Interface for Audio-Driven Talking Face Generation
 import os
 import gradio as gr
 import datetime
+import traceback
 from pathlib import Path
 
 # Import the inference components
@@ -83,7 +84,8 @@ class GradioInterface:
             return output_path, status_msg
             
         except Exception as e:
-            error_msg = f"❌ Error during generation: {str(e)}"
+            tb = traceback.format_exc()
+            error_msg = f"❌ Error during generation: {str(e)}\n\n--- Traceback ---\n{tb}"
             print(error_msg)
             return None, error_msg
 

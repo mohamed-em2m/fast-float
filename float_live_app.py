@@ -36,6 +36,7 @@ import shutil
 import tempfile
 import datetime
 import threading
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -156,7 +157,9 @@ class FloatModel:
             # Show only the file name — never leak server-side absolute paths.
             return output_path, f"✅ Saved to: {Path(output_path).name}"
         except Exception as e:
-            return None, f"❌ Error during generation: {e}"
+            tb = traceback.format_exc()
+            print(f"❌ Error during generation: {e}\n{tb}")
+            return None, f"❌ Error during generation: {e}\n\n--- Traceback ---\n{tb}"
 
 
 # --------------------------------------------------------------------------- #
@@ -248,7 +251,7 @@ def build_interface(ckpt_path="./checkpoints/float.pth",
                             b_e_cfg = gr.Slider(0.0, 3.0, value=1.0, step=0.1, label="Emotion CFG Scale")
 
                         b_generate_btn = gr.Button("🚀 Generate Video", variant="primary", size="lg")
-                        b_status = gr.Textbox(label="Status", lines=3)
+                        b_status = gr.Textbox(label="Status", lines=10)
                         b_video_out = gr.Video(label="Generated Video", height=400)
 
                 b_generate_btn.click(
@@ -404,7 +407,10 @@ def build_interface(ckpt_path="./checkpoints/float.pth",
                             e_cfg=e_cfg, nfe=nfe, seed=seed, no_crop=no_crop,
                         )
                     except Exception as e:
-                        return gr.update(), session, gr.update(value=f"❌ Chunk {idx} failed: {e}")
+                        tb = traceback.format_exc()
+                        print(f"❌ Chunk {idx} failed: {e}\n{tb}")
+                        return gr.update(), session, gr.update(
+                            value=f"❌ Chunk {idx} failed: {e}\n\n--- Traceback ---\n{tb}")
 
                     session.last_latency = time.time() - t0
 
