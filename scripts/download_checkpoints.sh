@@ -8,25 +8,19 @@ cd "${PROJECT_ROOT}"
 
 mkdir -p checkpoints
 
-if ! command -v uv >/dev/null 2>&1; then
-    echo "uv not found, installing..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.local/bin:$PATH"
-fi
-
-# Use the venv's interpreter when available so `gdown` / `huggingface-cli` land there
-if [ -x "${PROJECT_ROOT}/.venv/bin/python" ]; then
-    _UV_PY="--python ${PROJECT_ROOT}/.venv/bin/python"
+# gdown and huggingface-cli are project dependencies (uv sync) — just locate them.
+if [ -x "${PROJECT_ROOT}/.venv/bin/gdown" ]; then
     GDOWN="${PROJECT_ROOT}/.venv/bin/gdown"
     HF="${PROJECT_ROOT}/.venv/bin/huggingface-cli"
+elif [ -x "${PROJECT_ROOT}/.venv/Scripts/gdown.exe" ]; then
+    GDOWN="${PROJECT_ROOT}/.venv/Scripts/gdown.exe"
+    HF="${PROJECT_ROOT}/.venv/Scripts/huggingface-cli.exe"
 else
-    _UV_PY=""
-    GDOWN="gdown"
-    HF="huggingface-cli"
+    echo "No .venv found — running 'uv sync --frozen' first."
+    uv sync --frozen
+    GDOWN="${PROJECT_ROOT}/.venv/bin/gdown"
+    HF="${PROJECT_ROOT}/.venv/bin/huggingface-cli"
 fi
-
-# shellcheck disable=SC2086
-uv pip install $_UV_PY -q gdown "huggingface_hub[cli]>=0.14.1,<1.0"
 
 echo "=== Downloading float.pth ==="
 if [ -f "checkpoints/float.pth" ]; then

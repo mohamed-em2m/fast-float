@@ -44,12 +44,11 @@ Our method runs faster than current diffusion-based methods with fewer sampling 
 conda create -n FLOAT python=3.8.5
 conda activate FLOAT
 
-# 2. Install torch and requirements (requires [uv](https://docs.astral.sh/uv/getting-started/installation/))
+# 2. Install torch and requirements with uv (requires [uv](https://docs.astral.sh/uv/getting-started/installation/))
 sh environments.sh
 
-# or manual installation
-uv pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cu118
-uv pip install -r requirements.txt
+# or manual installation (Python comes from .python-version, CUDA torch pins from pyproject.toml)
+uv sync --frozen
 ```
 - Test on Linux, A100 GPU, and V100 GPU.
 

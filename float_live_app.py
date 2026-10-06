@@ -26,7 +26,7 @@ across chunks) — increasing CHUNK_SECONDS reduces how often you see a seam,
 at the cost of more latency.
 
 Requires Gradio >= 4.40 (for gr.Timer and streaming gr.Audio input).
-    uv pip install --upgrade "gradio>=4.44" soundfile numpy
+    Install the project env with: uv sync --frozen
 """
 
 import os

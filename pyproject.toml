@@ -1,0 +1,77 @@
+[project]
+name = "float-fast"
+version = "0.1.0"
+description = "FLOAT audio-driven talking-face generation: fast inference API plus Gradio batch and live apps"
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+    # Core Deep Learning - PyTorch Stack (CUDA 11.8 wheels, see [tool.uv.sources])
+    "torch==2.0.1",
+    "torchvision==0.15.2",
+    "torchaudio==2.0.2",
+    # Core Dependencies
+    "numpy==1.24.4",
+    # Transformers & NLP
+    "transformers==4.30.2",
+    # Computer Vision
+    "opencv-python==4.8.0.74",
+    "timm==1.0.9",
+    "face-alignment==1.4.1",
+    # Image Augmentation
+    "albumentations==1.4.15",
+    "albucore==0.0.16",
+    # Audio Processing
+    "librosa==0.10.1",
+    "pydub>=0.25.0",
+    "scipy>=1.11.0",
+    "pillow>=10.0.0",
+    # Video Processing
+    "av==14.0.0",
+    "torchdiffeq==0.2.5",
+    "aiortc==1.13.0",
+    # Data Processing & Visualization
+    "pandas==2.0.3",
+    "matplotlib==3.7.2",
+    "flow-vis==0.1",
+    "pyyaml==6.0.1",
+    "tqdm==4.65.0",
+    "gdown==5.2.0",
+    # Web Interface - Gradio (float_live_app.py needs >=4.40 for gr.Timer + streaming mic)
+    "gradio==4.44.1",
+    "soundfile>=0.12.1",
+    # Web API
+    "fastapi==0.122.0",
+    "hypercorn==0.15.0",
+    "uvicorn==0.24.0",
+    # Async performance (no Windows wheels)
+    "uvloop==0.19.0; sys_platform != 'win32'",
+    # WebSocket support
+    "websockets>=10.0,<12.0",
+    # HTTP client
+    "httpx==0.25.1",
+    # Pydantic for data validation
+    "pydantic==2.7.0",
+    "pydantic-settings==2.1.0",
+    "matplotlib-inline==0.1.7",
+    "ipython==8.36.0",
+    "huggingface-hub<1.0,>=0.14.1",
+    "ngrok==1.4.0",
+    "pyngrok==7.5.0",
+    "brotli==1.2.0",
+    "nest-asyncio==1.6.0",
+]
+
+# Flat scripts layout (no installable package) — manage the env only.
+[tool.uv]
+package = false
+
+# CUDA 11.8 PyTorch wheels instead of the default PyPI (CUDA-bundled) ones.
+[[tool.uv.index]]
+name = "pytorch-cu118"
+url = "https://download.pytorch.org/whl/cu118"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu118" }
+torchvision = { index = "pytorch-cu118" }
+torchaudio = { index = "pytorch-cu118" }
