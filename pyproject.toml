@@ -31,6 +31,7 @@ dependencies = [
     "aiortc==1.13.0",
     # Data Processing & Visualization
     "pandas==2.0.3",
+    "huggingface_hub[hf_transfer]===0.1.9",
     "matplotlib==3.7.2",
     "flow-vis==0.1",
     "pyyaml==6.0.1",
