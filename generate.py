@@ -41,9 +41,11 @@ class DataProcessor:
 	def process_img(self, img:np.ndarray) -> np.ndarray:
 		mult = 360. / img.shape[0]
 
-		resized_img = cv2.resize(img, dsize=(0, 0), fx = mult, fy = mult, interpolation=cv2.INTER_AREA if mult < 1. else cv2.INTER_CUBIC)        
+		resized_img = cv2.resize(img, dsize=(0, 0), fx = mult, fy = mult, interpolation=cv2.INTER_AREA if mult < 1. else cv2.INTER_CUBIC)
 		bboxes = self.fa.face_detector.detect_from_image(resized_img)
 		bboxes = [(int(x1 / mult), int(y1 / mult), int(x2 / mult), int(y2 / mult), score) for (x1, y1, x2, y2, score) in bboxes if score > 0.95]
+		if len(bboxes) == 0:
+			raise ValueError("No face detected (score > 0.95). Try --no_crop or a clearer frontal image.")
 		bboxes = bboxes[0] # Just use first bbox
 
 		bsy = int((bboxes[3] - bboxes[1]) / 2)
@@ -61,6 +63,8 @@ class DataProcessor:
 
 	def default_img_loader(self, path) -> np.ndarray:
 		img = cv2.imread(path)
+		if img is None:
+			raise FileNotFoundError(f"Reference image not found or unreadable: {path}")
 		return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 	def default_aud_loader(self, path: str) -> torch.Tensor:
@@ -79,7 +83,8 @@ class DataProcessor:
 
 class InferenceAgent:
 	def __init__(self, opt):
-		torch.cuda.empty_cache()
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
 		self.opt = opt
 		self.rank = opt.rank
 		
@@ -96,6 +101,8 @@ class InferenceAgent:
 		self.G = FLOAT(self.opt)
 
 	def load_weight(self, checkpoint_path: str, rank: int) -> None:
+		if not os.path.exists(checkpoint_path):
+			raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}. Run scripts/download_checkpoints.sh first.")
 		state_dict = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
 		with torch.no_grad():
 			for model_name, model_param in self.G.named_parameters():
@@ -170,7 +177,7 @@ class InferenceOptions(BaseOptions):
 		parser.add_argument('--aud_path',
 				default=None, type=str, help='audio')
 		parser.add_argument('--emo',
-				default=None, type=str, help='emotion', choices=['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise'])
+				default='S2E', type=str, help='emotion', choices=['S2E', 'angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise'])
 		parser.add_argument('--no_crop',
 				action = 'store_true', help = 'not using crop')
 		parser.add_argument('--res_video_path',

@@ -7,11 +7,15 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
+# uv binary (official image) — setup.sh uses it instead of pip
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
 # Copy everything
 COPY . .
 ENV IS_IT_RUN_IN_DOCKER=true
-# Run the unified setup script
-RUN chmod +x setup.sh && ./setup.sh
+ENV PATH="/root/.local/bin:${PATH}"
+# Run the unified setup script (it lives in scripts/)
+RUN chmod +x scripts/setup.sh scripts/download_checkpoints.sh && ./scripts/setup.sh
 
 # Expose port
 EXPOSE 8000

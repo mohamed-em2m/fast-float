@@ -26,7 +26,7 @@ across chunks) — increasing CHUNK_SECONDS reduces how often you see a seam,
 at the cost of more latency.
 
 Requires Gradio >= 4.40 (for gr.Timer and streaming gr.Audio input).
-    pip install --upgrade gradio soundfile numpy
+    uv pip install --upgrade "gradio>=4.44" soundfile numpy
 """
 
 import os
@@ -51,8 +51,20 @@ from generate import InferenceAgent, InferenceOptions
 # Shared model wrapper (one instance, shared across all sessions/users)
 # --------------------------------------------------------------------------- #
 class FloatModel:
-    def __init__(self):
-        self.opt = InferenceOptions().parse()
+    def __init__(self, ckpt_path="./checkpoints/float.pth",
+                 res_dir="./results", wav2vec_model_path=None):
+        # InferenceOptions uses argparse on sys.argv, so isolate parsing
+        # from the Gradio launch flags (--port, --share, ...).
+        import sys
+        overrides = ['--ckpt_path', ckpt_path, '--res_dir', res_dir]
+        if wav2vec_model_path:
+            overrides.extend(['--wav2vec_model_path', wav2vec_model_path])
+        original_argv = sys.argv.copy()
+        try:
+            sys.argv = [sys.argv[0]] + overrides
+            self.opt = InferenceOptions().parse()
+        finally:
+            sys.argv = original_argv
         self.opt.rank, self.opt.ngpus = 0, 1
         os.makedirs(self.opt.res_dir, exist_ok=True)
 
@@ -154,8 +166,10 @@ def _to_mono_float(chunk_sr_data):
     return sr, data
 
 
-def build_interface():
-    model = FloatModel()
+def build_interface(ckpt_path="./checkpoints/float.pth",
+                    res_dir="./results", wav2vec_model_path=None):
+    model = FloatModel(ckpt_path=ckpt_path, res_dir=res_dir,
+                       wav2vec_model_path=wav2vec_model_path)
 
     # ---------- custom CSS ----------
     custom_css = """
@@ -227,7 +241,10 @@ def build_interface():
                     """
                 )
 
-                session_state = gr.State(LiveSession())
+                # None = no session yet; a fresh LiveSession is created on Start.
+                # (Never put a mutable LiveSession() instance here — it would be
+                # shared across users.)
+                session_state = gr.State(value=None)
 
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -270,7 +287,7 @@ def build_interface():
                 l_timer = gr.Timer(0.5, active=False)
 
                 # ---- session lifecycle -------------------------------------------------
-                def start_live(ref_image, session: LiveSession):
+                def start_live(ref_image, session: Optional[LiveSession]):
                     if ref_image is None:
                         return session, gr.update(active=False), "❌ Upload a reference image first."
                     session = LiveSession()
@@ -280,7 +297,9 @@ def build_interface():
                         prefix="float_live_", dir=model.live_dir)
                     return session, gr.update(active=True), "🟢 Listening... start talking."
 
-                def stop_live(session: LiveSession):
+                def stop_live(session: Optional[LiveSession]):
+                    if session is None:
+                        return None, gr.update(active=False), "⏹️ Stopped."
                     session.running = False
                     if session.session_dir and os.path.isdir(session.session_dir):
                         shutil.rmtree(session.session_dir, ignore_errors=True)
@@ -298,8 +317,8 @@ def build_interface():
                 )
 
                 # ---- audio ingestion ----------------------------------------------------
-                def on_audio_stream(chunk, session: LiveSession):
-                    if chunk is None or not session.running:
+                def on_audio_stream(chunk, session: Optional[LiveSession]):
+                    if session is None or chunk is None or not session.running:
                         return session
                     sr, data = _to_mono_float(chunk)
                     if data.size == 0:
@@ -316,15 +335,21 @@ def build_interface():
                 )
 
                 # ---- periodic inference tick --------------------------------------------
-                def on_tick(session: LiveSession, emotion, a_cfg, r_cfg, e_cfg,
+                def on_tick(session: Optional[LiveSession], emotion, a_cfg, r_cfg, e_cfg,
                             nfe, seed, no_crop):
-                    if not session.running:
+                    if session is None or not session.running:
                         return gr.update(), session, gr.update()
 
                     if session.buffered_seconds < CHUNK_SECONDS or not session.buffer:
                         return gr.update(), session, gr.update(
                             value=f"🟢 Listening... buffering audio "
                                   f"({session.buffered_seconds:.1f}s / {CHUNK_SECONDS:.1f}s)")
+
+                    if not session.session_dir or not os.path.isdir(session.session_dir):
+                        os.makedirs(session.session_dir or model.live_dir, exist_ok=True)
+                        if not session.session_dir or not os.path.isdir(session.session_dir):
+                            return gr.update(), session, gr.update(
+                                value="❌ Session temp dir missing — please Stop and Start again.")
 
                     # Pull everything currently buffered and reset for the next chunk.
                     audio = np.concatenate(session.buffer)
@@ -372,6 +397,16 @@ def build_interface():
                     outputs=[l_video_out, session_state, l_status],
                 )
 
+                # Best-effort temp cleanup if the user closes the tab without Stop.
+                try:
+                    demo.unload(
+                        fn=stop_live,
+                        inputs=[session_state],
+                        outputs=[session_state, l_timer, l_status],
+                    )
+                except Exception:
+                    pass
+
         with gr.Accordion("ℹ️ Help & Information", open=False):
             gr.Markdown(
                 """
@@ -416,7 +451,8 @@ def parse_launch_args():
     parser.add_argument('--res_dir', type=str, default="./results")
     parser.add_argument('--wav2vec_model_path', type=str, default="facebook/wav2vec2-base-960h")
     parser.add_argument('--debug', action='store_true')
-    parser.add_argument('--queue', action='store_true', default=True)
+    import argparse as _argparse
+    parser.add_argument('--queue', action=_argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--max_threads', type=int, default=4)
     parser.add_argument('--inbrowser', action='store_true')
     parser.add_argument('--prevent_thread_lock', action='store_true')
@@ -430,19 +466,11 @@ def parse_launch_args():
 if __name__ == "__main__":
     args = parse_launch_args()
 
-    import sys
-    inference_args = []
-    if args.ckpt_path:
-        inference_args.extend(['--ckpt_path', args.ckpt_path])
-    if args.res_dir:
-        inference_args.extend(['--res_dir', args.res_dir])
-    if args.wav2vec_model_path:
-        inference_args.extend(['--wav2vec_model_path', args.wav2vec_model_path])
-
-    original_argv = sys.argv.copy()
-    sys.argv = [sys.argv[0]] + inference_args
-    demo = build_interface()
-    sys.argv = original_argv
+    demo = build_interface(
+        ckpt_path=args.ckpt_path,
+        res_dir=args.res_dir,
+        wav2vec_model_path=args.wav2vec_model_path,
+    )
 
     auth_tuple = None
     if args.auth:
@@ -467,6 +495,7 @@ if __name__ == "__main__":
         'show_error': True,
         'inbrowser': args.inbrowser,
         'prevent_thread_lock': args.prevent_thread_lock,
+        'allowed_paths': [os.path.abspath(args.res_dir)],
     }
     if auth_tuple:
         launch_kwargs['auth'] = auth_tuple
