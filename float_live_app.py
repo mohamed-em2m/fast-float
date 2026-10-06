@@ -47,6 +47,21 @@ import gradio as gr
 from generate import InferenceAgent, InferenceOptions
 
 
+def _coerce_int(value, default):
+    """Gradio sliders always return float — inference needs plain ints."""
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_float(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 # --------------------------------------------------------------------------- #
 # Shared model wrapper (one instance, shared across all sessions/users)
 # --------------------------------------------------------------------------- #
@@ -83,6 +98,13 @@ class FloatModel:
 
     def run(self, ref_path, audio_path, out_path, emotion, a_cfg, r_cfg,
             e_cfg, nfe, seed, no_crop):
+        # Gradio sliders yield floats (sometimes numpy scalars) — normalize
+        # to plain Python int/float before anything downstream touches them.
+        nfe = _coerce_int(nfe, 10)
+        seed = _coerce_int(seed, 25)
+        a_cfg = _coerce_float(a_cfg, 2.0)
+        r_cfg = _coerce_float(r_cfg, 1.0)
+        e_cfg = _coerce_float(e_cfg, 1.0)
         with self.infer_lock:
             return self.agent.run_inference(
                 res_video_path=out_path,
@@ -109,6 +131,14 @@ class FloatModel:
             if audio_file is None:
                 return None, "❌ Please upload an audio file"
 
+            # Gradio sliders return float — normalize to plain ints/floats
+            # before they are used in filenames or passed to inference.
+            nfe = _coerce_int(nfe, 10)
+            seed = _coerce_int(seed, 25)
+            a_cfg_scale = _coerce_float(a_cfg_scale, 2.0)
+            r_cfg_scale = _coerce_float(r_cfg_scale, 1.0)
+            e_cfg_scale = _coerce_float(e_cfg_scale, 1.0)
+
             video_name = Path(ref_image).stem
             audio_name = Path(audio_file).stem
             call_time = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
@@ -123,7 +153,8 @@ class FloatModel:
                                     emotion, a_cfg_scale, r_cfg_scale,
                                     e_cfg_scale, nfe, seed, no_crop)
             progress(1.0, desc="Complete!")
-            return output_path, f"✅ Saved to: {output_path}"
+            # Show only the file name — never leak server-side absolute paths.
+            return output_path, f"✅ Saved to: {Path(output_path).name}"
         except Exception as e:
             return None, f"❌ Error during generation: {e}"
 
@@ -154,6 +185,7 @@ MAX_LIVE_CLIPS_KEPT = 20  # rotate old temp files so disk doesn't fill up
 def _to_mono_float(chunk_sr_data):
     """Gradio streaming mic audio arrives as (sample_rate, np.ndarray)."""
     sr, data = chunk_sr_data
+    sr = int(sr)  # may arrive as a numpy scalar — soundfile needs plain int
     data = np.asarray(data)
     if data.ndim > 1:
         data = data.mean(axis=1)
@@ -488,6 +520,16 @@ if __name__ == "__main__":
     print(f"🤖 Model checkpoint: {args.ckpt_path}")
     print("=" * 60 + "\n")
 
+    # Only the results dir may be served over HTTP. Explicitly block the
+    # model/checkpoint source folders (and other sensitive dirs) so they
+    # can never be downloaded through the Gradio file server.
+    blocked_paths = []
+    ckpt_dir = os.path.dirname(args.ckpt_path)
+    if ckpt_dir:
+        blocked_paths.append(os.path.abspath(ckpt_dir))
+    for d in ("models", ".venv", ".git", "config"):
+        blocked_paths.append(os.path.abspath(d))
+
     launch_kwargs = {
         'server_name': args.server_name,
         'server_port': args.port,
@@ -496,6 +538,7 @@ if __name__ == "__main__":
         'inbrowser': args.inbrowser,
         'prevent_thread_lock': args.prevent_thread_lock,
         'allowed_paths': [os.path.abspath(args.res_dir)],
+        'blocked_paths': blocked_paths,
     }
     if auth_tuple:
         launch_kwargs['auth'] = auth_tuple

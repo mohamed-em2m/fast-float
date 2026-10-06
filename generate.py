@@ -147,6 +147,16 @@ class InferenceAgent:
 		verbose: bool 		= False
 	) -> str:
 
+		# Callers (Gradio sliders, API payloads) may hand over floats or numpy
+		# scalars — normalize to plain Python types before inference.
+		if nfe is not None:
+			nfe = int(nfe)
+		if seed is not None:
+			seed = int(seed)
+		a_cfg_scale = float(a_cfg_scale)
+		r_cfg_scale = float(r_cfg_scale)
+		e_cfg_scale = float(e_cfg_scale)
+
 		data = self.data_processor.preprocess(ref_path, audio_path, no_crop = no_crop)
 		if verbose: print(f"> [Done] Preprocess.")
 
