@@ -22,7 +22,7 @@ fi
 echo "=== Updating system packages ==="
 $USE_SUDO apt-get update -y
 
-echo "=== Installing Python and system dependencies ==="
+echo "=== Installing system dependencies ==="
 $USE_SUDO apt-get install -y python3.10 ffmpeg git wget curl
 
 echo "=== Installing uv (package manager) ==="
@@ -32,18 +32,9 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 echo "uv version: $(uv --version)"
 
-echo "=== Creating Python virtual environment with uv ==="
-if [ ! -d ".venv" ]; then
-    uv venv --python 3.10 .venv
-else
-    echo ".venv already exists, reusing it."
-fi
-
-echo "=== Installing CUDA PyTorch (cu118, must come before requirements.txt) ==="
-uv pip install --python .venv/bin/python torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 --index-url https://download.pytorch.org/whl/cu118
-
-echo "=== Installing base requirements ==="
-uv pip install --python .venv/bin/python -r requirements.txt
+echo "=== Syncing project environment (uv sync) ==="
+echo "--- Python comes from .python-version, deps from pyproject.toml + uv.lock ---"
+uv sync --frozen
 
 echo "=== Running checkpoint download script ==="
 chmod +x "${SCRIPT_DIR}/download_checkpoints.sh"
