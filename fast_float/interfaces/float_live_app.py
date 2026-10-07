@@ -73,14 +73,19 @@ def _coerce_float(value, default):
 # Shared model wrapper (one instance, shared across all sessions/users)
 # --------------------------------------------------------------------------- #
 class FloatModel:
-    def __init__(self, ckpt_path="./checkpoints/float.pth",
-                 res_dir="./results", wav2vec_model_path=None):
+    def __init__(
+        self,
+        ckpt_path="./checkpoints/float.pth",
+        res_dir="./results",
+        wav2vec_model_path=None,
+    ):
         # InferenceOptions uses argparse on sys.argv, so isolate parsing
         # from the Gradio launch flags (--port, --share, ...).
         import sys
-        overrides = ['--ckpt_path', ckpt_path, '--res_dir', res_dir]
+
+        overrides = ["--ckpt_path", ckpt_path, "--res_dir", res_dir]
         if wav2vec_model_path:
-            overrides.extend(['--wav2vec_model_path', wav2vec_model_path])
+            overrides.extend(["--wav2vec_model_path", wav2vec_model_path])
         original_argv = sys.argv.copy()
         try:
             sys.argv = [sys.argv[0]] + overrides
@@ -103,8 +108,19 @@ class FloatModel:
         self.infer_lock = threading.Lock()
         print("Model loaded successfully!")
 
-    def run(self, ref_path, audio_path, out_path, emotion, a_cfg, r_cfg,
-            e_cfg, nfe, seed, no_crop):
+    def run(
+        self,
+        ref_path,
+        audio_path,
+        out_path,
+        emotion,
+        a_cfg,
+        r_cfg,
+        e_cfg,
+        nfe,
+        seed,
+        no_crop,
+    ):
         # Gradio sliders yield floats (sometimes numpy scalars) — normalize
         # to plain Python int/float before anything downstream touches them.
         nfe = _coerce_int(nfe, 10)
@@ -128,9 +144,19 @@ class FloatModel:
             )
 
     # ---- batch (original) path, unchanged in spirit from the original app ---
-    def generate_video(self, ref_image, audio_file, emotion, a_cfg_scale,
-                        r_cfg_scale, e_cfg_scale, nfe, seed, no_crop,
-                        progress=gr.Progress()):
+    def generate_video(
+        self,
+        ref_image,
+        audio_file,
+        emotion,
+        a_cfg_scale,
+        r_cfg_scale,
+        e_cfg_scale,
+        nfe,
+        seed,
+        no_crop,
+        progress=gr.Progress(),
+    ):
         try:
             progress(0, desc="Preparing inputs...")
             if ref_image is None:
@@ -156,9 +182,18 @@ class FloatModel:
             )
 
             progress(0.3, desc="Running inference...")
-            output_path = self.run(ref_image, audio_file, res_video_path,
-                                    emotion, a_cfg_scale, r_cfg_scale,
-                                    e_cfg_scale, nfe, seed, no_crop)
+            output_path = self.run(
+                ref_image,
+                audio_file,
+                res_video_path,
+                emotion,
+                a_cfg_scale,
+                r_cfg_scale,
+                e_cfg_scale,
+                nfe,
+                seed,
+                no_crop,
+            )
             progress(1.0, desc="Complete!")
             # Show only the file name — never leak server-side absolute paths.
             return output_path, f"✅ Saved to: {Path(output_path).name}"
@@ -175,7 +210,7 @@ class FloatModel:
 class LiveSession:
     ref_image_path: Optional[str] = None
     sample_rate: Optional[int] = None
-    buffer: list = field(default_factory=list)   # list of 1-D numpy float chunks
+    buffer: list = field(default_factory=list)  # list of 1-D numpy float chunks
     buffered_seconds: float = 0.0
     chunk_idx: int = 0
     running: bool = False
@@ -187,7 +222,7 @@ class LiveSession:
         self.buffered_seconds = 0.0
 
 
-CHUNK_SECONDS = 1.5      # how much audio to accumulate before generating a clip
+CHUNK_SECONDS = 1.5  # how much audio to accumulate before generating a clip
 MAX_LIVE_CLIPS_KEPT = 20  # rotate old temp files so disk doesn't fill up
 
 
@@ -207,10 +242,12 @@ def _to_mono_float(chunk_sr_data):
     return sr, data
 
 
-def build_interface(ckpt_path="./checkpoints/float.pth",
-                    res_dir="./results", wav2vec_model_path=None):
-    model = FloatModel(ckpt_path=ckpt_path, res_dir=res_dir,
-                       wav2vec_model_path=wav2vec_model_path)
+def build_interface(
+    ckpt_path="./checkpoints/float.pth", res_dir="./results", wav2vec_model_path=None
+):
+    model = FloatModel(
+        ckpt_path=ckpt_path, res_dir=res_dir, wav2vec_model_path=wav2vec_model_path
+    )
 
     # ---------- custom CSS ----------
     custom_css = """
@@ -235,35 +272,75 @@ def build_interface(ckpt_path="./checkpoints/float.pth",
                 with gr.Row():
                     with gr.Column(scale=1):
                         gr.Markdown("### 📥 Input Files")
-                        b_ref_image = gr.Image(label="Reference Image", type="filepath",
-                                                sources=["upload"], height=300)
-                        b_audio_file = gr.Audio(label="Audio File", type="filepath",
-                                                 sources=["upload"])
+                        b_ref_image = gr.Image(
+                            label="Reference Image",
+                            type="filepath",
+                            sources=["upload"],
+                            height=300,
+                        )
+                        b_audio_file = gr.Audio(
+                            label="Audio File", type="filepath", sources=["upload"]
+                        )
 
                         with gr.Accordion("⚙️ Advanced Options", open=False):
                             b_emotion = gr.Dropdown(
-                                choices=['S2E', 'angry', 'disgust', 'fear', 'happy',
-                                         'neutral', 'sad', 'surprise'],
-                                value='S2E', label="Emotion Control")
-                            b_no_crop = gr.Checkbox(label="Skip Face Cropping", value=False)
-                            b_seed = gr.Slider(0, 10000, value=25, step=1, label="Random Seed")
+                                choices=[
+                                    "S2E",
+                                    "angry",
+                                    "disgust",
+                                    "fear",
+                                    "happy",
+                                    "neutral",
+                                    "sad",
+                                    "surprise",
+                                ],
+                                value="S2E",
+                                label="Emotion Control",
+                            )
+                            b_no_crop = gr.Checkbox(
+                                label="Skip Face Cropping", value=False
+                            )
+                            b_seed = gr.Slider(
+                                0, 10000, value=25, step=1, label="Random Seed"
+                            )
 
                     with gr.Column(scale=1):
                         gr.Markdown("### 🎛️ Generation Parameters")
                         with gr.Group():
                             b_nfe = gr.Slider(1, 50, value=10, step=1, label="NFE")
-                            b_a_cfg = gr.Slider(0.0, 5.0, value=2.0, step=0.1, label="Audio CFG Scale")
-                            b_r_cfg = gr.Slider(0.0, 3.0, value=1.0, step=0.1, label="Reference CFG Scale")
-                            b_e_cfg = gr.Slider(0.0, 3.0, value=1.0, step=0.1, label="Emotion CFG Scale")
+                            b_a_cfg = gr.Slider(
+                                0.0, 5.0, value=2.0, step=0.1, label="Audio CFG Scale"
+                            )
+                            b_r_cfg = gr.Slider(
+                                0.0,
+                                3.0,
+                                value=1.0,
+                                step=0.1,
+                                label="Reference CFG Scale",
+                            )
+                            b_e_cfg = gr.Slider(
+                                0.0, 3.0, value=1.0, step=0.1, label="Emotion CFG Scale"
+                            )
 
-                        b_generate_btn = gr.Button("🚀 Generate Video", variant="primary", size="lg")
+                        b_generate_btn = gr.Button(
+                            "🚀 Generate Video", variant="primary", size="lg"
+                        )
                         b_status = gr.Textbox(label="Status", lines=10)
                         b_video_out = gr.Video(label="Generated Video", height=400)
 
                 b_generate_btn.click(
                     fn=model.generate_video,
-                    inputs=[b_ref_image, b_audio_file, b_emotion, b_a_cfg, b_r_cfg,
-                            b_e_cfg, b_nfe, b_seed, b_no_crop],
+                    inputs=[
+                        b_ref_image,
+                        b_audio_file,
+                        b_emotion,
+                        b_a_cfg,
+                        b_r_cfg,
+                        b_e_cfg,
+                        b_nfe,
+                        b_seed,
+                        b_no_crop,
+                    ],
                     outputs=[b_video_out, b_status],
                 )
 
@@ -289,22 +366,55 @@ def build_interface(ckpt_path="./checkpoints/float.pth",
 
                 with gr.Row():
                     with gr.Column(scale=1):
-                        l_ref_image = gr.Image(label="Reference Image (set once)",
-                                                type="filepath", sources=["upload"], height=280)
+                        l_ref_image = gr.Image(
+                            label="Reference Image (set once)",
+                            type="filepath",
+                            sources=["upload"],
+                            height=280,
+                        )
 
                         with gr.Accordion("⚙️ Live Generation Settings", open=True):
                             gr.Markdown("*Keep NFE low for lower latency.*")
                             l_emotion = gr.Dropdown(
-                                choices=['S2E', 'angry', 'disgust', 'fear', 'happy',
-                                         'neutral', 'sad', 'surprise'],
-                                value='S2E', label="Emotion Control")
-                            l_no_crop = gr.Checkbox(label="Skip Face Cropping", value=False)
-                            l_seed = gr.Slider(0, 10000, value=25, step=1, label="Random Seed")
-                            l_nfe = gr.Slider(1, 20, value=6, step=1,
-                                               label="NFE (lower = faster/less latency)")
-                            l_a_cfg = gr.Slider(0.0, 5.0, value=2.0, step=0.1, label="Audio CFG Scale")
-                            l_r_cfg = gr.Slider(0.0, 3.0, value=1.0, step=0.1, label="Reference CFG Scale")
-                            l_e_cfg = gr.Slider(0.0, 3.0, value=1.0, step=0.1, label="Emotion CFG Scale")
+                                choices=[
+                                    "S2E",
+                                    "angry",
+                                    "disgust",
+                                    "fear",
+                                    "happy",
+                                    "neutral",
+                                    "sad",
+                                    "surprise",
+                                ],
+                                value="S2E",
+                                label="Emotion Control",
+                            )
+                            l_no_crop = gr.Checkbox(
+                                label="Skip Face Cropping", value=False
+                            )
+                            l_seed = gr.Slider(
+                                0, 10000, value=25, step=1, label="Random Seed"
+                            )
+                            l_nfe = gr.Slider(
+                                1,
+                                20,
+                                value=6,
+                                step=1,
+                                label="NFE (lower = faster/less latency)",
+                            )
+                            l_a_cfg = gr.Slider(
+                                0.0, 5.0, value=2.0, step=0.1, label="Audio CFG Scale"
+                            )
+                            l_r_cfg = gr.Slider(
+                                0.0,
+                                3.0,
+                                value=1.0,
+                                step=0.1,
+                                label="Reference CFG Scale",
+                            )
+                            l_e_cfg = gr.Slider(
+                                0.0, 3.0, value=1.0, step=0.1, label="Emotion CFG Scale"
+                            )
 
                         l_mic = gr.Audio(
                             label="Microphone",
@@ -318,10 +428,12 @@ def build_interface(ckpt_path="./checkpoints/float.pth",
                             l_stop_btn = gr.Button("⏹️ Stop")
 
                     with gr.Column(scale=1):
-                        l_video_out = gr.Video(label="Live Output", height=400,
-                                                autoplay=True, loop=False)
-                        l_status = gr.Textbox(label="Live Status", lines=3,
-                                               elem_classes=["live-status"])
+                        l_video_out = gr.Video(
+                            label="Live Output", height=400, autoplay=True, loop=False
+                        )
+                        l_status = gr.Textbox(
+                            label="Live Status", lines=3, elem_classes=["live-status"]
+                        )
 
                 # Ticks periodically; each tick checks whether enough audio has
                 # been buffered, and if so, runs one inference call.
@@ -330,13 +442,22 @@ def build_interface(ckpt_path="./checkpoints/float.pth",
                 # ---- session lifecycle -------------------------------------------------
                 def start_live(ref_image, session: Optional[LiveSession]):
                     if ref_image is None:
-                        return session, gr.update(active=False), "❌ Upload a reference image first."
+                        return (
+                            session,
+                            gr.update(active=False),
+                            "❌ Upload a reference image first.",
+                        )
                     session = LiveSession()
                     session.ref_image_path = ref_image
                     session.running = True
                     session.session_dir = tempfile.mkdtemp(
-                        prefix="float_live_", dir=model.live_dir)
-                    return session, gr.update(active=True), "🟢 Listening... start talking."
+                        prefix="float_live_", dir=model.live_dir
+                    )
+                    return (
+                        session,
+                        gr.update(active=True),
+                        "🟢 Listening... start talking.",
+                    )
 
                 def stop_live(session: Optional[LiveSession]):
                     if session is None:
@@ -376,21 +497,45 @@ def build_interface(ckpt_path="./checkpoints/float.pth",
                 )
 
                 # ---- periodic inference tick --------------------------------------------
-                def on_tick(session: Optional[LiveSession], emotion, a_cfg, r_cfg, e_cfg,
-                            nfe, seed, no_crop):
+                def on_tick(
+                    session: Optional[LiveSession],
+                    emotion,
+                    a_cfg,
+                    r_cfg,
+                    e_cfg,
+                    nfe,
+                    seed,
+                    no_crop,
+                ):
                     if session is None or not session.running:
                         return gr.update(), session, gr.update()
 
                     if session.buffered_seconds < CHUNK_SECONDS or not session.buffer:
-                        return gr.update(), session, gr.update(
-                            value=f"🟢 Listening... buffering audio "
-                                  f"({session.buffered_seconds:.1f}s / {CHUNK_SECONDS:.1f}s)")
+                        return (
+                            gr.update(),
+                            session,
+                            gr.update(
+                                value=f"🟢 Listening... buffering audio "
+                                f"({session.buffered_seconds:.1f}s / {CHUNK_SECONDS:.1f}s)"
+                            ),
+                        )
 
-                    if not session.session_dir or not os.path.isdir(session.session_dir):
-                        os.makedirs(session.session_dir or model.live_dir, exist_ok=True)
-                        if not session.session_dir or not os.path.isdir(session.session_dir):
-                            return gr.update(), session, gr.update(
-                                value="❌ Session temp dir missing — please Stop and Start again.")
+                    if not session.session_dir or not os.path.isdir(
+                        session.session_dir
+                    ):
+                        os.makedirs(
+                            session.session_dir or model.live_dir, exist_ok=True
+                        )
+                        if not session.session_dir or not os.path.isdir(
+                            session.session_dir
+                        ):
+                            return (
+                                gr.update(),
+                                session,
+                                gr.update(
+                                    value="❌ Session temp dir missing — please Stop and Start again."
+                                ),
+                            )
 
                     # Pull everything currently buffered and reset for the next chunk.
                     audio = np.concatenate(session.buffer)
@@ -399,8 +544,12 @@ def build_interface(ckpt_path="./checkpoints/float.pth",
                     session.chunk_idx += 1
                     idx = session.chunk_idx
 
-                    chunk_wav = os.path.join(session.session_dir, f"chunk_{idx:05d}.wav")
-                    chunk_mp4 = os.path.join(session.session_dir, f"chunk_{idx:05d}.mp4")
+                    chunk_wav = os.path.join(
+                        session.session_dir, f"chunk_{idx:05d}.wav"
+                    )
+                    chunk_mp4 = os.path.join(
+                        session.session_dir, f"chunk_{idx:05d}.mp4"
+                    )
                     sf.write(chunk_wav, audio, sr)
 
                     t0 = time.time()
@@ -409,14 +558,24 @@ def build_interface(ckpt_path="./checkpoints/float.pth",
                             ref_path=session.ref_image_path,
                             audio_path=chunk_wav,
                             out_path=chunk_mp4,
-                            emotion=emotion, a_cfg=a_cfg, r_cfg=r_cfg,
-                            e_cfg=e_cfg, nfe=nfe, seed=seed, no_crop=no_crop,
+                            emotion=emotion,
+                            a_cfg=a_cfg,
+                            r_cfg=r_cfg,
+                            e_cfg=e_cfg,
+                            nfe=nfe,
+                            seed=seed,
+                            no_crop=no_crop,
                         )
                     except Exception as e:
                         tb = traceback.format_exc()
                         print(f"❌ Chunk {idx} failed: {e}\n{tb}")
-                        return gr.update(), session, gr.update(
-                            value=f"❌ Chunk {idx} failed: {e}\n\n--- Traceback ---\n{tb}")
+                        return (
+                            gr.update(),
+                            session,
+                            gr.update(
+                                value=f"❌ Chunk {idx} failed: {e}\n\n--- Traceback ---\n{tb}"
+                            ),
+                        )
 
                     session.last_latency = time.time() - t0
 
@@ -425,19 +584,30 @@ def build_interface(ckpt_path="./checkpoints/float.pth",
                         old_idx = idx - MAX_LIVE_CLIPS_KEPT
                         for ext in (".wav", ".mp4"):
                             old_path = os.path.join(
-                                session.session_dir, f"chunk_{old_idx:05d}{ext}")
+                                session.session_dir, f"chunk_{old_idx:05d}{ext}"
+                            )
                             if os.path.exists(old_path):
                                 os.remove(old_path)
 
-                    status = (f"🟢 Live — chunk {idx} generated in "
-                              f"{session.last_latency:.1f}s "
-                              f"(clip length {CHUNK_SECONDS:.1f}s)")
+                    status = (
+                        f"🟢 Live — chunk {idx} generated in "
+                        f"{session.last_latency:.1f}s "
+                        f"(clip length {CHUNK_SECONDS:.1f}s)"
+                    )
                     return gr.update(value=out_path), session, gr.update(value=status)
 
                 l_timer.tick(
                     fn=on_tick,
-                    inputs=[session_state, l_emotion, l_a_cfg, l_r_cfg, l_e_cfg,
-                            l_nfe, l_seed, l_no_crop],
+                    inputs=[
+                        session_state,
+                        l_emotion,
+                        l_a_cfg,
+                        l_r_cfg,
+                        l_e_cfg,
+                        l_nfe,
+                        l_seed,
+                        l_no_crop,
+                    ],
                     outputs=[l_video_out, session_state, l_status],
                 )
 
@@ -485,25 +655,32 @@ def build_interface(ckpt_path="./checkpoints/float.pth",
 
 def parse_launch_args():
     import argparse
-    parser = argparse.ArgumentParser(description='Launch FLOAT Gradio Interface')
-    parser.add_argument('--port', type=int, default=7860)
-    parser.add_argument('--server_name', type=str, default="0.0.0.0")
-    parser.add_argument('--share', action='store_true')
-    parser.add_argument('--auth', type=str, default=None)
-    parser.add_argument('--auth_message', type=str, default="Please login to access FLOAT")
-    parser.add_argument('--ckpt_path', type=str, default="./checkpoints/float.pth")
-    parser.add_argument('--res_dir', type=str, default="./results")
-    parser.add_argument('--wav2vec_model_path', type=str, default="facebook/wav2vec2-base-960h")
-    parser.add_argument('--debug', action='store_true')
     import argparse as _argparse
-    parser.add_argument('--queue', action=_argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--max_threads', type=int, default=4)
-    parser.add_argument('--inbrowser', action='store_true')
-    parser.add_argument('--prevent_thread_lock', action='store_true')
-    parser.add_argument('--ssl_keyfile', type=str, default=None)
-    parser.add_argument('--ssl_certfile', type=str, default=None)
-    parser.add_argument('--ssl_keyfile_password', type=str, default=None)
-    parser.add_argument('--favicon_path', type=str, default=None)
+
+    parser = argparse.ArgumentParser(description="Launch FLOAT Gradio Interface")
+    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--server_name", type=str, default="0.0.0.0")
+    parser.add_argument("--share", action="store_true")
+    parser.add_argument("--auth", type=str, default=None)
+    parser.add_argument(
+        "--auth_message", type=str, default="Please login to access FLOAT"
+    )
+    parser.add_argument("--ckpt_path", type=str, default="./checkpoints/float.pth")
+    parser.add_argument("--res_dir", type=str, default="./results")
+    parser.add_argument(
+        "--wav2vec_model_path", type=str, default="facebook/wav2vec2-base-960h"
+    )
+    parser.add_argument("--debug", action="store_true")
+
+    parser.add_argument("--queue", action=_argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--max_threads", type=int, default=4)
+    parser.add_argument("--inbrowser", action="store_true")
+    parser.add_argument("--prevent_thread_lock", action="store_true")
+    parser.add_argument("--ssl_keyfile", type=str, default=None)
+    parser.add_argument("--ssl_certfile", type=str, default=None)
+    parser.add_argument("--ssl_keyfile_password", type=str, default=None)
+    parser.add_argument("--favicon_path", type=str, default=None)
+    parser.add_argument("--ngpus", type=int, default=1)
     return parser.parse_args()
 
 
@@ -519,7 +696,7 @@ if __name__ == "__main__":
     auth_tuple = None
     if args.auth:
         try:
-            username, password = args.auth.split(':', 1)
+            username, password = args.auth.split(":", 1)
             auth_tuple = (username, password)
         except ValueError:
             print("⚠️ Invalid auth format. Use 'username:password'")
@@ -543,27 +720,27 @@ if __name__ == "__main__":
         blocked_paths.append(os.path.abspath(d))
 
     launch_kwargs = {
-        'server_name': args.server_name,
-        'server_port': args.port,
-        'share': args.share,
-        'show_error': True,
-        'inbrowser': args.inbrowser,
-        'prevent_thread_lock': args.prevent_thread_lock,
-        'allowed_paths': [os.path.abspath(args.res_dir)],
-        'blocked_paths': blocked_paths,
+        "server_name": args.server_name,
+        "server_port": args.port,
+        "share": args.share,
+        "show_error": True,
+        "inbrowser": args.inbrowser,
+        "prevent_thread_lock": args.prevent_thread_lock,
+        "allowed_paths": [os.path.abspath(args.res_dir)],
+        "blocked_paths": blocked_paths,
     }
     if auth_tuple:
-        launch_kwargs['auth'] = auth_tuple
-        launch_kwargs['auth_message'] = args.auth_message
+        launch_kwargs["auth"] = auth_tuple
+        launch_kwargs["auth_message"] = args.auth_message
     if args.ssl_keyfile and args.ssl_certfile:
-        launch_kwargs['ssl_keyfile'] = args.ssl_keyfile
-        launch_kwargs['ssl_certfile'] = args.ssl_certfile
+        launch_kwargs["ssl_keyfile"] = args.ssl_keyfile
+        launch_kwargs["ssl_certfile"] = args.ssl_certfile
         if args.ssl_keyfile_password:
-            launch_kwargs['ssl_keyfile_password'] = args.ssl_keyfile_password
+            launch_kwargs["ssl_keyfile_password"] = args.ssl_keyfile_password
     if args.favicon_path:
-        launch_kwargs['favicon_path'] = args.favicon_path
+        launch_kwargs["favicon_path"] = args.favicon_path
     if args.debug:
-        launch_kwargs['debug'] = True
+        launch_kwargs["debug"] = True
 
     try:
         if args.queue:
