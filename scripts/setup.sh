@@ -34,7 +34,7 @@ echo "uv version: $(uv --version)"
 
 echo "=== Syncing project environment (uv sync) ==="
 echo "--- Python comes from .python-version, deps from pyproject.toml + uv.lock ---"
-uv sync --frozen
+uv pip install -e .
 
 echo "=== Running checkpoint download script ==="
 chmod +x "${SCRIPT_DIR}/download_checkpoints.sh"
