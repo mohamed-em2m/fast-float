@@ -19,7 +19,7 @@ else
     echo "No .venv found — running 'uv sync --frozen' first."
     uv sync --frozen
     GDOWN="${PROJECT_ROOT}/.venv/bin/gdown"
-    HF="${PROJECT_ROOT}/.venv/bin/huggingface-cli"
+    HF="${PROJECT_ROOT}/.venv/bin/hf"
 fi
 
 echo "=== Downloading float.pth ==="
