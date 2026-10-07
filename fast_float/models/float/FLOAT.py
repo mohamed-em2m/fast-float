@@ -67,16 +67,6 @@ import threading
 import queue
 from dataclasses import dataclass
 
-
-@dataclass
-class FrameData:
-    """Container for frame data passed between producer and consumer"""
-
-    frame_np: np.ndarray
-    frame_idx: int
-    is_last: bool = False
-
-
 from fast_float.models.wav2vec2 import Wav2VecModel
 from fast_float.models.wav2vec2_ser import Wav2Vec2ForSpeechClassification
 
@@ -99,9 +89,20 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict
 
 import torch
+import logging
 
+logger = logging.getHandlerByName(__name__)
 GiB = 1024**3
 _ABORT = object()
+
+
+@dataclass
+class FrameData:
+    """Container for frame data passed between producer and consumer"""
+
+    frame_np: np.ndarray
+    frame_idx: int
+    is_last: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -269,7 +270,7 @@ class StreamingVideoSaver:
         primary = self._cuda_device()
         visible = torch.cuda.device_count()
         want = max(1, int(getattr(self.opt, "ngpus", 1)))
-        print(
+        logger.info(
             f"[MULTI-GPU] ngpus={want} requested but only {visible} visible; using {visible}"
         )
         if want > visible:
