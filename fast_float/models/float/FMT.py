@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torchdiffeq import odeint
-from models import BaseModel
+from fast_float.models import BaseModel
 
 from timm.layers import use_fused_attn
 from timm.models.vision_transformer import Mlp
@@ -383,7 +383,7 @@ class FlowMatchingTransformer(BaseModel):
         a_cfg_scale=1.0,
         r_cfg_scale=1.0,
         e_cfg_scale=1.0,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
         if a_cfg_scale != 1.0 or r_cfg_scale != 1.0 or e_cfg_scale != 1.0:
             null_wa = torch.zeros_like(wa)

@@ -22,15 +22,23 @@ for path in (str(CURRENT_DIR), str(REPO_ROOT)):
         sys.path.insert(0, path)
 
 from fast_float.initialize_env import initialize_environment
+
 initialize_environment()
 
 from fast_float.utils.logger import logger
 from fast_float.utils.gpu import print_gpu_status
-from fast_float.utils.media import DEFAULT_IMAGE_PATH, TARGET_IMAGE_SIZE, ensure_default_image
+from fast_float.utils.media import (
+    DEFAULT_IMAGE_PATH,
+    TARGET_IMAGE_SIZE,
+    ensure_default_image,
+)
 from fast_float.utils.video_optimizer import VideoSaveOptimizer
 from fast_float.core.state import app_state
 from fast_float.core.service import run_inference_blocking
-from fast_float.core.inference_optimized import OptimizedInferenceAgent, InferenceOptions
+from fast_float.core.inference_optimized import (
+    OptimizedInferenceAgent,
+    InferenceOptions,
+)
 from fast_float.routers import api_router
 
 # Configuration

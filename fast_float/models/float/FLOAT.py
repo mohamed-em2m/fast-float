@@ -1,23 +1,24 @@
 """
 stream_pipeline.py - auto-tuned, multi-stream streaming decode + ffmpeg pipeline for FLOAT.
- 
+
 Pipeline (all stages overlap):
- 
+
   producer thread          decode workers (1 CUDA stream each)        writer thread
   ----------------         ------------------------------------      ----------------
   sample() ODE chunks  ->  decode micro-batch -> uint8 NHWC ->       reorder -> ffmpeg stdin
   re-batched to B          async copy to pinned host buffer          (NVENC / x264)
- 
+
 The tuner measures, once per process, on THIS GPU:
   * the decode micro-batch size B where throughput stops improving
   * the real peak GPU memory of one in-flight batch
 and then, before every run, sizes the number of concurrent decode streams from the
 memory that is actually free right now. OOM at runtime halves the batch and retries.
- 
+
 Usage in your model file:
     from stream_pipeline import StreamingVideoSaver
     class FLOAT(BaseModel, StreamingVideoSaver): ...
 """
+
 import os
 import torch, math
 import time
@@ -69,12 +70,12 @@ class FrameData:
     is_last: bool = False
 
 
-from models.wav2vec2 import Wav2VecModel
-from models.wav2vec2_ser import Wav2Vec2ForSpeechClassification
+from fast_float.models.wav2vec2 import Wav2VecModel
+from fast_float.models.wav2vec2_ser import Wav2Vec2ForSpeechClassification
 
-from models import BaseModel
-from models.float.generator import Generator
-from models.float.FMT import FlowMatchingTransformer
+from fast_float.models import BaseModel
+from fast_float.models.float.generator import Generator
+from fast_float.models.float.FMT import FlowMatchingTransformer
 import traceback
 
 torch.backends.cudnn.benchmark = True

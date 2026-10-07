@@ -2,7 +2,7 @@ from torch import nn
 from .encoder import Encoder
 from .styledecoder import Synthesis
 
-from models import BaseModel
+from fast_float.models import BaseModel
 
 
 class Generator(BaseModel):
