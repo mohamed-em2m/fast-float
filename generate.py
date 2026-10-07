@@ -150,23 +150,47 @@ class InferenceAgent:
     def save_video(
         self, vid_target_recon: torch.Tensor, video_path: str, audio_path: str
     ) -> str:
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_video:
-            temp_filename = temp_video.name
-            vid = vid_target_recon.permute(0, 2, 3, 1)
-            vid = vid.detach().clamp(-1, 1).cpu()
-            vid = ((vid + 1) / 2 * 255).type("torch.ByteTensor")
-            torchvision.io.write_video(temp_filename, vid, fps=int(self.opt.fps))
-            if audio_path is not None:
-                with open(os.devnull, "wb") as f:
-                    command = "ffmpeg -i {} -i {} -c:v copy -c:a aac {} -y".format(
-                        temp_filename, audio_path, video_path
-                    )
-                    subprocess.call(command, shell=True, stdout=f, stderr=f)
-                if os.path.exists(video_path):
-                    os.remove(temp_filename)
-            else:
-                os.rename(temp_filename, video_path)
-            return video_path
+        vid = vid_target_recon.permute(0, 2, 3, 1)
+        vid = vid.detach().clamp(-1, 1).cpu()
+        vid = ((vid + 1) / 2 * 255).to(torch.uint8).contiguous()
+        T, H, W, _ = vid.shape
+        fps = int(self.opt.fps)
+
+        # Encode and mux audio in one ffmpeg call (no temp file needed)
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{W}x{H}",
+            "-r",
+            str(fps),
+            "-i",
+            "-",
+        ]
+        if audio_path is not None:
+            cmd += ["-i", audio_path, "-c:a", "aac", "-shortest"]
+        cmd += [
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            "18",
+            # "-c:v", "h264_nvenc",   # use instead of libx264 if you have NVENC
+            video_path,
+        ]
+
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        _, err = p.communicate(vid.numpy().tobytes())
+        if p.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {err.decode(errors='ignore')}")
+        return video_path
 
     @torch.no_grad()
     def run_inference(
