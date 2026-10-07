@@ -680,6 +680,7 @@ def parse_launch_args():
     parser.add_argument("--ssl_certfile", type=str, default=None)
     parser.add_argument("--ssl_keyfile_password", type=str, default=None)
     parser.add_argument("--favicon_path", type=str, default=None)
+    parser.add_argument("--ngpus", type=int, default=1)
     return parser.parse_args()
 
 
