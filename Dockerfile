@@ -7,18 +7,16 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# uv binary (official image) — setup.sh uses it instead of pip
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-
 # Copy everything
 COPY . .
 ENV IS_IT_RUN_IN_DOCKER=true
-ENV PATH="/root/.local/bin:${PATH}"
-# Run the unified setup script (it lives in scripts/)
-RUN chmod +x scripts/setup.sh scripts/download_checkpoints.sh && ./scripts/setup.sh
+# Run the unified setup script
+RUN chmod +x ./setup.sh
+RUN ./setup.sh
 
-# Expose port
-EXPOSE 8000
+# Expose port (Cloud Run uses $PORT env variable)
+EXPOSE 8080
+ENV PORT=8080
 
-# Run the application
-CMD [".venv/bin/hypercorn", "main:app", "--bind", "0.0.0.0:8000", "--worker-class", "asyncio", "--log-level", "info", "--access-logfile", "-"]
+# Use shell form to allow environment variable expansion
+CMD .venv/bin/hypercorn main:app --bind 0.0.0.0:${PORT} --log-level info --startup-timeout 600 --workers 1

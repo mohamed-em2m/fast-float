@@ -31,7 +31,7 @@ dependencies = [
     "aiortc==1.13.0",
     # Data Processing & Visualization
     "pandas==2.0.3",
-    "huggingface_hub[hf_transfer]>=0.1.9",
+    "hf_transfer>=0.1.9",
     "matplotlib==3.7.2",
     "flow-vis==0.1",
     "pyyaml==6.0.1",
@@ -55,7 +55,7 @@ dependencies = [
     "pydantic-settings==2.1.0",
     "matplotlib-inline==0.1.7",
     "ipython==8.36.0",
-    "huggingface-hub<1.0,>=0.14.1",
+    "huggingface-hub[hf-transfer]>=0.14.1,<1.0",
     "ngrok==1.4.0",
     "pyngrok==7.5.0",
     "brotli==1.2.0",
