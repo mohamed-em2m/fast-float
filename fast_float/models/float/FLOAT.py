@@ -91,7 +91,7 @@ from typing import Callable, Dict
 import torch
 import logging
 
-logger = logging.getHandlerByName(__name__)
+logger = logging.getHandlerNames(__name__)
 GiB = 1024**3
 _ABORT = object()
 
