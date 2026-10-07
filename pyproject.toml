@@ -1,5 +1,5 @@
 [project]
-name = "float-fast"
+name = "fast-float"
 version = "0.1.0"
 description = "FLOAT audio-driven talking-face generation: fast inference API plus Gradio batch and live apps"
 readme = "README.md"

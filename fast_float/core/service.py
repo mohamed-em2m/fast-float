@@ -1,0 +1,159 @@
+import os
+import time
+import base64
+import tempfile
+import datetime
+import asyncio
+from typing import Dict, Tuple, Any
+
+from fast_float.utils.logger import logger
+from fast_float.utils.media import (
+    DEFAULT_IMAGE_PATH,
+    ensure_default_image,
+    resize_image_to_256,
+    process_audio_format,
+)
+from fast_float.core.state import app_state
+
+
+def run_inference_blocking(
+    agent: Any,
+    video_path_raw: str,
+    image_path: str,
+    audio_path: str,
+    request_data: Dict[str, Any],
+) -> str:
+    """Synchronous inference runner invoked within ThreadPoolExecutor."""
+    return agent.run_inference(
+        res_video_path=video_path_raw,
+        ref_path=image_path,
+        audio_path=audio_path,
+        a_cfg_scale=request_data.get("a_cfg_scale", 2.0),
+        r_cfg_scale=request_data.get("r_cfg_scale", 1.0),
+        e_cfg_scale=request_data.get("e_cfg_scale", 1.0),
+        emo=request_data.get("emotion", "S2E"),
+        nfe=request_data.get("nfe", 10),
+        no_crop=request_data.get("no_crop", False),
+        seed=request_data.get("seed", 25),
+        verbose=True,
+    )
+
+
+async def generate_video(
+    request_data: Dict[str, Any],
+    request_id: str,
+    state=app_state,
+) -> Tuple[str, Dict[str, float]]:
+    """Complete pipeline to process inputs, run model inference, and return final video."""
+    temp_files = []
+    total_start_time = time.time()
+    timings = {}
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+
+    try:
+        logger.info(f"[{request_id}] 🚀 Starting video generation")
+
+        # 1. Audio processing
+        preprocess_start = time.time()
+        wav_bytes = process_audio_format(
+            request_data["audio_base64"],
+            request_data.get("audio_format", "pcm"),
+            request_data.get("sample_rate", 16000),
+            request_data.get("channels", 1),
+            request_data.get("sample_width", 2),
+        )
+
+        audio_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+        with open(audio_path, "wb") as f:
+            f.write(wav_bytes)
+        temp_files.append(audio_path)
+
+        # 2. Image processing
+        if request_data.get("image_base64"):
+            image_bytes = base64.b64decode(request_data["image_base64"])
+            image_path_temp = tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=f".{request_data.get('image_format', 'jpg')}",
+            ).name
+            with open(image_path_temp, "wb") as f:
+                f.write(image_bytes)
+            temp_files.append(image_path_temp)
+
+            image_path = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg").name
+            resize_image_to_256(image_path_temp, image_path)
+            temp_files.append(image_path)
+        else:
+            image_path = ensure_default_image(DEFAULT_IMAGE_PATH)
+
+        timings["preprocess"] = time.time() - preprocess_start
+
+        # 3. Model Inference with lock
+        res_dir = getattr(state.opt, "res_dir", "./results") if state.opt else "./results"
+        os.makedirs(res_dir, exist_ok=True)
+        video_path_final = os.path.join(
+            res_dir,
+            f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{request_id}.mp4",
+        )
+
+        inference_start = time.time()
+
+        if state.inference_lock is None:
+            state.inference_lock = asyncio.Lock()
+
+        async with state.inference_lock:
+            output_path = await loop.run_in_executor(
+                state.executor,
+                run_inference_blocking,
+                state.agent,
+                video_path_final,
+                image_path,
+                audio_path,
+                request_data,
+            )
+
+        timings["inference"] = time.time() - inference_start
+        timings["total"] = time.time() - total_start_time
+        timings["fps"] = 1.0 / timings["inference"] if timings["inference"] > 0 else 0.0
+
+        # 4. Update performance stats
+        stats = state.performance_stats
+        stats["total_requests"] += 1
+        stats["total_inference_time"] += timings["inference"]
+        stats["total_preprocess_time"] += timings["preprocess"]
+        if stats["total_inference_time"] > 0:
+            stats["average_fps"] = stats["total_requests"] / stats["total_inference_time"]
+
+        # 5. Clean temporary files
+        for temp_file in temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except Exception as cleanup_error:
+                logger.debug(f"[{request_id}] Cleanup warning: {cleanup_error}")
+
+        # 6. Verify final video
+        if not os.path.exists(output_path):
+            raise FileNotFoundError(f"Final video not found at {output_path}")
+
+        file_size = os.path.getsize(output_path) / (1024 * 1024)
+        logger.info(
+            f"[{request_id}] ✅ Complete: {timings['total']:.2f}s "
+            f"(prep: {timings['preprocess']:.2f}s, inf: {timings['inference']:.2f}s) | "
+            f"{file_size:.2f}MB"
+        )
+
+        return output_path, timings
+
+    except Exception as e:
+        logger.error(f"[{request_id}] ❌ Generation failed: {str(e)}", exc_info=True)
+        for temp_file in temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except Exception:
+                pass
+        raise

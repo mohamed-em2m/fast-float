@@ -6,8 +6,18 @@ import albumentations.pytorch.transforms as A_pytorch
 from tqdm import tqdm
 from pathlib import Path
 from transformers import Wav2Vec2FeatureExtractor
-from models.float.FLOAT import FLOAT
-from options.base_options import BaseOptions
+try:
+    from fast_float.models.float.FLOAT import FLOAT
+except ImportError:
+    from models.float.FLOAT import FLOAT
+
+try:
+    from fast_float.schemas.base_options import BaseOptions
+except ImportError:
+    try:
+        from schemas.base_options import BaseOptions
+    except ImportError:
+        from options.base_options import BaseOptions
 import time
 import uuid
 import logging

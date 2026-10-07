@@ -14,11 +14,19 @@ import argparse # Moved from parse_args into the top-level imports
 
 
 try:
-    from inference_optimized import OptimizedInferenceAgent, InferenceOptions
+    from fast_float.core.inference_optimized import OptimizedInferenceAgent, InferenceOptions
     LOCAL_MODE_AVAILABLE = True
 except ImportError:
-    LOCAL_MODE_AVAILABLE = False
-    print("⚠️ Local inference not available. API mode only.")
+    try:
+        from core.inference_optimized import OptimizedInferenceAgent, InferenceOptions
+        LOCAL_MODE_AVAILABLE = True
+    except ImportError:
+        try:
+            from inference_optimized import OptimizedInferenceAgent, InferenceOptions
+            LOCAL_MODE_AVAILABLE = True
+        except ImportError:
+            LOCAL_MODE_AVAILABLE = False
+            print("⚠️ Local inference not available. API mode only.")
 
 class GradioAPIInterface:
     def __init__(self, api_url: str = "https://colab.him-world.com", use_local: bool = False): # Fixed: init -> __init__

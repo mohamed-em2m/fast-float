@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 PORT="${PORT:-8000}"
-exec uv run --frozen hypercorn main:app \
+exec uv run --frozen hypercorn fast_float.main:app \
     --bind "0.0.0.0:${PORT}" \
     --worker-class asyncio \
     --log-level info \

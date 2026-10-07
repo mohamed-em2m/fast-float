@@ -12,8 +12,18 @@ from tqdm import tqdm
 from pathlib import Path
 from transformers import Wav2Vec2FeatureExtractor
 
-from models.float.FLOAT import FLOAT
-from options.base_options import BaseOptions
+try:
+    from fast_float.models.float.FLOAT import FLOAT
+except ImportError:
+    from models.float.FLOAT import FLOAT
+
+try:
+    from fast_float.schemas.base_options import BaseOptions
+except ImportError:
+    try:
+        from schemas.base_options import BaseOptions
+    except ImportError:
+        from options.base_options import BaseOptions
 
 
 class DataProcessor:
@@ -276,14 +286,15 @@ class InferenceOptions(BaseOptions):
         parser.add_argument(
             "--res_dir", default="./results", type=str, help="result dir"
         )
-        parser.add_argument("--ngpu", default="1", type=int, help="number of gpus")
+        parser.add_argument("--ngpus", default=1, type=int, help="number of gpus")
 
         return parser
 
 
 if __name__ == "__main__":
     opt = InferenceOptions().parse()
-    opt.rank, opt.ngpus = 0, 1
+    opt.rank = 0
+
     agent = InferenceAgent(opt)
     os.makedirs(opt.res_dir, exist_ok=True)
 

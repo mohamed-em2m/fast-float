@@ -9,15 +9,20 @@ import traceback
 from pathlib import Path
 
 # Import the inference components
-from generate import InferenceAgent, InferenceOptions
+try:
+    from fast_float.core.generate import InferenceAgent, InferenceOptions
+except ImportError:
+    try:
+        from core.generate import InferenceAgent, InferenceOptions
+    except ImportError:
+        from generate import InferenceAgent, InferenceOptions
 
 
 class GradioInterface:
     def __init__(self):
         # Initialize options with defaults
         self.opt = InferenceOptions().parse()
-        self.opt.rank, self.opt.ngpus = 0, self.opt.ngpu
-
+        self.opt.rank = 0
         # Create results directory
         os.makedirs(self.opt.res_dir, exist_ok=True)
 

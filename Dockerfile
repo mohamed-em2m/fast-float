@@ -19,4 +19,4 @@ EXPOSE 8080
 ENV PORT=8080
 
 # Use shell form to allow environment variable expansion
-CMD .venv/bin/hypercorn main:app --bind 0.0.0.0:${PORT} --log-level info --startup-timeout 600 --workers 1
+CMD .venv/bin/hypercorn fast_float.main:app --bind 0.0.0.0:${PORT} --log-level info --startup-timeout 600 --workers 1

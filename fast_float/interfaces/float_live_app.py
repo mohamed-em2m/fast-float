@@ -45,7 +45,13 @@ import numpy as np
 import soundfile as sf
 import gradio as gr
 
-from generate import InferenceAgent, InferenceOptions
+try:
+    from fast_float.core.generate import InferenceAgent, InferenceOptions
+except ImportError:
+    try:
+        from core.generate import InferenceAgent, InferenceOptions
+    except ImportError:
+        from generate import InferenceAgent, InferenceOptions
 
 
 def _coerce_int(value, default):
