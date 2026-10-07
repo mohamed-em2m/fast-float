@@ -75,7 +75,7 @@ explicit = true
 
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
 include = ["fast_float*"]
 
 [tool.uv.sources]
