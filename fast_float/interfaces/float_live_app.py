@@ -92,7 +92,7 @@ class FloatModel:
             self.opt = InferenceOptions().parse()
         finally:
             sys.argv = original_argv
-        self.opt.rank, self.opt.ngpus = 0, self.opt
+        self.opt.rank = 0
         os.makedirs(self.opt.res_dir, exist_ok=True)
 
         self.live_dir = os.path.join(self.opt.res_dir, "live_chunks")
