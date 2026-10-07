@@ -639,7 +639,7 @@ class InferenceOptions(BaseOptions):
 
 if __name__ == '__main__':
     opt = InferenceOptions().parse()
-    opt.rank, opt.ngpus = 0, 1
+    opt.rank, opt.ngpus = 0, 
     
     print(f"\n{'='*60}")
     print(f"FLOAT Optimized Inference (No FFmpeg)")

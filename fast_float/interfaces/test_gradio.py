@@ -36,7 +36,7 @@ class GradioAPIInterface:
         if self.use_local: # Fixed: Indentation
             print("🔧 Initializing LOCAL inference mode...")
             self.opt = InferenceOptions().parse()
-            self.opt.rank, self.opt.ngpus = 0, 1
+            self.opt.rank, self.opt.ngpus = 0, self.opt
             self.opt.optimization_mode = 'torch_compile'
             self.opt.use_fp16 = True
             os.makedirs(self.opt.res_dir, exist_ok=True)
