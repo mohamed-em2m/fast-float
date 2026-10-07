@@ -1,18 +1,25 @@
 """
-stream_pipeline.py - auto-tuned, multi-stream streaming decode + ffmpeg pipeline for FLOAT.
+stream_pipeline.py - auto-tuned, multi-stream, multi-GPU streaming decode + ffmpeg pipeline for FLOAT.
 
-Pipeline (all stages overlap):
+                         +--> GPU0: N0 decode streams --+
+  sampler (GPU0, ODE) -> |--> GPU1: N1 decode streams --|-> reorder -> ffmpeg (NVENC/x264)
+  re-batched latents     +--> GPU2: N2 decode streams --+     (pinned host buffers)
 
-  producer thread          decode workers (1 CUDA stream each)        writer thread
-  ----------------         ------------------------------------      ----------------
-  sample() ODE chunks  ->  decode micro-batch -> uint8 NHWC ->       reorder -> ffmpeg stdin
-  re-batched to B          async copy to pinned host buffer          (NVENC / x264)
+* The ODE sampler is sequential (chunk t needs chunk t-1), so it stays on the primary GPU.
+* Decoding is per-frame and independent, so micro-batches are spread over all GPUs. Every decode
+  worker pulls from ONE shared queue, so faster / less-busy GPUs automatically take more work.
+* Latents are tiny, so they are handed to other GPUs through host memory (no P2P required).
+  Each GPU copies its finished uint8 frames straight into pinned host buffers.
+* Each GPU is auto-tuned separately (batch size + stream count from its own free VRAM).
 
-The tuner measures, once per process, on THIS GPU:
-  * the decode micro-batch size B where throughput stops improving
-  * the real peak GPU memory of one in-flight batch
-and then, before every run, sizes the number of concurrent decode streams from the
-memory that is actually free right now. OOM at runtime halves the batch and retries.
+Options read from self.opt (all optional):
+    ngpus              number of GPUs for decoding (default 1; clamped to what is visible)
+    decode_on_primary  False -> keep GPU0 for the sampler only when ngpus > 1 (default True)
+    decode_streams     force streams PER GPU (0/absent -> auto)
+    decode_max_streams cap for auto mode (default 3)
+    decode_max_batch   largest micro-batch the tuner may try (default 32)
+    decode_reserve_gib VRAM kept free per GPU (default: auto)
+    use_nvenc          False -> libx264 (default True if ffmpeg has h264_nvenc)
 
 Usage in your model file:
     from stream_pipeline import StreamingVideoSaver
@@ -80,8 +87,8 @@ import traceback
 
 torch.backends.cudnn.benchmark = True
 
-
 import contextlib  # noqa: F401  (handy for the sample() patch: contextlib.nullcontext())
+import copy
 import queue
 import shutil
 import subprocess
@@ -98,15 +105,16 @@ _ABORT = object()
 
 
 # --------------------------------------------------------------------------- #
-# Auto-tuner
+# Auto-tuner (one instance per GPU)
 # --------------------------------------------------------------------------- #
 @dataclass
 class DecodeProfile:
     batch_size: int
-    transient_bytes: int  # peak extra GPU bytes for ONE in-flight batch
+    transient_bytes: int  # peak extra GPU bytes of ONE batch at batch_size
     height: int
     width: int
     channels: int
+    transient_by_batch: Dict[int, int] = field(default_factory=dict)
     fps_by_batch: Dict[int, float] = field(default_factory=dict)
 
 
@@ -114,6 +122,7 @@ class DecodeAutoTuner:
     def __init__(
         self,
         device,
+        primary=True,
         max_batch=32,
         max_streams=3,
         reserve_gib=None,
@@ -123,23 +132,29 @@ class DecodeAutoTuner:
         verbose=True,
     ):
         self.device = device
+        self.primary = (
+            primary  # primary GPU also hosts sampler + NVENC -> bigger reserve
+        )
         self.max_batch = max_batch
         self.max_streams = max_streams
-        self.reserve_gib = reserve_gib  # None -> max(1.5 GiB, 15% of VRAM)
+        self.reserve_gib = reserve_gib
         self.plateau = plateau  # "good enough" fraction of best throughput
         self.safety = safety  # headroom for allocator fragmentation
         self.repeats = repeats
         self.verbose = verbose
 
-    # memory we are allowed to spend on decode streams right now
     def _budget(self) -> int:
+        """Bytes we may spend on decode streams right now (call with this device current)."""
         torch.cuda.empty_cache()
         free, total = torch.cuda.mem_get_info(self.device)
         if self.reserve_gib is not None:
             reserve = int(self.reserve_gib * GiB)
+        elif self.primary:
+            reserve = max(
+                int(1.5 * GiB), int(0.15 * total)
+            )  # sampler + NVENC + context
         else:
-            # headroom for the sampler (ODE + wav2vec), NVENC session, CUDA context growth
-            reserve = max(int(1.5 * GiB), int(0.15 * total))
+            reserve = max(int(0.75 * GiB), int(0.08 * total))  # decode only
         return int(free) - reserve
 
     def _measure(self, fn: Callable[[int], torch.Tensor], b: int):
@@ -162,55 +177,65 @@ class DecodeAutoTuner:
 
     @torch.no_grad()
     def tune(self, decode_fn: Callable[[int], torch.Tensor]) -> DecodeProfile:
-        """decode_fn(b) -> uint8 [b, H, W, C] CUDA tensor (no OOM fallback inside)."""
-        results = {}
-        shape = None
-        b = 1
-        while b <= self.max_batch:
-            if results:
-                prev = max(results)
-                projected = results[prev][0] * (b / prev) * self.safety
-                if projected > self._budget():
+        """decode_fn(b) -> uint8 [b, H, W, C] tensor on self.device (no OOM fallback inside)."""
+        with torch.cuda.device(self.device):
+            results, shape, b = {}, None, 1
+            while b <= self.max_batch:
+                if results:
+                    prev = max(results)
+                    projected = results[prev][0] * (b / prev) * self.safety
+                    if projected > self._budget():
+                        break
+                try:
+                    transient, fps, shape = self._measure(decode_fn, b)
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
                     break
-            try:
-                transient, fps, shape = self._measure(decode_fn, b)
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                break
-            results[b] = (transient, fps)
-            b *= 2
-        if not results:
-            raise RuntimeError(
-                "Decoding even a single frame does not fit in free GPU memory"
+                results[b] = (transient, fps)
+                b *= 2
+            if not results:
+                raise RuntimeError(
+                    f"{self.device}: decoding even 1 frame does not fit in free VRAM"
+                )
+
+            budget = self._budget()
+            feasible = {
+                k: v for k, v in results.items() if v[0] * self.safety <= budget
+            }
+            if not feasible:
+                k = min(results)
+                feasible = {k: results[k]}
+            best = max(f for _, f in feasible.values())
+            chosen = min(
+                k for k, (_, f) in feasible.items() if f >= self.plateau * best
             )
 
-        budget = self._budget()
-        feasible = {k: v for k, v in results.items() if v[0] * self.safety <= budget}
-        if not feasible:
-            k = min(results)
-            feasible = {k: results[k]}
-        best = max(f for _, f in feasible.values())
-        chosen = min(k for k, (_, f) in feasible.items() if f >= self.plateau * best)
+            h, w, c = shape
+            prof = DecodeProfile(
+                chosen,
+                results[chosen][0],
+                h,
+                w,
+                c,
+                {k: v[0] for k, v in results.items()},
+                {k: round(v[1], 1) for k, v in results.items()},
+            )
+            if self.verbose:
+                print(
+                    f"[TUNER {self.device}] frames/s by batch {prof.fps_by_batch} -> batch={chosen}, "
+                    f"{prof.transient_bytes / GiB:.2f} GiB per in-flight batch"
+                )
+            return prof
 
-        h, w, c = shape
-        prof = DecodeProfile(
-            chosen,
-            results[chosen][0],
-            h,
-            w,
-            c,
-            {k: round(v[1], 1) for k, v in results.items()},
+    def num_streams(self, prof: DecodeProfile, batch: int = None) -> int:
+        t = (
+            prof.transient_by_batch.get(batch, prof.transient_bytes)
+            if batch
+            else prof.transient_bytes
         )
-        if self.verbose:
-            print(
-                f"[TUNER] frames/s by batch: {prof.fps_by_batch} -> batch={chosen}, "
-                f"{prof.transient_bytes / GiB:.2f} GiB per in-flight batch"
-            )
-        return prof
-
-    def num_streams(self, prof: DecodeProfile) -> int:
-        per_stream = max(1, int(prof.transient_bytes * self.safety))
-        n = self._budget() // per_stream
+        per_stream = max(1, int(t * self.safety))
+        with torch.cuda.device(self.device):
+            n = self._budget() // per_stream
         return int(max(1, min(self.max_streams, n)))
 
 
@@ -229,10 +254,10 @@ def _qget(q: queue.Queue, stop: threading.Event):
 class StreamingVideoSaver:
     """
     Mixin. Expects on self: opt, sample(), encode_image_into_latent(),
-    encode_identity_into_motion(), motion_autoencoder, decode_latent_into_image().
+    encode_identity_into_motion(), motion_autoencoder (with .dec).
     """
 
-    # ---------------- helpers ---------------- #
+    # ---------------- devices / replicas ---------------- #
     def _cuda_device(self) -> torch.device:
         r = self.opt.rank
         dev = torch.device(f"cuda:{r}") if isinstance(r, int) else torch.device(r)
@@ -240,16 +265,51 @@ class StreamingVideoSaver:
             dev = torch.device("cuda", torch.cuda.current_device())
         return dev
 
-    def _decode_u8(self, s_r, s_r_feats, lat, allow_split=True) -> torch.Tensor:
-        """lat [b, dim] -> uint8 [b, H, W, C] on the current stream. Halves the batch on OOM."""
+    def _decode_devices(self):
+        primary = self._cuda_device()
+        visible = torch.cuda.device_count()
+        want = max(1, int(getattr(self.opt, "ngpus", 1)))
+        if want > visible:
+            print(
+                f"[MULTI-GPU] ngpus={want} requested but only {visible} visible; using {visible}"
+            )
+        n = min(want, visible)
+        others = [
+            torch.device("cuda", i) for i in range(visible) if i != primary.index
+        ][: n - 1]
+        devs = [primary] + others
+        if n > 1 and not getattr(self.opt, "decode_on_primary", True):
+            devs = others
+        return primary, devs
+
+    def _get_ae(self, dev, primary):
+        """Motion autoencoder on `dev`: the original on the primary GPU, cached replicas elsewhere.
+        If you reload weights into self.motion_autoencoder, call self._ae_replicas.clear().
+        """
+        if dev.index == primary.index:
+            return self.motion_autoencoder
+        reps = getattr(self, "_ae_replicas", None)
+        if reps is None:
+            reps = self._ae_replicas = {}
+        if dev.index not in reps:
+            ae = copy.deepcopy(self.motion_autoencoder).to(dev).eval()
+            ae.requires_grad_(False)
+            reps[dev.index] = ae
+        return reps[dev.index]
+
+    # ---------------- decode ---------------- #
+    def _decode_u8(self, ae, feats_in, lat, allow_split=True) -> torch.Tensor:
+        """lat [b, dim] -> uint8 [b, H, W, C] on lat's device/current stream. Halves batch on OOM."""
         b = lat.shape[0]
         # expand is a zero-copy view; harmless if the decoder already broadcasts
         feats = [
             f.expand(b, *f.shape[1:]) if (f.shape[0] == 1 and b > 1) else f
-            for f in s_r_feats
+            for f in feats_in
         ]
         try:
-            out = self.decode_latent_into_image(s_r=s_r, s_r_feats=feats, r_d=lat)
+            out = ae.dec(
+                lat, alpha=None, feats=feats
+            )  # same call as decode_latent_into_image
             if isinstance(out, (tuple, list)):
                 out = out[0]
             return (
@@ -266,33 +326,34 @@ class StreamingVideoSaver:
         h = b // 2
         return torch.cat(
             [
-                self._decode_u8(s_r, s_r_feats, lat[:h]),
-                self._decode_u8(s_r, s_r_feats, lat[h:]),
+                self._decode_u8(ae, feats_in, lat[:h]),
+                self._decode_u8(ae, feats_in, lat[h:]),
             ],
             0,
         )
 
-    def _get_decode_profile(self, s_r, s_r_feats):
-        cached = getattr(self, "_decode_profile", None)
-        if cached is not None:
-            return self._decode_tuner, cached
-        dev = self._cuda_device()
-        tuner = DecodeAutoTuner(
-            dev,
-            max_batch=int(getattr(self.opt, "decode_max_batch", 32)),
-            max_streams=int(getattr(self.opt, "decode_max_streams", 3)),
-            reserve_gib=getattr(self.opt, "decode_reserve_gib", None),
-        )
-        dim = self.opt.dim_w
+    def _get_decode_profile(self, dev, primary, ae, feats, dtype):
+        if getattr(self, "_decode_profiles", None) is None:
+            self._decode_profiles, self._decode_tuners = {}, {}
+        if dev.index not in self._decode_profiles:
+            tuner = DecodeAutoTuner(
+                dev,
+                primary=(dev.index == primary.index),
+                max_batch=int(getattr(self.opt, "decode_max_batch", 32)),
+                max_streams=int(getattr(self.opt, "decode_max_streams", 3)),
+                reserve_gib=getattr(self.opt, "decode_reserve_gib", None),
+            )
+            dim = self.opt.dim_w
 
-        def fn(b):
-            lat = torch.randn(b, dim, device=dev, dtype=s_r.dtype)
-            return self._decode_u8(s_r, s_r_feats, lat, allow_split=False)
+            def fn(b):
+                lat = torch.randn(b, dim, device=dev, dtype=dtype)
+                return self._decode_u8(ae, feats, lat, allow_split=False)
 
-        prof = tuner.tune(fn)
-        self._decode_tuner, self._decode_profile = tuner, prof
-        return tuner, prof
+            self._decode_profiles[dev.index] = tuner.tune(fn)
+            self._decode_tuners[dev.index] = tuner
+        return self._decode_tuners[dev.index], self._decode_profiles[dev.index]
 
+    # ---------------- ffmpeg ---------------- #
     def _encoder_args(self):
         if getattr(self, "_has_nvenc", None) is None:
             try:
@@ -384,8 +445,8 @@ class StreamingVideoSaver:
         if shutil.which("ffmpeg") is None:
             raise RuntimeError("ffmpeg not found in PATH")
 
-        dev = self._cuda_device()
-        torch.cuda.set_device(dev)
+        primary, devs = self._decode_devices()
+        torch.cuda.set_device(primary)
 
         s = data["s"]
         s_r, r_s_lambda, s_r_feats = self.encode_image_into_latent(s.to(self.opt.rank))
@@ -403,14 +464,35 @@ class StreamingVideoSaver:
             e_cfg_scale = self.opt.e_cfg_scale
         fps = int(getattr(self.opt, "fps", 25))
 
-        # ---- plan: batch size (cached) + stream count (from memory free right now) ----
-        tuner, prof = self._get_decode_profile(s_r, s_r_feats)
-        B = prof.batch_size
-        n_streams = int(getattr(self.opt, "decode_streams", 0)) or tuner.num_streams(
-            prof
+        # ---- per-GPU context: model replica, reference features, tuned profile ----
+        ctx = {}
+        for dev in devs:
+            ae = self._get_ae(dev, primary)
+            feats = (
+                s_r_feats
+                if dev.index == primary.index
+                else [f.to(dev) for f in s_r_feats]
+            )
+            tuner, prof = self._get_decode_profile(dev, primary, ae, feats, s_r.dtype)
+            ctx[dev.index] = dict(dev=dev, ae=ae, feats=feats, tuner=tuner, prof=prof)
+
+        # one micro-batch size for everyone (all smaller sizes were already benchmarked per GPU)
+        B = min(c["prof"].batch_size for c in ctx.values())
+        override = int(getattr(self.opt, "decode_streams", 0))
+        for c in ctx.values():
+            c["n_streams"] = override or c["tuner"].num_streams(c["prof"], B)
+        any_prof = next(iter(ctx.values()))["prof"]
+        H, W, C = any_prof.height, any_prof.width, any_prof.channels
+        n_workers = sum(c["n_streams"] for c in ctx.values())
+        need_host_latents = any(i != primary.index for i in ctx)
+
+        print(
+            f"[PLAN] batch={B} frame={W}x{H}x{C} @ {fps}fps, {len(ctx)} GPU(s), {n_workers} streams"
         )
-        H, W, C = prof.height, prof.width, prof.channels
-        print(f"[PLAN] batch={B} streams={n_streams} frame={W}x{H}x{C} @ {fps}fps")
+        for i, c in ctx.items():
+            print(
+                f"       cuda:{i} {torch.cuda.get_device_name(i)}: {c['n_streams']} streams"
+            )
 
         # ---- shared state ----
         stop = threading.Event()
@@ -420,18 +502,25 @@ class StreamingVideoSaver:
         work_q: queue.Queue = queue.Queue()  # latents only: tiny, unbounded is fine
         done_q: queue.Queue = queue.Queue()
         pool: queue.Queue = queue.Queue()  # pinned host buffers = backpressure
-        for _ in range(n_streams * 2 + 2):
+        for _ in range(n_workers * 2 + 2):
             pool.put(torch.empty((B, H, W, C), dtype=torch.uint8, pin_memory=True))
-        streams = [torch.cuda.Stream(device=dev) for _ in range(n_streams)]
 
         def fail(where, e):
             errors.append((where, e, traceback.format_exc()))
             stop.set()
 
-        # ---- producer: ODE sampling, re-batched into fixed-size micro-batches ----
+        # ---- producer: ODE sampling on the primary GPU, re-batched to fixed micro-batches ----
         def producer():
             try:
-                torch.cuda.set_device(dev)
+                torch.cuda.set_device(primary)
+
+                def emit(seq, lat, n_valid):
+                    ev = torch.cuda.Event()
+                    ev.record(torch.cuda.current_stream(primary))
+                    # one tiny sync per group (~100 KB) so other GPUs can read it via host memory
+                    lat_host = lat.cpu() if need_host_latents else None
+                    return ev, lat_host
+
                 seq, carry = 0, None
                 for chunk in self.sample(
                     data,
@@ -451,10 +540,17 @@ class StreamingVideoSaver:
                         carry = None
                     n_full = (lat.shape[0] // B) * B
                     if n_full:
-                        ev = torch.cuda.Event()
-                        ev.record(torch.cuda.current_stream(dev))
+                        ev, lat_host = emit(seq, lat[:n_full], B)
                         for i in range(0, n_full, B):
-                            work_q.put((seq, lat[i : i + B], B, ev))
+                            work_q.put(
+                                (
+                                    seq,
+                                    lat[i : i + B],
+                                    None if lat_host is None else lat_host[i : i + B],
+                                    B,
+                                    ev,
+                                )
+                            )
                             seq += 1
                     if n_full < lat.shape[0]:
                         carry = lat[n_full:]
@@ -462,20 +558,21 @@ class StreamingVideoSaver:
                     n = carry.shape[0]
                     padded = torch.cat(
                         [carry, carry[-1:].expand(B - n, -1)], 0
-                    )  # fixed shape
-                    ev = torch.cuda.Event()
-                    ev.record(torch.cuda.current_stream(dev))
-                    work_q.put((seq, padded, n, ev))
+                    )  # keep fixed shape
+                    ev, lat_host = emit(seq, padded, n)
+                    work_q.put((seq, padded, lat_host, n, ev))
                     seq += 1
                 state["total"] = seq
             except BaseException as e:  # noqa: BLE001
                 fail("producer", e)
             finally:
-                for _ in range(n_streams):
+                for _ in range(n_workers):
                     work_q.put(None)
 
-        # ---- decode workers: one CUDA stream each ----
-        def worker(stream):
+        # ---- decode workers: one CUDA stream each, spread over all GPUs ----
+        def worker(c, stream):
+            dev = c["dev"]
+            is_primary = dev.index == primary.index
             try:
                 torch.cuda.set_device(dev)
                 with torch.no_grad():  # grad mode is thread-local
@@ -483,7 +580,7 @@ class StreamingVideoSaver:
                         item = _qget(work_q, stop)
                         if item is _ABORT or item is None:
                             return
-                        seq, lat, n_valid, ev = item
+                        seq, lat_gpu, lat_host, n_valid, ev = item
 
                         # take buffers strictly in sequence order -> no pool deadlock
                         with cond:
@@ -497,18 +594,22 @@ class StreamingVideoSaver:
                             cond.notify_all()
 
                         with torch.cuda.stream(stream):
-                            stream.wait_event(
-                                ev
-                            )  # latents were made on the sampler stream
-                            lat.record_stream(stream)
-                            u8 = self._decode_u8(s_r, s_r_feats, lat)
+                            if is_primary:
+                                stream.wait_event(
+                                    ev
+                                )  # latents made on the sampler stream
+                                lat_gpu.record_stream(stream)
+                                lat = lat_gpu
+                            else:
+                                lat = lat_host.to(dev, non_blocking=True)
+                            u8 = self._decode_u8(c["ae"], c["feats"], lat)
                             buf[:n_valid].copy_(u8[:n_valid], non_blocking=True)
                             done = torch.cuda.Event()
                             done.record(stream)
                         done.synchronize()  # blocks this thread only
                         done_q.put((seq, buf, n_valid))
             except BaseException as e:  # noqa: BLE001
-                fail("decode_worker", e)
+                fail(f"decode_worker[{dev}]", e)
 
         # ---- writer: restore order, feed ffmpeg ----
         def writer():
@@ -560,11 +661,16 @@ class StreamingVideoSaver:
                     proc.kill()
 
         threads = [threading.Thread(target=producer, name="sampler")]
-        threads += [
-            threading.Thread(target=worker, args=(st,), name=f"decode-{i}")
-            for i, st in enumerate(streams)
-        ]
-        threads += [threading.Thread(target=writer, name="writer")]
+        for i, c in ctx.items():
+            for k in range(c["n_streams"]):
+                threads.append(
+                    threading.Thread(
+                        target=worker,
+                        args=(c, torch.cuda.Stream(device=c["dev"])),
+                        name=f"decode-cuda{i}-{k}",
+                    )
+                )
+        threads.append(threading.Thread(target=writer, name="writer"))
         for t in threads:
             t.start()
         for t in threads:
