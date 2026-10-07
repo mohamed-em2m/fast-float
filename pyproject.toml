@@ -37,6 +37,7 @@ dependencies = [
     "pyyaml==6.0.1",
     "tqdm==4.65.0",
     "gdown==5.2.0",
+    "setuptools==80.10.2",
     # Web Interface - Gradio (float_live_app.py needs >=4.40 for gr.Timer + streaming mic)
     "gradio==4.44.1",
     "soundfile>=0.12.1",

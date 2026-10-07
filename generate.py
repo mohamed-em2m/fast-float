@@ -276,6 +276,7 @@ class InferenceOptions(BaseOptions):
         parser.add_argument(
             "--res_dir", default="./results", type=str, help="result dir"
         )
+        parser.add_argument("--ngpu", default="1", type=int, help="number of gpus")
 
         return parser
 
