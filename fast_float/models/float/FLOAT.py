@@ -269,6 +269,9 @@ class StreamingVideoSaver:
         primary = self._cuda_device()
         visible = torch.cuda.device_count()
         want = max(1, int(getattr(self.opt, "ngpus", 1)))
+        print(
+            f"[MULTI-GPU] ngpus={want} requested but only {visible} visible; using {visible}"
+        )
         if want > visible:
             print(
                 f"[MULTI-GPU] ngpus={want} requested but only {visible} visible; using {visible}"
