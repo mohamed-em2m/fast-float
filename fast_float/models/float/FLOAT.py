@@ -27,68 +27,37 @@ Usage in your model file:
 """
 
 import os
-import torch, math
+import math
 import time
 import uuid
 import logging
 import struct
 import wave
 import subprocess
-import torch
-import numpy as np
-import time
 import shutil
-import os
+import contextlib
+import copy
+import queue
+import threading
+import traceback
+from dataclasses import dataclass, field
+from typing import Callable, Dict, Generator, Optional, List
+
+import numpy as np
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import asyncio
 from torchdiffeq import odeint
 from transformers import Wav2Vec2Config
 from transformers.modeling_outputs import BaseModelOutput
-import torch
-import subprocess
-import time
-import shutil
-import numpy as np
-from typing import Generator
-import traceback
-import threading
-import queue
-from dataclasses import dataclass
-
-import torch
-import subprocess
-import time
-import shutil
-import numpy as np
-from typing import Generator
-import traceback
-import threading
-import queue
-from dataclasses import dataclass
 
 from fast_float.models.wav2vec2 import Wav2VecModel
 from fast_float.models.wav2vec2_ser import Wav2Vec2ForSpeechClassification
-
 from fast_float.models import BaseModel
 from fast_float.models.float.generator import Generator
 from fast_float.models.float.FMT import FlowMatchingTransformer
-import traceback
 
 torch.backends.cudnn.benchmark = True
-
-import contextlib  # noqa: F401  (handy for the sample() patch: contextlib.nullcontext())
-import copy
-import queue
-import shutil
-import subprocess
-import threading
-import time
-import traceback
-from dataclasses import dataclass, field
-from typing import Callable, Dict
-
-import torch
 
 logger = logging.getLogger(__name__)
 GiB = 1024**3
@@ -250,7 +219,9 @@ class StreamingVideoSaver:
 
     # ---------------- devices / replicas ---------------- #
     def _cuda_device(self) -> torch.device:
-        r = self.opt.rank
+        r = getattr(self.opt, "rank", 0)
+        if not torch.cuda.is_available():
+            return torch.device("cpu")
         dev = torch.device(f"cuda:{r}") if isinstance(r, int) else torch.device(r)
         if dev.index is None:
             dev = torch.device("cuda", torch.cuda.current_device())
@@ -259,19 +230,20 @@ class StreamingVideoSaver:
     def _decode_devices(self):
         primary = self._cuda_device()
         visible = torch.cuda.device_count()
-        want = max(1, int(getattr(self.opt, "ngpus", 2)))
+        want = max(1, int(getattr(self.opt, "ngpus", 1)))
         n = min(want, visible)
+        p_idx = primary.index if primary.index is not None else 0
         if want > visible:
             logger.warning(
                 f"[MULTI-GPU] ngpus={want} requested but only {visible} visible; using {n}"
             )
         else:
             logger.info(
-                f"[MULTI-GPU] using {n}/{visible} GPU(s) (primary=cuda:{primary.index})"
+                f"[MULTI-GPU] using {n}/{visible} GPU(s) (primary=cuda:{p_idx})"
             )
         others = [
             torch.device("cuda", i) for i in range(visible) if i != primary.index
-        ][: n - 1]
+        ][: max(0, n - 1)]
         devs = [primary] + others
         if n > 1 and not getattr(self.opt, "decode_on_primary", True):
             devs = others
@@ -281,16 +253,17 @@ class StreamingVideoSaver:
         """Motion autoencoder on `dev`: the original on the primary GPU, cached replicas elsewhere.
         If you reload weights into self.motion_autoencoder, call self._ae_replicas.clear().
         """
-        if dev.index == primary.index:
+        if dev == primary or (dev.index is not None and primary.index is not None and dev.index == primary.index):
             return self.motion_autoencoder
         reps = getattr(self, "_ae_replicas", None)
         if reps is None:
             reps = self._ae_replicas = {}
-        if dev.index not in reps:
+        idx = dev.index if dev.index is not None else str(dev)
+        if idx not in reps:
             ae = copy.deepcopy(self.motion_autoencoder).to(dev).eval()
             ae.requires_grad_(False)
-            reps[dev.index] = ae
-        return reps[dev.index]
+            reps[idx] = ae
+        return reps[idx]
 
     # ---------------- decode ---------------- #
     def _decode_u8(self, ae, feats_in, lat, allow_split=True) -> torch.Tensor:
@@ -314,7 +287,7 @@ class StreamingVideoSaver:
                 .contiguous()
             )
         except torch.cuda.OutOfMemoryError:
-            if not allow_split or b == 1:
+            if not allow_split or b <= 1:
                 raise
         # (outside the except block so the failed tensors are released first)
         torch.cuda.empty_cache()
@@ -542,9 +515,11 @@ class StreamingVideoSaver:
                     """
                     ev = torch.cuda.Event()
                     ev.record(primary_stream)
-                    # CPU copy must happen after the event is recorded so the
-                    # synchronize() in the worker guarantees the data is ready.
-                    lat_host = lat_slice.cpu() if need_host_latents else None
+                    lat_host = (
+                        lat_slice.cpu().pin_memory()
+                        if (need_host_latents and torch.cuda.is_available())
+                        else (lat_slice.cpu() if need_host_latents else None)
+                    )
                     return ev, lat_host
 
                 seq, carry = 0, None
@@ -720,12 +695,17 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         super().__init__()
         self.opt = opt
         logger.info(opt)
-        print(opt)
-        self.stream_decode_2 = torch.cuda.Stream(
-            device=self.opt.rank
-        )  # device optional
-        self.stream_decode = torch.cuda.Stream(device=self.opt.rank)  # device optional
-        self.stream_encode = torch.cuda.Stream(device=self.opt.rank)  # device optional
+        rank = getattr(self.opt, "rank", 0)
+        self.rank = rank
+        device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            self.stream_decode_2 = torch.cuda.Stream(device=device)
+            self.stream_decode = torch.cuda.Stream(device=device)
+            self.stream_encode = torch.cuda.Stream(device=device)
+        else:
+            self.stream_decode_2 = None
+            self.stream_decode = None
+            self.stream_encode = None
 
         self.num_frames_for_clip = int(self.opt.wav2vec_sec * self.opt.fps)
         self.num_prev_frames = int(self.opt.num_prev_frames)
@@ -739,8 +719,7 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         # condition encoders
         self.audio_encoder = AudioEncoder(opt)
         self.emotion_encoder = Audio2Emotion(opt)
-        self.decode_semaphore = asyncio.Semaphore(10)
-        # FMT; Flow Matchingssss Transformer
+        # FMT; Flow Matching Transformer
         self.fmt = FlowMatchingTransformer(opt)
 
         # ODE options
@@ -767,10 +746,16 @@ class FLOAT(BaseModel, StreamingVideoSaver):
     def decode_latent_into_image(
         self, s_r: torch.Tensor, s_r_feats: list, r_d: torch.Tensor
     ) -> torch.Tensor:
-        """Decode a single frame (not a chunk with time dimension)"""
-        # r_d is now [B, dim] - a single frame
-        img, _ = self.motion_autoencoder.dec(r_d, alpha=None, feats=s_r_feats)
-        return img  # Return single decoded frame
+        """Decode latent into image with broadcasted features"""
+        b = r_d.shape[0] if r_d.ndim > 1 else 1
+        feats = [
+            f.expand(b, *f.shape[1:]) if (f.shape[0] == 1 and b > 1) else f
+            for f in s_r_feats
+        ]
+        img = self.motion_autoencoder.dec(r_d, alpha=None, feats=feats)
+        if isinstance(img, (tuple, list)):
+            img = img[0]
+        return img
 
     @torch.no_grad()
     def sample(
@@ -784,14 +769,22 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         seed: int = None,
         s_r=None,
     ) -> torch.Tensor:
-        with torch.cuda.stream(self.stream_encode):
+        rank = getattr(self.opt, "rank", 0)
+        device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
+        stream_ctx = (
+            torch.cuda.stream(self.stream_encode)
+            if (self.stream_encode is not None and torch.cuda.is_available())
+            else contextlib.nullcontext()
+        )
+        with stream_ctx:
             r_s, a = data["r_s"], data["a"]
             B = a.shape[0]
             # make time
-            time = torch.linspace(0, 1, self.opt.nfe, device=self.opt.rank)
+            steps = nfe if nfe is not None else getattr(self.opt, "nfe", 10)
+            time = torch.linspace(0, 1, steps, device=device)
 
             # encoding audio first with whole audio
-            a = a.to(self.opt.rank)
+            a = a.to(device)
             T = math.ceil(a.shape[-1] * self.opt.fps / self.opt.sampling_rate)
             wa = self.audio_encoder.inference(a, seq_len=T)
 
@@ -805,6 +798,7 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                         torch.tensor(emo_idx, device=a.device),
                         num_classes=self.opt.dim_e,
                     )
+                    .float()
                     .unsqueeze(0)
                     .unsqueeze(0)
                 )
@@ -813,15 +807,15 @@ class FLOAT(BaseModel, StreamingVideoSaver):
 
             # sampling chunk by chunk
             for t in range(0, int(math.ceil(T / self.num_frames_for_clip))):
-                if self.opt.fix_noise_seed:
-                    seed = self.opt.seed if seed is None else seed
-                    g = torch.Generator(self.opt.rank)
+                if getattr(self.opt, "fix_noise_seed", False):
+                    seed = getattr(self.opt, "seed", 25) if seed is None else seed
+                    g = torch.Generator(device=device)
                     g.manual_seed(seed)
                     x0 = torch.randn(
                         B,
                         self.num_frames_for_clip,
                         self.opt.dim_w,
-                        device=self.opt.rank,
+                        device=device,
                         generator=g,
                     )
                 else:
@@ -829,15 +823,15 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                         B,
                         self.num_frames_for_clip,
                         self.opt.dim_w,
-                        device=self.opt.rank,
+                        device=device,
                     )
 
                 if t == 0:  # should define the previous
-                    prev_x_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_w).to(
-                        self.opt.rank
+                    prev_x_t = torch.zeros(
+                        B, self.num_prev_frames, self.opt.dim_w, device=device
                     )
-                    prev_wa_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_w).to(
-                        self.opt.rank
+                    prev_wa_t = torch.zeros(
+                        B, self.num_prev_frames, self.opt.dim_w, device=device
                     )
                 else:
                     prev_x_t = sample_t[:, -self.num_prev_frames :]
@@ -879,30 +873,23 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                     sample_t_trim = sample_t[:, :frames_remaining]
                 else:
                     sample_t_trim = sample_t
-                # sample_t_trim = sample_t
                 samples_len = sample_t_trim.shape[1]
                 decoded_length += samples_len
-                # Add reference and yield frame by frame
-                s_r_d_t = s_r + sample_t_trim
 
-                # Yield frame by frame for streaming
-                # print("shape of sample_t before squeeze",s_r_d_t.shape)
+                # Add reference and yield chunk
+                s_r_b = (
+                    s_r.unsqueeze(1)
+                    if (s_r is not None and s_r.ndim == 2)
+                    else s_r
+                )
+                s_r_d_t = (
+                    (s_r_b + sample_t_trim)
+                    if s_r_b is not None
+                    else sample_t_trim
+                )
+                s_r_d_t_squeezed = s_r_d_t.squeeze(0)  # [T, dim_w]
 
-                s_r_d_t_squeezed = s_r_d_t.squeeze(0)  # [T, C, H, W]
-                T_ = s_r_d_t_squeezed.shape[0]
-
-                # Divide into 3 parts
-                part_size = T_ // 2
-                remainder = T_ % 2
-
-                # Split points
-                split1 = part_size + (1 if remainder > 0 else 0)
-                split2 = split1 + part_size + (1 if remainder > 1 else 0)
-
-                # Yield each part
                 yield s_r_d_t_squeezed
-
-                # print("shape of sample_t after squeeze",s_r_d_t.squeeze(0).shape)
 
                 # Stop if we've reached the target length
                 if decoded_length >= T:
@@ -919,8 +906,12 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         nfe=10,
         seed=None,
     ) -> dict:
+        rank = getattr(self.opt, "rank", 0)
+        device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
+        primary = torch.device(device)
+
         s, a = data["s"], data["a"]
-        s_r, r_s_lambda, s_r_feats = self.encode_image_into_latent(s.to(self.opt.rank))
+        s_r, r_s_lambda, s_r_feats = self.encode_image_into_latent(s.to(device))
 
         if "s_r" in data:
             r_s = self.encode_identity_into_motion(s_r)
@@ -929,19 +920,51 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         data["r_s"] = r_s
 
         if a_cfg_scale is None:
-            a_cfg_scale = self.opt.a_cfg_scale
+            a_cfg_scale = getattr(self.opt, "a_cfg_scale", 1.0)
         if r_cfg_scale is None:
-            r_cfg_scale = self.opt.r_cfg_scale
+            r_cfg_scale = getattr(self.opt, "r_cfg_scale", 1.0)
         if e_cfg_scale is None:
-            e_cfg_scale = self.opt.e_cfg_scale
+            e_cfg_scale = getattr(self.opt, "e_cfg_scale", 1.0)
 
         try:
-            # list of (tensor_on_gpu, stream)
+            # Check for multi-GPU decode support
+            if torch.cuda.is_available():
+                _, devs = self._decode_devices()
+            else:
+                devs = [primary]
+
+            # Setup decode workers context
+            gpu_ctx = []
+            for dev in devs:
+                ae = self._get_ae(dev, primary)
+                is_prim = (
+                    dev == primary
+                    or (
+                        dev.index is not None
+                        and primary.index is not None
+                        and dev.index == primary.index
+                    )
+                )
+                feats = (
+                    s_r_feats
+                    if is_prim
+                    else [f.to(dev) for f in s_r_feats]
+                )
+                stream = (
+                    self.stream_decode
+                    if (self.stream_decode is not None and is_prim)
+                    else (
+                        torch.cuda.Stream(device=dev)
+                        if torch.cuda.is_available()
+                        else None
+                    )
+                )
+                gpu_ctx.append((dev, ae, feats, stream))
+
+            num_devs = len(gpu_ctx)
             decode_results = []
+            dev_idx = 0
 
-            # s_r_feats = [f.expand(50, -1, -1, -1) for f in s_r_feats]
-
-            # If sample yields lazily, we will create per-frame streams and decode on them.
             for frame_latent in self.sample(
                 data,
                 a_cfg_scale=a_cfg_scale,
@@ -952,60 +975,51 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                 seed=seed,
                 s_r=s_r,
             ):
-                # create and keep a reference to the stream
-                # launch decode on that stream
-                with torch.cuda.stream(self.stream_decode):
+                dev, ae, feats, stream = gpu_ctx[dev_idx % num_devs]
+                dev_idx += 1
+                lat = (
+                    frame_latent.to(dev, non_blocking=True)
+                    if dev != primary
+                    else frame_latent
+                )
+                ctx_mgr = (
+                    torch.cuda.stream(stream)
+                    if (stream is not None and torch.cuda.is_available())
+                    else contextlib.nullcontext()
+                )
+                with ctx_mgr:
+                    b = lat.shape[0] if lat.ndim > 1 else 1
+                    b_feats = [
+                        f.expand(b, *f.shape[1:])
+                        if (f.shape[0] == 1 and b > 1)
+                        else f
+                        for f in feats
+                    ]
+                    out = ae.dec(lat, alpha=None, feats=b_feats)
+                    if isinstance(out, (tuple, list)):
+                        out = out[0]
+                    if not out.is_cuda and torch.cuda.is_available():
+                        out = out.to(device=primary, non_blocking=True)
+                    elif out.device != primary:
+                        out = out.to(device=primary, non_blocking=True)
+                    decode_results.append((out, stream))
 
-                    # IMPORTANT: decode_latent_into_image must perform CUDA ops only,
-                    # and must NOT move tensors to CPU / PIL or call .item() etc.
-                    try:
-                        out = self.decode_latent_into_image(
-                            s_r=s_r, s_r_feats=s_r_feats, r_d=frame_latent
-                        )
-                        # out should be a torch.Tensor located on GPU (e.g. [B, C, H, W])
-                        # If decode returns (tensor, other) adapt accordingly.
-                        if isinstance(out, tuple) or isinstance(out, list):
-                            # assume primary tensor is first element
-                            out_tensor = out[0]
-                        else:
-                            out_tensor = out
-
-                        # ensure it's a CUDA tensor
-                        if not out_tensor.is_cuda:
-                            # If your decode runs on CPU, you lose streaming benefits. Move to GPU (non-blocking)
-                            out_tensor = out_tensor.to(
-                                device=self.opt.rank, non_blocking=True
-                            )
-
-                        # keep pair for later synchronization/stack
-                        decode_results.append((out_tensor, self.stream_decode))
-                    except Exception as e:
-                        print(f"Error: {e}\n{traceback.format_exc()}")
-                        raise
-
-            # now wait for each stream to finish and move outputs to the current/default stream
             stacked_list = []
-            cur = torch.cuda.current_stream(device=self.opt.rank)
+            cur = (
+                torch.cuda.current_stream(device=primary)
+                if torch.cuda.is_available()
+                else None
+            )
             for out_tensor, stream in decode_results:
-                # make sure default stream waits for worker stream before we touch `out_tensor`
-                cur.wait_stream(stream)
-                # Clone to default stream
-                out_on_default = out_tensor.clone()  # shape: [T, C, H, W]
-                stacked_list.append(out_on_default)
+                if cur is not None and stream is not None:
+                    cur.wait_stream(stream)
+                stacked_list.append(out_tensor)
 
-            # Concatenate along temporal dimension (dim=0): [T_total, C, H, W]
-            d_hat = torch.cat(stacked_list, dim=0)  # [156, 3, 512, 512] in your example
-
-            # If you really need [B, T, H, W, C], permute:
-            print("d_hat", d_hat.shape)
-            # if B==1 and you want remove batch dim:
-            if d_hat.shape[1] == 1:
-                d_hat = d_hat.squeeze(1)
-
+            d_hat = torch.cat(stacked_list, dim=0)
             return {"d_hat": d_hat}
 
         except Exception as e:
-            print(f"Error: {e}\n{traceback.format_exc()}")
+            logger.error(f"Error in inference: {e}\n{traceback.format_exc()}")
             raise
 
 

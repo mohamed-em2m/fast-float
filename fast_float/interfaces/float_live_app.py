@@ -81,16 +81,26 @@ logger = setup_logger("float_live_app")
 
 try:
     from fast_float.core.inference_optimized import (
-        OptimizedInferenceAgent,
+        OptimizedInferenceAgent as InferenceAgent,
         InferenceOptions,
     )
-
-    InferenceAgent = OptimizedInferenceAgent
 except ImportError:
     try:
-        from core.inference_optimized import InferenceAgent, InferenceOptions
+        from core.inference_optimized import (
+            OptimizedInferenceAgent as InferenceAgent,
+            InferenceOptions,
+        )
     except ImportError:
-        from inference_optimized import InferenceAgent, InferenceOptions
+        try:
+            from inference_optimized import (
+                OptimizedInferenceAgent as InferenceAgent,
+                InferenceOptions,
+            )
+        except ImportError:
+            from fast_float.core.generate import (
+                InferenceAgent,
+                InferenceOptions,
+            )
 
 
 def _coerce_int(value, default):
