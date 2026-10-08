@@ -112,12 +112,34 @@ class DataProcessor:
             speech_array, sampling_rate=sampling_rate, return_tensors="pt"
         ).input_values[0]
 
-    def preprocess(self, ref_path: str, audio_path: str, no_crop: bool) -> dict:
-        s = self.default_img_loader(ref_path)
-        if not no_crop:
-            s = self.process_img(s)
-        s = self.transform(image=s)["image"].unsqueeze(0)
-        a = self.default_aud_loader(audio_path).unsqueeze(0)
+    def preprocess(self, ref_path, audio_path, no_crop: bool = False) -> dict:
+        if isinstance(ref_path, (list, tuple)):
+            s_list = []
+            for rp in ref_path:
+                img = self.default_img_loader(rp)
+                if not no_crop:
+                    img = self.process_img(img)
+                s_list.append(self.transform(image=img)["image"])
+            s = torch.stack(s_list, dim=0)
+        else:
+            s = self.default_img_loader(ref_path)
+            if not no_crop:
+                s = self.process_img(s)
+            s = self.transform(image=s)["image"].unsqueeze(0)
+
+        if isinstance(audio_path, (list, tuple)):
+            a_list = [self.default_aud_loader(ap) for ap in audio_path]
+            max_len = max(aud.shape[-1] for aud in a_list)
+            a_padded = [
+                F.pad(aud, (0, max_len - aud.shape[-1]), mode="constant", value=0)
+                if aud.shape[-1] < max_len
+                else aud
+                for aud in a_list
+            ]
+            a = torch.stack(a_padded, dim=0)
+        else:
+            a = self.default_aud_loader(audio_path).unsqueeze(0)
+
         return {"s": s, "a": a, "p": None, "e": None}
 
 

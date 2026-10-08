@@ -47,7 +47,18 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchdiffeq import odeint
+try:
+    from torchdiffeq import odeint
+except ImportError:
+    odeint = None
+
+try:
+    import torchvision
+except Exception:
+    import sys
+    sys.modules["torchvision"] = None
+    sys.modules["torchvision.io"] = None
+
 from transformers import Wav2Vec2Config
 from transformers.modeling_outputs import BaseModelOutput
 
@@ -417,9 +428,9 @@ class StreamingVideoSaver:
         torch.cuda.set_device(primary)
 
         s = data["s"]
-        s_r, r_s_lambda, s_r_feats = self.encode_image_into_latent(s.to(self.opt.rank))
+        s_r, r_s_lambda, s_r_feats = self.encode_image_into_latent(s.to(primary))
         if "s_r" in data:
-            r_s = self.encode_identity_into_motion(s_r)
+            r_s = self.encode_identity_into_motion(data["s_r"])
         else:
             r_s = self.motion_autoencoder.dec.direction(r_s_lambda)
         data["r_s"] = r_s
@@ -746,34 +757,171 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         r_x = self.motion_autoencoder.dec.direction(x_r_lambda)
         return r_x
 
+    def get_optimal_decode_batch_size(self, device=None) -> int:
+        """Automatically select optimal frame decode batch size based on GPU memory.
+        - Checks self.opt.decode_batch_size for user override.
+        - Otherwise inspects total and available VRAM on device:
+            * >= 22 GB (e.g. RTX 3090/4090, A100): batch size 16
+            * 11 GB - 22 GB (e.g. RTX 3060 12G, 4070/4080): batch size 8
+            * 6 GB - 11 GB (e.g. RTX 2060, 3060 8G, 4060): batch size 4 (sweet spot)
+            * < 6 GB: batch size 2
+        - If CPU: batch size 4
+        """
+        if hasattr(self, "opt") and getattr(self.opt, "decode_batch_size", None) is not None:
+            return max(1, int(self.opt.decode_batch_size))
+
+        if not torch.cuda.is_available():
+            return 4
+
+        try:
+            if device is None:
+                rank = getattr(self.opt, "rank", 0) if hasattr(self, "opt") else 0
+                device = getattr(self, "device", None) or torch.device(f"cuda:{rank}")
+            if isinstance(device, str):
+                device = torch.device(device)
+            if device.type != "cuda":
+                return 4
+
+            idx = device.index if device.index is not None else torch.cuda.current_device()
+            free_b, total_b = torch.cuda.mem_get_info(idx)
+            gib = 1024 ** 3
+            free_gib = free_b / gib
+            total_gib = total_b / gib
+
+            if total_gib >= 22.0 and free_gib >= 8.0:
+                return 16
+            elif total_gib >= 11.0 and free_gib >= 4.0:
+                return 8
+            elif total_gib >= 6.0 and free_gib >= 2.0:
+                return 4
+            elif free_gib >= 1.0:
+                return 2
+            else:
+                return 1
+        except Exception:
+            return 4
+
     @torch.no_grad()
-    def decode_latent_into_image(
-        self, s_r: torch.Tensor, s_r_feats: list, r_d: torch.Tensor
+    def _decode_latent_batched(
+        self,
+        ae,
+        r_d: torch.Tensor,
+        s_r_feats: list,
+        batch_size: int = None,
+        device=None,
     ) -> torch.Tensor:
-        """Decode latent into image with broadcasted features (supports 2D [N, D] and 3D [B, T, D])"""
+        """Decode motion latents into images in mini-batches (e.g., 4 frames gathered together)
+        to prevent OOM and maximize GPU throughput. Supports 2D [N, D] and 3D [B, T, D] latents.
+        """
+        if device is None:
+            device = r_d.device if (hasattr(r_d, "device") and r_d.device.type == "cuda") else None
+
+        bs = batch_size if batch_size is not None else self.get_optimal_decode_batch_size(device)
+        bs = max(1, int(bs))
+
         if r_d.ndim == 3:
             b_dim, t_dim, d_dim = r_d.shape
-            r_d_flat = r_d.reshape(b_dim * t_dim, d_dim)
-            feats = [
-                f.expand(b_dim * t_dim, *f.shape[1:])
-                if f.shape[0] == 1
-                else f.unsqueeze(1).expand(-1, t_dim, *f.shape[1:]).reshape(b_dim * t_dim, *f.shape[1:])
-                for f in s_r_feats
-            ]
-            img = self.motion_autoencoder.dec(r_d_flat, alpha=None, feats=feats)
-            if isinstance(img, (tuple, list)):
-                img = img[0]
-            return img.view(b_dim, t_dim, *img.shape[1:])
+            n_total = b_dim * t_dim
+            r_d_flat = r_d.reshape(n_total, d_dim)
+
+            aligned_feats = []
+            for f in s_r_feats:
+                if f.shape[0] == 1:
+                    aligned_feats.append(("broadcast", f))
+                elif f.shape[0] == b_dim:
+                    full_f = f.unsqueeze(1).expand(-1, t_dim, *f.shape[1:]).reshape(n_total, *f.shape[1:])
+                    aligned_feats.append(("slice", full_f))
+                elif f.shape[0] == n_total:
+                    aligned_feats.append(("slice", f))
+                else:
+                    aligned_feats.append(("broadcast", f[:1]))
+
+            if n_total <= bs:
+                chunk_feats = [
+                    f.expand(n_total, *f.shape[1:]) if mode == "broadcast" else f
+                    for mode, f in aligned_feats
+                ]
+                out = ae.dec(r_d_flat, alpha=None, feats=chunk_feats)
+                if isinstance(out, (tuple, list)):
+                    out = out[0]
+                return out.view(b_dim, t_dim, *out.shape[1:])
+            else:
+                out_chunks = []
+                for i in range(0, n_total, bs):
+                    chunk_r_d = r_d_flat[i : i + bs]
+                    m = chunk_r_d.shape[0]
+                    chunk_feats = [
+                        f.expand(m, *f.shape[1:]) if mode == "broadcast" else f[i : i + m]
+                        for mode, f in aligned_feats
+                    ]
+                    chunk_out = ae.dec(chunk_r_d, alpha=None, feats=chunk_feats)
+                    if isinstance(chunk_out, (tuple, list)):
+                        chunk_out = chunk_out[0]
+                    out_chunks.append(chunk_out)
+                out = torch.cat(out_chunks, dim=0)
+                return out.view(b_dim, t_dim, *out.shape[1:])
         else:
-            b = r_d.shape[0] if r_d.ndim > 1 else 1
-            feats = [
-                f.expand(b, *f.shape[1:]) if (f.shape[0] == 1 and b > 1) else f
-                for f in s_r_feats
-            ]
-            img = self.motion_autoencoder.dec(r_d, alpha=None, feats=feats)
-            if isinstance(img, (tuple, list)):
-                img = img[0]
-            return img
+            is_1d = (r_d.ndim == 1)
+            if is_1d:
+                r_d = r_d.unsqueeze(0)
+            n_total = r_d.shape[0]
+
+            aligned_feats = []
+            for f in s_r_feats:
+                if f.shape[0] == 1:
+                    aligned_feats.append(("broadcast", f))
+                elif f.shape[0] == n_total:
+                    aligned_feats.append(("slice", f))
+                elif n_total % f.shape[0] == 0:
+                    t = n_total // f.shape[0]
+                    full_f = f.unsqueeze(1).expand(-1, t, *f.shape[1:]).reshape(n_total, *f.shape[1:])
+                    aligned_feats.append(("slice", full_f))
+                else:
+                    aligned_feats.append(("broadcast", f[:1]))
+
+            if n_total <= bs:
+                chunk_feats = [
+                    f.expand(n_total, *f.shape[1:]) if mode == "broadcast" else f
+                    for mode, f in aligned_feats
+                ]
+                out = ae.dec(r_d, alpha=None, feats=chunk_feats)
+                if isinstance(out, (tuple, list)):
+                    out = out[0]
+                return out.squeeze(0) if is_1d else out
+            else:
+                out_chunks = []
+                for i in range(0, n_total, bs):
+                    chunk_r_d = r_d[i : i + bs]
+                    m = chunk_r_d.shape[0]
+                    chunk_feats = [
+                        f.expand(m, *f.shape[1:]) if mode == "broadcast" else f[i : i + m]
+                        for mode, f in aligned_feats
+                    ]
+                    chunk_out = ae.dec(chunk_r_d, alpha=None, feats=chunk_feats)
+                    if isinstance(chunk_out, (tuple, list)):
+                        chunk_out = chunk_out[0]
+                    out_chunks.append(chunk_out)
+                out = torch.cat(out_chunks, dim=0)
+                return out.squeeze(0) if is_1d else out
+
+    @torch.no_grad()
+    def decode_latent_into_image(
+        self,
+        s_r: torch.Tensor,
+        s_r_feats: list,
+        r_d: torch.Tensor,
+        batch_size: int = None,
+    ) -> torch.Tensor:
+        """Decode latent into image with broadcasted features (supports 2D [N, D] and 3D [B, T, D])
+        Processes frames in mini-batches (e.g. 4 frames at a time, auto-selected based on GPU VRAM)
+        to prevent OOM and maximize decoding throughput.
+        """
+        return self._decode_latent_batched(
+            self.motion_autoencoder,
+            r_d,
+            s_r_feats,
+            batch_size=batch_size,
+        )
 
     @torch.no_grad()
     def sample(
@@ -927,6 +1075,8 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                     return out_current
 
                 # solve ODE
+                if odeint is None:
+                    raise ImportError("torchdiffeq is required for ODE sampling. Install with: pip install torchdiffeq")
                 trajectory_t = odeint(sample_chunk, x0, time, **self.odeint_kwargs)
                 sample_t = trajectory_t[-1]
 
@@ -1068,30 +1218,13 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                     else contextlib.nullcontext()
                 )
                 with ctx_mgr:
-                    if is_batched or lat.ndim == 3:
-                        B_curr, T_curr, D_curr = lat.shape
-                        lat_flat = lat.reshape(B_curr * T_curr, D_curr)
-                        b_feats = [
-                            f.expand(B_curr * T_curr, *f.shape[1:])
-                            if f.shape[0] == 1
-                            else f.unsqueeze(1).expand(-1, T_curr, *f.shape[1:]).reshape(B_curr * T_curr, *f.shape[1:])
-                            for f in feats
-                        ]
-                        out = ae.dec(lat_flat, alpha=None, feats=b_feats)
-                        if isinstance(out, (tuple, list)):
-                            out = out[0]
-                        out = out.view(B_curr, T_curr, *out.shape[1:])
-                    else:
-                        b = lat.shape[0] if lat.ndim > 1 else 1
-                        b_feats = [
-                            f.expand(b, *f.shape[1:])
-                            if (f.shape[0] == 1 and b > 1)
-                            else f
-                            for f in feats
-                        ]
-                        out = ae.dec(lat, alpha=None, feats=b_feats)
-                        if isinstance(out, (tuple, list)):
-                            out = out[0]
+                    out = self._decode_latent_batched(
+                        ae,
+                        lat,
+                        feats,
+                        batch_size=getattr(self.opt, "decode_batch_size", None),
+                        device=dev,
+                    )
                     if not out.is_cuda and torch.cuda.is_available():
                         out = out.to(device=primary, non_blocking=True)
                     elif out.device != primary:
