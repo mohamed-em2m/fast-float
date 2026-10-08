@@ -44,31 +44,39 @@ from pathlib import Path
 from typing import Optional
 
 # ---- logging setup -------------------------------------------------------- #
-# Ensure logs are visible regardless of how Gradio captures stdout/stderr.
-# We configure the root logger once here so all child loggers inherit it.
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    stream=sys.stdout,
-    force=True,  # override any previously installed root handlers
-)
-
+# NOTE: This block is intentionally placed BEFORE gradio so that we can
+# install our handler first. However, because Gradio also reconfigures
+# logging during its import, we re-attach via setup_logger() which uses
+# propagate=False — making our named logger immune to root-logger rewiring.
 try:
     from fast_float.utils.logger import setup_logger
 except ImportError:
     try:
         from utils.logger import setup_logger
     except ImportError:
-        # Fallback: plain logger that still honours the basicConfig above.
+        # Fallback: self-contained logger that doesn't rely on the root logger.
         def setup_logger(name="float_fast", **_):
-            return logging.getLogger(name)
-
-logger = setup_logger("float_live_app")
+            _log = logging.getLogger(name)
+            _log.setLevel(logging.INFO)
+            _log.handlers.clear()
+            _h = logging.StreamHandler(sys.stderr)
+            _h.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            _log.addHandler(_h)
+            _log.propagate = False
+            return _log
 
 import numpy as np
 import soundfile as sf
 import gradio as gr
+
+# Re-create the logger AFTER gradio is imported so our handler is attached
+# last and propagate=False keeps it safe from any further root-logger changes.
+logger = setup_logger("float_live_app")
 
 try:
     from fast_float.core.generate import InferenceAgent, InferenceOptions

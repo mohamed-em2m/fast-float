@@ -42,10 +42,17 @@ def setup_logger(name: str = "float_fast", level: int = logging.INFO) -> logging
     logger = logging.getLogger(name)
     logger.setLevel(level)
 
-    if not logger.handlers:
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(ColoredFormatter())
-        logger.addHandler(console_handler)
+    # Remove stale handlers (important when the module is re-imported in a
+    # Jupyter / Kaggle notebook without restarting the kernel).
+    logger.handlers.clear()
+
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setFormatter(ColoredFormatter())
+    logger.addHandler(console_handler)
+
+    # Prevent the root logger (which Gradio/IPython may rewire) from
+    # intercepting our records and potentially swallowing them.
+    logger.propagate = False
 
     # Suppress verbose 3rd party loggers
     logging.getLogger("libav").setLevel(logging.ERROR)
