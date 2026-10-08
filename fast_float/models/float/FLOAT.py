@@ -260,14 +260,13 @@ class StreamingVideoSaver:
         primary = self._cuda_device()
         visible = torch.cuda.device_count()
         want = max(1, int(getattr(self.opt, "ngpus", 1)))
-        logger.info(
-            f"[MULTI-GPU] ngpus={want} requested but only {visible} visible; using {visible}"
-        )
-        if want > visible:
-            print(
-                f"[MULTI-GPU] ngpus={want} requested but only {visible} visible; using {visible}"
-            )
         n = min(want, visible)
+        if want > visible:
+            logger.warning(
+                f"[MULTI-GPU] ngpus={want} requested but only {visible} visible; using {n}"
+            )
+        else:
+            logger.info(f"[MULTI-GPU] using {n}/{visible} GPU(s) (primary=cuda:{primary.index})")
         others = [
             torch.device("cuda", i) for i in range(visible) if i != primary.index
         ][: n - 1]
@@ -502,12 +501,13 @@ class StreamingVideoSaver:
         n_workers = sum(c["n_streams"] for c in ctx.values())
         need_host_latents = any(i != primary.index for i in ctx)
 
-        print(
-            f"[PLAN] batch={B} frame={W}x{H}x{C} @ {fps}fps, {len(ctx)} GPU(s), {n_workers} streams"
+        logger.info(
+            f"[PLAN] batch={B} frame={W}x{H}x{C} @ {fps}fps, "
+            f"{len(ctx)} GPU(s), {n_workers} decode stream(s)"
         )
         for i, c in ctx.items():
-            print(
-                f"       cuda:{i} {torch.cuda.get_device_name(i)}: {c['n_streams']} streams"
+            logger.info(
+                f"       cuda:{i} {torch.cuda.get_device_name(i)}: {c['n_streams']} stream(s)"
             )
 
         # ---- shared state ----
@@ -529,12 +529,20 @@ class StreamingVideoSaver:
         def producer():
             try:
                 torch.cuda.set_device(primary)
+                primary_stream = torch.cuda.current_stream(primary)
 
-                def emit(seq, lat, n_valid):
+                def emit_one(lat_slice, n_valid):
+                    """Record a per-item event and (if needed) copy latents to host.
+
+                    Each work item gets its own Event so workers on secondary GPUs
+                    can call ev.synchronize() before touching lat_host without
+                    incorrectly racing against the *next* producer step.
+                    """
                     ev = torch.cuda.Event()
-                    ev.record(torch.cuda.current_stream(primary))
-                    # one tiny sync per group (~100 KB) so other GPUs can read it via host memory
-                    lat_host = lat.cpu() if need_host_latents else None
+                    ev.record(primary_stream)
+                    # CPU copy must happen after the event is recorded so the
+                    # synchronize() in the worker guarantees the data is ready.
+                    lat_host = lat_slice.cpu() if need_host_latents else None
                     return ev, lat_host
 
                 seq, carry = 0, None
@@ -556,17 +564,11 @@ class StreamingVideoSaver:
                         carry = None
                     n_full = (lat.shape[0] // B) * B
                     if n_full:
-                        ev, lat_host = emit(seq, lat[:n_full], B)
                         for i in range(0, n_full, B):
-                            work_q.put(
-                                (
-                                    seq,
-                                    lat[i : i + B],
-                                    None if lat_host is None else lat_host[i : i + B],
-                                    B,
-                                    ev,
-                                )
-                            )
+                            # Each micro-batch gets its own event + host copy.
+                            sl = lat[i : i + B]
+                            ev, lat_host = emit_one(sl, B)
+                            work_q.put((seq, sl, lat_host, B, ev))
                             seq += 1
                     if n_full < lat.shape[0]:
                         carry = lat[n_full:]
@@ -575,7 +577,7 @@ class StreamingVideoSaver:
                     padded = torch.cat(
                         [carry, carry[-1:].expand(B - n, -1)], 0
                     )  # keep fixed shape
-                    ev, lat_host = emit(seq, padded, n)
+                    ev, lat_host = emit_one(padded, n)
                     work_q.put((seq, padded, lat_host, n, ev))
                     seq += 1
                 state["total"] = seq
@@ -611,18 +613,24 @@ class StreamingVideoSaver:
 
                         with torch.cuda.stream(stream):
                             if is_primary:
-                                stream.wait_event(
-                                    ev
-                                )  # latents made on the sampler stream
+                                # Wait for the sampler stream to finish writing
+                                # this micro-batch before we decode it.
+                                stream.wait_event(ev)
                                 lat_gpu.record_stream(stream)
                                 lat = lat_gpu
                             else:
+                                # For secondary GPUs the latents live in pinned
+                                # host memory. We must ensure the producer has
+                                # finished the CPU copy (recorded in ev) before
+                                # we upload them. ev.synchronize() is a host-side
+                                # wait so it does NOT block the CUDA stream.
+                                ev.synchronize()
                                 lat = lat_host.to(dev, non_blocking=True)
                             u8 = self._decode_u8(c["ae"], c["feats"], lat)
                             buf[:n_valid].copy_(u8[:n_valid], non_blocking=True)
                             done = torch.cuda.Event()
                             done.record(stream)
-                        done.synchronize()  # blocks this thread only
+                        done.synchronize()  # blocks this thread only; CUDA stream continues
                         done_q.put((seq, buf, n_valid))
             except BaseException as e:  # noqa: BLE001
                 fail(f"decode_worker[{dev}]", e)
@@ -698,7 +706,7 @@ class StreamingVideoSaver:
 
         dt = time.perf_counter() - t_start
         self.last_stats = {"frames": state["frames"], "seconds": dt}
-        print(
+        logger.info(
             f"[DONE] {state['frames']} frames in {dt:.2f}s "
             f"({state['frames'] / dt:.1f} fps end-to-end) -> {video_path}"
         )
