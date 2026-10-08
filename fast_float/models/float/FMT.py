@@ -461,60 +461,84 @@ class FlowMatchingTransformer(BaseModel):
         a_cfg_scale=1.0,
         r_cfg_scale=1.0,
         e_cfg_scale=1.0,
+        # ---- pre-built constant tensors (optional) ----
+        # Pass these from the caller to avoid re-allocating on every ODE step:
+        #   _ref_cat     : torch.cat([wr, wr, wr], 0)          - constant all inference
+        #   _emotion_cat : torch.cat([null_we, we, null_we], 0) - constant all inference
+        #   _audio_cat   : torch.cat([null_wa, wa, wa], 0)      - constant within a chunk
+        #   _prev_x_cat  : torch.cat([prev_x]*3, 0)             - constant within a chunk
+        #   _prev_wa_cat : torch.cat([prev_wa]*3, 0)            - constant within a chunk
+        _ref_cat=None,
+        _emotion_cat=None,
+        _audio_cat=None,
+        _prev_x_cat=None,
+        _prev_wa_cat=None,
         **kwargs,
     ) -> torch.Tensor:
         if a_cfg_scale != 1.0 or r_cfg_scale != 1.0 or e_cfg_scale != 1.0:
             B = x.shape[0]
-            if wa.ndim == 2:
-                wa = wa.unsqueeze(0)
-            if wa.shape[0] != B:
-                wa = wa.expand(B, -1, -1)
 
-            if wr.ndim == 1:
-                wr = wr.unsqueeze(0).unsqueeze(1)
-            elif wr.ndim == 2:
-                wr = wr.unsqueeze(1)
-            if wr.shape[0] != B:
-                wr = wr.expand(B, -1, -1)
+            # ---- audio cat (changes every chunk, pre-built per chunk) ----
+            if _audio_cat is not None:
+                audio_cat = _audio_cat
+            else:
+                if wa.ndim == 2:
+                    wa = wa.unsqueeze(0)
+                if wa.shape[0] != B:
+                    wa = wa.expand(B, -1, -1)
+                null_wa = torch.zeros_like(wa)
+                audio_cat = torch.cat([null_wa, wa, wa], dim=0)
 
-            if we.ndim == 1:
-                we = we.unsqueeze(0).unsqueeze(1)
-            elif we.ndim == 2:
-                we = we.unsqueeze(1)
-            if we.shape[0] != B:
-                we = we.expand(B, -1, -1)
+            # ---- ref cat (constant for entire inference) ----
+            if _ref_cat is not None:
+                ref_cat = _ref_cat
+            else:
+                if wr.ndim == 1:
+                    wr = wr.unsqueeze(0).unsqueeze(1)
+                elif wr.ndim == 2:
+                    wr = wr.unsqueeze(1)
+                if wr.shape[0] != B:
+                    wr = wr.expand(B, -1, -1)
+                ref_cat = torch.cat([wr, wr, wr], dim=0)
 
-            if prev_x is not None:
+            # ---- emotion cat (constant for entire inference) ----
+            if _emotion_cat is not None:
+                emotion_cat = _emotion_cat
+            else:
+                if we.ndim == 1:
+                    we = we.unsqueeze(0).unsqueeze(1)
+                elif we.ndim == 2:
+                    we = we.unsqueeze(1)
+                if we.shape[0] != B:
+                    we = we.expand(B, -1, -1)
+                null_we = torch.zeros_like(we)
+                emotion_cat = torch.cat([null_we, we, null_we], dim=0)
+
+            # ---- x (changes every ODE step, must always be built here) ----
+            x_cat = torch.cat([x, x, x], dim=0)
+
+            # ---- prev tensors (constant within a chunk) ----
+            if _prev_x_cat is not None:
+                prev_x_cat = _prev_x_cat
+            elif prev_x is not None:
                 if prev_x.ndim == 2:
                     prev_x = prev_x.unsqueeze(0)
                 if prev_x.shape[0] != B:
                     prev_x = prev_x.expand(B, -1, -1)
+                prev_x_cat = torch.cat([prev_x, prev_x, prev_x], dim=0)
+            else:
+                prev_x_cat = None
 
-            if prev_wa is not None:
+            if _prev_wa_cat is not None:
+                prev_wa_cat = _prev_wa_cat
+            elif prev_wa is not None:
                 if prev_wa.ndim == 2:
                     prev_wa = prev_wa.unsqueeze(0)
                 if prev_wa.shape[0] != B:
                     prev_wa = prev_wa.expand(B, -1, -1)
-
-            null_wa = torch.zeros_like(wa)
-            null_we = torch.zeros_like(we)
-            null_wr = torch.zeros_like(wr)
-
-            audio_cat = torch.cat([null_wa, wa, wa], dim=0)  # concat along batch (3B)
-            ref_cat = torch.cat([wr, wr, wr], dim=0)  # concat along batch (3B)
-            emotion_cat = torch.cat([null_we, we, null_we], dim=0)  # concat along batch (3B)
-            x_cat = torch.cat([x, x, x], dim=0)  # concat along batch (3B)
-
-            prev_x_cat = (
-                torch.cat([prev_x, prev_x, prev_x], dim=0)
-                if prev_x is not None
-                else None
-            )
-            prev_wa_cat = (
-                torch.cat([prev_wa, prev_wa, prev_wa], dim=0)
-                if prev_wa is not None
-                else None
-            )
+                prev_wa_cat = torch.cat([prev_wa, prev_wa, prev_wa], dim=0)
+            else:
+                prev_wa_cat = None
 
             # Replicate t along batch if t was already explicitly sized to B
             if torch.is_tensor(t) and t.ndim > 0 and t.shape[0] == B and B > 1:

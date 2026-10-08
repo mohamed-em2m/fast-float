@@ -429,24 +429,37 @@ class ToFlow(nn.Module):
         self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))
     
     def forward(self, input, style, feat, skip=None):
-        """Enhanced to handle batch processing with dynamic grid generation"""
+        """Batch-compatible forward with cached coordinate grid.
+
+        The grid is computed once and stored on the module instance,
+        keyed by (h, w, device, dtype).  It is reused on every subsequent
+        call with the same configuration, eliminating the repeated
+        torch.meshgrid + torch.linspace overhead.
+        """
         batch_size = input.size(0)
         h, w = input.size(2), input.size(3)
-        
+
         out = self.conv(input, style)
         out = out + self.bias
-        
-        # Create coordinate grid directly on device - batch compatible
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-1, 1, h, device=input.device, dtype=input.dtype),
-            torch.linspace(-1, 1, w, device=input.device, dtype=input.dtype),
-            indexing="ij",
-        )
-        grid = (
-            torch.stack([grid_x, grid_y], dim=-1)
-            .unsqueeze(0)
-            .expand(batch_size, -1, -1, -1)
-        )
+
+        # Cached coordinate grid — only rebuilt when resolution/device/dtype changes.
+        # Uses a (h, w, device_type, device_index, dtype) key so it is safe across
+        # devices and mixed-precision contexts.
+        cache_key = (h, w, input.device.type,
+                     input.device.index, input.dtype)
+        if getattr(self, "_grid_cache_key", None) != cache_key:
+            grid_y, grid_x = torch.meshgrid(
+                torch.linspace(-1, 1, h, device=input.device, dtype=input.dtype),
+                torch.linspace(-1, 1, w, device=input.device, dtype=input.dtype),
+                indexing="ij",
+            )
+            # Store as [1, H, W, 2] — expand() is a zero-copy view
+            self._cached_grid = (
+                torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+            )
+            self._grid_cache_key = cache_key
+
+        grid = self._cached_grid.expand(batch_size, -1, -1, -1)
         
         if skip is not None:
             skip = self.upsample(skip)

@@ -759,13 +759,16 @@ class FLOAT(BaseModel, StreamingVideoSaver):
 
     def get_optimal_decode_batch_size(self, device=None) -> int:
         """Automatically select optimal frame decode batch size based on GPU memory.
-        - Checks self.opt.decode_batch_size for user override.
-        - Otherwise inspects total and available VRAM on device:
-            * >= 22 GB (e.g. RTX 3090/4090, A100): batch size 16
-            * 11 GB - 22 GB (e.g. RTX 3060 12G, 4070/4080): batch size 8
-            * 6 GB - 11 GB (e.g. RTX 2060, 3060 8G, 4060): batch size 4 (sweet spot)
-            * < 6 GB: batch size 2
-        - If CPU: batch size 4
+
+        The result is memoized per device index in ``self._decode_bs_cache`` so that
+        ``torch.cuda.mem_get_info`` is only called once per device, not once per chunk.
+
+        Tiers (total VRAM / free VRAM):
+            * >= 22 GiB total & >= 8 GiB free  (RTX 3090/4090, A100):  batch 16
+            * >= 11 GiB total & >= 4 GiB free  (RTX 3060 12G, 4070/4080): batch 8
+            * >=  6 GiB total & >= 2 GiB free  (RTX 2060, 3060 8G, 4060): batch 4
+            * >=  1 GiB free                                              : batch 2
+            * otherwise / CPU                                              : batch 1
         """
         if hasattr(self, "opt") and getattr(self.opt, "decode_batch_size", None) is not None:
             return max(1, int(self.opt.decode_batch_size))
@@ -783,21 +786,33 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                 return 4
 
             idx = device.index if device.index is not None else torch.cuda.current_device()
+
+            # Return memoized result to avoid repeated cudaMemGetInfo calls
+            cache = getattr(self, "_decode_bs_cache", None)
+            if cache is None:
+                self._decode_bs_cache = {}
+                cache = self._decode_bs_cache
+            if idx in cache:
+                return cache[idx]
+
             free_b, total_b = torch.cuda.mem_get_info(idx)
             gib = 1024 ** 3
             free_gib = free_b / gib
             total_gib = total_b / gib
 
             if total_gib >= 22.0 and free_gib >= 8.0:
-                return 16
+                bs = 16
             elif total_gib >= 11.0 and free_gib >= 4.0:
-                return 8
+                bs = 8
             elif total_gib >= 6.0 and free_gib >= 2.0:
-                return 4
+                bs = 4
             elif free_gib >= 1.0:
-                return 2
+                bs = 2
             else:
-                return 1
+                bs = 1
+
+            cache[idx] = bs
+            return bs
         except Exception:
             return 4
 
@@ -1016,6 +1031,39 @@ class FLOAT(BaseModel, StreamingVideoSaver):
 
             decoded_length = 0
 
+            # ------------------------------------------------------------------
+            # Pre-build CFG constant tensors that are invariant across ALL ODE
+            # steps and ALL chunks (ref / emotion never change during inference).
+            # Avoids 2 × torch.cat allocations per ODE step for free.
+            # ------------------------------------------------------------------
+            _cfg_active = (
+                a_cfg_scale != 1.0 or r_cfg_scale != 1.0 or e_cfg_scale != 1.0
+            )
+            _ref_cat = None
+            _emotion_cat = None
+            if _cfg_active and r_s is not None:
+                # Mirror the shape normalisation that forward_with_cfv would do.
+                wr_ready = r_s
+                if wr_ready.ndim == 1:
+                    wr_ready = wr_ready.unsqueeze(0).unsqueeze(1)
+                elif wr_ready.ndim == 2:
+                    wr_ready = wr_ready.unsqueeze(1)
+                if wr_ready.shape[0] != B and wr_ready.shape[0] == 1:
+                    wr_ready = wr_ready.expand(B, -1, -1)
+                _ref_cat = torch.cat([wr_ready, wr_ready, wr_ready], dim=0)
+
+            if _cfg_active:
+                # we is already shaped [B, 1, dim_e] at this point.
+                we_ready = we
+                if we_ready.ndim == 1:
+                    we_ready = we_ready.unsqueeze(0).unsqueeze(1)
+                elif we_ready.ndim == 2:
+                    we_ready = we_ready.unsqueeze(1)
+                if we_ready.shape[0] != B and we_ready.shape[0] == 1:
+                    we_ready = we_ready.expand(B, -1, -1)
+                _null_we = torch.zeros_like(we_ready)
+                _emotion_cat = torch.cat([_null_we, we_ready, _null_we], dim=0)
+
             # sampling chunk by chunk
             for t in range(0, int(math.ceil(T / self.num_frames_for_clip))):
                 if getattr(self.opt, "fix_noise_seed", False):
@@ -1058,7 +1106,31 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                         mode="replicate",
                     )
 
-                def sample_chunk(tt, zt):
+                # ------------------------------------------------------------------
+                # Pre-build per-chunk CFG tensors (invariant within one ODE solve).
+                # audio_cat / prev_x_cat / prev_wa_cat change between chunks but
+                # are constant across the NFE ODE steps inside a single chunk.
+                # ------------------------------------------------------------------
+                _audio_cat = None
+                _prev_x_cat = None
+                _prev_wa_cat = None
+                if _cfg_active:
+                    wa_t_exp = wa_t
+                    if wa_t_exp.shape[0] != B and wa_t_exp.shape[0] == 1:
+                        wa_t_exp = wa_t_exp.expand(B, -1, -1)
+                    _null_wa = torch.zeros_like(wa_t_exp)
+                    _audio_cat = torch.cat([_null_wa, wa_t_exp, wa_t_exp], dim=0)
+
+                    _prev_x_cat = torch.cat(
+                        [prev_x_t, prev_x_t, prev_x_t], dim=0
+                    )
+                    _prev_wa_cat = torch.cat(
+                        [prev_wa_t, prev_wa_t, prev_wa_t], dim=0
+                    )
+
+                def sample_chunk(tt, zt,
+                                 _ac=_audio_cat, _rc=_ref_cat, _ec=_emotion_cat,
+                                 _pxc=_prev_x_cat, _pwc=_prev_wa_cat):
                     out = self.fmt.forward_with_cfv(
                         t=tt.unsqueeze(0),
                         x=zt,
@@ -1070,6 +1142,11 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                         a_cfg_scale=a_cfg_scale,
                         r_cfg_scale=r_cfg_scale,
                         e_cfg_scale=e_cfg_scale,
+                        _audio_cat=_ac,
+                        _ref_cat=_rc,
+                        _emotion_cat=_ec,
+                        _prev_x_cat=_pxc,
+                        _prev_wa_cat=_pwc,
                     )
                     out_current = out[:, self.num_prev_frames :]
                     return out_current
