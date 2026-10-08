@@ -80,12 +80,12 @@ import gradio as gr
 logger = setup_logger("float_live_app")
 
 try:
-    from fast_float.core.generate import InferenceAgent, InferenceOptions
+    from fast_float.core.inference_optimized import InferenceAgent, InferenceOptions
 except ImportError:
     try:
-        from core.generate import InferenceAgent, InferenceOptions
+        from core.inference_optimized import InferenceAgent, InferenceOptions
     except ImportError:
-        from generate import InferenceAgent, InferenceOptions
+        from inference_optimized import InferenceAgent, InferenceOptions
 
 
 def _coerce_int(value, default):

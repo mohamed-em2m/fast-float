@@ -259,7 +259,7 @@ class StreamingVideoSaver:
     def _decode_devices(self):
         primary = self._cuda_device()
         visible = torch.cuda.device_count()
-        want = max(1, int(getattr(self.opt, "ngpus", 1)))
+        want = max(1, int(getattr(self.opt, "ngpus", 2)))
         n = min(want, visible)
         if want > visible:
             logger.warning(
