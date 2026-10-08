@@ -70,6 +70,7 @@ except ImportError:
             _log.propagate = False
             return _log
 
+
 import numpy as np
 import soundfile as sf
 import gradio as gr
@@ -111,6 +112,7 @@ class FloatModel:
         ckpt_path="./checkpoints/float.pth",
         res_dir="./results",
         wav2vec_model_path=None,
+        ngpus=1,
     ):
         # InferenceOptions uses argparse on sys.argv, so isolate parsing
         # from the Gradio launch flags (--port, --share, ...).
@@ -125,6 +127,7 @@ class FloatModel:
             self.opt = InferenceOptions().parse()
         finally:
             sys.argv = original_argv
+        self.opt.ngpus = ngpus
         self.opt.rank = 0
         os.makedirs(self.opt.res_dir, exist_ok=True)
 
@@ -276,10 +279,16 @@ def _to_mono_float(chunk_sr_data):
 
 
 def build_interface(
-    ckpt_path="./checkpoints/float.pth", res_dir="./results", wav2vec_model_path=None
+    ckpt_path="./checkpoints/float.pth",
+    res_dir="./results",
+    wav2vec_model_path=None,
+    ngpus=1,
 ):
     model = FloatModel(
-        ckpt_path=ckpt_path, res_dir=res_dir, wav2vec_model_path=wav2vec_model_path
+        ckpt_path=ckpt_path,
+        res_dir=res_dir,
+        wav2vec_model_path=wav2vec_model_path,
+        ngpus=ngpus,
     )
 
     # ---------- custom CSS ----------
@@ -724,6 +733,7 @@ if __name__ == "__main__":
         ckpt_path=args.ckpt_path,
         res_dir=args.res_dir,
         wav2vec_model_path=args.wav2vec_model_path,
+        ngpus=args.ngpus,
     )
 
     auth_tuple = None
