@@ -436,19 +436,16 @@ class ToFlow(nn.Module):
         out = self.conv(input, style)
         out = out + self.bias
         
-        # Create coordinate grid - batch compatible
-        xs = np.linspace(-1, 1, h)
-        ys = np.linspace(-1, 1, w)
-        xs, ys = np.meshgrid(xs, ys)
-        grid = np.stack([xs, ys], axis=2)
-        
-        # Convert to tensor and repeat for batch
+        # Create coordinate grid directly on device - batch compatible
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, h, device=input.device, dtype=input.dtype),
+            torch.linspace(-1, 1, w, device=input.device, dtype=input.dtype),
+            indexing="ij",
+        )
         grid = (
-            torch.tensor(grid, requires_grad=False)
-            .float()
+            torch.stack([grid_x, grid_y], dim=-1)
             .unsqueeze(0)
-            .repeat(batch_size, 1, 1, 1)
-            .to(input.device)
+            .expand(batch_size, -1, -1, -1)
         )
         
         if skip is not None:

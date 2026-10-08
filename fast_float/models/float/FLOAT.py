@@ -732,12 +732,16 @@ class FLOAT(BaseModel, StreamingVideoSaver):
     ######## Motion Encoder - Decoder ########
     @torch.no_grad()
     def encode_image_into_latent(self, x: torch.Tensor) -> list:
+        if x.ndim == 3:
+            x = x.unsqueeze(0)
         x_r, _, x_r_feats = self.motion_autoencoder.enc(x, input_target=None)
         x_r_lambda = self.motion_autoencoder.enc.fc(x_r)
         return x_r, x_r_lambda, x_r_feats
 
     @torch.no_grad()
     def encode_identity_into_motion(self, x_r: torch.Tensor) -> torch.Tensor:
+        if x_r.ndim == 1:
+            x_r = x_r.unsqueeze(0)
         x_r_lambda = self.motion_autoencoder.enc.fc(x_r)
         r_x = self.motion_autoencoder.dec.direction(x_r_lambda)
         return r_x
@@ -746,16 +750,30 @@ class FLOAT(BaseModel, StreamingVideoSaver):
     def decode_latent_into_image(
         self, s_r: torch.Tensor, s_r_feats: list, r_d: torch.Tensor
     ) -> torch.Tensor:
-        """Decode latent into image with broadcasted features"""
-        b = r_d.shape[0] if r_d.ndim > 1 else 1
-        feats = [
-            f.expand(b, *f.shape[1:]) if (f.shape[0] == 1 and b > 1) else f
-            for f in s_r_feats
-        ]
-        img = self.motion_autoencoder.dec(r_d, alpha=None, feats=feats)
-        if isinstance(img, (tuple, list)):
-            img = img[0]
-        return img
+        """Decode latent into image with broadcasted features (supports 2D [N, D] and 3D [B, T, D])"""
+        if r_d.ndim == 3:
+            b_dim, t_dim, d_dim = r_d.shape
+            r_d_flat = r_d.reshape(b_dim * t_dim, d_dim)
+            feats = [
+                f.expand(b_dim * t_dim, *f.shape[1:])
+                if f.shape[0] == 1
+                else f.unsqueeze(1).expand(-1, t_dim, *f.shape[1:]).reshape(b_dim * t_dim, *f.shape[1:])
+                for f in s_r_feats
+            ]
+            img = self.motion_autoencoder.dec(r_d_flat, alpha=None, feats=feats)
+            if isinstance(img, (tuple, list)):
+                img = img[0]
+            return img.view(b_dim, t_dim, *img.shape[1:])
+        else:
+            b = r_d.shape[0] if r_d.ndim > 1 else 1
+            feats = [
+                f.expand(b, *f.shape[1:]) if (f.shape[0] == 1 and b > 1) else f
+                for f in s_r_feats
+            ]
+            img = self.motion_autoencoder.dec(r_d, alpha=None, feats=feats)
+            if isinstance(img, (tuple, list)):
+                img = img[0]
+            return img
 
     @torch.no_grad()
     def sample(
@@ -778,7 +796,26 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         )
         with stream_ctx:
             r_s, a = data["r_s"], data["a"]
-            B = a.shape[0]
+            if a.ndim == 1:
+                a = a.unsqueeze(0)
+            B_a = a.shape[0]
+            B_r = r_s.shape[0] if (r_s is not None and r_s.ndim > 1) else 1
+            B_s = s_r.shape[0] if (s_r is not None and s_r.ndim > 1) else 1
+            B = max(B_a, B_r, B_s)
+
+            if a.shape[0] != B and a.shape[0] == 1:
+                a = a.expand(B, -1)
+            if r_s is not None:
+                if r_s.ndim == 1:
+                    r_s = r_s.unsqueeze(0)
+                if r_s.shape[0] != B and r_s.shape[0] == 1:
+                    r_s = r_s.expand(B, -1)
+            if s_r is not None:
+                if s_r.ndim == 1:
+                    s_r = s_r.unsqueeze(0)
+                if s_r.shape[0] != B and s_r.shape[0] == 1:
+                    s_r = s_r.expand(B, -1)
+
             # make time
             steps = nfe if nfe is not None else getattr(self.opt, "nfe", 10)
             time = torch.linspace(0, 1, steps, device=device)
@@ -789,19 +826,45 @@ class FLOAT(BaseModel, StreamingVideoSaver):
             wa = self.audio_encoder.inference(a, seq_len=T)
 
             # encoding emotion first
-            emo_idx = self.emotion_encoder.label2id.get(str(emo).lower(), None)
-            if emo_idx is None:
-                we = self.emotion_encoder.predict_emotion(a).unsqueeze(1)
-            else:
+            if isinstance(emo, torch.Tensor):
+                we = emo.to(device=device, dtype=torch.float32)
+                if we.ndim == 1:
+                    we = we.unsqueeze(0).unsqueeze(1)
+                elif we.ndim == 2:
+                    we = we.unsqueeze(1)
+                if we.shape[0] != B and we.shape[0] == 1:
+                    we = we.expand(B, -1, -1)
+            elif isinstance(emo, (list, tuple)):
+                emo_tensors = []
+                for e in emo:
+                    idx = self.emotion_encoder.label2id.get(str(e).lower(), None)
+                    if idx is not None:
+                        one_hot = F.one_hot(
+                            torch.tensor(idx, device=device),
+                            num_classes=self.opt.dim_e,
+                        ).float()
+                    else:
+                        one_hot = torch.zeros(self.opt.dim_e, device=device)
+                    emo_tensors.append(one_hot)
+                we = torch.stack(emo_tensors, dim=0).unsqueeze(1)
+                if we.shape[0] != B and we.shape[0] == 1:
+                    we = we.expand(B, -1, -1)
+            elif emo is not None and str(emo).lower() in self.emotion_encoder.label2id:
+                emo_idx = self.emotion_encoder.label2id[str(emo).lower()]
                 we = (
                     F.one_hot(
-                        torch.tensor(emo_idx, device=a.device),
+                        torch.tensor(emo_idx, device=device),
                         num_classes=self.opt.dim_e,
                     )
                     .float()
                     .unsqueeze(0)
                     .unsqueeze(0)
+                    .expand(B, -1, -1)
                 )
+            else:
+                we = self.emotion_encoder.predict_emotion(a).unsqueeze(1)
+                if we.shape[0] != B and we.shape[0] == 1:
+                    we = we.expand(B, -1, -1)
 
             decoded_length = 0
 
@@ -887,9 +950,10 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                     if s_r_b is not None
                     else sample_t_trim
                 )
-                s_r_d_t_squeezed = s_r_d_t.squeeze(0)  # [T, dim_w]
-
-                yield s_r_d_t_squeezed
+                if B == 1:
+                    yield s_r_d_t.squeeze(0)  # [T, dim_w]
+                else:
+                    yield s_r_d_t  # [B, T, dim_w]
 
                 # Stop if we've reached the target length
                 if decoded_length >= T:
@@ -911,10 +975,25 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         primary = torch.device(device)
 
         s, a = data["s"], data["a"]
+        if s.ndim == 3:
+            s = s.unsqueeze(0)
+        if a.ndim == 1:
+            a = a.unsqueeze(0)
+
+        B_s = s.shape[0]
+        B_a = a.shape[0]
+        B = max(B_s, B_a)
+        if s.shape[0] != B and s.shape[0] == 1:
+            s = s.expand(B, *s.shape[1:])
+        if a.shape[0] != B and a.shape[0] == 1:
+            a = a.expand(B, *a.shape[1:])
+        data["s"] = s
+        data["a"] = a
+
         s_r, r_s_lambda, s_r_feats = self.encode_image_into_latent(s.to(device))
 
         if "s_r" in data:
-            r_s = self.encode_identity_into_motion(s_r)
+            r_s = self.encode_identity_into_motion(data["s_r"])
         else:
             r_s = self.motion_autoencoder.dec.direction(r_s_lambda)
         data["r_s"] = r_s
@@ -964,6 +1043,7 @@ class FLOAT(BaseModel, StreamingVideoSaver):
             num_devs = len(gpu_ctx)
             decode_results = []
             dev_idx = 0
+            is_batched = (B > 1)
 
             for frame_latent in self.sample(
                 data,
@@ -988,16 +1068,30 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                     else contextlib.nullcontext()
                 )
                 with ctx_mgr:
-                    b = lat.shape[0] if lat.ndim > 1 else 1
-                    b_feats = [
-                        f.expand(b, *f.shape[1:])
-                        if (f.shape[0] == 1 and b > 1)
-                        else f
-                        for f in feats
-                    ]
-                    out = ae.dec(lat, alpha=None, feats=b_feats)
-                    if isinstance(out, (tuple, list)):
-                        out = out[0]
+                    if is_batched or lat.ndim == 3:
+                        B_curr, T_curr, D_curr = lat.shape
+                        lat_flat = lat.reshape(B_curr * T_curr, D_curr)
+                        b_feats = [
+                            f.expand(B_curr * T_curr, *f.shape[1:])
+                            if f.shape[0] == 1
+                            else f.unsqueeze(1).expand(-1, T_curr, *f.shape[1:]).reshape(B_curr * T_curr, *f.shape[1:])
+                            for f in feats
+                        ]
+                        out = ae.dec(lat_flat, alpha=None, feats=b_feats)
+                        if isinstance(out, (tuple, list)):
+                            out = out[0]
+                        out = out.view(B_curr, T_curr, *out.shape[1:])
+                    else:
+                        b = lat.shape[0] if lat.ndim > 1 else 1
+                        b_feats = [
+                            f.expand(b, *f.shape[1:])
+                            if (f.shape[0] == 1 and b > 1)
+                            else f
+                            for f in feats
+                        ]
+                        out = ae.dec(lat, alpha=None, feats=b_feats)
+                        if isinstance(out, (tuple, list)):
+                            out = out[0]
                     if not out.is_cuda and torch.cuda.is_available():
                         out = out.to(device=primary, non_blocking=True)
                     elif out.device != primary:
@@ -1015,7 +1109,10 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                     cur.wait_stream(stream)
                 stacked_list.append(out_tensor)
 
-            d_hat = torch.cat(stacked_list, dim=0)
+            if is_batched:
+                d_hat = torch.cat(stacked_list, dim=1)  # [B, total_T, 3, H, W]
+            else:
+                d_hat = torch.cat(stacked_list, dim=0)  # [total_T, 3, H, W]
             return {"d_hat": d_hat}
 
         except Exception as e:
@@ -1078,6 +1175,8 @@ class AudioEncoder(BaseModel):
         )
 
     def get_wav2vec2_feature(self, a: torch.Tensor, seq_len: int) -> torch.Tensor:
+        if a.ndim == 1:
+            a = a.unsqueeze(0)
         a = self.wav2vec2(
             a, seq_len=seq_len, output_hidden_states=not self.only_last_features
         )
@@ -1089,64 +1188,47 @@ class AudioEncoder(BaseModel):
         return a
 
     def forward(self, a: torch.Tensor, prev_a: torch.Tensor = None) -> torch.Tensor:
+        if a.ndim == 1:
+            a = a.unsqueeze(0)
         if prev_a is not None:
+            if prev_a.ndim == 1:
+                prev_a = prev_a.unsqueeze(0)
             a = torch.cat([prev_a, a], dim=1)
-            if (
-                a.shape[1]
-                % int(
-                    (self.num_frames_for_clip + self.num_prev_frames)
-                    * self.opt.sampling_rate
-                    / self.opt.fps
-                )
-                != 0
-            ):
-                a = F.pad(
-                    a,
-                    (
-                        0,
-                        int(
-                            (self.num_frames_for_clip + self.num_prev_frames)
-                            * self.opt.sampling_rate
-                            / self.opt.fps
-                        )
-                        - a.shape[1],
-                    ),
-                    mode="replicate",
-                )
+            target_len = int(
+                (self.num_frames_for_clip + self.num_prev_frames)
+                * self.opt.sampling_rate
+                / self.opt.fps
+            )
+            if a.shape[1] % target_len != 0:
+                pad_amt = target_len - (a.shape[1] % target_len)
+                a = F.pad(a, (0, pad_amt), mode="replicate")
             a = self.get_wav2vec2_feature(
                 a, seq_len=self.num_frames_for_clip + self.num_prev_frames
             )
         else:
-            if (
-                a.shape[1]
-                % int(self.num_frames_for_clip * self.opt.sampling_rate / self.opt.fps)
-                != 0
-            ):
-                a = F.pad(
-                    a,
-                    (
-                        0,
-                        int(
-                            self.num_frames_for_clip
-                            * self.opt.sampling_rate
-                            / self.opt.fps
-                        )
-                        - a.shape[1],
-                    ),
-                    mode="replicate",
-                )
+            target_len = int(
+                self.num_frames_for_clip * self.opt.sampling_rate / self.opt.fps
+            )
+            if a.shape[1] % target_len != 0:
+                pad_amt = target_len - (a.shape[1] % target_len)
+                a = F.pad(a, (0, pad_amt), mode="replicate")
             a = self.get_wav2vec2_feature(a, seq_len=self.num_frames_for_clip)
 
         return self.audio_projection(a)  # frame by frame
 
     @torch.no_grad()
     def inference(self, a: torch.Tensor, seq_len: int) -> torch.Tensor:
-        if a.shape[1] % int(seq_len * self.opt.sampling_rate / self.opt.fps) != 0:
+        if a.ndim == 1:
+            a = a.unsqueeze(0)
+        expected_len = int(seq_len * self.opt.sampling_rate / self.opt.fps)
+        if a.shape[1] < expected_len:
             a = F.pad(
                 a,
-                (0, int(seq_len * self.opt.sampling_rate / self.opt.fps) - a.shape[1]),
+                (0, expected_len - a.shape[1]),
                 mode="replicate",
             )
+        elif a.shape[1] > expected_len:
+            a = a[:, :expected_len]
         a = self.get_wav2vec2_feature(a, seq_len=seq_len)
         return self.audio_projection(a)
 
@@ -1184,8 +1266,12 @@ class Audio2Emotion(nn.Module):
     def predict_emotion(
         self, a: torch.Tensor, prev_a: torch.Tensor = None
     ) -> torch.Tensor:
+        if a.ndim == 1:
+            a = a.unsqueeze(0)
         # Concatenate previous audio if provided
         if prev_a is not None:
+            if prev_a.ndim == 1:
+                prev_a = prev_a.unsqueeze(0)
             a = torch.cat([prev_a, a], dim=1)
 
         logits = self.wav2vec2_for_emotion(a).logits

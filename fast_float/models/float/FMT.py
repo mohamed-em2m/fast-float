@@ -2,11 +2,45 @@ import os, math, torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from torchdiffeq import odeint
+try:
+    from torchdiffeq import odeint
+except ImportError:
+    odeint = None
 from fast_float.models import BaseModel
 
-from timm.layers import use_fused_attn
-from timm.models.vision_transformer import Mlp
+try:
+    from timm.layers import use_fused_attn
+    from timm.models.vision_transformer import Mlp
+except Exception:
+    def use_fused_attn():
+        return hasattr(F, "scaled_dot_product_attention")
+
+    class Mlp(nn.Module):
+        def __init__(
+            self,
+            in_features,
+            hidden_features=None,
+            out_features=None,
+            act_layer=nn.GELU,
+            drop=0.0,
+        ):
+            super().__init__()
+            out_features = out_features or in_features
+            hidden_features = hidden_features or in_features
+            self.fc1 = nn.Linear(in_features, hidden_features)
+            self.act = act_layer()
+            self.drop1 = nn.Dropout(drop)
+            self.norm = nn.Identity()
+            self.fc2 = nn.Linear(hidden_features, out_features)
+            self.drop2 = nn.Dropout(drop)
+
+        def forward(self, x):
+            x = self.fc1(x)
+            x = self.act(x)
+            x = self.drop1(x)
+            x = self.fc2(x)
+            x = self.drop2(x)
+            return x
 
 
 def enc_dec_mask(T, S, frame_width=1, expansion=2):
@@ -89,6 +123,8 @@ class Attention(nn.Module):
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
+            if mask is not None:
+                attn = attn.masked_fill(~mask, float("-inf"))
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             x = attn @ v
@@ -141,6 +177,10 @@ class TimestepEmbedder(nn.Module):
         return embedding
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
+        if not torch.is_tensor(t):
+            t = torch.tensor([t], dtype=torch.float32)
+        elif t.ndim == 0:
+            t = t.unsqueeze(0)
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
@@ -317,46 +357,84 @@ class FlowMatchingTransformer(BaseModel):
         self, t, x, wa, wr, we, prev_x=None, prev_wa=None, train=True, **kwargs
     ) -> torch.Tensor:
         """
-        Forward pass of ConditionalFlowMatchingTransformer.
+        Forward pass of ConditionalFlowMatchingTransformer supporting batch size B >= 1.
 
-        t: (B,) tensor of diffusion timesteps [0, 1]
+        t: (B,) or scalar tensor of diffusion timesteps [0, 1]
         x: (B, L, 512) : tensor of sequence of motion latent
 
         wa:  (B, L, 512)  / tensor sequence of wa latent
-        wp:  (B, L, 6)    / tensor sequence of wp latent
-        wr:  (B, 512)     / tensor of reference motion latent (i.e., r -> s)
-        we:  (B, 1, 7)    / tensor of emotion latent
+        wr:  (B, 512) or (B, 1, 512) / tensor of reference motion latent
+        we:  (B, 1, 7) or (B, 7) / tensor of emotion latent
 
         prev_x:  (B, L', 512) / previous x for auto-regressive generation
         prev_wa: (B, L', 512) / previous audio for auto-regressive generation
         """
+        B = x.shape[0]
 
         # time encoding
-        t = self.t_embedder(t).unsqueeze(1)  # (N, D)
+        if not torch.is_tensor(t):
+            t = torch.tensor([t], device=x.device, dtype=torch.float32)
+        elif t.ndim == 0:
+            t = t.unsqueeze(0)
+        if t.device != x.device:
+            t = t.to(x.device)
+        t = self.t_embedder(t).unsqueeze(1)  # (N_t, 1, D)
+        if t.shape[0] != B and t.shape[0] == 1:
+            t = t.expand(B, -1, -1)
 
-        # condition encoding
+        # condition encoding & batch dimension alignment
+        if wa.ndim == 2:
+            wa = wa.unsqueeze(0)
+        if wa.shape[0] != B:
+            wa = wa.expand(B, -1, -1)
         wa = self.sequence_embedder(
             wa, dropout_prob=self.opt.audio_dropout_prob, train=train
         )
+
+        if wr.ndim == 1:
+            wr = wr.unsqueeze(0).unsqueeze(1)
+        elif wr.ndim == 2:
+            wr = wr.unsqueeze(1)
+        if wr.shape[0] != B:
+            wr = wr.expand(B, -1, -1)
         wr = self.sequence_embedder(
-            wr.unsqueeze(1), dropout_prob=self.opt.ref_dropout_prob, train=train
+            wr, dropout_prob=self.opt.ref_dropout_prob, train=train
         )
+
+        if we.ndim == 1:
+            we = we.unsqueeze(0).unsqueeze(1)
+        elif we.ndim == 2:
+            we = we.unsqueeze(1)
+        if we.shape[0] != B:
+            we = we.expand(B, -1, -1)
         we = self.sequence_embedder(
             we, dropout_prob=self.opt.emotion_dropout_prob, train=train
         )
 
         # previous condition encoding
         if prev_x is not None:
+            if prev_x.ndim == 2:
+                prev_x = prev_x.unsqueeze(0)
+            if prev_x.shape[0] != B:
+                prev_x = prev_x.expand(B, -1, -1)
             prev_x = self.sequence_embedder(prev_x, dropout_prob=0.5, train=train)
+
+        if prev_wa is not None:
+            if prev_wa.ndim == 2:
+                prev_wa = prev_wa.unsqueeze(0)
+            if prev_wa.shape[0] != B:
+                prev_wa = prev_wa.expand(B, -1, -1)
             prev_wa = self.sequence_embedder(prev_wa, dropout_prob=0.5, train=train)
 
+        if prev_x is not None:
             x = torch.cat([prev_x, x], dim=1)
+        if prev_wa is not None:
             wa = torch.cat([prev_wa, wa], dim=1)
 
         x = self.x_embedder(x)
         x = (
             x + self.pos_embed
-        )  # (N, L + L', D), where T = opt.wav2vec_sec * opt.fps, D = dim_w
+        )  # (B, L + L', D), where T = opt.wav2vec_sec * opt.fps, D = dim_w
 
         wr = wr.repeat(1, wa.shape[1], 1)
         we = we.repeat(1, wa.shape[1], 1)
@@ -367,7 +445,7 @@ class FlowMatchingTransformer(BaseModel):
 
         # forwarding FMT Blocks
         for block in self.blocks:
-            x = block(x, c, self.alignment_mask)  # (N, T, D)
+            x = block(x, c, self.alignment_mask)  # (B, T, D)
         return self.decoder(x, c)
 
     @torch.no_grad()
@@ -378,29 +456,75 @@ class FlowMatchingTransformer(BaseModel):
         wa,
         wr,
         we,
-        prev_x,
-        prev_wa,
+        prev_x=None,
+        prev_wa=None,
         a_cfg_scale=1.0,
         r_cfg_scale=1.0,
         e_cfg_scale=1.0,
         **kwargs,
     ) -> torch.Tensor:
         if a_cfg_scale != 1.0 or r_cfg_scale != 1.0 or e_cfg_scale != 1.0:
+            B = x.shape[0]
+            if wa.ndim == 2:
+                wa = wa.unsqueeze(0)
+            if wa.shape[0] != B:
+                wa = wa.expand(B, -1, -1)
+
+            if wr.ndim == 1:
+                wr = wr.unsqueeze(0).unsqueeze(1)
+            elif wr.ndim == 2:
+                wr = wr.unsqueeze(1)
+            if wr.shape[0] != B:
+                wr = wr.expand(B, -1, -1)
+
+            if we.ndim == 1:
+                we = we.unsqueeze(0).unsqueeze(1)
+            elif we.ndim == 2:
+                we = we.unsqueeze(1)
+            if we.shape[0] != B:
+                we = we.expand(B, -1, -1)
+
+            if prev_x is not None:
+                if prev_x.ndim == 2:
+                    prev_x = prev_x.unsqueeze(0)
+                if prev_x.shape[0] != B:
+                    prev_x = prev_x.expand(B, -1, -1)
+
+            if prev_wa is not None:
+                if prev_wa.ndim == 2:
+                    prev_wa = prev_wa.unsqueeze(0)
+                if prev_wa.shape[0] != B:
+                    prev_wa = prev_wa.expand(B, -1, -1)
+
             null_wa = torch.zeros_like(wa)
             null_we = torch.zeros_like(we)
             null_wr = torch.zeros_like(wr)
 
-            audio_cat = torch.cat([null_wa, wa, wa], dim=0)  # concat along batch
-            ref_cat = torch.cat([wr, wr, wr], dim=0)  # concat along batch
-            emotion_cat = torch.cat([null_we, we, null_we], dim=0)  # concat along batch
-            x = torch.cat([x, x, x], dim=0)  # concat along batch
+            audio_cat = torch.cat([null_wa, wa, wa], dim=0)  # concat along batch (3B)
+            ref_cat = torch.cat([wr, wr, wr], dim=0)  # concat along batch (3B)
+            emotion_cat = torch.cat([null_we, we, null_we], dim=0)  # concat along batch (3B)
+            x_cat = torch.cat([x, x, x], dim=0)  # concat along batch (3B)
 
-            prev_x_cat = torch.cat([prev_x, prev_x, prev_x], dim=0)
-            prev_wa_cat = torch.cat([prev_wa, prev_wa, prev_wa], dim=0)
+            prev_x_cat = (
+                torch.cat([prev_x, prev_x, prev_x], dim=0)
+                if prev_x is not None
+                else None
+            )
+            prev_wa_cat = (
+                torch.cat([prev_wa, prev_wa, prev_wa], dim=0)
+                if prev_wa is not None
+                else None
+            )
+
+            # Replicate t along batch if t was already explicitly sized to B
+            if torch.is_tensor(t) and t.ndim > 0 and t.shape[0] == B and B > 1:
+                t_cat = torch.cat([t, t, t], dim=0)
+            else:
+                t_cat = t
 
             model_output = self.forward(
-                t,
-                x,
+                t_cat,
+                x_cat,
                 audio_cat,
                 ref_cat,
                 emotion_cat,
