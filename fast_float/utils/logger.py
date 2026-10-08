@@ -42,6 +42,9 @@ def setup_logger(name: str = "float_fast", level: int = logging.INFO) -> logging
     logging.getLogger("ffmpeg").setLevel(logging.ERROR)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("asyncio").setLevel(logging.WARNING)
+    logging.getLogger("numba").setLevel(logging.WARNING)
+    logging.getLogger("numba.core").setLevel(logging.WARNING)
+    logging.getLogger("numba.typed").setLevel(logging.WARNING)
 
     return logger
 
