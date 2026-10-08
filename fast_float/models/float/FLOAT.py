@@ -266,7 +266,9 @@ class StreamingVideoSaver:
                 f"[MULTI-GPU] ngpus={want} requested but only {visible} visible; using {n}"
             )
         else:
-            logger.info(f"[MULTI-GPU] using {n}/{visible} GPU(s) (primary=cuda:{primary.index})")
+            logger.info(
+                f"[MULTI-GPU] using {n}/{visible} GPU(s) (primary=cuda:{primary.index})"
+            )
         others = [
             torch.device("cuda", i) for i in range(visible) if i != primary.index
         ][: n - 1]
@@ -717,6 +719,8 @@ class FLOAT(BaseModel, StreamingVideoSaver):
     def __init__(self, opt):
         super().__init__()
         self.opt = opt
+        logger.info(opt)
+        print.info(opt)
         self.stream_decode_2 = torch.cuda.Stream(
             device=self.opt.rank
         )  # device optional

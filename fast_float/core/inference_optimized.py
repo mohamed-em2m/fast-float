@@ -13,6 +13,8 @@ try:
 except ImportError:
     from models.float.FLOAT import FLOAT
 
+import contextlib
+
 try:
     from fast_float.schemas.base_options import BaseOptions
 except ImportError:
