@@ -171,6 +171,7 @@ class FloatModel:
         nfe,
         seed,
         no_crop,
+        decode_batch_size=0,
     ):
         # Gradio sliders yield floats (sometimes numpy scalars) — normalize
         # to plain Python int/float before anything downstream touches them.
@@ -179,6 +180,19 @@ class FloatModel:
         a_cfg = _coerce_float(a_cfg, 2.0)
         r_cfg = _coerce_float(r_cfg, 1.0)
         e_cfg = _coerce_float(e_cfg, 1.0)
+        dbs = _coerce_int(decode_batch_size, 0)
+
+        # Apply decode batch size override; 0 = Auto (let VRAM tuner decide).
+        # We set / clear on self.opt so the tuner's memoized cache is bypassed
+        # only when an explicit size is requested.
+        if dbs > 0:
+            self.opt.decode_batch_size = dbs
+            # Bust the memoized cache so the new value takes effect immediately.
+            if hasattr(self.agent, "model") and hasattr(self.agent.model, "_decode_bs_cache"):
+                self.agent.model._decode_bs_cache.clear()
+        else:
+            self.opt.decode_batch_size = None
+
         with self.infer_lock:
             return self.agent.run_inference(
                 res_video_path=out_path,
@@ -206,6 +220,7 @@ class FloatModel:
         nfe,
         seed,
         no_crop,
+        decode_batch_size=0,
         progress=gr.Progress(),
     ):
         try:
@@ -244,6 +259,7 @@ class FloatModel:
                 nfe,
                 seed,
                 no_crop,
+                decode_batch_size=decode_batch_size,
             )
             progress(1.0, desc="Complete!")
             # Show only the file name — never leak server-side absolute paths.
@@ -360,6 +376,13 @@ def build_interface(
                             b_seed = gr.Slider(
                                 0, 10000, value=25, step=1, label="Random Seed"
                             )
+                            b_decode_batch = gr.Radio(
+                                choices=["Auto", "1", "2", "4", "8", "16"],
+                                value="Auto",
+                                label="🗂️ Decode Batch Size",
+                                info="Frames decoded per GPU micro-batch. "
+                                     "'Auto' picks the best size for your VRAM.",
+                            )
 
                     with gr.Column(scale=1):
                         gr.Markdown("### 🎛️ Generation Parameters")
@@ -397,6 +420,7 @@ def build_interface(
                         b_nfe,
                         b_seed,
                         b_no_crop,
+                        b_decode_batch,
                     ],
                     outputs=[b_video_out, b_status],
                 )
@@ -471,6 +495,13 @@ def build_interface(
                             )
                             l_e_cfg = gr.Slider(
                                 0.0, 3.0, value=1.0, step=0.1, label="Emotion CFG Scale"
+                            )
+                            l_decode_batch = gr.Radio(
+                                choices=["Auto", "1", "2", "4", "8", "16"],
+                                value="Auto",
+                                label="🗂️ Decode Batch Size",
+                                info="Frames decoded per GPU micro-batch. "
+                                     "'Auto' picks the best size for your VRAM.",
                             )
 
                         l_mic = gr.Audio(
@@ -563,6 +594,7 @@ def build_interface(
                     nfe,
                     seed,
                     no_crop,
+                    decode_batch_size,
                 ):
                     if session is None or not session.running:
                         return gr.update(), session, gr.update()
@@ -622,6 +654,7 @@ def build_interface(
                             nfe=nfe,
                             seed=seed,
                             no_crop=no_crop,
+                            decode_batch_size=decode_batch_size,
                         )
                     except Exception as e:
                         tb = traceback.format_exc()
@@ -664,6 +697,7 @@ def build_interface(
                         l_nfe,
                         l_seed,
                         l_no_crop,
+                        l_decode_batch,
                     ],
                     outputs=[l_video_out, session_state, l_status],
                 )
