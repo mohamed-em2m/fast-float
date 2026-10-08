@@ -80,7 +80,12 @@ import gradio as gr
 logger = setup_logger("float_live_app")
 
 try:
-    from fast_float.core.inference_optimized import InferenceAgent, InferenceOptions
+    from fast_float.core.inference_optimized import (
+        OptimizedInferenceAgent,
+        InferenceOptions,
+    )
+
+    InferenceAgent = OptimizedInferenceAgent
 except ImportError:
     try:
         from core.inference_optimized import InferenceAgent, InferenceOptions
