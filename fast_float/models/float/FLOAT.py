@@ -89,20 +89,9 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict
 
 import torch
-import logging
 
-logger = logging.getLogger(__name__)
 GiB = 1024**3
 _ABORT = object()
-
-
-@dataclass
-class FrameData:
-    """Container for frame data passed between producer and consumer"""
-
-    frame_np: np.ndarray
-    frame_idx: int
-    is_last: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -270,7 +259,6 @@ class StreamingVideoSaver:
         primary = self._cuda_device()
         visible = torch.cuda.device_count()
         want = max(1, int(getattr(self.opt, "ngpus", 1)))
-        logger.info(f"[MULTI-GPU] ngpus={want} and visable gpu {visible}")
         if want > visible:
             print(
                 f"[MULTI-GPU] ngpus={want} requested but only {visible} visible; using {visible}"
@@ -315,7 +303,7 @@ class StreamingVideoSaver:
             if isinstance(out, (tuple, list)):
                 out = out[0]
             return (
-                (out.clamp(-1, 1) * 127.5 + 127.5)
+                (out.float().clamp(-1, 1) * 127.5 + 127.5)
                 .to(torch.uint8)
                 .permute(0, 2, 3, 1)
                 .contiguous()
@@ -465,6 +453,28 @@ class StreamingVideoSaver:
         if e_cfg_scale is None:
             e_cfg_scale = self.opt.e_cfg_scale
         fps = int(getattr(self.opt, "fps", 25))
+
+        # autocast state is thread-local: capture it here, re-enter it in every pipeline thread
+        try:
+            amp_on = torch.is_autocast_enabled("cuda")
+        except TypeError:  # older torch: no device argument
+            amp_on = torch.is_autocast_enabled()
+        try:
+            amp_dtype = torch.get_autocast_dtype("cuda")
+        except AttributeError:
+            amp_dtype = torch.get_autocast_gpu_dtype()
+
+        def with_amp(fn):
+            def run(*a, **k):
+                ctx = (
+                    torch.autocast("cuda", dtype=amp_dtype)
+                    if amp_on
+                    else contextlib.nullcontext()
+                )
+                with ctx:
+                    return fn(*a, **k)
+
+            return run
 
         # ---- per-GPU context: model replica, reference features, tuned profile ----
         ctx = {}
@@ -662,12 +672,12 @@ class StreamingVideoSaver:
                 if proc is not None and proc.poll() is None:
                     proc.kill()
 
-        threads = [threading.Thread(target=producer, name="sampler")]
+        threads = [threading.Thread(target=with_amp(producer), name="sampler")]
         for i, c in ctx.items():
             for k in range(c["n_streams"]):
                 threads.append(
                     threading.Thread(
-                        target=worker,
+                        target=with_amp(worker),
                         args=(c, torch.cuda.Stream(device=c["dev"])),
                         name=f"decode-cuda{i}-{k}",
                     )
@@ -683,6 +693,7 @@ class StreamingVideoSaver:
             raise RuntimeError(f"[{where}] {exc}\n{tb}") from exc
 
         dt = time.perf_counter() - t_start
+        self.last_stats = {"frames": state["frames"], "seconds": dt}
         print(
             f"[DONE] {state['frames']} frames in {dt:.2f}s "
             f"({state['frames'] / dt:.1f} fps end-to-end) -> {video_path}"

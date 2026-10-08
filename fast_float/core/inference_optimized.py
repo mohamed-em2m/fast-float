@@ -575,6 +575,114 @@ class OptimizedInferenceAgent:
         verbose: bool = True,
         benchmark: bool = False,
     ) -> str:
+        timings = {}
+        total_start = time.perf_counter()
+
+        # ---- preprocess ----
+        t0 = time.perf_counter()
+        data = self.data_processor.preprocess(ref_path, audio_path, no_crop=no_crop)
+        timings["preprocess"] = time.perf_counter() - t0
+        if verbose:
+            print(f"> [Done] Preprocess ({timings['preprocess']:.3f}s)")
+
+        gen_kwargs = dict(
+            a_cfg_scale=a_cfg_scale,
+            r_cfg_scale=r_cfg_scale,
+            e_cfg_scale=e_cfg_scale,
+            emo=emo,
+            nfe=nfe,
+            seed=seed,
+        )
+
+        # Autocast: same behaviour as before. Only use_amp_fp16 turns it on
+        # (autocast(dtype=float32) is a no-op on CUDA). stream_pipeline copies this autocast
+        # state into its sampler/decode threads, so wrapping the call here is enough.
+        def make_amp():
+            if getattr(self, "use_amp_fp16", False):
+                return torch.autocast("cuda", dtype=torch.float16)
+            return contextlib.nullcontext()
+
+        def generate(out_path: str) -> str:
+            """Sampling + decoding + ffmpeg encoding + audio mux, fully overlapped."""
+            with make_amp():
+                return self.G_opt.inference_and_save(
+                    data=data,
+                    video_path=out_path,
+                    audio_path=audio_path,
+                    **gen_kwargs,
+                )
+
+        # ---- benchmark (measures the whole generate+encode pipeline) ----
+        if benchmark:
+            warmup_runs, benchmark_runs = 3, 10
+            fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
+            os.close(fd)
+            try:
+                print("Warming up (first run also runs the one-time GPU auto-tune)...")
+                for _ in range(warmup_runs):
+                    generate(tmp_path)
+
+                print(f"Running {benchmark_runs} benchmark iterations...")
+                frames = 0
+                t0 = time.perf_counter()
+                for _ in range(benchmark_runs):
+                    generate(tmp_path)
+                    frames += self.G_opt.last_stats["frames"]
+                elapsed = time.perf_counter() - t0
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+
+            print(
+                f"Average generate+encode time: {elapsed / benchmark_runs * 1000:.2f} ms/run"
+            )
+            print(f"Throughput: {frames / elapsed:.2f} frames/s")
+
+        # ---- actual run ----
+        first_run = getattr(self.G_opt, "_decode_profiles", None) is None
+        t0 = time.perf_counter()
+        res_video_path = generate(res_video_path)
+        timings["generate_and_save"] = time.perf_counter() - t0
+        timings["total"] = time.perf_counter() - total_start
+
+        stats = getattr(self.G_opt, "last_stats", {})
+        frames = stats.get("frames", 0)
+
+        if verbose:
+            gs = timings["generate_and_save"]
+            note = "  (includes one-time GPU auto-tune)" if first_run else ""
+            print(f"> [Done] Generate + save ({gs:.3f}s){note}")
+            print(f"\n{'=' * 50}")
+            print("⏱️  PERFORMANCE SUMMARY")
+            print(f"{'=' * 50}")
+            print(f"  Preprocess:       {timings['preprocess']:>8.3f}s")
+            print(f"  Generate + save:  {gs:>8.3f}s")
+            print(f"  {'─' * 40}")
+            print(f"  Total Time:       {timings['total']:>8.3f}s")
+            if frames:
+                print(f"  Frames:           {frames:>8d}")
+                print(f"  FPS (gen+save):   {frames / gs:>8.2f}")
+            print(f"{'=' * 50}")
+            print(f"> Result saved at {res_video_path}")
+
+        return res_video_path
+
+    @torch.no_grad()
+    def run_inference_old(
+        self,
+        res_video_path: str,
+        ref_path: str,
+        audio_path: str,
+        a_cfg_scale: float = 2.0,
+        r_cfg_scale: float = 1.0,
+        e_cfg_scale: float = 1.0,
+        emo: str = "S2E",
+        nfe: int = 10,
+        no_crop: bool = False,
+        seed: int = 25,
+        verbose: bool = True,
+        benchmark: bool = False,
+    ) -> str:
 
         timings = {}
         total_start = time.time()
