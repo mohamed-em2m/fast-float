@@ -14,11 +14,21 @@ class ColoredFormatter(logging.Formatter):
     reset = "\x1b[0m"
 
     FORMATS = {
-        logging.DEBUG: grey + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s" + reset,
-        logging.INFO: green + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s" + reset,
-        logging.WARNING: yellow + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s" + reset,
-        logging.ERROR: red + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s" + reset,
-        logging.CRITICAL: bold_red + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s" + reset,
+        logging.DEBUG: grey
+        + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+        + reset,
+        logging.INFO: green
+        + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+        + reset,
+        logging.WARNING: yellow
+        + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+        + reset,
+        logging.ERROR: red
+        + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+        + reset,
+        logging.CRITICAL: bold_red
+        + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+        + reset,
     }
 
     def format(self, record: logging.LogRecord) -> str:
@@ -45,7 +55,9 @@ def setup_logger(name: str = "float_fast", level: int = logging.INFO) -> logging
     logging.getLogger("numba").setLevel(logging.WARNING)
     logging.getLogger("numba.core").setLevel(logging.WARNING)
     logging.getLogger("numba.typed").setLevel(logging.WARNING)
-
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("matplotlib").setLevel(logging.WARNING)
     return logger
 
 

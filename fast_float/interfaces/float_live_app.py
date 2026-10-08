@@ -64,6 +64,7 @@ except ImportError:
         def setup_logger(name="float_fast", **_):
             return logging.getLogger(name)
 
+
 logger = setup_logger("float_live_app")
 
 import numpy as np
@@ -154,7 +155,7 @@ class FloatModel:
         r_cfg = _coerce_float(r_cfg, 1.0)
         e_cfg = _coerce_float(e_cfg, 1.0)
         with self.infer_lock:
-            return self.agent.run_inference(
+            return self.agent.inference_and_save(
                 res_video_path=out_path,
                 ref_path=ref_path,
                 audio_path=audio_path,
