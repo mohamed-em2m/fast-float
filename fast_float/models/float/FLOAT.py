@@ -720,7 +720,7 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         super().__init__()
         self.opt = opt
         logger.info(opt)
-        print.info(opt)
+        print(opt)
         self.stream_decode_2 = torch.cuda.Stream(
             device=self.opt.rank
         )  # device optional
