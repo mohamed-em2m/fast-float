@@ -30,9 +30,11 @@ Requires Gradio >= 4.40 (for gr.Timer and streaming gr.Audio input).
 """
 
 import os
+import sys
 import time
 import queue
 import shutil
+import logging
 import tempfile
 import datetime
 import threading
@@ -40,6 +42,29 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+# ---- logging setup -------------------------------------------------------- #
+# Ensure logs are visible regardless of how Gradio captures stdout/stderr.
+# We configure the root logger once here so all child loggers inherit it.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+    force=True,  # override any previously installed root handlers
+)
+
+try:
+    from fast_float.utils.logger import setup_logger
+except ImportError:
+    try:
+        from utils.logger import setup_logger
+    except ImportError:
+        # Fallback: plain logger that still honours the basicConfig above.
+        def setup_logger(name="float_fast", **_):
+            return logging.getLogger(name)
+
+logger = setup_logger("float_live_app")
 
 import numpy as np
 import soundfile as sf
@@ -98,7 +123,7 @@ class FloatModel:
         self.live_dir = os.path.join(self.opt.res_dir, "live_chunks")
         os.makedirs(self.live_dir, exist_ok=True)
 
-        print("Loading FLOAT model...")
+        logger.info("Loading FLOAT model...")
         self.agent = InferenceAgent(self.opt)
         # A lock around inference is the safe default: most diffusion
         # pipelines aren't written to be called concurrently from multiple
@@ -106,7 +131,7 @@ class FloatModel:
         # (e.g. you've wrapped it with its own batching), you can remove
         # this lock to let multiple users' chunks process in parallel.
         self.infer_lock = threading.Lock()
-        print("Model loaded successfully!")
+        logger.info("Model loaded successfully!")
 
     def run(
         self,
@@ -199,7 +224,7 @@ class FloatModel:
             return output_path, f"✅ Saved to: {Path(output_path).name}"
         except Exception as e:
             tb = traceback.format_exc()
-            print(f"❌ Error during generation: {e}\n{tb}")
+            logger.error(f"❌ Error during generation: {e}\n{tb}")
             return None, f"❌ Error during generation: {e}\n\n--- Traceback ---\n{tb}"
 
 
@@ -568,7 +593,7 @@ def build_interface(
                         )
                     except Exception as e:
                         tb = traceback.format_exc()
-                        print(f"❌ Chunk {idx} failed: {e}\n{tb}")
+                        logger.error(f"❌ Chunk {idx} failed: {e}\n{tb}")
                         return (
                             gr.update(),
                             session,
@@ -699,15 +724,15 @@ if __name__ == "__main__":
             username, password = args.auth.split(":", 1)
             auth_tuple = (username, password)
         except ValueError:
-            print("⚠️ Invalid auth format. Use 'username:password'")
+            logger.warning("⚠️ Invalid auth format. Use 'username:password'")
 
-    print("\n" + "=" * 60)
-    print("🚀 Launching FLOAT Gradio Interface (with Live tab)")
-    print("=" * 60)
-    print(f"📍 Server: {args.server_name}:{args.port}")
-    print(f"💾 Results directory: {args.res_dir}")
-    print(f"🤖 Model checkpoint: {args.ckpt_path}")
-    print("=" * 60 + "\n")
+    logger.info("=" * 60)
+    logger.info("🚀 Launching FLOAT Gradio Interface (with Live tab)")
+    logger.info("=" * 60)
+    logger.info(f"📍 Server: {args.server_name}:{args.port}")
+    logger.info(f"💾 Results directory: {args.res_dir}")
+    logger.info(f"🤖 Model checkpoint: {args.ckpt_path}")
+    logger.info("=" * 60)
 
     # Only the results dir may be served over HTTP. Explicitly block the
     # model/checkpoint source folders (and other sensitive dirs) so they
@@ -741,14 +766,15 @@ if __name__ == "__main__":
         launch_kwargs["favicon_path"] = args.favicon_path
     if args.debug:
         launch_kwargs["debug"] = True
+        logging.getLogger().setLevel(logging.DEBUG)  # verbose mode
 
     try:
         if args.queue:
             demo.queue(max_size=args.max_threads)
         demo.launch(**launch_kwargs)
     except KeyboardInterrupt:
-        print("\n\n👋 Shutting down gracefully...")
+        logger.info("👋 Shutting down gracefully...")
     except Exception as e:
-        print(f"\n❌ Error launching interface: {e}")
+        logger.error(f"❌ Error launching interface: {e}")
         if args.debug:
             raise
