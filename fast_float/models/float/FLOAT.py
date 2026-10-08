@@ -90,6 +90,7 @@ from typing import Callable, Dict
 
 import torch
 
+logger = logging.getLogger(__name__)
 GiB = 1024**3
 _ABORT = object()
 
@@ -259,6 +260,9 @@ class StreamingVideoSaver:
         primary = self._cuda_device()
         visible = torch.cuda.device_count()
         want = max(1, int(getattr(self.opt, "ngpus", 1)))
+        logger.info(
+            f"[MULTI-GPU] ngpus={want} requested but only {visible} visible; using {visible}"
+        )
         if want > visible:
             print(
                 f"[MULTI-GPU] ngpus={want} requested but only {visible} visible; using {visible}"
