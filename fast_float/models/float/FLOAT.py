@@ -101,6 +101,7 @@ class DecodeAutoTuner:
         safety=1.3,
         repeats=2,
         verbose=True,
+        opt=None,
     ):
         self.device = device
         self.primary = (
@@ -113,6 +114,7 @@ class DecodeAutoTuner:
         self.safety = safety  # headroom for allocator fragmentation
         self.repeats = repeats
         self.verbose = verbose
+        self.opt = opt
 
     def _budget(self) -> int:
         """Bytes we may spend on decode streams right now (call with this device current)."""
@@ -122,10 +124,10 @@ class DecodeAutoTuner:
             reserve = int(self.reserve_gib * GiB)
         elif self.primary:
             reserve = max(
-                int(1.5 * GiB), int(0.15 * total)
+                int(0.8 * GiB), int(0.08 * total)
             )  # sampler + NVENC + context
         else:
-            reserve = max(int(0.75 * GiB), int(0.08 * total))  # decode only
+            reserve = max(int(0.35 * GiB), int(0.03 * total))  # decode only
         return int(free) - reserve
 
     def _measure(self, fn: Callable[[int], torch.Tensor], b: int):
@@ -176,10 +178,20 @@ class DecodeAutoTuner:
             if not feasible:
                 k = min(results)
                 feasible = {k: results[k]}
-            best = max(f for _, f in feasible.values())
-            chosen = min(
-                k for k, (_, f) in feasible.items() if f >= self.plateau * best
-            )
+
+            opt_bs = getattr(self.opt, "decode_batch_size", None) if self.opt else None
+            if opt_bs is not None and int(opt_bs) > 0:
+                req_bs = int(opt_bs)
+                if req_bs in results:
+                    chosen = req_bs
+                else:
+                    chosen = min(req_bs, max(feasible.keys()))
+            else:
+                best = max(f for _, f in feasible.values())
+                # Use maximum batch size within the throughput plateau to maximize GPU utilization
+                chosen = max(
+                    k for k, (_, f) in feasible.items() if f >= self.plateau * best
+                )
 
             h, w, c = shape
             prof = DecodeProfile(
@@ -321,6 +333,7 @@ class StreamingVideoSaver:
                 max_batch=int(getattr(self.opt, "decode_max_batch", 32)),
                 max_streams=int(getattr(self.opt, "decode_max_streams", 3)),
                 reserve_gib=getattr(self.opt, "decode_reserve_gib", None),
+                opt=self.opt,
             )
             dim = self.opt.dim_w
 
@@ -477,8 +490,13 @@ class StreamingVideoSaver:
             tuner, prof = self._get_decode_profile(dev, primary, ae, feats, s_r.dtype)
             ctx[dev.index] = dict(dev=dev, ae=ae, feats=feats, tuner=tuner, prof=prof)
 
-        # one micro-batch size for everyone (all smaller sizes were already benchmarked per GPU)
-        B = min(c["prof"].batch_size for c in ctx.values())
+        # Select micro-batch size: user override takes precedence, otherwise use maximum tuned size
+        # to maximize GPU utilization and tensor core saturation.
+        override_bs = getattr(self.opt, "decode_batch_size", None)
+        if override_bs is not None and int(override_bs) > 0:
+            B = int(override_bs)
+        else:
+            B = max(c["prof"].batch_size for c in ctx.values())
         override = int(getattr(self.opt, "decode_streams", 0))
         for c in ctx.values():
             c["n_streams"] = override or c["tuner"].num_streams(c["prof"], B)
@@ -504,7 +522,7 @@ class StreamingVideoSaver:
         work_q: queue.Queue = queue.Queue()  # latents only: tiny, unbounded is fine
         done_q: queue.Queue = queue.Queue()
         pool: queue.Queue = queue.Queue()  # pinned host buffers = backpressure
-        for _ in range(n_workers * 2 + 2):
+        for _ in range(max(16, n_workers * 4 + 4)):
             pool.put(torch.empty((B, H, W, C), dtype=torch.uint8, pin_memory=True))
 
         def fail(where, e):
@@ -518,19 +536,19 @@ class StreamingVideoSaver:
                 primary_stream = torch.cuda.current_stream(primary)
 
                 def emit_one(lat_slice, n_valid):
-                    """Record a per-item event and (if needed) copy latents to host.
+                    """Record a per-item event and (if needed) copy latents to host non-blocking.
 
                     Each work item gets its own Event so workers on secondary GPUs
                     can call ev.synchronize() before touching lat_host without
                     incorrectly racing against the *next* producer step.
                     """
+                    if need_host_latents and torch.cuda.is_available():
+                        lat_host = torch.empty(lat_slice.shape, dtype=lat_slice.dtype, pin_memory=True)
+                        lat_host.copy_(lat_slice, non_blocking=True)
+                    else:
+                        lat_host = None
                     ev = torch.cuda.Event()
                     ev.record(primary_stream)
-                    lat_host = (
-                        lat_slice.cpu().pin_memory()
-                        if (need_host_latents and torch.cuda.is_available())
-                        else (lat_slice.cpu() if need_host_latents else None)
-                    )
                     return ev, lat_host
 
                 seq, carry = 0, None
@@ -757,21 +775,33 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         r_x = self.motion_autoencoder.dec.direction(x_r_lambda)
         return r_x
 
+    def clear_decode_cache(self):
+        """Clears memoized batch size and tuner profiles so GPU VRAM is re-evaluated."""
+        if hasattr(self, "_decode_bs_cache") and self._decode_bs_cache:
+            self._decode_bs_cache.clear()
+        if hasattr(self, "_decode_profiles") and self._decode_profiles:
+            self._decode_profiles.clear()
+        if hasattr(self, "_decode_tuners") and self._decode_tuners:
+            self._decode_tuners.clear()
+
     def get_optimal_decode_batch_size(self, device=None) -> int:
         """Automatically select optimal frame decode batch size based on GPU memory.
+        Maximized for high GPU utilization and throughput.
 
         The result is memoized per device index in ``self._decode_bs_cache`` so that
         ``torch.cuda.mem_get_info`` is only called once per device, not once per chunk.
 
         Tiers (total VRAM / free VRAM):
-            * >= 22 GiB total & >= 8 GiB free  (RTX 3090/4090, A100):  batch 16
-            * >= 11 GiB total & >= 4 GiB free  (RTX 3060 12G, 4070/4080): batch 8
-            * >=  6 GiB total & >= 2 GiB free  (RTX 2060, 3060 8G, 4060): batch 4
-            * >=  1 GiB free                                              : batch 2
-            * otherwise / CPU                                              : batch 1
+            * >= 6 GiB free OR (>= 14 GiB total & >= 3.8 GiB free): batch 16
+            * >= 3 GiB free OR (>= 10 GiB total & >= 1.8 GiB free): batch 8
+            * >= 1.2 GiB free OR >= 6 GiB total                   : batch 4
+            * >= 0.7 GiB free                                     : batch 2
+            * otherwise / CPU                                     : batch 1
         """
         if hasattr(self, "opt") and getattr(self.opt, "decode_batch_size", None) is not None:
-            return max(1, int(self.opt.decode_batch_size))
+            val = int(self.opt.decode_batch_size)
+            if val > 0:
+                return val
 
         if not torch.cuda.is_available():
             return 4
@@ -800,13 +830,15 @@ class FLOAT(BaseModel, StreamingVideoSaver):
             free_gib = free_b / gib
             total_gib = total_b / gib
 
-            if total_gib >= 22.0 and free_gib >= 8.0:
+            # StyleDecoder decoding takes ~20-40 MB per frame (e.g. ~300-500 MB for batch 16).
+            # When ~5 GiB free out of 15 GiB is available, batch 16 is easily accommodated!
+            if free_gib >= 6.0 or (total_gib >= 14.0 and free_gib >= 3.8):
                 bs = 16
-            elif total_gib >= 11.0 and free_gib >= 4.0:
+            elif free_gib >= 3.0 or (total_gib >= 10.0 and free_gib >= 1.8):
                 bs = 8
-            elif total_gib >= 6.0 and free_gib >= 2.0:
+            elif free_gib >= 1.2 or total_gib >= 6.0:
                 bs = 4
-            elif free_gib >= 1.0:
+            elif free_gib >= 0.7:
                 bs = 2
             else:
                 bs = 1
@@ -952,12 +984,15 @@ class FLOAT(BaseModel, StreamingVideoSaver):
     ) -> torch.Tensor:
         rank = getattr(self.opt, "rank", 0)
         device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
-        stream_ctx = (
-            torch.cuda.stream(self.stream_encode)
-            if (self.stream_encode is not None and torch.cuda.is_available())
+        cur_stream = torch.cuda.current_stream(device) if torch.cuda.is_available() else None
+        encode_stream = self.stream_encode if (self.stream_encode is not None and torch.cuda.is_available()) else None
+
+        encode_ctx = (
+            torch.cuda.stream(encode_stream)
+            if encode_stream is not None
             else contextlib.nullcontext()
         )
-        with stream_ctx:
+        with encode_ctx:
             r_s, a = data["r_s"], data["a"]
             if a.ndim == 1:
                 a = a.unsqueeze(0)
@@ -1029,162 +1064,168 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                 if we.shape[0] != B and we.shape[0] == 1:
                     we = we.expand(B, -1, -1)
 
-            decoded_length = 0
+        # Synchronize sampling stream so ODE starts with audio & emotion features ready.
+        # This keeps encoding isolated to encode_stream and lets ODE sampling run on cur_stream
+        # without interfering with or stalling concurrent decode streams.
+        if cur_stream is not None and encode_stream is not None and cur_stream != encode_stream:
+            cur_stream.wait_stream(encode_stream)
+
+        decoded_length = 0
+
+        # ------------------------------------------------------------------
+        # Pre-build CFG constant tensors that are invariant across ALL ODE
+        # steps and ALL chunks (ref / emotion never change during inference).
+        # Avoids 2 × torch.cat allocations per ODE step for free.
+        # ------------------------------------------------------------------
+        _cfg_active = (
+            a_cfg_scale != 1.0 or r_cfg_scale != 1.0 or e_cfg_scale != 1.0
+        )
+        _ref_cat = None
+        _emotion_cat = None
+        if _cfg_active and r_s is not None:
+            # Mirror the shape normalisation that forward_with_cfv would do.
+            wr_ready = r_s
+            if wr_ready.ndim == 1:
+                wr_ready = wr_ready.unsqueeze(0).unsqueeze(1)
+            elif wr_ready.ndim == 2:
+                wr_ready = wr_ready.unsqueeze(1)
+            if wr_ready.shape[0] != B and wr_ready.shape[0] == 1:
+                wr_ready = wr_ready.expand(B, -1, -1)
+            _ref_cat = torch.cat([wr_ready, wr_ready, wr_ready], dim=0)
+
+        if _cfg_active:
+            # we is already shaped [B, 1, dim_e] at this point.
+            we_ready = we
+            if we_ready.ndim == 1:
+                we_ready = we_ready.unsqueeze(0).unsqueeze(1)
+            elif we_ready.ndim == 2:
+                we_ready = we_ready.unsqueeze(1)
+            if we_ready.shape[0] != B and we_ready.shape[0] == 1:
+                we_ready = we_ready.expand(B, -1, -1)
+            _null_we = torch.zeros_like(we_ready)
+            _emotion_cat = torch.cat([_null_we, we_ready, _null_we], dim=0)
+
+        # sampling chunk by chunk
+        for t in range(0, int(math.ceil(T / self.num_frames_for_clip))):
+            if getattr(self.opt, "fix_noise_seed", False):
+                seed = getattr(self.opt, "seed", 25) if seed is None else seed
+                g = torch.Generator(device=device)
+                g.manual_seed(seed)
+                x0 = torch.randn(
+                    B,
+                    self.num_frames_for_clip,
+                    self.opt.dim_w,
+                    device=device,
+                    generator=g,
+                )
+            else:
+                x0 = torch.randn(
+                    B,
+                    self.num_frames_for_clip,
+                    self.opt.dim_w,
+                    device=device,
+                )
+
+            if t == 0:  # should define the previous
+                prev_x_t = torch.zeros(
+                    B, self.num_prev_frames, self.opt.dim_w, device=device
+                )
+                prev_wa_t = torch.zeros(
+                    B, self.num_prev_frames, self.opt.dim_w, device=device
+                )
+            else:
+                prev_x_t = sample_t[:, -self.num_prev_frames :]
+                prev_wa_t = wa_t[:, -self.num_prev_frames :]
+
+            wa_t = wa[
+                :, t * self.num_frames_for_clip : (t + 1) * self.num_frames_for_clip
+            ]
+            if wa_t.shape[1] < self.num_frames_for_clip:  # padding by replicate
+                wa_t = F.pad(
+                    wa_t,
+                    (0, 0, 0, self.num_frames_for_clip - wa_t.shape[1]),
+                    mode="replicate",
+                )
 
             # ------------------------------------------------------------------
-            # Pre-build CFG constant tensors that are invariant across ALL ODE
-            # steps and ALL chunks (ref / emotion never change during inference).
-            # Avoids 2 × torch.cat allocations per ODE step for free.
+            # Pre-build per-chunk CFG tensors (invariant within one ODE solve).
+            # audio_cat / prev_x_cat / prev_wa_cat change between chunks but
+            # are constant across the NFE ODE steps inside a single chunk.
             # ------------------------------------------------------------------
-            _cfg_active = (
-                a_cfg_scale != 1.0 or r_cfg_scale != 1.0 or e_cfg_scale != 1.0
-            )
-            _ref_cat = None
-            _emotion_cat = None
-            if _cfg_active and r_s is not None:
-                # Mirror the shape normalisation that forward_with_cfv would do.
-                wr_ready = r_s
-                if wr_ready.ndim == 1:
-                    wr_ready = wr_ready.unsqueeze(0).unsqueeze(1)
-                elif wr_ready.ndim == 2:
-                    wr_ready = wr_ready.unsqueeze(1)
-                if wr_ready.shape[0] != B and wr_ready.shape[0] == 1:
-                    wr_ready = wr_ready.expand(B, -1, -1)
-                _ref_cat = torch.cat([wr_ready, wr_ready, wr_ready], dim=0)
-
+            _audio_cat = None
+            _prev_x_cat = None
+            _prev_wa_cat = None
             if _cfg_active:
-                # we is already shaped [B, 1, dim_e] at this point.
-                we_ready = we
-                if we_ready.ndim == 1:
-                    we_ready = we_ready.unsqueeze(0).unsqueeze(1)
-                elif we_ready.ndim == 2:
-                    we_ready = we_ready.unsqueeze(1)
-                if we_ready.shape[0] != B and we_ready.shape[0] == 1:
-                    we_ready = we_ready.expand(B, -1, -1)
-                _null_we = torch.zeros_like(we_ready)
-                _emotion_cat = torch.cat([_null_we, we_ready, _null_we], dim=0)
+                wa_t_exp = wa_t
+                if wa_t_exp.shape[0] != B and wa_t_exp.shape[0] == 1:
+                    wa_t_exp = wa_t_exp.expand(B, -1, -1)
+                _null_wa = torch.zeros_like(wa_t_exp)
+                _audio_cat = torch.cat([_null_wa, wa_t_exp, wa_t_exp], dim=0)
 
-            # sampling chunk by chunk
-            for t in range(0, int(math.ceil(T / self.num_frames_for_clip))):
-                if getattr(self.opt, "fix_noise_seed", False):
-                    seed = getattr(self.opt, "seed", 25) if seed is None else seed
-                    g = torch.Generator(device=device)
-                    g.manual_seed(seed)
-                    x0 = torch.randn(
-                        B,
-                        self.num_frames_for_clip,
-                        self.opt.dim_w,
-                        device=device,
-                        generator=g,
-                    )
-                else:
-                    x0 = torch.randn(
-                        B,
-                        self.num_frames_for_clip,
-                        self.opt.dim_w,
-                        device=device,
-                    )
-
-                if t == 0:  # should define the previous
-                    prev_x_t = torch.zeros(
-                        B, self.num_prev_frames, self.opt.dim_w, device=device
-                    )
-                    prev_wa_t = torch.zeros(
-                        B, self.num_prev_frames, self.opt.dim_w, device=device
-                    )
-                else:
-                    prev_x_t = sample_t[:, -self.num_prev_frames :]
-                    prev_wa_t = wa_t[:, -self.num_prev_frames :]
-
-                wa_t = wa[
-                    :, t * self.num_frames_for_clip : (t + 1) * self.num_frames_for_clip
-                ]
-                if wa_t.shape[1] < self.num_frames_for_clip:  # padding by replicate
-                    wa_t = F.pad(
-                        wa_t,
-                        (0, 0, 0, self.num_frames_for_clip - wa_t.shape[1]),
-                        mode="replicate",
-                    )
-
-                # ------------------------------------------------------------------
-                # Pre-build per-chunk CFG tensors (invariant within one ODE solve).
-                # audio_cat / prev_x_cat / prev_wa_cat change between chunks but
-                # are constant across the NFE ODE steps inside a single chunk.
-                # ------------------------------------------------------------------
-                _audio_cat = None
-                _prev_x_cat = None
-                _prev_wa_cat = None
-                if _cfg_active:
-                    wa_t_exp = wa_t
-                    if wa_t_exp.shape[0] != B and wa_t_exp.shape[0] == 1:
-                        wa_t_exp = wa_t_exp.expand(B, -1, -1)
-                    _null_wa = torch.zeros_like(wa_t_exp)
-                    _audio_cat = torch.cat([_null_wa, wa_t_exp, wa_t_exp], dim=0)
-
-                    _prev_x_cat = torch.cat(
-                        [prev_x_t, prev_x_t, prev_x_t], dim=0
-                    )
-                    _prev_wa_cat = torch.cat(
-                        [prev_wa_t, prev_wa_t, prev_wa_t], dim=0
-                    )
-
-                def sample_chunk(tt, zt,
-                                 _ac=_audio_cat, _rc=_ref_cat, _ec=_emotion_cat,
-                                 _pxc=_prev_x_cat, _pwc=_prev_wa_cat):
-                    out = self.fmt.forward_with_cfv(
-                        t=tt.unsqueeze(0),
-                        x=zt,
-                        wa=wa_t,
-                        wr=r_s,
-                        we=we,
-                        prev_x=prev_x_t,
-                        prev_wa=prev_wa_t,
-                        a_cfg_scale=a_cfg_scale,
-                        r_cfg_scale=r_cfg_scale,
-                        e_cfg_scale=e_cfg_scale,
-                        _audio_cat=_ac,
-                        _ref_cat=_rc,
-                        _emotion_cat=_ec,
-                        _prev_x_cat=_pxc,
-                        _prev_wa_cat=_pwc,
-                    )
-                    out_current = out[:, self.num_prev_frames :]
-                    return out_current
-
-                # solve ODE
-                if odeint is None:
-                    raise ImportError("torchdiffeq is required for ODE sampling. Install with: pip install torchdiffeq")
-                trajectory_t = odeint(sample_chunk, x0, time, **self.odeint_kwargs)
-                sample_t = trajectory_t[-1]
-
-                # Trim to exact length T on the last chunk
-                frames_remaining = T - decoded_length
-                if frames_remaining < sample_t.shape[1]:
-                    sample_t_trim = sample_t[:, :frames_remaining]
-                else:
-                    sample_t_trim = sample_t
-                samples_len = sample_t_trim.shape[1]
-                decoded_length += samples_len
-
-                # Add reference and yield chunk
-                s_r_b = (
-                    s_r.unsqueeze(1)
-                    if (s_r is not None and s_r.ndim == 2)
-                    else s_r
+                _prev_x_cat = torch.cat(
+                    [prev_x_t, prev_x_t, prev_x_t], dim=0
                 )
-                s_r_d_t = (
-                    (s_r_b + sample_t_trim)
-                    if s_r_b is not None
-                    else sample_t_trim
+                _prev_wa_cat = torch.cat(
+                    [prev_wa_t, prev_wa_t, prev_wa_t], dim=0
                 )
-                if B == 1:
-                    yield s_r_d_t.squeeze(0)  # [T, dim_w]
-                else:
-                    yield s_r_d_t  # [B, T, dim_w]
 
-                # Stop if we've reached the target length
-                if decoded_length >= T:
-                    break
+            def sample_chunk(tt, zt,
+                             _ac=_audio_cat, _rc=_ref_cat, _ec=_emotion_cat,
+                             _pxc=_prev_x_cat, _pwc=_prev_wa_cat):
+                out = self.fmt.forward_with_cfv(
+                    t=tt.unsqueeze(0),
+                    x=zt,
+                    wa=wa_t,
+                    wr=r_s,
+                    we=we,
+                    prev_x=prev_x_t,
+                    prev_wa=prev_wa_t,
+                    a_cfg_scale=a_cfg_scale,
+                    r_cfg_scale=r_cfg_scale,
+                    e_cfg_scale=e_cfg_scale,
+                    _audio_cat=_ac,
+                    _ref_cat=_rc,
+                    _emotion_cat=_ec,
+                    _prev_x_cat=_pxc,
+                    _prev_wa_cat=_pwc,
+                )
+                out_current = out[:, self.num_prev_frames :]
+                return out_current
+
+            # solve ODE
+            if odeint is None:
+                raise ImportError("torchdiffeq is required for ODE sampling. Install with: pip install torchdiffeq")
+            trajectory_t = odeint(sample_chunk, x0, time, **self.odeint_kwargs)
+            sample_t = trajectory_t[-1]
+
+            # Trim to exact length T on the last chunk
+            frames_remaining = T - decoded_length
+            if frames_remaining < sample_t.shape[1]:
+                sample_t_trim = sample_t[:, :frames_remaining]
+            else:
+                sample_t_trim = sample_t
+            samples_len = sample_t_trim.shape[1]
+            decoded_length += samples_len
+
+            # Add reference and yield chunk
+            s_r_b = (
+                s_r.unsqueeze(1)
+                if (s_r is not None and s_r.ndim == 2)
+                else s_r
+            )
+            s_r_d_t = (
+                (s_r_b + sample_t_trim)
+                if s_r_b is not None
+                else sample_t_trim
+            )
+            if B == 1:
+                yield s_r_d_t.squeeze(0)  # [T, dim_w]
+            else:
+                yield s_r_d_t  # [B, T, dim_w]
+
+            # Stop if we've reached the target length
+            if decoded_length >= T:
+                break
 
     @torch.no_grad()
     def inference(

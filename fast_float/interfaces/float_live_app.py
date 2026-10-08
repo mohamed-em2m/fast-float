@@ -185,13 +185,17 @@ class FloatModel:
         # Apply decode batch size override; 0 = Auto (let VRAM tuner decide).
         # We set / clear on self.opt so the tuner's memoized cache is bypassed
         # only when an explicit size is requested.
+        target_model = getattr(self.agent, "G_opt", getattr(self.agent, "model", None))
         if dbs > 0:
             self.opt.decode_batch_size = dbs
-            # Bust the memoized cache so the new value takes effect immediately.
-            if hasattr(self.agent, "model") and hasattr(self.agent.model, "_decode_bs_cache"):
-                self.agent.model._decode_bs_cache.clear()
         else:
             self.opt.decode_batch_size = None
+
+        if target_model is not None:
+            if hasattr(target_model, "clear_decode_cache"):
+                target_model.clear_decode_cache()
+            elif hasattr(target_model, "_decode_bs_cache"):
+                target_model._decode_bs_cache.clear()
 
         with self.infer_lock:
             return self.agent.run_inference(
