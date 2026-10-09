@@ -303,12 +303,9 @@ class StreamingVideoSaver:
             )  # same call as decode_latent_into_image
             if isinstance(out, (tuple, list)):
                 out = out[0]
-            return (
-                (out.float().clamp(-1, 1) * 127.5 + 127.5)
-                .to(torch.uint8)
-                .permute(0, 2, 3, 1)
-                .contiguous()
-            )
+            out = out.float()
+            out = out.add_(1.0).mul_(127.5).clamp_(0.0, 255.0).to(torch.uint8)
+            return out.permute(0, 2, 3, 1).contiguous()
         except torch.cuda.OutOfMemoryError:
             if not allow_split or b <= 1:
                 raise
@@ -517,8 +514,7 @@ class StreamingVideoSaver:
         # ---- shared state ----
         stop = threading.Event()
         errors = []
-        state = {"total": None, "frames": 0, "next_alloc": 0}
-        cond = threading.Condition()
+        state = {"total": None, "frames": 0}
         work_q: queue.Queue = queue.Queue()  # latents only: tiny, unbounded is fine
         done_q: queue.Queue = queue.Queue()
         pool: queue.Queue = queue.Queue()  # pinned host buffers = backpressure
@@ -529,7 +525,7 @@ class StreamingVideoSaver:
             errors.append((where, e, traceback.format_exc()))
             stop.set()
 
-        # ---- producer: ODE sampling on the primary GPU, re-batched to fixed micro-batches ----
+        # ---- producer: ODE sampling on primary GPU, immediately dispatched to fixed micro-batches ----
         def producer():
             try:
                 torch.cuda.set_device(primary)
@@ -551,7 +547,7 @@ class StreamingVideoSaver:
                     ev.record(primary_stream)
                     return ev, lat_host
 
-                seq, carry = 0, None
+                seq = 0
                 for chunk in self.sample(
                     data,
                     a_cfg_scale=a_cfg_scale,
@@ -565,27 +561,18 @@ class StreamingVideoSaver:
                     if stop.is_set():
                         return
                     lat = chunk.reshape(-1, chunk.shape[-1])
-                    if carry is not None:
-                        lat = torch.cat([carry, lat], 0)
-                        carry = None
-                    n_full = (lat.shape[0] // B) * B
-                    if n_full:
-                        for i in range(0, n_full, B):
-                            # Each micro-batch gets its own event + host copy.
-                            sl = lat[i : i + B]
-                            ev, lat_host = emit_one(sl, B)
-                            work_q.put((seq, sl, lat_host, B, ev))
-                            seq += 1
-                    if n_full < lat.shape[0]:
-                        carry = lat[n_full:]
-                if carry is not None and carry.shape[0]:
-                    n = carry.shape[0]
-                    padded = torch.cat(
-                        [carry, carry[-1:].expand(B - n, -1)], 0
-                    )  # keep fixed shape
-                    ev, lat_host = emit_one(padded, n)
-                    work_q.put((seq, padded, lat_host, n, ev))
-                    seq += 1
+                    n_total = lat.shape[0]
+                    # Immediately emit ALL frames in this chunk so decoder never starves.
+                    for i in range(0, n_total, B):
+                        sl = lat[i : i + B]
+                        n_valid = sl.shape[0]
+                        if n_valid < B:
+                            # Pad remainder to fixed batch size B to maintain uniform pinned host buffer shape
+                            sl = torch.cat([sl, sl[-1:].expand(B - n_valid, -1)], 0)
+                        ev, lat_host = emit_one(sl, n_valid)
+                        work_q.put((seq, sl, lat_host, n_valid, ev))
+                        seq += 1
+
                 state["total"] = seq
             except BaseException as e:  # noqa: BLE001
                 fail("producer", e)
@@ -606,16 +593,9 @@ class StreamingVideoSaver:
                             return
                         seq, lat_gpu, lat_host, n_valid, ev = item
 
-                        # take buffers strictly in sequence order -> no pool deadlock
-                        with cond:
-                            while state["next_alloc"] != seq and not stop.is_set():
-                                cond.wait(0.1)
                         buf = _qget(pool, stop)
                         if buf is _ABORT:
                             return
-                        with cond:
-                            state["next_alloc"] += 1
-                            cond.notify_all()
 
                         with torch.cuda.stream(stream):
                             if is_primary:
@@ -636,8 +616,10 @@ class StreamingVideoSaver:
                             buf[:n_valid].copy_(u8[:n_valid], non_blocking=True)
                             done = torch.cuda.Event()
                             done.record(stream)
-                        done.synchronize()  # blocks this thread only; CUDA stream continues
-                        done_q.put((seq, buf, n_valid))
+
+                        # Do NOT call done.synchronize() here to avoid stalling the worker
+                        # thread and starving the GPU stream. The writer synchronizes before reading buf.
+                        done_q.put((seq, buf, n_valid, done))
             except BaseException as e:  # noqa: BLE001
                 fail(f"decode_worker[{dev}]", e)
 
@@ -656,12 +638,14 @@ class StreamingVideoSaver:
                     if total is not None and nxt >= total:
                         break
                     try:
-                        seq, buf, n = done_q.get(timeout=0.1)
+                        seq, buf, n, done = done_q.get(timeout=0.1)
                     except queue.Empty:
                         continue
-                    pending[seq] = (buf, n)
+                    pending[seq] = (buf, n, done)
                     while nxt in pending:
-                        buf, n = pending.pop(nxt)
+                        buf, n, done = pending.pop(nxt)
+                        if done is not None:
+                            done.synchronize()
                         proc.stdin.write(buf[:n].numpy().reshape(-1))
                         state["frames"] += n
                         pool.put(buf)
@@ -1228,7 +1212,7 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                 break
 
     @torch.no_grad()
-    def inference(
+    def inference_stream(
         self,
         data: dict,
         a_cfg_scale=None,
@@ -1237,7 +1221,11 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         emo=None,
         nfe=10,
         seed=None,
-    ) -> dict:
+    ):
+        """Generator that streams sampling latents sequentially and decodes them concurrently
+        on dedicated CUDA stream(s), yielding each decoded video chunk [T_chunk, 3, H, W]
+        (or [B, T_chunk, 3, H, W]) as soon as it finishes decoding.
+        """
         rank = getattr(self.opt, "rank", 0)
         device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
         primary = torch.device(device)
@@ -1273,69 +1261,182 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         if e_cfg_scale is None:
             e_cfg_scale = getattr(self.opt, "e_cfg_scale", 1.0)
 
-        try:
-            # Check for multi-GPU decode support
-            if torch.cuda.is_available():
-                _, devs = self._decode_devices()
+        # Multi-GPU / multi-stream decode support
+        if torch.cuda.is_available():
+            _, devs = self._decode_devices()
+        else:
+            devs = [primary]
+
+        gpu_ctx = []
+        for dev in devs:
+            ae = self._get_ae(dev, primary)
+            is_prim = (
+                dev == primary
+                or (
+                    dev.index is not None
+                    and primary.index is not None
+                    and dev.index == primary.index
+                )
+            )
+            feats = (
+                s_r_feats
+                if is_prim
+                else [f.to(dev) for f in s_r_feats]
+            )
+            if is_prim:
+                prim_streams = [
+                    st for st in (self.stream_decode, self.stream_decode_2)
+                    if st is not None
+                ]
+                if not prim_streams and torch.cuda.is_available():
+                    prim_streams = [torch.cuda.Stream(device=dev)]
+                for st in prim_streams:
+                    gpu_ctx.append((dev, ae, feats, st))
             else:
-                devs = [primary]
-
-            # Setup decode workers context
-            gpu_ctx = []
-            for dev in devs:
-                ae = self._get_ae(dev, primary)
-                is_prim = (
-                    dev == primary
-                    or (
-                        dev.index is not None
-                        and primary.index is not None
-                        and dev.index == primary.index
-                    )
+                st = (
+                    torch.cuda.Stream(device=dev)
+                    if torch.cuda.is_available()
+                    else None
                 )
-                feats = (
-                    s_r_feats
-                    if is_prim
-                    else [f.to(dev) for f in s_r_feats]
-                )
-                stream = (
-                    self.stream_decode
-                    if (self.stream_decode is not None and is_prim)
-                    else (
-                        torch.cuda.Stream(device=dev)
-                        if torch.cuda.is_available()
-                        else None
-                    )
-                )
-                gpu_ctx.append((dev, ae, feats, stream))
+                gpu_ctx.append((dev, ae, feats, st))
 
-            num_devs = len(gpu_ctx)
-            decode_results = []
-            dev_idx = 0
-            is_batched = (B > 1)
+        num_devs = len(gpu_ctx)
 
-            for frame_latent in self.sample(
-                data,
-                a_cfg_scale=a_cfg_scale,
-                r_cfg_scale=r_cfg_scale,
-                e_cfg_scale=e_cfg_scale,
-                emo=emo,
-                nfe=nfe,
-                seed=seed,
-                s_r=s_r,
-            ):
+        # Synchronize decode streams with initial reference features
+        if torch.cuda.is_available():
+            init_ev = torch.cuda.Event()
+            init_ev.record(torch.cuda.current_stream(primary))
+            for _, _, _, st in gpu_ctx:
+                if st is not None and st != torch.cuda.current_stream(primary):
+                    st.wait_event(init_ev)
+
+        # Autocast state is thread-local: capture to re-enter inside producer thread
+        try:
+            amp_on = torch.is_autocast_enabled("cuda")
+        except TypeError:
+            amp_on = torch.is_autocast_enabled()
+        try:
+            amp_dtype = torch.get_autocast_dtype("cuda")
+        except AttributeError:
+            amp_dtype = torch.get_autocast_gpu_dtype()
+
+        def with_amp(fn):
+            def run(*args, **kwargs):
+                ctx = (
+                    torch.autocast("cuda", dtype=amp_dtype)
+                    if amp_on
+                    else contextlib.nullcontext()
+                )
+                with ctx:
+                    return fn(*args, **kwargs)
+
+            return run
+
+        # Producer-consumer queue for streaming latents immediately to decode streams
+        work_q = queue.Queue(maxsize=max(2, num_devs * 2))
+        stop_event = threading.Event()
+        prod_error = []
+
+        def producer():
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.set_device(primary)
+                    prod_stream = torch.cuda.current_stream(primary)
+                else:
+                    prod_stream = None
+
+                seq = 0
+                for frame_latent in self.sample(
+                    data,
+                    a_cfg_scale=a_cfg_scale,
+                    r_cfg_scale=r_cfg_scale,
+                    e_cfg_scale=e_cfg_scale,
+                    emo=emo,
+                    nfe=nfe,
+                    seed=seed,
+                    s_r=s_r,
+                ):
+                    if stop_event.is_set():
+                        break
+
+                    ev = None
+                    if prod_stream is not None:
+                        ev = torch.cuda.Event()
+                        ev.record(prod_stream)
+
+                    while not stop_event.is_set():
+                        try:
+                            work_q.put((seq, frame_latent, ev), timeout=0.1)
+                            break
+                        except queue.Full:
+                            continue
+                    seq += 1
+
+                while not stop_event.is_set():
+                    try:
+                        work_q.put((None, None, None), timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+            except BaseException as e:
+                prod_error.append((e, traceback.format_exc()))
+                while not stop_event.is_set():
+                    try:
+                        work_q.put(("ERROR", None, None), timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+
+        prod_thread = threading.Thread(
+            target=with_amp(producer), name="sampler_producer", daemon=True
+        )
+        prod_thread.start()
+
+        dev_idx = 0
+        cur = (
+            torch.cuda.current_stream(device=primary)
+            if torch.cuda.is_available()
+            else None
+        )
+
+        try:
+            while True:
+                try:
+                    seq, frame_latent, ev = work_q.get(timeout=0.1)
+                except queue.Empty:
+                    if not prod_thread.is_alive() and work_q.empty():
+                        break
+                    continue
+
+                if seq == "ERROR":
+                    if prod_error:
+                        err, tb = prod_error[0]
+                        raise RuntimeError(f"Error in sampling producer thread:\n{tb}") from err
+                    raise RuntimeError("Error in sampling producer thread")
+
+                if seq is None or frame_latent is None:
+                    break
+
                 dev, ae, feats, stream = gpu_ctx[dev_idx % num_devs]
                 dev_idx += 1
-                lat = (
-                    frame_latent.to(dev, non_blocking=True)
-                    if dev != primary
-                    else frame_latent
-                )
+
                 ctx_mgr = (
                     torch.cuda.stream(stream)
                     if (stream is not None and torch.cuda.is_available())
                     else contextlib.nullcontext()
                 )
                 with ctx_mgr:
+                    if stream is not None and ev is not None:
+                        stream.wait_event(ev)
+
+                    lat = (
+                        frame_latent.to(dev, non_blocking=True)
+                        if dev != primary
+                        else frame_latent
+                    )
+                    if stream is not None and torch.cuda.is_available():
+                        lat.record_stream(stream)
+
                     out = self._decode_latent_batched(
                         ae,
                         lat,
@@ -1347,18 +1448,51 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                         out = out.to(device=primary, non_blocking=True)
                     elif out.device != primary:
                         out = out.to(device=primary, non_blocking=True)
-                    decode_results.append((out, stream))
+
+                    done_ev = None
+                    if stream is not None and torch.cuda.is_available():
+                        done_ev = torch.cuda.Event()
+                        done_ev.record(stream)
+
+                if cur is not None:
+                    if done_ev is not None:
+                        cur.wait_event(done_ev)
+                    elif stream is not None:
+                        cur.wait_stream(stream)
+
+                yield out
+        finally:
+            stop_event.set()
+            prod_thread.join(timeout=2.0)
+
+    @torch.no_grad()
+    def inference(
+        self,
+        data: dict,
+        a_cfg_scale=None,
+        r_cfg_scale=None,
+        e_cfg_scale=None,
+        emo=None,
+        nfe=10,
+        seed=None,
+    ) -> dict:
+        try:
+            s, a = data["s"], data["a"]
+            B_s = s.shape[0] if s.ndim >= 4 else 1
+            B_a = a.shape[0] if a.ndim >= 2 else 1
+            is_batched = max(B_s, B_a) > 1
 
             stacked_list = []
-            cur = (
-                torch.cuda.current_stream(device=primary)
-                if torch.cuda.is_available()
-                else None
-            )
-            for out_tensor, stream in decode_results:
-                if cur is not None and stream is not None:
-                    cur.wait_stream(stream)
-                stacked_list.append(out_tensor)
+            for chunk in self.inference_stream(
+                data=data,
+                a_cfg_scale=a_cfg_scale,
+                r_cfg_scale=r_cfg_scale,
+                e_cfg_scale=e_cfg_scale,
+                emo=emo,
+                nfe=nfe,
+                seed=seed,
+            ):
+                stacked_list.append(chunk)
 
             if is_batched:
                 d_hat = torch.cat(stacked_list, dim=1)  # [B, total_T, 3, H, W]
