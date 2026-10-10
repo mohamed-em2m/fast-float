@@ -528,7 +528,18 @@ class StreamingVideoSaver:
             errors.append((where, e, traceback.format_exc()))
             stop.set()
 
-        # ---- producer: ODE sampling on primary GPU, immediately dispatched to fixed micro-batches ----
+        # ---- producer: ODE sampling on primary GPU, dynamic-batch dispatch ----
+        # Frames are accumulated into a carry buffer and flushed to work_q when:
+        #   (a) carry reaches B frames  — maximises GPU utilisation
+        #   (b) COALESCE_MS elapses since the first frame was added  — minimises
+        #       latency at ODE chunk boundaries / end-of-video remainders
+        # This eliminates padding waste without sacrificing throughput: mid-video
+        # the buffer always fills to B before the deadline fires, so behaviour
+        # is identical to the old fixed-slice path. At boundaries we coalesce
+        # frames from adjacent chunks instead of dispatching tiny padded batches.
+        COALESCE_MS = float(getattr(self.opt, "decode_coalesce_ms", 15.0))
+        COALESCE_S  = COALESCE_MS / 1_000.0
+
         def producer():
             try:
                 torch.cuda.set_device(primary)
@@ -550,7 +561,21 @@ class StreamingVideoSaver:
                     ev.record(primary_stream)
                     return ev, lat_host
 
-                seq = 0
+                def flush_carry(carry, seq):
+                    """Pad carry to B, emit one work item, return (seq+1, [])."""
+                    n_valid = len(carry)
+                    sl = torch.stack(carry, 0)           # [n_valid, dim]
+                    if n_valid < B:
+                        pad = sl[-1:].expand(B - n_valid, -1)
+                        sl  = torch.cat([sl, pad], 0)   # [B, dim]
+                    ev, lat_host = emit_one(sl, n_valid)
+                    work_q.put((seq, sl, lat_host, n_valid, ev))
+                    return seq + 1, []
+
+                seq   = 0
+                carry: list = []      # accumulate individual latent rows
+                deadline: float = 0.0 # wall-clock deadline for current carry window
+
                 for chunk in self.sample(
                     data,
                     a_cfg_scale=a_cfg_scale,
@@ -563,18 +588,18 @@ class StreamingVideoSaver:
                 ):
                     if stop.is_set():
                         return
-                    lat = chunk.reshape(-1, chunk.shape[-1])
-                    n_total = lat.shape[0]
-                    # Immediately emit ALL frames in this chunk so decoder never starves.
-                    for i in range(0, n_total, B):
-                        sl = lat[i : i + B]
-                        n_valid = sl.shape[0]
-                        if n_valid < B:
-                            # Pad remainder to fixed batch size B to maintain uniform pinned host buffer shape
-                            sl = torch.cat([sl, sl[-1:].expand(B - n_valid, -1)], 0)
-                        ev, lat_host = emit_one(sl, n_valid)
-                        work_q.put((seq, sl, lat_host, n_valid, ev))
-                        seq += 1
+                    lat = chunk.reshape(-1, chunk.shape[-1])  # [n, dim]
+                    for row in lat.unbind(0):                 # iterate frame-by-frame
+                        if not carry:
+                            deadline = time.perf_counter() + COALESCE_S
+                        carry.append(row)
+                        # Flush when batch is full OR coalesce window has expired
+                        if len(carry) >= B or time.perf_counter() >= deadline:
+                            seq, carry = flush_carry(carry, seq)
+
+                # Flush whatever remains at end-of-video
+                if carry:
+                    seq, carry = flush_carry(carry, seq)
 
                 state["total"] = seq
             except BaseException as e:  # noqa: BLE001
