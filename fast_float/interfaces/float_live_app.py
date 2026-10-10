@@ -381,7 +381,7 @@ def build_interface(
                                 0, 10000, value=25, step=1, label="Random Seed"
                             )
                             b_decode_batch = gr.Radio(
-                                choices=["Auto", "1", "2", "4", "8", "16"],
+                                choices=["Auto", "1", "2", "4", "8", "16","32","64"],
                                 value="Auto",
                                 label="🗂️ Decode Batch Size",
                                 info="Frames decoded per GPU micro-batch. "
