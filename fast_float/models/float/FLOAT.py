@@ -975,6 +975,9 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         cur_stream = torch.cuda.current_stream(device) if torch.cuda.is_available() else None
         encode_stream = self.stream_encode if (self.stream_encode is not None and torch.cuda.is_available()) else None
 
+        if cur_stream is not None and encode_stream is not None and cur_stream != encode_stream:
+            encode_stream.wait_stream(cur_stream)
+
         encode_ctx = (
             torch.cuda.stream(encode_stream)
             if encode_stream is not None
