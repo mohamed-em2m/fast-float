@@ -94,12 +94,12 @@ class DecodeAutoTuner:
         self,
         device,
         primary=True,
-        max_batch=32,
-        max_streams=3,
+        max_batch=16,
+        max_streams=1,
         reserve_gib=None,
         plateau=0.93,
         safety=1.3,
-        repeats=2,
+        repeats=1,
         verbose=True,
         opt=None,
     ):
@@ -188,8 +188,9 @@ class DecodeAutoTuner:
                     chosen = min(req_bs, max(feasible.keys()))
             else:
                 best = max(f for _, f in feasible.values())
-                # Use maximum batch size within the throughput plateau to maximize GPU utilization
-                chosen = max(
+                # Choose the smallest batch size that achieves plateau throughput
+                # to minimize VRAM usage, lower latency, and prevent cuDNN grouped-conv alignment issues.
+                chosen = min(
                     k for k, (_, f) in feasible.items() if f >= self.plateau * best
                 )
 
@@ -327,8 +328,8 @@ class StreamingVideoSaver:
             tuner = DecodeAutoTuner(
                 dev,
                 primary=(dev.index == primary.index),
-                max_batch=int(getattr(self.opt, "decode_max_batch", 32)),
-                max_streams=int(getattr(self.opt, "decode_max_streams", 3)),
+                max_batch=int(getattr(self.opt, "decode_max_batch", 16)),
+                max_streams=int(getattr(self.opt, "decode_max_streams", 1)),
                 reserve_gib=getattr(self.opt, "decode_reserve_gib", None),
                 opt=self.opt,
             )
@@ -479,11 +480,13 @@ class StreamingVideoSaver:
         ctx = {}
         for dev in devs:
             ae = self._get_ae(dev, primary)
-            feats = (
-                s_r_feats
-                if dev.index == primary.index
-                else [f.to(dev) for f in s_r_feats]
-            )
+            if dev.index == primary.index:
+                feats = s_r_feats
+            else:
+                feats = [f.to(dev) for f in s_r_feats]
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize(dev)
+                    torch.cuda.synchronize(primary)
             tuner, prof = self._get_decode_profile(dev, primary, ae, feats, s_r.dtype)
             ctx[dev.index] = dict(dev=dev, ae=ae, feats=feats, tuner=tuner, prof=prof)
 
@@ -612,6 +615,7 @@ class StreamingVideoSaver:
                                 # wait so it does NOT block the CUDA stream.
                                 ev.synchronize()
                                 lat = lat_host.to(dev, non_blocking=True)
+                                lat.record_stream(stream)
                             u8 = self._decode_u8(c["ae"], c["feats"], lat)
                             buf[:n_valid].copy_(u8[:n_valid], non_blocking=True)
                             done = torch.cuda.Event()
