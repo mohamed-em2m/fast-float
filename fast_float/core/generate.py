@@ -3,7 +3,7 @@ Inference Stage 2
 """
 
 import os
-import os, torch, random, cv2, torchvision, subprocess, librosa, datetime, tempfile, face_alignment
+import os, torch, random, cv2, subprocess, librosa, datetime, tempfile, face_alignment
 import numpy as np
 import albumentations as A
 import albumentations.pytorch.transforms as A_pytorch
@@ -180,13 +180,32 @@ class InferenceAgent:
         del state_dict
 
     def save_video(
-        self, vid_target_recon: torch.Tensor, video_path: str, audio_path: str
+        self,
+        vid_target_recon: torch.Tensor,
+        video_path: str,
+        audio_path: str,
+        video_encoder: Optional[str] = None,
     ) -> str:
+        fps = int(self.opt.fps)
+        encoder_choice = str(video_encoder or getattr(self.opt, "video_encoder", "")).strip().lower()
+        if encoder_choice in ("torchcodec", "torch codec", "tc"):
+            try:
+                from fast_float.utils.pyav_writer import save_video_torchcodec
+            except ImportError:
+                from utils.pyav_writer import save_video_torchcodec
+            return save_video_torchcodec(vid_target_recon, video_path, audio_path=audio_path, fps=fps)
+
+        if encoder_choice in ("cpu pyav", "pyav", "pyav_cpu"):
+            try:
+                from fast_float.utils.pyav_writer import save_video_pyav
+            except ImportError:
+                from utils.pyav_writer import save_video_pyav
+            return save_video_pyav(vid_target_recon, video_path, audio_path=audio_path, fps=fps)
+
         vid = vid_target_recon.permute(0, 2, 3, 1)
         vid = vid.detach().clamp(-1, 1).cpu()
         vid = ((vid + 1) / 2 * 255).to(torch.uint8).contiguous()
         T, H, W, _ = vid.shape
-        fps = int(self.opt.fps)
 
         # Encode and mux audio in one ffmpeg call (no temp file needed)
         cmd = [
@@ -238,6 +257,7 @@ class InferenceAgent:
         no_crop: bool = False,
         seed: int = 25,
         verbose: bool = False,
+        video_encoder: Optional[str] = None,
     ) -> str:
 
         # Callers (Gradio sliders, API payloads) may hand over floats or numpy
@@ -265,7 +285,9 @@ class InferenceAgent:
             seed=seed,
         )["d_hat"]
 
-        res_video_path = self.save_video(d_hat, res_video_path, audio_path)
+        res_video_path = self.save_video(
+            d_hat, res_video_path, audio_path, video_encoder=video_encoder
+        )
         if verbose:
             print(f"> [Done] result saved at {res_video_path}")
         return res_video_path
@@ -307,6 +329,13 @@ class InferenceOptions(BaseOptions):
         )
         parser.add_argument(
             "--res_dir", default="./results", type=str, help="result dir"
+        )
+        parser.add_argument(
+            "--video_encoder",
+            default="FFmpeg NVENC",
+            type=str,
+            choices=["FFmpeg NVENC", "CPU PyAV", "Torchcodec"],
+            help="Video encoding backend ('FFmpeg NVENC', 'CPU PyAV', or 'Torchcodec')",
         )
 
         return parser

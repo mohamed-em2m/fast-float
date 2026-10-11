@@ -430,9 +430,14 @@ class StreamingVideoSaver:
         emo=None,
         nfe=10,
         seed=None,
+        video_encoder=None,
     ) -> str:
         t_start = time.perf_counter()
-        if shutil.which("ffmpeg") is None:
+        encoder_choice = str(video_encoder or getattr(self.opt, "video_encoder", "FFmpeg NVENC")).strip().lower()
+        use_pyav = encoder_choice in ("cpu pyav", "pyav", "pyav_cpu")
+        use_torchcodec = encoder_choice in ("torchcodec", "torch codec", "tc")
+
+        if not use_pyav and not use_torchcodec and shutil.which("ffmpeg") is None:
             raise RuntimeError("ffmpeg not found in PATH")
 
         primary, devs = self._decode_devices()
@@ -652,8 +657,102 @@ class StreamingVideoSaver:
             except BaseException as e:  # noqa: BLE001
                 fail(f"decode_worker[{dev}]", e)
 
-        # ---- writer: restore order, feed ffmpeg ----
+        # ---- writer: restore order, feed video encoder (torchcodec / PyAV / FFmpeg) ----
         def writer():
+            if use_torchcodec:
+                # torchcodec VideoEncoder needs ALL frames at once, so we
+                # accumulate them in order first, then encode in one shot.
+                try:
+                    from fast_float.utils.pyav_writer import save_video_torchcodec
+                except ImportError:
+                    try:
+                        from utils.pyav_writer import save_video_torchcodec
+                    except ImportError:
+                        from pyav_writer import save_video_torchcodec
+
+                all_frames = []  # list of (n, H, W, C) uint8 numpy arrays
+                pending, nxt = {}, 0
+                try:
+                    while not stop.is_set():
+                        total = state["total"]
+                        if total is not None and nxt >= total:
+                            break
+                        try:
+                            seq, buf, n, done = done_q.get(timeout=0.1)
+                        except queue.Empty:
+                            continue
+                        pending[seq] = (buf, n, done)
+                        while nxt in pending:
+                            buf, n, done = pending.pop(nxt)
+                            if done is not None:
+                                done.synchronize()
+                            all_frames.append(buf[:n].numpy().copy())
+                            state["frames"] += n
+                            pool.put(buf)
+                            nxt += 1
+                    if stop.is_set():
+                        return
+                    frames_np = np.concatenate(all_frames, axis=0)  # (T, H, W, C) uint8
+                    save_video_torchcodec(
+                        frames_np,
+                        video_path,
+                        audio_path=audio_path,
+                        fps=fps,
+                    )
+                except BaseException as e:  # noqa: BLE001
+                    fail("writer_torchcodec", e)
+                return
+
+            if use_pyav:
+                try:
+                    from fast_float.utils.pyav_writer import PyAVVideoWriter
+                except ImportError:
+                    try:
+                        from utils.pyav_writer import PyAVVideoWriter
+                    except ImportError:
+                        from pyav_writer import PyAVVideoWriter
+
+                writer_inst = None
+                try:
+                    writer_inst = PyAVVideoWriter(
+                        output_path=video_path,
+                        width=W,
+                        height=H,
+                        fps=fps,
+                        channels=C,
+                        audio_path=audio_path,
+                    )
+                    pending, nxt = {}, 0
+                    while not stop.is_set():
+                        total = state["total"]
+                        if total is not None and nxt >= total:
+                            break
+                        try:
+                            seq, buf, n, done = done_q.get(timeout=0.1)
+                        except queue.Empty:
+                            continue
+                        pending[seq] = (buf, n, done)
+                        while nxt in pending:
+                            buf, n, done = pending.pop(nxt)
+                            if done is not None:
+                                done.synchronize()
+                            writer_inst.write_frames(buf[:n].numpy())
+                            state["frames"] += n
+                            pool.put(buf)
+                            nxt += 1
+                    if stop.is_set():
+                        return
+                    writer_inst.close()
+                except BaseException as e:  # noqa: BLE001
+                    fail("writer_pyav", e)
+                finally:
+                    if writer_inst is not None:
+                        try:
+                            writer_inst.close()
+                        except Exception:
+                            pass
+                return
+
             proc, err_chunks, drain = None, [], None
             try:
                 proc = self._start_ffmpeg(video_path, audio_path, H, W, C, fps)

@@ -1,4 +1,4 @@
-import os, torch, random, cv2, torchvision, librosa, datetime, tempfile, face_alignment
+import os, torch, random, cv2, librosa, datetime, tempfile, face_alignment
 
 torch.backends.cudnn.benchmark = True
 import numpy as np
@@ -360,18 +360,36 @@ class OptimizedInferenceAgent:
             self.use_amp_fp16 = True
             print("✓ FP16 will be applied via autocast during inference")
 
-    def save_video(self, vid: "torch.Tensor", video_path: str, audio_path: str) -> str:
+    def save_video(
+        self,
+        vid: "torch.Tensor",
+        video_path: str,
+        audio_path: str,
+        video_encoder: Optional[str] = None,
+    ) -> str:
         """
         Save video with proper CUDA synchronization to prevent corruption.
-
-        Key fixes:
-        1. Fixed missing torch.cuda.synchronize() calls
-        2. Better error handling for FFmpeg stderr
-        3. Simplified retry logic
-        4. Early detection of FFmpeg errors
+        Supports FFmpeg NVENC, CPU PyAV, and Torchcodec alternatives.
         """
         try:
             start_time = time.time()
+
+            encoder_choice = str(video_encoder or getattr(self.opt, "video_encoder", "FFmpeg NVENC")).strip().lower()
+            if encoder_choice in ("cpu pyav", "pyav", "pyav_cpu"):
+                try:
+                    from fast_float.utils.pyav_writer import save_video_pyav
+                except ImportError:
+                    from utils.pyav_writer import save_video_pyav
+                fps = int(getattr(self.opt, "fps", 25))
+                return save_video_pyav(vid, video_path, audio_path=audio_path, fps=fps)
+
+            if encoder_choice in ("torchcodec", "torch codec", "tc"):
+                try:
+                    from fast_float.utils.pyav_writer import save_video_torchcodec
+                except ImportError:
+                    from utils.pyav_writer import save_video_torchcodec
+                fps = int(getattr(self.opt, "fps", 25))
+                return save_video_torchcodec(vid, video_path, audio_path=audio_path, fps=fps)
 
             # Sanity: ffmpeg present
             if shutil.which("ffmpeg") is None:
@@ -598,6 +616,7 @@ class OptimizedInferenceAgent:
         seed: int = 25,
         verbose: bool = True,
         benchmark: bool = False,
+        video_encoder: Optional[str] = None,
     ) -> str:
         timings = {}
         total_start = time.perf_counter()
@@ -627,12 +646,13 @@ class OptimizedInferenceAgent:
             return contextlib.nullcontext()
 
         def generate(out_path: str) -> str:
-            """Sampling + decoding + ffmpeg encoding + audio mux, fully overlapped."""
+            """Sampling + decoding + video encoding + audio mux, fully overlapped."""
             with make_amp():
                 return self.G_opt.inference_and_save(
                     data=data,
                     video_path=out_path,
                     audio_path=audio_path,
+                    video_encoder=video_encoder,
                     **gen_kwargs,
                 )
 
@@ -868,6 +888,13 @@ class InferenceOptions(BaseOptions):
         )
         parser.add_argument(
             "--benchmark", action="store_true", help="Run benchmark mode"
+        )
+        parser.add_argument(
+            "--video_encoder",
+            default="FFmpeg NVENC",
+            type=str,
+            choices=["FFmpeg NVENC", "CPU PyAV", "Torchcodec"],
+            help="Video encoding backend ('FFmpeg NVENC', 'CPU PyAV', or 'Torchcodec')",
         )
 
         return parser

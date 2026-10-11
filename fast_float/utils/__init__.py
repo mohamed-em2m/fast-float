@@ -14,6 +14,13 @@ from fast_float.utils.media import (
     process_audio_format,
 )
 from fast_float.utils.video_optimizer import VideoSaveOptimizer
+from fast_float.utils.pyav_writer import (
+    PyAVVideoWriter,
+    save_video_pyav,
+    is_pyav_available,
+    save_video_torchcodec,
+    is_torchcodec_available,
+)
 
 __all__ = [
     "ColoredFormatter",
@@ -30,4 +37,10 @@ __all__ = [
     "convert_pcm_to_wav",
     "process_audio_format",
     "VideoSaveOptimizer",
+    "PyAVVideoWriter",
+    "save_video_pyav",
+    "is_pyav_available",
+    "save_video_torchcodec",
+    "is_torchcodec_available",
 ]
+
