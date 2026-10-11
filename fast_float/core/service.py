@@ -92,7 +92,9 @@ async def generate_video(
         timings["preprocess"] = time.time() - preprocess_start
 
         # 3. Model Inference with lock
-        res_dir = getattr(state.opt, "res_dir", "./results") if state.opt else "./results"
+        res_dir = (
+            getattr(state.opt, "res_dir", "./results") if state.opt else "./results"
+        )
         os.makedirs(res_dir, exist_ok=True)
         video_path_final = os.path.join(
             res_dir,
@@ -125,7 +127,9 @@ async def generate_video(
         stats["total_inference_time"] += timings["inference"]
         stats["total_preprocess_time"] += timings["preprocess"]
         if stats["total_inference_time"] > 0:
-            stats["average_fps"] = stats["total_requests"] / stats["total_inference_time"]
+            stats["average_fps"] = (
+                stats["total_requests"] / stats["total_inference_time"]
+            )
 
         # 5. Clean temporary files
         for temp_file in temp_files:

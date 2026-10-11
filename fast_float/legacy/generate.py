@@ -2,14 +2,19 @@
 Inference Stage 2
 """
 
+import datetime
 import os
-import os, torch, random, cv2, subprocess, librosa, datetime, tempfile, face_alignment
-import numpy as np
+import subprocess
+from typing import Optional
+
 import albumentations as A
 import albumentations.pytorch.transforms as A_pytorch
-
-from tqdm import tqdm
-from pathlib import Path
+import cv2
+import face_alignment
+import librosa
+import numpy as np
+import torch
+import torch.nn.functional as F
 from transformers import Wav2Vec2FeatureExtractor
 
 try:
@@ -187,20 +192,26 @@ class InferenceAgent:
         video_encoder: Optional[str] = None,
     ) -> str:
         fps = int(self.opt.fps)
-        encoder_choice = str(video_encoder or getattr(self.opt, "video_encoder", "")).strip().lower()
+        encoder_choice = (
+            str(video_encoder or getattr(self.opt, "video_encoder", "")).strip().lower()
+        )
         if encoder_choice in ("torchcodec", "torch codec", "tc"):
             try:
                 from fast_float.utils.pyav_writer import save_video_torchcodec
             except ImportError:
                 from utils.pyav_writer import save_video_torchcodec
-            return save_video_torchcodec(vid_target_recon, video_path, audio_path=audio_path, fps=fps)
+            return save_video_torchcodec(
+                vid_target_recon, video_path, audio_path=audio_path, fps=fps
+            )
 
         if encoder_choice in ("cpu pyav", "pyav", "pyav_cpu"):
             try:
                 from fast_float.utils.pyav_writer import save_video_pyav
             except ImportError:
                 from utils.pyav_writer import save_video_pyav
-            return save_video_pyav(vid_target_recon, video_path, audio_path=audio_path, fps=fps)
+            return save_video_pyav(
+                vid_target_recon, video_path, audio_path=audio_path, fps=fps
+            )
 
         vid = vid_target_recon.permute(0, 2, 3, 1)
         vid = vid.detach().clamp(-1, 1).cpu()
@@ -272,7 +283,7 @@ class InferenceAgent:
 
         data = self.data_processor.preprocess(ref_path, audio_path, no_crop=no_crop)
         if verbose:
-            print(f"> [Done] Preprocess.")
+            print("> [Done] Preprocess.")
 
         # inference
         d_hat = self.G.inference(
