@@ -284,7 +284,13 @@ class StreamingVideoSaver:
             reps = self._ae_replicas = {}
         idx = dev.index if dev.index is not None else str(dev)
         if idx not in reps:
-            ae = copy.deepcopy(self.motion_autoencoder).to(dev).eval()
+            try:
+                ae = copy.deepcopy(self.motion_autoencoder).to(dev).eval()
+            except Exception:
+                ae = Generator(
+                    size=self.opt.input_size, style_dim=self.opt.dim_w, motion_dim=self.opt.dim_m
+                ).to(dev).eval()
+                ae.load_state_dict(self.motion_autoencoder.state_dict())
             ae.requires_grad_(False)
             reps[idx] = ae
         return reps[idx]
@@ -869,6 +875,61 @@ class FLOAT(BaseModel, StreamingVideoSaver):
             "rtol": self.opt.ode_rtol,
             "method": self.opt.torchdiffeq_ode_method,
         }
+
+    def compile_models(self, mode: str = "default", fullgraph: bool = False, dynamic: Optional[bool] = None) -> bool:
+        """Compile internal PyTorch submodules using torch.compile for high-throughput inference.
+
+        Compiles:
+          1. FlowMatchingTransformer (self.fmt) - the ODE sampling hotspot
+          2. StyleDecoder (self.motion_autoencoder.dec) - the per-frame image synthesis hotspot
+          3. Motion Encoder (self.motion_autoencoder.enc) - source image encoder
+          4. Audio projection layers (self.audio_encoder.audio_projection)
+        """
+        if not hasattr(torch, "compile"):
+            logger.warning("torch.compile is not supported in this PyTorch version.")
+            return False
+
+        logger.info(f"Applying torch.compile (mode='{mode}') to FLOAT submodels...")
+
+        # 1. FlowMatchingTransformer (FMT)
+        if hasattr(self, "fmt") and self.fmt is not None:
+            try:
+                self.fmt = torch.compile(self.fmt, mode=mode, fullgraph=fullgraph, dynamic=dynamic)
+                logger.info("✓ FlowMatchingTransformer compiled successfully")
+            except Exception as e:
+                logger.warning(f"! Failed to compile FlowMatchingTransformer: {e}")
+
+        # 2. StyleDecoder (Synthesis)
+        if hasattr(self, "motion_autoencoder") and hasattr(self.motion_autoencoder, "dec"):
+            try:
+                self.motion_autoencoder.dec = torch.compile(
+                    self.motion_autoencoder.dec, mode=mode, fullgraph=fullgraph, dynamic=dynamic
+                )
+                logger.info("✓ StyleDecoder compiled successfully")
+            except Exception as e:
+                logger.warning(f"! Failed to compile StyleDecoder: {e}")
+
+        # 3. Motion Encoder
+        if hasattr(self, "motion_autoencoder") and hasattr(self.motion_autoencoder, "enc"):
+            try:
+                self.motion_autoencoder.enc = torch.compile(
+                    self.motion_autoencoder.enc, mode=mode, fullgraph=fullgraph, dynamic=dynamic
+                )
+                logger.info("✓ Motion Encoder compiled successfully")
+            except Exception as e:
+                logger.warning(f"! Failed to compile Motion Encoder: {e}")
+
+        # 4. Audio Projection
+        if hasattr(self, "audio_encoder") and hasattr(self.audio_encoder, "audio_projection"):
+            try:
+                self.audio_encoder.audio_projection = torch.compile(
+                    self.audio_encoder.audio_projection, mode=mode, fullgraph=fullgraph, dynamic=dynamic
+                )
+                logger.info("✓ Audio Projection compiled successfully")
+            except Exception as e:
+                logger.warning(f"! Failed to compile Audio Projection: {e}")
+
+        return True
 
     ######## Motion Encoder - Decoder ########
     @torch.no_grad()

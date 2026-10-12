@@ -117,7 +117,7 @@ class Attention(nn.Module):
                 q,
                 k,
                 v,
-                attn_mask=~mask,
+                attn_mask=mask,
                 dropout_p=self.attn_drop.p if self.training else 0.0,
             )
         else:
@@ -313,6 +313,14 @@ class FlowMatchingTransformer(BaseModel):
             expansion=opt.attention_window,
         ).to(opt.rank)
         self.register_buffer("alignment_mask", alignment_mask)
+        # Precompute positive attention mask (True for attending positions, False for masked positions)
+        # Eliminates repeated ~mask allocations across all blocks on every ODE sampling step
+        self.register_buffer("attn_mask", ~alignment_mask)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+        if hasattr(self, "alignment_mask"):
+            self.attn_mask = ~self.alignment_mask
 
     def initialize_weights(self) -> None:
         def _basic_init(module):
@@ -443,9 +451,13 @@ class FlowMatchingTransformer(BaseModel):
         c = self.c_embedder(c)
         c = t + c
 
-        # forwarding FMT Blocks
+        # forwarding FMT Blocks using precomputed attention mask
+        attn_mask = getattr(self, "attn_mask", None)
+        if attn_mask is None and hasattr(self, "alignment_mask"):
+            attn_mask = ~self.alignment_mask
+
         for block in self.blocks:
-            x = block(x, c, self.alignment_mask)  # (B, T, D)
+            x = block(x, c, attn_mask)  # (B, T, D)
         return self.decoder(x, c)
 
     @torch.no_grad()

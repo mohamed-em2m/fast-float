@@ -64,24 +64,28 @@ class OptimizedInferenceAgent:
         state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         with torch.no_grad():
             for model_name, model_param in self.G.named_parameters():
+                clean_name = model_name.replace("._orig_mod", "")
                 if model_name in state_dict:
                     model_param.copy_(state_dict[model_name].to(rank))
-                elif "wav2vec2" in model_name:
+                elif clean_name in state_dict:
+                    model_param.copy_(state_dict[clean_name].to(rank))
+                elif "wav2vec2" in model_name or "wav2vec2" in clean_name:
                     pass
                 else:
-                    logger.warning(f"! Warning: {model_name} not found in state_dict.")
+                    logger.warning(f"! Warning: {clean_name} not found in state_dict.")
         del state_dict
 
     def apply_optimization(self) -> None:
         """Apply various GPU optimization strategies."""
+        compile_mode = getattr(self.opt, "compile_mode", "default")
+
         if self.optimization_mode == "torch_compile":
             try:
                 if hasattr(torch, "compile"):
-                    logger.info("Applying torch.compile optimization...")
-                    self.G_opt = torch.compile(
-                        self.G, mode="max-autotune", fullgraph=False
-                    )
-                    logger.info("✓ torch.compile applied successfully")
+                    logger.info(f"Applying torch.compile optimization (mode='{compile_mode}')...")
+                    self.G.compile_models(mode=compile_mode)
+                    self.G_opt = self.G
+                    logger.info("✓ torch.compile applied to FLOAT submodules successfully")
                 else:
                     logger.warning(
                         "! torch.compile not available (requires PyTorch 2.0+)"
@@ -132,15 +136,12 @@ class OptimizedInferenceAgent:
 
             if hasattr(torch, "compile"):
                 try:
-                    self.G_opt = torch.compile(self.G, mode="max-autotune")
-                    logger.info("✓ All optimizations applied")
+                    self.G.compile_models(mode=compile_mode)
+                    logger.info("✓ torch.compile applied to FLOAT submodules")
                 except Exception as e:
                     logger.warning(f"! torch.compile failed: {e}")
-                    self.G_opt = self.G
-                    logger.info("✓ Partial optimizations applied")
-            else:
-                self.G_opt = self.G
-                logger.info("✓ Partial optimizations applied")
+            self.G_opt = self.G
+            logger.info("✓ All optimizations applied")
         else:
             logger.info("No optimization applied")
             self.G_opt = self.G
