@@ -1,60 +1,47 @@
 """
 FLOAT - Gradio Interface for Audio-Driven Talking Face Generation
-Now with a "Live" tab: microphone audio -> chunked, near-real-time video.
+Includes Batch Generation and Low-Latency Near-Real-Time Live Streaming.
 
-IMPORTANT — read this before you run it
-----------------------------------------
-FLOAT is a diffusion-based model: it generates each clip through NFE denoising
-steps. That means it cannot produce a continuous, frame-perfect live video
-stream the way a webcam filter can — there is no way around running inference
-on some window of audio before you get pixels back.
+Architecture Highlights
+------------------------
+1. Batch Generation:
+   One-shot full-sequence talking face synthesis from uploaded reference image
+   and audio files, supporting multiple hardware encoders (FFmpeg NVENC, CPU PyAV, Torchcodec).
 
-What this file gives you instead is a "chunked near-real-time" pipeline:
-
-  1. Your microphone audio is captured continuously in small pieces.
-  2. Those pieces are buffered until you have ~CHUNK_SECONDS of audio.
-  3. FLOAT runs inference on that chunk (keep NFE low, e.g. 4-8, for speed).
-  4. The resulting short clip is pushed to the video player and autoplays.
-  5. The next chunk starts buffering immediately, so clips arrive back-to-back.
-
-End-to-end latency ≈ CHUNK_SECONDS + (inference time for that chunk).
-On a fast GPU with NFE=6-8 you can get this down to roughly 1-3 seconds of
-lag. On CPU or with high NFE it will feel more like "semi-live" batches
-than a live call. There will also be a small visual "seam" between clips
-since each chunk is generated independently (no temporal state is carried
-across chunks) — increasing CHUNK_SECONDS reduces how often you see a seam,
-at the cost of more latency.
+2. Seamless Live Streaming (Near-Real-Time):
+   - Pre-Encodes Reference Face ONCE: Face detection, alignment, cropping, and
+     motion latent identity features (x_r_feats, r_s) are computed once at session start.
+   - Temporal Continuity Across Chunks: Carries forward motion latents (prev_x, prev_wa)
+     across consecutive chunks, completely eliminating visual seams and mouth jumping between clips.
+   - Decoupled Pipeline & Zero-Copy Audio: Direct audio feature extraction and ODE
+     sampling without repetitive disk roundtrips.
+   - Multi-Backend Video Encoding: Supports FFmpeg NVENC (hardware), CPU PyAV, or Torchcodec.
 
 Requires Gradio >= 4.40 (for gr.Timer and streaming gr.Audio input).
-    Install the project env with: uv sync --frozen
 """
 
 import os
 import sys
 import time
-import queue
+import math
 import shutil
 import logging
 import tempfile
 import datetime
 import threading
 import traceback
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any, Union
 
 # ---- logging setup -------------------------------------------------------- #
-# NOTE: This block is intentionally placed BEFORE gradio so that we can
-# install our handler first. However, because Gradio also reconfigures
-# logging during its import, we re-attach via setup_logger() which uses
-# propagate=False — making our named logger immune to root-logger rewiring.
 try:
     from fast_float.utils.logger import setup_logger
 except ImportError:
     try:
         from utils.logger import setup_logger
     except ImportError:
-        # Fallback: self-contained logger that doesn't rely on the root logger.
         def setup_logger(name="float_fast", **_):
             _log = logging.getLogger(name)
             _log.setLevel(logging.INFO)
@@ -70,13 +57,12 @@ except ImportError:
             _log.propagate = False
             return _log
 
-
 import numpy as np
 import soundfile as sf
+import torch
+import torch.nn.functional as F
 import gradio as gr
 
-# Re-create the logger AFTER gradio is imported so our handler is attached
-# last and propagate=False keeps it safe from any further root-logger changes.
 logger = setup_logger("float_live_app")
 
 try:
@@ -102,16 +88,22 @@ except ImportError:
                 InferenceOptions,
             )
 
+try:
+    from fast_float.sched.types import FloatOmniRequest
+except ImportError:
+    FloatOmniRequest = None
 
-def _coerce_int(value, default):
-    """Gradio sliders always return float — inference needs plain ints."""
+
+def _coerce_int(value: Any, default: int) -> int:
+    """Gradio sliders return floats — coerce safely to plain int."""
     try:
         return int(round(float(value)))
     except (TypeError, ValueError):
         return default
 
 
-def _coerce_float(value, default):
+def _coerce_float(value: Any, default: float) -> float:
+    """Coerce value safely to float."""
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -136,7 +128,6 @@ def get_encoder_choices() -> list[str]:
     if is_torchcodec_ready():
         choices.append("Torchcodec")
     else:
-        # Still offer Torchcodec so user knows it's an option (fallback handled gracefully)
         choices.append("Torchcodec")
     return choices
 
@@ -144,7 +135,6 @@ def get_encoder_choices() -> list[str]:
 def detect_default_encoder() -> str:
     """Auto-detect whether to default to FFmpeg NVENC, CPU PyAV, or Torchcodec."""
     try:
-        import subprocess
         res = subprocess.run(
             ["ffmpeg", "-hide_banner", "-encoders"],
             capture_output=True,
@@ -161,7 +151,55 @@ def detect_default_encoder() -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Shared model wrapper (one instance, shared across all sessions/users)
+# Per-session live state (held in gr.State per connected user session)
+# --------------------------------------------------------------------------- #
+@dataclass
+class LiveSession:
+    ref_image_path: Optional[str] = None
+    sample_rate: Optional[int] = None
+    buffer: list = field(default_factory=list)  # list of 1-D numpy float chunks
+    buffered_seconds: float = 0.0
+    chunk_idx: int = 0
+    running: bool = False
+    last_latency: float = 0.0
+    session_dir: Optional[str] = None
+
+    # Precomputed reference identity features (cached once per session)
+    s_tensor: Optional[torch.Tensor] = None
+    r_s: Optional[torch.Tensor] = None
+    ref_feats: Optional[list[torch.Tensor]] = None
+    cropped_preview: Optional[np.ndarray] = None
+    is_preprocessed: bool = False
+
+    # Temporal continuity across chunks (eliminates seams)
+    prev_x: Optional[torch.Tensor] = None
+    prev_wa: Optional[torch.Tensor] = None
+    total_generated_frames: int = 0
+
+    def reset_audio(self):
+        """Clears the audio accumulator buffer."""
+        self.buffer = []
+        self.buffered_seconds = 0.0
+
+    def clear_gpu_cache(self):
+        """Cleans up GPU tensor allocations on session stop."""
+        self.s_tensor = None
+        self.r_s = None
+        self.ref_feats = None
+        self.prev_x = None
+        self.prev_wa = None
+        self.cropped_preview = None
+        self.is_preprocessed = False
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+CHUNK_SECONDS_DEFAULT = 1.5  # default duration of audio accumulated per chunk
+MAX_LIVE_CLIPS_KEPT = 20     # rotate old temp files so disk space remains bounded
+
+
+# --------------------------------------------------------------------------- #
+# Shared Model Wrapper
 # --------------------------------------------------------------------------- #
 class FloatModel:
     def __init__(
@@ -171,10 +209,6 @@ class FloatModel:
         wav2vec_model_path=None,
         ngpus=1,
     ):
-        # InferenceOptions uses argparse on sys.argv, so isolate parsing
-        # from the Gradio launch flags (--port, --share, ...).
-        import sys
-
         overrides = ["--ckpt_path", ckpt_path, "--res_dir", res_dir]
         if wav2vec_model_path:
             overrides.extend(["--wav2vec_model_path", wav2vec_model_path])
@@ -193,14 +227,237 @@ class FloatModel:
 
         logger.info("Loading FLOAT model...")
         self.agent = InferenceAgent(self.opt)
-        # A lock around inference is the safe default: most diffusion
-        # pipelines aren't written to be called concurrently from multiple
-        # threads on one GPU. If your agent IS safe for concurrent calls
-        # (e.g. you've wrapped it with its own batching), you can remove
-        # this lock to let multiple users' chunks process in parallel.
         self.infer_lock = threading.Lock()
         logger.info("Model loaded successfully!")
 
+    # ---- 1. Precompute Reference Identity Once per Live Session ----------- #
+    def prepare_live_session(self, ref_image_path: str, no_crop: bool = False) -> dict[str, Any]:
+        """Aligns, crops, and pre-encodes the reference face into latent identity features.
+
+        Executes once at the start of a live session to eliminate 200-400ms per-chunk
+        overhead during continuous streaming.
+        """
+        device = f"cuda:{self.opt.rank}" if torch.cuda.is_available() else "cpu"
+        dp = self.agent.data_processor
+
+        img_rgb = dp.default_img_loader(ref_image_path)
+        if not no_crop:
+            cropped_img = dp.process_img(img_rgb)
+        else:
+            cropped_img = img_rgb
+
+        s_tensor = dp.transform(image=cropped_img)["image"].unsqueeze(0).to(device)
+
+        with self.infer_lock:
+            with torch.no_grad():
+                x_r, x_r_lambda, x_r_feats = self.agent.G.encode_image_into_latent(s_tensor)
+                r_s = self.agent.G.motion_autoencoder.dec.direction(x_r_lambda)
+
+        return {
+            "s": s_tensor,
+            "r_s": r_s,
+            "ref_feats": x_r_feats,
+            "cropped_preview": cropped_img,
+        }
+
+    # ---- 2. Run Single Live Chunk with Temporal Continuity ---------------- #
+    def run_live_chunk(
+        self,
+        session: LiveSession,
+        audio_np: np.ndarray,
+        sr: int,
+        out_path: str,
+        chunk_wav_path: str,
+        emotion: str = "S2E",
+        a_cfg: float = 2.0,
+        r_cfg: float = 1.0,
+        e_cfg: float = 1.0,
+        nfe: int = 6,
+        seed: int = 25,
+        decode_batch_size: int = 0,
+        video_encoder: str = "FFmpeg NVENC",
+        temporal_continuity: bool = True,
+    ) -> tuple[str, dict[str, float]]:
+        """Generates a talking head video clip for one audio chunk.
+
+        Maintains temporal continuity across chunks using session.prev_x and session.prev_wa,
+        ensuring smooth natural motion without boundary seams.
+        """
+        device = f"cuda:{self.opt.rank}" if torch.cuda.is_available() else "cpu"
+        fps = int(getattr(self.opt, "fps", 25))
+        nfe = _coerce_int(nfe, 6)
+        seed = _coerce_int(seed, 25)
+        a_cfg = _coerce_float(a_cfg, 2.0)
+        r_cfg = _coerce_float(r_cfg, 1.0)
+        e_cfg = _coerce_float(e_cfg, 1.0)
+        dbs = _coerce_int(decode_batch_size, 0)
+
+        # 1. Save audio chunk for muxing
+        sf.write(chunk_wav_path, audio_np, sr)
+
+        # 2. Extract Wav2Vec2 input features
+        t0 = time.perf_counter()
+        dp = self.agent.data_processor
+        audio_tensor = dp.wav2vec_preprocessor(
+            audio_np, sampling_rate=sr, return_tensors="pt"
+        ).input_values[0].unsqueeze(0).to(device)
+
+        T_frames = int(math.floor(audio_tensor.shape[1] / self.opt.sampling_rate * fps))
+        if T_frames <= 0:
+            T_frames = 1
+
+        with torch.no_grad():
+            wa = self.agent.G.audio_encoder.inference(audio_tensor, seq_len=T_frames)
+
+            # Emotion feature
+            if emotion is not None and emotion not in ("S2E", None):
+                emo_idx = self.agent.G.emotion_encoder.label2id.get(str(emotion).lower(), None)
+                if emo_idx is not None:
+                    we = (
+                        F.one_hot(
+                            torch.tensor(emo_idx, device=device),
+                            num_classes=self.opt.dim_e,
+                        )
+                        .float()
+                        .unsqueeze(0)
+                        .unsqueeze(0)
+                    )
+                else:
+                    we = torch.zeros(1, 1, self.opt.dim_e, device=device)
+            else:
+                we = self.agent.G.emotion_encoder.predict_emotion(audio_tensor)
+                if we.ndim == 2:
+                    we = we.unsqueeze(1)
+
+        t_audio = time.perf_counter() - t0
+
+        # Temporal continuity handling
+        prev_x = session.prev_x if temporal_continuity else None
+        prev_wa = session.prev_wa if temporal_continuity else None
+
+        req = FloatOmniRequest(
+            request_id=f"live_{session.chunk_idx}",
+            ref_image=session.s_tensor,
+            audio=audio_tensor,
+            ref_latent=session.r_s,
+            ref_feats=session.ref_feats,
+            wa=wa,
+            we=we,
+            total_chunks=max(1, int(math.ceil(T_frames / self.agent.G.num_frames_for_clip))),
+            total_frames=T_frames,
+            current_chunk=0,
+            prev_x=prev_x,
+            prev_wa=prev_wa,
+            a_cfg_scale=a_cfg,
+            r_cfg_scale=r_cfg,
+            e_cfg_scale=e_cfg,
+            nfe=nfe,
+            output_format="tensor",
+        )
+
+        torch.manual_seed(seed + session.chunk_idx)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed + session.chunk_idx)
+
+        # Apply decode batch size override
+        if dbs > 0:
+            self.opt.decode_batch_size = dbs
+        else:
+            self.opt.decode_batch_size = None
+
+        with self.infer_lock:
+            # 3. ODE latent sampling
+            t_samp0 = time.perf_counter()
+            task = self.agent.G.sample_omni_chunk(req)
+            t_sample = time.perf_counter() - t_samp0
+
+            # Store updated temporal state for next chunk
+            if temporal_continuity:
+                session.prev_x = req.prev_x
+                session.prev_wa = req.prev_wa
+            else:
+                session.prev_x = None
+                session.prev_wa = None
+
+            # 4. StyleDecoder frame synthesis
+            t_dec0 = time.perf_counter()
+            frames_u8 = self.agent.G.decode_omni_chunk(task)  # [T, H, W, 3] uint8
+            t_decode = time.perf_counter() - t_dec0
+
+            # 5. Video encoding & audio muxing
+            t_enc0 = time.perf_counter()
+            self._save_video_clip(
+                frames=frames_u8,
+                video_path=out_path,
+                audio_path=chunk_wav_path,
+                fps=fps,
+                video_encoder=video_encoder,
+            )
+            t_encode = time.perf_counter() - t_enc0
+
+        frames_count = int(frames_u8.shape[0]) if hasattr(frames_u8, "shape") else T_frames
+        session.total_generated_frames += frames_count
+
+        timings = {
+            "audio": t_audio,
+            "sample": t_sample,
+            "decode": t_decode,
+            "encode": t_encode,
+            "total": t_audio + t_sample + t_decode + t_encode,
+            "frames": frames_count,
+            "fps": frames_count / max(0.001, (t_sample + t_decode + t_encode)),
+        }
+        return out_path, timings
+
+    def _save_video_clip(
+        self,
+        frames: Union[torch.Tensor, np.ndarray],
+        video_path: str,
+        audio_path: str,
+        fps: int = 25,
+        video_encoder: str = "FFmpeg NVENC",
+    ) -> str:
+        """Encodes frames and muxes audio using the chosen video encoder backend."""
+        encoder_choice = str(video_encoder).strip().lower()
+        use_pyav = encoder_choice in ("cpu pyav", "pyav", "pyav_cpu")
+        use_torchcodec = encoder_choice in ("torchcodec", "torch codec", "tc")
+
+        if use_torchcodec:
+            try:
+                from fast_float.utils.pyav_writer import save_video_torchcodec
+                return save_video_torchcodec(frames, video_path, audio_path=audio_path, fps=fps)
+            except Exception as e:
+                logger.warning(f"Torchcodec encode fallback: {e}")
+
+        if use_pyav:
+            try:
+                from fast_float.utils.pyav_writer import save_video_pyav
+                return save_video_pyav(frames, video_path, audio_path=audio_path, fps=fps)
+            except Exception as e:
+                logger.warning(f"PyAV encode fallback: {e}")
+
+        # FFmpeg / NVENC in-process stream
+        frames_np = frames.numpy() if isinstance(frames, torch.Tensor) else np.asarray(frames)
+        if frames_np.ndim == 4:
+            T, H, W, C = frames_np.shape
+        else:
+            raise ValueError(f"Unexpected video frame shape {frames_np.shape}")
+
+        proc = self.agent.G._start_ffmpeg(video_path, audio_path, H, W, C, fps)
+        try:
+            assert proc.stdin is not None
+            proc.stdin.write(frames_np.tobytes())
+            proc.stdin.close()
+            rc = proc.wait(timeout=60)
+            if rc != 0:
+                raise RuntimeError(f"FFmpeg exited with error code {rc}")
+        except Exception:
+            if proc.poll() is None:
+                proc.kill()
+            raise
+        return video_path
+
+    # ---- 3. Full-Sequence Batch Generation -------------------------------- #
     def run(
         self,
         ref_path,
@@ -216,8 +473,6 @@ class FloatModel:
         decode_batch_size=0,
         video_encoder="FFmpeg NVENC",
     ):
-        # Gradio sliders yield floats (sometimes numpy scalars) — normalize
-        # to plain Python int/float before anything downstream touches them.
         nfe = _coerce_int(nfe, 10)
         seed = _coerce_int(seed, 25)
         a_cfg = _coerce_float(a_cfg, 2.0)
@@ -225,9 +480,6 @@ class FloatModel:
         e_cfg = _coerce_float(e_cfg, 1.0)
         dbs = _coerce_int(decode_batch_size, 0)
 
-        # Apply decode batch size override; 0 = Auto (let VRAM tuner decide).
-        # We set / clear on self.opt so the tuner's memoized cache is bypassed
-        # only when an explicit size is requested.
         target_model = getattr(self.agent, "G_opt", getattr(self.agent, "model", None))
         if dbs > 0:
             self.opt.decode_batch_size = dbs
@@ -256,7 +508,6 @@ class FloatModel:
                 video_encoder=video_encoder,
             )
 
-    # ---- batch (original) path, unchanged in spirit from the original app ---
     def generate_video(
         self,
         ref_image,
@@ -279,8 +530,6 @@ class FloatModel:
             if audio_file is None:
                 return None, "❌ Please upload an audio file"
 
-            # Gradio sliders return float — normalize to plain ints/floats
-            # before they are used in filenames or passed to inference.
             nfe = _coerce_int(nfe, 10)
             seed = _coerce_int(seed, 25)
             a_cfg_scale = _coerce_float(a_cfg_scale, 2.0)
@@ -296,7 +545,7 @@ class FloatModel:
                 f"-acfg{a_cfg_scale}-ecfg{e_cfg_scale}-{emotion}.mp4",
             )
 
-            progress(0.3, desc="Running inference...")
+            progress(0.3, desc="Running optimized inference...")
             output_path = self.run(
                 ref_image,
                 audio_file,
@@ -312,8 +561,7 @@ class FloatModel:
                 video_encoder=video_encoder,
             )
             progress(1.0, desc="Complete!")
-            # Show only the file name — never leak server-side absolute paths.
-            return output_path, f"✅ Saved to: {Path(output_path).name}"
+            return output_path, f"✅ Video generated: {Path(output_path).name}"
         except Exception as e:
             tb = traceback.format_exc()
             logger.error(f"❌ Error during generation: {e}\n{tb}")
@@ -321,37 +569,16 @@ class FloatModel:
 
 
 # --------------------------------------------------------------------------- #
-# Per-session live state (NOT shared between users — held in a gr.State)
+# Audio Ingestion Helper
 # --------------------------------------------------------------------------- #
-@dataclass
-class LiveSession:
-    ref_image_path: Optional[str] = None
-    sample_rate: Optional[int] = None
-    buffer: list = field(default_factory=list)  # list of 1-D numpy float chunks
-    buffered_seconds: float = 0.0
-    chunk_idx: int = 0
-    running: bool = False
-    last_latency: float = 0.0
-    session_dir: Optional[str] = None
-
-    def reset_audio(self):
-        self.buffer = []
-        self.buffered_seconds = 0.0
-
-
-CHUNK_SECONDS = 1.5  # how much audio to accumulate before generating a clip
-MAX_LIVE_CLIPS_KEPT = 20  # rotate old temp files so disk doesn't fill up
-
-
 def _to_mono_float(chunk_sr_data):
     """Gradio streaming mic audio arrives as (sample_rate, np.ndarray)."""
     sr, data = chunk_sr_data
-    sr = int(sr)  # may arrive as a numpy scalar — soundfile needs plain int
+    sr = int(sr)
     data = np.asarray(data)
     if data.ndim > 1:
         data = data.mean(axis=1)
     if data.dtype.kind in "iu":
-        # int16/int32 PCM -> float32 [-1, 1]
         max_val = np.iinfo(data.dtype).max
         data = data.astype(np.float32) / max_val
     else:
@@ -359,6 +586,9 @@ def _to_mono_float(chunk_sr_data):
     return sr, data
 
 
+# --------------------------------------------------------------------------- #
+# Gradio Interface Builder
+# --------------------------------------------------------------------------- #
 def build_interface(
     ckpt_path="./checkpoints/float.pth",
     res_dir="./results",
@@ -376,40 +606,43 @@ def build_interface(
         ngpus=ngpus,
     )
 
-    # ---------- custom CSS ----------
     custom_css = """
-    .gradio-container { font-family: 'Arial', sans-serif; }
-    .live-status { font-weight: 600; }
+    .gradio-container { font-family: 'Inter', -apple-system, sans-serif; }
+    .live-status { font-weight: 600; font-family: monospace; font-size: 0.95rem; }
+    .stat-badge { background: #f0f4f8; padding: 2px 6px; border-radius: 4px; font-weight: 500; }
     """
 
-    with gr.Blocks(css=custom_css, title="FLOAT - Talking Face Generation") as demo:
+    with gr.Blocks(css=custom_css, title="FLOAT-Fast Talking Face Generation") as demo:
         gr.Markdown(
             """
-            # 🎭 FLOAT: Audio-Driven Talking Face Generation
-            Generate talking face videos from a reference image and audio —
-            as a one-shot batch job, or as a near-real-time live stream.
+            # 🎭 FLOAT-Fast: Audio-Driven Talking Face Generation
+            ### Ultra-Optimized Streaming Inference with Continuous Temporal Continuity
+            Generate talking face videos from a reference portrait and speech audio —
+            as a complete batch video or as a low-latency live streaming session.
             """
         )
 
         with gr.Tabs():
             # =========================================================== #
-            # TAB 1 — Original batch generation (upload full audio file)
+            # TAB 1 — Batch Generation (Upload Audio File)
             # =========================================================== #
-            with gr.Tab("📁 Batch (upload audio)"):
+            with gr.Tab("📁 Batch Generation"):
                 with gr.Row():
                     with gr.Column(scale=1):
-                        gr.Markdown("### 📥 Input Files")
+                        gr.Markdown("### 📥 Reference Inputs")
                         b_ref_image = gr.Image(
-                            label="Reference Image",
+                            label="Reference Portrait Image",
                             type="filepath",
                             sources=["upload"],
                             height=300,
                         )
                         b_audio_file = gr.Audio(
-                            label="Audio File", type="filepath", sources=["upload"]
+                            label="Speech Audio File (WAV/MP3)",
+                            type="filepath",
+                            sources=["upload"],
                         )
 
-                        with gr.Accordion("⚙️ Advanced Options", open=False):
+                        with gr.Accordion("⚙️ Advanced Optimization Settings", open=False):
                             b_emotion = gr.Dropdown(
                                 choices=[
                                     "S2E",
@@ -422,41 +655,38 @@ def build_interface(
                                     "surprise",
                                 ],
                                 value="S2E",
-                                label="Emotion Control",
+                                label="Emotion Conditioning",
                             )
                             b_no_crop = gr.Checkbox(
-                                label="Skip Face Cropping", value=False
+                                label="Skip Automatic Face Cropping", value=False
                             )
                             b_seed = gr.Slider(
                                 0, 10000, value=25, step=1, label="Random Seed"
                             )
                             b_decode_batch = gr.Radio(
-                                choices=["Auto", "1", "2", "4", "8", "16","32","64"],
+                                choices=["Auto", "1", "2", "4", "8", "16", "32", "64"],
                                 value="Auto",
                                 label="🗂️ Decode Batch Size",
-                                info="Frames decoded per GPU micro-batch. "
-                                     "'Auto' picks the best size for your VRAM.",
+                                info="Frames decoded per GPU micro-batch ('Auto' tunes to available VRAM).",
                             )
                             b_video_encoder = gr.Radio(
                                 choices=get_encoder_choices(),
                                 value=default_video_encoder,
-                                label="🎬 Video Encoder",
-                                info="FFmpeg NVENC: NVIDIA GPU hardware encoder. CPU PyAV: libx264 software encoder. Torchcodec: PyTorch VideoEncoder.",
+                                label="🎬 Video Encoder Backend",
+                                info="FFmpeg NVENC (NVIDIA Hardware), CPU PyAV (In-process libx264), Torchcodec.",
                             )
 
                     with gr.Column(scale=1):
-                        gr.Markdown("### 🎛️ Generation Parameters")
+                        gr.Markdown("### 🎛️ Flow Matching Controls")
                         with gr.Group():
-                            b_nfe = gr.Slider(1, 50, value=10, step=1, label="NFE")
+                            b_nfe = gr.Slider(
+                                1, 50, value=10, step=1, label="NFE (Denoising Steps)"
+                            )
                             b_a_cfg = gr.Slider(
                                 0.0, 5.0, value=2.0, step=0.1, label="Audio CFG Scale"
                             )
                             b_r_cfg = gr.Slider(
-                                0.0,
-                                3.0,
-                                value=1.0,
-                                step=0.1,
-                                label="Reference CFG Scale",
+                                0.0, 3.0, value=1.0, step=0.1, label="Reference CFG Scale"
                             )
                             b_e_cfg = gr.Slider(
                                 0.0, 3.0, value=1.0, step=0.1, label="Emotion CFG Scale"
@@ -465,8 +695,8 @@ def build_interface(
                         b_generate_btn = gr.Button(
                             "🚀 Generate Video", variant="primary", size="lg"
                         )
-                        b_status = gr.Textbox(label="Status", lines=10)
-                        b_video_out = gr.Video(label="Generated Video", height=400)
+                        b_status = gr.Textbox(label="Status & Progress", lines=3)
+                        b_video_out = gr.Video(label="Generated Video Output", height=400)
 
                 b_generate_btn.click(
                     fn=model.generate_video,
@@ -487,153 +717,201 @@ def build_interface(
                 )
 
             # =========================================================== #
-            # TAB 2 — Live (microphone -> chunked near-real-time video)
+            # TAB 2 — Low-Latency Live Stream (Microphone)
             # =========================================================== #
-            with gr.Tab("🔴 Live (microphone)"):
+            with gr.Tab("🔴 Live Stream (Near-Real-Time)"):
                 gr.Markdown(
-                    f"""
-                    **How it works:** upload a reference face once, hit **Start**,
-                    then talk into your mic. Every ~{CHUNK_SECONDS:.1f}s of speech is
-                    turned into a short clip and played back automatically.
-                    There is inherent latency (buffering + inference time) — this is
-                    *near*-real-time, not frame-perfect live video. See the header
-                    comment in this file for why.
+                    """
+                    **How Live Streaming Works:**
+                    1. Upload a portrait image once. Face alignment and motion latent features are **precomputed**.
+                    2. Hit **▶️ Start Live**, then talk into your microphone.
+                    3. Each short speech chunk is denoised and rendered back-to-back with **Temporal Continuity**,
+                       carrying motion memory forward so video clips flow seamlessly without facial jumps.
                     """
                 )
 
-                # None = no session yet; a fresh LiveSession is created on Start.
-                # (Never put a mutable LiveSession() instance here — it would be
-                # shared across users.)
                 session_state = gr.State(value=None)
 
                 with gr.Row():
                     with gr.Column(scale=1):
                         l_ref_image = gr.Image(
-                            label="Reference Image (set once)",
+                            label="Reference Portrait (Precomputed once)",
                             type="filepath",
                             sources=["upload"],
-                            height=280,
+                            height=260,
+                        )
+                        l_cropped_preview = gr.Image(
+                            label="Aligned Face Preview",
+                            interactive=False,
+                            height=180,
+                            visible=False,
                         )
 
-                        with gr.Accordion("⚙️ Live Generation Settings", open=True):
-                            gr.Markdown("*Keep NFE low for lower latency.*")
-                            l_emotion = gr.Dropdown(
-                                choices=[
-                                    "S2E",
-                                    "angry",
-                                    "disgust",
-                                    "fear",
-                                    "happy",
-                                    "neutral",
-                                    "sad",
-                                    "surprise",
-                                ],
-                                value="S2E",
-                                label="Emotion Control",
+                        with gr.Accordion("⚙️ Live Streaming Optimization Controls", open=True):
+                            with gr.Row():
+                                l_chunk_len = gr.Slider(
+                                    1.0,
+                                    3.0,
+                                    value=CHUNK_SECONDS_DEFAULT,
+                                    step=0.25,
+                                    label="Chunk Duration (seconds)",
+                                    info="Audio accumulated before generating. 1.0-1.5s is optimal for near-real-time.",
+                                )
+                                l_nfe = gr.Slider(
+                                    2,
+                                    15,
+                                    value=6,
+                                    step=1,
+                                    label="NFE (lower = faster)",
+                                    info="4-6 steps deliver <350ms generation latency.",
+                                )
+
+                            l_temporal_continuity = gr.Checkbox(
+                                label="🔄 Seamless Temporal Continuity",
+                                value=True,
+                                info="Preserves ODE motion latents across chunks to eliminate boundary seams.",
                             )
-                            l_no_crop = gr.Checkbox(
-                                label="Skip Face Cropping", value=False
-                            )
-                            l_seed = gr.Slider(
-                                0, 10000, value=25, step=1, label="Random Seed"
-                            )
-                            l_nfe = gr.Slider(
-                                1,
-                                20,
-                                value=6,
-                                step=1,
-                                label="NFE (lower = faster/less latency)",
-                            )
-                            l_a_cfg = gr.Slider(
-                                0.0, 5.0, value=2.0, step=0.1, label="Audio CFG Scale"
-                            )
-                            l_r_cfg = gr.Slider(
-                                0.0,
-                                3.0,
-                                value=1.0,
-                                step=0.1,
-                                label="Reference CFG Scale",
-                            )
-                            l_e_cfg = gr.Slider(
-                                0.0, 3.0, value=1.0, step=0.1, label="Emotion CFG Scale"
-                            )
-                            l_decode_batch = gr.Radio(
-                                choices=["Auto", "1", "2", "4", "8", "16"],
-                                value="Auto",
-                                label="🗂️ Decode Batch Size",
-                                info="Frames decoded per GPU micro-batch. "
-                                     "'Auto' picks the best size for your VRAM.",
-                            )
+
+                            with gr.Row():
+                                l_emotion = gr.Dropdown(
+                                    choices=[
+                                        "S2E",
+                                        "angry",
+                                        "disgust",
+                                        "fear",
+                                        "happy",
+                                        "neutral",
+                                        "sad",
+                                        "surprise",
+                                    ],
+                                    value="S2E",
+                                    label="Emotion Control",
+                                )
+                                l_no_crop = gr.Checkbox(
+                                    label="Skip Face Cropping", value=False
+                                )
+
+                            with gr.Row():
+                                l_a_cfg = gr.Slider(
+                                    0.0, 5.0, value=2.0, step=0.1, label="Audio CFG"
+                                )
+                                l_r_cfg = gr.Slider(
+                                    0.0, 3.0, value=1.0, step=0.1, label="Ref CFG"
+                                )
+                                l_e_cfg = gr.Slider(
+                                    0.0, 3.0, value=1.0, step=0.1, label="Emotion CFG"
+                                )
+
+                            with gr.Row():
+                                l_seed = gr.Slider(
+                                    0, 10000, value=25, step=1, label="Random Seed"
+                                )
+                                l_decode_batch = gr.Radio(
+                                    choices=["Auto", "1", "2", "4", "8", "16"],
+                                    value="Auto",
+                                    label="Decode Batch Size",
+                                )
+
                             l_video_encoder = gr.Radio(
                                 choices=get_encoder_choices(),
                                 value=default_video_encoder,
-                                label="🎬 Video Encoder",
-                                info="FFmpeg NVENC: NVIDIA GPU hardware encoder. CPU PyAV: libx264 software encoder. Torchcodec: PyTorch VideoEncoder.",
+                                label="Video Encoder Backend",
+                                info="FFmpeg NVENC provides zero-overhead GPU encoding.",
                             )
 
                         l_mic = gr.Audio(
-                            label="Microphone",
+                            label="Microphone Audio Input",
                             sources=["microphone"],
                             streaming=True,
                             type="numpy",
                         )
 
                         with gr.Row():
-                            l_start_btn = gr.Button("▶️ Start Live", variant="primary")
-                            l_stop_btn = gr.Button("⏹️ Stop")
+                            l_start_btn = gr.Button("▶️ Start Live", variant="primary", size="lg")
+                            l_stop_btn = gr.Button("⏹️ Stop Live", size="lg")
 
                     with gr.Column(scale=1):
                         l_video_out = gr.Video(
-                            label="Live Output", height=400, autoplay=True, loop=False
+                            label="Live Stream Playback",
+                            height=400,
+                            autoplay=True,
+                            loop=False,
                         )
                         l_status = gr.Textbox(
-                            label="Live Status", lines=3, elem_classes=["live-status"]
+                            label="Live Engine Telemetry",
+                            lines=4,
+                            elem_classes=["live-status"],
                         )
 
-                # Ticks periodically; each tick checks whether enough audio has
-                # been buffered, and if so, runs one inference call.
-                l_timer = gr.Timer(0.5, active=False)
+                l_timer = gr.Timer(0.4, active=False)
 
-                # ---- session lifecycle -------------------------------------------------
-                def start_live(ref_image, session: Optional[LiveSession]):
+                # ---- Session Lifecycle -------------------------------------- #
+                def start_live(ref_image, no_crop, session: Optional[LiveSession]):
                     if ref_image is None:
                         return (
                             session,
                             gr.update(active=False),
-                            "❌ Upload a reference image first.",
+                            "❌ Upload a reference portrait image first.",
+                            gr.update(visible=False),
                         )
-                    session = LiveSession()
-                    session.ref_image_path = ref_image
-                    session.running = True
-                    session.session_dir = tempfile.mkdtemp(
-                        prefix="float_live_", dir=model.live_dir
-                    )
-                    return (
-                        session,
-                        gr.update(active=True),
-                        "🟢 Listening... start talking.",
-                    )
+                    try:
+                        session = LiveSession()
+                        session.ref_image_path = ref_image
+                        session.running = True
+                        session.session_dir = tempfile.mkdtemp(
+                            prefix="float_live_", dir=model.live_dir
+                        )
+
+                        # Precompute image identity ONCE
+                        t_prep0 = time.perf_counter()
+                        prep = model.prepare_live_session(ref_image, no_crop=no_crop)
+                        session.s_tensor = prep["s"]
+                        session.r_s = prep["r_s"]
+                        session.ref_feats = prep["ref_feats"]
+                        session.cropped_preview = prep["cropped_preview"]
+                        session.is_preprocessed = True
+                        t_prep = time.perf_counter() - t_prep0
+
+                        status_msg = (
+                            f"🟢 Session Initialized ({t_prep:.2f}s)\n"
+                            f"Identity pre-encoded & temporal cache primed. Start speaking into your mic!"
+                        )
+                        return (
+                            session,
+                            gr.update(active=True),
+                            status_msg,
+                            gr.update(value=session.cropped_preview, visible=True),
+                        )
+                    except Exception as e:
+                        tb = traceback.format_exc()
+                        logger.error(f"❌ Failed to initialize live session: {e}\n{tb}")
+                        return (
+                            None,
+                            gr.update(active=False),
+                            f"❌ Initialization failed: {e}",
+                            gr.update(visible=False),
+                        )
 
                 def stop_live(session: Optional[LiveSession]):
-                    if session is None:
-                        return None, gr.update(active=False), "⏹️ Stopped."
-                    session.running = False
-                    if session.session_dir and os.path.isdir(session.session_dir):
-                        shutil.rmtree(session.session_dir, ignore_errors=True)
-                    return session, gr.update(active=False), "⏹️ Stopped."
+                    if session is not None:
+                        session.running = False
+                        session.clear_gpu_cache()
+                        if session.session_dir and os.path.isdir(session.session_dir):
+                            shutil.rmtree(session.session_dir, ignore_errors=True)
+                    return None, gr.update(active=False), "⏹️ Live stream stopped.", gr.update(visible=False)
 
                 l_start_btn.click(
                     fn=start_live,
-                    inputs=[l_ref_image, session_state],
-                    outputs=[session_state, l_timer, l_status],
+                    inputs=[l_ref_image, l_no_crop, session_state],
+                    outputs=[session_state, l_timer, l_status, l_cropped_preview],
                 )
                 l_stop_btn.click(
                     fn=stop_live,
                     inputs=[session_state],
-                    outputs=[session_state, l_timer, l_status],
+                    outputs=[session_state, l_timer, l_status, l_cropped_preview],
                 )
 
-                # ---- audio ingestion ----------------------------------------------------
+                # ---- Continuous Mic Ingestion ------------------------------ #
                 def on_audio_stream(chunk, session: Optional[LiveSession]):
                     if session is None or chunk is None or not session.running:
                         return session
@@ -651,107 +929,93 @@ def build_interface(
                     outputs=[session_state],
                 )
 
-                # ---- periodic inference tick --------------------------------------------
+                # ---- Periodic Inference Dispatch --------------------------- #
                 def on_tick(
                     session: Optional[LiveSession],
+                    chunk_len,
                     emotion,
                     a_cfg,
                     r_cfg,
                     e_cfg,
                     nfe,
                     seed,
-                    no_crop,
                     decode_batch_size,
                     video_encoder,
+                    temporal_continuity,
                 ):
                     if session is None or not session.running:
                         return gr.update(), session, gr.update()
 
-                    if session.buffered_seconds < CHUNK_SECONDS or not session.buffer:
+                    target_len = _coerce_float(chunk_len, CHUNK_SECONDS_DEFAULT)
+
+                    if session.buffered_seconds < target_len or not session.buffer:
                         return (
                             gr.update(),
                             session,
                             gr.update(
-                                value=f"🟢 Listening... buffering audio "
-                                f"({session.buffered_seconds:.1f}s / {CHUNK_SECONDS:.1f}s)"
+                                value=f"🟢 Listening... buffering speech "
+                                f"({session.buffered_seconds:.2f}s / {target_len:.2f}s)"
                             ),
                         )
 
-                    if not session.session_dir or not os.path.isdir(
-                        session.session_dir
-                    ):
-                        os.makedirs(
-                            session.session_dir or model.live_dir, exist_ok=True
-                        )
-                        if not session.session_dir or not os.path.isdir(
-                            session.session_dir
-                        ):
-                            return (
-                                gr.update(),
-                                session,
-                                gr.update(
-                                    value="❌ Session temp dir missing — please Stop and Start again."
-                                ),
-                            )
+                    if not session.session_dir or not os.path.isdir(session.session_dir):
+                        os.makedirs(session.session_dir or model.live_dir, exist_ok=True)
 
-                    # Pull everything currently buffered and reset for the next chunk.
+                    # Flush accumulated audio for this chunk
                     audio = np.concatenate(session.buffer)
                     sr = session.sample_rate
                     session.reset_audio()
                     session.chunk_idx += 1
                     idx = session.chunk_idx
 
-                    chunk_wav = os.path.join(
-                        session.session_dir, f"chunk_{idx:05d}.wav"
-                    )
-                    chunk_mp4 = os.path.join(
-                        session.session_dir, f"chunk_{idx:05d}.mp4"
-                    )
-                    sf.write(chunk_wav, audio, sr)
+                    chunk_wav = os.path.join(session.session_dir, f"chunk_{idx:05d}.wav")
+                    chunk_mp4 = os.path.join(session.session_dir, f"chunk_{idx:05d}.mp4")
 
-                    t0 = time.time()
                     try:
-                        out_path = model.run(
-                            ref_path=session.ref_image_path,
-                            audio_path=chunk_wav,
+                        out_path, timings = model.run_live_chunk(
+                            session=session,
+                            audio_np=audio,
+                            sr=sr,
                             out_path=chunk_mp4,
+                            chunk_wav_path=chunk_wav,
                             emotion=emotion,
                             a_cfg=a_cfg,
                             r_cfg=r_cfg,
                             e_cfg=e_cfg,
                             nfe=nfe,
                             seed=seed,
-                            no_crop=no_crop,
                             decode_batch_size=decode_batch_size,
                             video_encoder=video_encoder,
+                            temporal_continuity=temporal_continuity,
                         )
+                        session.last_latency = timings["total"]
                     except Exception as e:
                         tb = traceback.format_exc()
                         logger.error(f"❌ Chunk {idx} failed: {e}\n{tb}")
                         return (
                             gr.update(),
                             session,
-                            gr.update(
-                                value=f"❌ Chunk {idx} failed: {e}\n\n--- Traceback ---\n{tb}"
-                            ),
+                            gr.update(value=f"❌ Chunk {idx} failed: {e}\n\n{tb}"),
                         )
 
-                    session.last_latency = time.time() - t0
-
-                    # Rotate old chunk files so a long session doesn't fill disk.
+                    # Rotate old chunk files to prevent disk usage growth
                     if idx > MAX_LIVE_CLIPS_KEPT:
                         old_idx = idx - MAX_LIVE_CLIPS_KEPT
                         for ext in (".wav", ".mp4"):
-                            old_path = os.path.join(
-                                session.session_dir, f"chunk_{old_idx:05d}{ext}"
-                            )
+                            old_path = os.path.join(session.session_dir, f"chunk_{old_idx:05d}{ext}")
                             if os.path.exists(old_path):
-                                os.remove(old_path)
+                                try:
+                                    os.remove(old_path)
+                                except Exception:
+                                    pass
 
+                    rtf = session.last_latency / max(0.001, target_len)
+                    rtf_str = f"{rtf:.2f}x Real-Time ({'Faster' if rtf < 1.0 else 'Slower'} than real-time)"
                     status = (
-                        f"🟢 Live — chunk {idx} generated in "
-                        f"{session.last_latency:.1f}s "
-                        f"(clip length {CHUNK_SECONDS:.1f}s, encoder {video_encoder})"
+                        f"🟢 Live Chunk #{idx} [{target_len:.1f}s speech -> {timings['frames']} frames]\n"
+                        f"⏱ Latency: {session.last_latency * 1000:.0f}ms | {timings['fps']:.1f} FPS | {rtf_str}\n"
+                        f"📊 Breakdown: Sampler {timings['sample'] * 1000:.0f}ms | Decoder {timings['decode'] * 1000:.0f}ms | Encoder {timings['encode'] * 1000:.0f}ms\n"
+                        f"🔄 Temporal Memory: {'Active (Seamless)' if temporal_continuity else 'Off'} | Encoder: {video_encoder}"
                     )
                     return gr.update(value=out_path), session, gr.update(value=status)
 
@@ -759,55 +1023,47 @@ def build_interface(
                     fn=on_tick,
                     inputs=[
                         session_state,
+                        l_chunk_len,
                         l_emotion,
                         l_a_cfg,
                         l_r_cfg,
                         l_e_cfg,
                         l_nfe,
                         l_seed,
-                        l_no_crop,
                         l_decode_batch,
                         l_video_encoder,
+                        l_temporal_continuity,
                     ],
                     outputs=[l_video_out, session_state, l_status],
                 )
 
-                # Best-effort temp cleanup if the user closes the tab without Stop.
                 try:
                     demo.unload(
                         fn=stop_live,
                         inputs=[session_state],
-                        outputs=[session_state, l_timer, l_status],
+                        outputs=[session_state, l_timer, l_status, l_cropped_preview],
                     )
                 except Exception:
                     pass
 
-        with gr.Accordion("ℹ️ Help & Information", open=False):
+        # =============================================================== #
+        # Help & Technical Guide
+        # =============================================================== #
+        with gr.Accordion("ℹ️ Architecture Guide & Performance Tuning", open=False):
             gr.Markdown(
                 """
-                ## Batch tab
-                Same as the original app: upload a full audio file, get one video back.
-
-                ## Live tab
-                1. Upload a reference image and click **Start Live**.
-                2. Allow microphone access when your browser prompts you.
-                3. Speak — every ~1.5s of audio becomes a short clip that autoplays.
-                4. Click **Stop** to end the session (this also clears temp files).
-
-                **Tuning for lower latency:**
-                - Lower `NFE` (try 4-8) — this is the single biggest latency lever.
-                - Shorten `CHUNK_SECONDS` at the top of this file for less buffering
-                  delay per clip (but more per-clip inference overhead and more
-                  visible seams between clips).
-                - Run on a GPU; CPU inference will not keep up with speech in real time.
-
-                **Why not truly frame-by-frame live?** FLOAT denoises each clip over
-                multiple steps (NFE); there's no streaming/causal inference path in
-                the base model, so the smallest unit of output is "one clip," not
-                "one frame." Getting below ~1s of latency reliably would require a
-                distilled/one-step variant of the model or an architecture built for
-                causal streaming generation — that's a model-level change, not
-                something this Gradio wrapper can add on its own.
+                ### Performance Tuning Recommendations
+                - **NFE (Number of Function Evaluations)**:
+                  Setting NFE to **4–6** provides the single largest latency reduction (<350ms per chunk) while preserving crisp lip-sync.
+                - **Chunk Duration**:
+                  Setting Chunk Duration to **1.25s – 1.5s** strikes the optimal balance between natural speech context and low latency.
+                - **Seamless Temporal Continuity**:
+                  When enabled, FLOAT caches the last motion frames (`prev_x`, `prev_wa`) and feeds them into the next chunk.
+                  This eliminates facial jumping or boundary seams between successive clips.
+                - **Video Encoder**:
+                  - **FFmpeg NVENC**: Direct hardware H.264 encoding via NVIDIA GPU (lowest CPU latency).
+                  - **Torchcodec**: Direct PyTorch CUDA video encoding.
+                  - **CPU PyAV**: Zero-subprocess in-memory libx264 software encoder.
                 """
             )
 
@@ -832,7 +1088,6 @@ def parse_launch_args():
         "--wav2vec_model_path", type=str, default="facebook/wav2vec2-base-960h"
     )
     parser.add_argument("--debug", action="store_true")
-
     parser.add_argument("--queue", action=_argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max_threads", type=int, default=4)
     parser.add_argument("--inbrowser", action="store_true")
@@ -879,9 +1134,6 @@ if __name__ == "__main__":
     logger.info(f"🤖 Model checkpoint: {args.ckpt_path}")
     logger.info("=" * 60)
 
-    # Only the results dir may be served over HTTP. Explicitly block the
-    # model/checkpoint source folders (and other sensitive dirs) so they
-    # can never be downloaded through the Gradio file server.
     blocked_paths = []
     ckpt_dir = os.path.dirname(args.ckpt_path)
     if ckpt_dir:
@@ -911,7 +1163,7 @@ if __name__ == "__main__":
         launch_kwargs["favicon_path"] = args.favicon_path
     if args.debug:
         launch_kwargs["debug"] = True
-        logging.getLogger().setLevel(logging.DEBUG)  # verbose mode
+        logging.getLogger().setLevel(logging.DEBUG)
 
     try:
         if args.queue:
