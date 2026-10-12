@@ -20,6 +20,7 @@ class AppState:
         self.executor: Optional[ThreadPoolExecutor] = None
         self.request_semaphore: Optional[asyncio.Semaphore] = None
         self.inference_lock: Optional[asyncio.Lock] = None
+        self.pipeline_engine: Optional[Any] = None
         self.performance_stats: Dict[str, Any] = {
             "total_requests": 0,
             "total_inference_time": 0.0,
@@ -29,18 +30,31 @@ class AppState:
         }
 
     def initialize_runtime(self):
-        """Initialize async primitives and executors."""
+        """Initialize async primitives, executors, and the Omni pipeline engine."""
         if self.request_semaphore is None:
             self.request_semaphore = asyncio.Semaphore(self.max_concurrent_requests)
         if self.inference_lock is None:
             self.inference_lock = asyncio.Lock()
         if self.executor is None:
             self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        if self.pipeline_engine is None and self.agent is not None and hasattr(self.agent, "G"):
+            from fast_float.sched.pipeline_engine import FloatOmniPipelineEngine
+            self.pipeline_engine = FloatOmniPipelineEngine(
+                self.agent.G,
+                max_running_requests=self.max_concurrent_requests,
+            )
 
     def shutdown(self):
         """Release resources on application shutdown."""
         if self.executor is not None:
             self.executor.shutdown(wait=False)
+        if self.pipeline_engine is not None:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(self.pipeline_engine.stop())
+            except Exception:
+                pass
 
 
 # Global singleton instance
