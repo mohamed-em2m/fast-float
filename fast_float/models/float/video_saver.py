@@ -216,7 +216,11 @@ class StreamingVideoSaver:
         return primary, devs
 
     def _get_ae(self, dev, primary):
-        """Motion autoencoder on dev: original on primary GPU, cached replicas elsewhere."""
+        """Motion autoencoder on dev: original on primary GPU, cached replicas elsewhere.
+
+        Avoids copy.deepcopy on torch.compile()'d modules (which breaks due to _orig_mod
+        wrappers) by always using state_dict() + fresh Generator construction.
+        """
         if dev == primary or (dev.index is not None and primary.index is not None and dev.index == primary.index):
             return self.motion_autoencoder
         reps = getattr(self, "_ae_replicas", None)
@@ -224,13 +228,22 @@ class StreamingVideoSaver:
             reps = self._ae_replicas = {}
         idx = dev.index if dev.index is not None else str(dev)
         if idx not in reps:
+            # Build a clean (uncompiled) Generator replica and transfer weights.
+            # We cannot use copy.deepcopy on torch.compile()'d modules - the _orig_mod
+            # wrapper raises errors and the state_dict keys will have _orig_mod. prefixes.
+            ae = Generator(
+                size=self.opt.input_size, style_dim=self.opt.dim_w, motion_dim=self.opt.dim_m
+            ).to(dev).eval()
             try:
-                ae = copy.deepcopy(self.motion_autoencoder).to(dev).eval()
-            except Exception:
-                ae = Generator(
-                    size=self.opt.input_size, style_dim=self.opt.dim_w, motion_dim=self.opt.dim_m
-                ).to(dev).eval()
-                ae.load_state_dict(self.motion_autoencoder.state_dict())
+                # Strip ._orig_mod prefixes from compiled module state_dict keys
+                raw_sd = self.motion_autoencoder.state_dict()
+                clean_sd = {
+                    k.replace("._orig_mod", "").replace("_orig_mod.", ""): v
+                    for k, v in raw_sd.items()
+                }
+                ae.load_state_dict(clean_sd, strict=False)
+            except Exception as e:
+                logger.warning(f"[_get_ae] state_dict copy failed for {dev}: {e}, replica may use random weights")
             ae.requires_grad_(False)
             reps[idx] = ae
         return reps[idx]
@@ -461,8 +474,22 @@ class StreamingVideoSaver:
         work_q: queue.Queue = queue.Queue()
         done_q: queue.Queue = queue.Queue()
         pool: queue.Queue = queue.Queue()
-        for _ in range(max(16, n_workers * 4 + 4)):
-            pool.put(torch.empty((B, H, W, C), dtype=torch.uint8, pin_memory=True))
+        _pool_size = max(16, n_workers * 4 + 4)
+        # Allocate pinned memory pool with a safe fallback to pageable memory.
+        # Pinned alloc can throw c10::Error on some CUDA contexts (e.g. multi-process
+        # or after torch.compile), so catch and fall back gracefully.
+        _use_pinned = True
+        try:
+            torch.empty((1, H, W, C), dtype=torch.uint8, pin_memory=True)
+        except Exception:
+            _use_pinned = False
+            logger.warning("[video_saver] pin_memory unavailable, using pageable host buffers")
+        for _ in range(_pool_size):
+            try:
+                buf = torch.empty((B, H, W, C), dtype=torch.uint8, pin_memory=_use_pinned)
+            except Exception:
+                buf = torch.empty((B, H, W, C), dtype=torch.uint8)
+            pool.put(buf)
 
         def fail(where, e):
             errors.append((where, e, traceback.format_exc()))
@@ -535,10 +562,15 @@ class StreamingVideoSaver:
             except BaseException as e:
                 fail("producer", e)
 
-        def worker(c, stream):
+        def worker(c):
+            """Decode worker. Creates its own CUDA stream on entry (not in main thread)."""
             dev = c["dev"]
+            stream = None
             try:
                 torch.cuda.set_device(dev)
+                # Create stream inside the worker thread to avoid CUDA context issues
+                # when a stream created in the main thread is used in a child thread.
+                stream = torch.cuda.Stream(device=dev)
                 while not stop.is_set():
                     item = _qget(work_q, stop)
                     if item is _ABORT:
@@ -568,6 +600,14 @@ class StreamingVideoSaver:
                         done_q.put((seq, buf, n_valid, done))
             except BaseException as e:
                 fail(f"decode_worker[{dev}]", e)
+            finally:
+                # Synchronize and release stream before thread exits to avoid
+                # C++ terminate() from stream destructor racing with other threads.
+                if stream is not None:
+                    try:
+                        torch.cuda.synchronize(dev)
+                    except Exception:
+                        pass
 
         def writer():
             if use_torchcodec:
@@ -706,7 +746,7 @@ class StreamingVideoSaver:
                 threads.append(
                     threading.Thread(
                         target=with_amp(worker),
-                        args=(c, torch.cuda.Stream(device=c["dev"])),
+                        args=(c,),  # Stream created inside worker thread
                         name=f"decode-cuda{i}-{k}",
                     )
                 )
