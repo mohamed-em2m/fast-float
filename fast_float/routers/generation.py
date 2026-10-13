@@ -1,7 +1,7 @@
+import asyncio
 import os
 import uuid
-from typing import Dict, Any
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
 from fast_float.utils.logger import logger
@@ -11,6 +11,11 @@ from fast_float.core.state import app_state
 from fast_float.core.service import generate_video
 
 router = APIRouter(tags=["generation"])
+
+# How long a request waits for a free generation slot before getting a 429.
+# Inference takes minutes; holding the connection open for all of it would
+# exhaust the server's connection pool, so we fail fast instead of queueing.
+ACQUIRE_TIMEOUT_S = 5.0
 
 
 @router.post("/generate", response_model=GenerationResponse)
@@ -22,7 +27,16 @@ async def generate(request: GenerationRequest):
     if app_state.request_semaphore is None:
         app_state.initialize_runtime()
 
-    async with app_state.request_semaphore:
+    try:
+        await asyncio.wait_for(
+            app_state.request_semaphore.acquire(), timeout=ACQUIRE_TIMEOUT_S
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=429, detail="Server busy, try again shortly"
+        ) from None
+
+    try:
         app_state.queue_counter += 1
         request_id = f"req_{app_state.queue_counter}_{uuid.uuid4().hex[:8]}"
 
@@ -64,9 +78,19 @@ async def generate(request: GenerationRequest):
                 ),
             )
 
+        except HTTPException:
+            raise
+        except ValueError as e:
+            logger.warning(f"[{request_id}] Bad request: {e}")
+            raise HTTPException(status_code=400, detail=str(e))
+        except FileNotFoundError as e:
+            logger.error(f"[{request_id}] Generation output missing: {e}")
+            raise HTTPException(status_code=502, detail="Video generation failed")
         except Exception as e:
-            logger.error(f"[{request_id}] Generation failed: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
+            logger.error(f"[{request_id}] Generation failed: {e!s}")
+            raise HTTPException(status_code=500, detail="Video generation failed")
+    finally:
+        app_state.request_semaphore.release()
 
 
 @router.get("/download/{request_id}")

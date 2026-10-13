@@ -12,7 +12,6 @@ import soundfile as sf
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
 
 # Ensure current directory and repository root are in sys.path
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -47,7 +46,14 @@ RESULTS_DIR = os.getenv("RESULTS_DIR", "./results")
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "10"))
 OPTIMIZATION_MODE = os.getenv("OPTIMIZATION_MODE", "all")
 USE_FP16 = os.getenv("USE_FP16", "true").lower() in ("true", "1", "yes")
-COMPRESS_RESPONSES = True
+# Comma-separated list of allowed browser origins, e.g.
+# CORS_ORIGINS=http://localhost:3000,https://studio.example.com
+# Default allows local dev (Vite :3000) plus the configured public URL.
+CORS_ORIGINS = [
+    o.strip()
+    for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+    if o.strip()
+]
 
 
 @asynccontextmanager
@@ -143,10 +149,15 @@ async def lifespan(app: FastAPI):
 
     # Shutdown logic
     logger.info("🛑 Shutting down server...")
-    if app_state.pcs:
-        close_coros = [pc.close() for pc in app_state.pcs]
-        await asyncio.gather(*close_coros, return_exceptions=True)
-        app_state.pcs.clear()
+    from fast_float.routers.webrtc import _cleanup_peer
+
+    for pc in list(app_state.pcs):
+        try:
+            await pc.close()
+        except Exception:
+            pass
+        finally:
+            _cleanup_peer(pc)
 
     app_state.shutdown()
     logger.info("👋 Shutdown complete.")
@@ -159,13 +170,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-if COMPRESS_RESPONSES:
-    app.add_middleware(GZipMiddleware, minimum_size=1000)
-
+# NOTE: No GZipMiddleware on purpose. Starlette's GZip compresses every
+# streaming response (including video/mp4, only text/event-stream is
+# excluded), which wastes CPU on already-compressed video and corrupts
+# byte-range streaming. JSON API responses are a few hundred bytes and
+# compress to nothing anyway.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

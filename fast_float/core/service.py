@@ -6,6 +6,8 @@ import datetime
 import asyncio
 from typing import Dict, Tuple, Any
 
+import cv2
+
 from fast_float.utils.logger import logger
 from fast_float.utils.media import (
     DEFAULT_IMAGE_PATH,
@@ -14,6 +16,21 @@ from fast_float.utils.media import (
     process_audio_format,
 )
 from fast_float.core.state import app_state
+
+ALLOWED_IMAGE_FORMATS = {"jpg", "jpeg", "png", "webp"}
+
+
+def _probe_frame_count(video_path: str) -> int:
+    """Best-effort frame count probe for fps reporting. Returns 0 on failure."""
+    try:
+        cap = cv2.VideoCapture(video_path)
+        try:
+            count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        finally:
+            cap.release()
+        return max(count, 0)
+    except Exception:
+        return 0
 
 
 def run_inference_blocking(
@@ -75,9 +92,12 @@ async def generate_video(
         # 2. Image processing
         if request_data.get("image_base64"):
             image_bytes = base64.b64decode(request_data["image_base64"])
+            image_format = str(request_data.get("image_format", "jpg")).lower().lstrip(".")
+            if image_format not in ALLOWED_IMAGE_FORMATS:
+                raise ValueError(f"Unsupported image_format '{image_format}'")
             image_path_temp = tempfile.NamedTemporaryFile(
                 delete=False,
-                suffix=f".{request_data.get('image_format', 'jpg')}",
+                suffix=f".{image_format}",
             ).name
             with open(image_path_temp, "wb") as f:
                 f.write(image_bytes)
@@ -119,16 +139,24 @@ async def generate_video(
 
         timings["inference"] = time.time() - inference_start
         timings["total"] = time.time() - total_start_time
-        timings["fps"] = 1.0 / timings["inference"] if timings["inference"] > 0 else 0.0
+        # Real video fps: encoded frames per second of inference wall time,
+        # not 1/inference_time (which is requests/sec and mislabels throughput).
+        frame_count = _probe_frame_count(output_path)
+        timings["fps"] = (
+            frame_count / timings["inference"]
+            if frame_count > 0 and timings["inference"] > 0
+            else 0.0
+        )
 
         # 4. Update performance stats
         stats = state.performance_stats
         stats["total_requests"] += 1
         stats["total_inference_time"] += timings["inference"]
         stats["total_preprocess_time"] += timings["preprocess"]
+        stats["total_frames"] = stats.get("total_frames", 0) + frame_count
         if stats["total_inference_time"] > 0:
             stats["average_fps"] = (
-                stats["total_requests"] / stats["total_inference_time"]
+                stats["total_frames"] / stats["total_inference_time"]
             )
 
         # 5. Clean temporary files

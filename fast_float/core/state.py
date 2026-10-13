@@ -6,7 +6,10 @@ from typing import Optional, Dict, Set, Any
 class AppState:
     """Shared application state containing runtime models, locks, and counters."""
 
-    def __init__(self, max_concurrent_requests: int = 10, max_workers: int = 14):
+    def __init__(self, max_concurrent_requests: int = 10, max_workers: int = 2):
+        # NOTE: inference is serialized by inference_lock (one GPU), so a
+        # large thread pool only wastes RAM. 2 workers cover inference +
+        # lifespan warmup overlap.
         self.agent: Optional[Any] = None
         self.opt: Optional[Any] = None
         self.video_optimizer: Optional[Any] = None

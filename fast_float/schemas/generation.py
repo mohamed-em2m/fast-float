@@ -1,24 +1,26 @@
-from typing import Optional, Dict, Any
+from typing import Literal, Optional, Dict, Any
 from pydantic import BaseModel, Field
 
 
 class GenerationRequest(BaseModel):
     audio_base64: str = Field(..., description="Base64 encoded audio bytes")
     audio_format: str = Field("pcm", description="Audio container format (pcm, wav, mp3, etc.)")
-    sample_rate: int = Field(16000, description="Audio sample rate in Hz")
-    channels: int = Field(1, description="Audio channel count")
+    sample_rate: int = Field(16000, ge=8000, le=48000, description="Audio sample rate in Hz")
+    channels: int = Field(1, ge=1, le=2, description="Audio channel count")
     sample_width: int = Field(2, description="Audio sample width in bytes (1=8bit, 2=16bit, 4=32bit)")
     image_base64: Optional[str] = Field(None, description="Base64 encoded portrait image. If omitted, default image is used.")
     image_format: Optional[str] = Field("jpg", description="Format of image_base64 (jpg, png, etc.)")
-    emotion: str = Field("S2E", description="Emotion conditioning mode")
-    nfe: int = Field(10, description="Number of ODE solver function evaluations (steps)")
-    seed: int = Field(25, description="Random seed")
-    a_cfg_scale: float = Field(2.0, description="Audio classifier-free guidance scale")
-    r_cfg_scale: float = Field(1.0, description="Reference classifier-free guidance scale")
-    e_cfg_scale: float = Field(1.0, description="Emotion classifier-free guidance scale")
+    emotion: Literal["S2E", "neutral", "happy", "sad", "angry", "surprise", "disgust"] = Field(
+        "S2E", description="Emotion conditioning mode"
+    )
+    nfe: int = Field(10, ge=5, le=25, description="Number of ODE solver function evaluations (steps)")
+    seed: int = Field(25, ge=0, description="Random seed")
+    a_cfg_scale: float = Field(2.0, ge=0.5, le=5.0, description="Audio classifier-free guidance scale")
+    r_cfg_scale: float = Field(1.0, ge=0.5, le=3.0, description="Reference classifier-free guidance scale")
+    e_cfg_scale: float = Field(1.0, ge=0.5, le=3.0, description="Emotion classifier-free guidance scale")
     no_crop: bool = Field(False, description="Disable automatic face crop")
     compress: bool = Field(True, description="Compress output video using optimized encoder")
-    quality: str = Field("balanced", description="Encoding quality (fast, balanced, high)")
+    quality: Literal["fast", "balanced", "high"] = Field("balanced", description="Encoding quality (fast, balanced, high)")
 
 
 class PerformanceTimings(BaseModel):
@@ -52,8 +54,8 @@ class HealthResponse(BaseModel):
 
 
 class WebRTCOfferRequest(BaseModel):
-    sdp: str
-    type: str
+    sdp: str = Field(..., min_length=1)
+    type: str = Field(..., min_length=1)
     stream_id: Optional[str] = None
 
 
