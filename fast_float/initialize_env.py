@@ -19,6 +19,8 @@ def set_env_variables(path: str):
     with open(path, "r", encoding="utf-8") as file:
         j = json.load(file)
         for var, val in j.items():
+            if var.startswith("_"):
+                continue  # comment / documentation keys, not env vars
             if var not in os.environ or not os.environ[var]:
                 os.environ[var] = str(val)
     return True

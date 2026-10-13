@@ -5,7 +5,7 @@ import AudioEngine from './components/AudioEngine';
 import ParameterControls from './components/ParameterControls';
 import StudioStage from './components/StudioStage';
 import TelemetryDashboard from './components/TelemetryDashboard';
-import { generateVideo, blobToBase64 } from './services/api';
+import { generateVideo, blobToBase64, alignUrlToApi } from './services/api';
 
 const DEFAULT_PORTRAIT = '/samples/portrait1.jpg';
 
@@ -89,6 +89,10 @@ export default function App() {
       };
 
       const result = await generateVideo(payload);
+      // Point playback/download URLs at the API host the browser can reach.
+      result.stream_url = alignUrlToApi(result.stream_url);
+      result.download_url = alignUrlToApi(result.download_url);
+      if (result.download_backup) result.download_backup = alignUrlToApi(result.download_backup);
       setGenerationResult(result);
       setHistory((prev) => [result, ...prev]);
       showToast(`Talking portrait generated successfully in ${result.performance?.total_time}s!`, 'success');

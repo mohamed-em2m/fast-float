@@ -1,4 +1,3 @@
 {
-  "AVATER_PUBLIC_URL": "https://ai.him-world.com",
-  "BACKUP_AVATER_PUBLIC_URL": "https://colab.him-world.com"
+  "_note": "Optional public URL overrides. When empty, the server defaults to http://localhost:{PORT}. Set AVATER_PUBLIC_URL / BACKUP_AVATER_PUBLIC_URL here (or as env vars) only if you own a reachable public domain."
 }
