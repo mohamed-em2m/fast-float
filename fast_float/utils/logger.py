@@ -65,6 +65,10 @@ def setup_logger(name: str = "float_fast", level: int = logging.INFO) -> logging
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
+    logging.getLogger("torch._dynamo").setLevel(logging.WARNING)
+    logging.getLogger("torch._inductor").setLevel(logging.WARNING)
+    logging.getLogger("torch.fx").setLevel(logging.WARNING)
+    logging.getLogger("torch._functorch").setLevel(logging.WARNING)
     return logger
 
 

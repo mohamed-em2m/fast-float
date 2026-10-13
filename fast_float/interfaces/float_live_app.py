@@ -31,9 +31,28 @@ import datetime
 import threading
 import traceback
 import subprocess
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Any, Union
+
+# Suppress Albumentations auto-update check and noisy deprecation warnings
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+warnings.filterwarnings("ignore", category=UserWarning, module="torch._utils")
+warnings.filterwarnings("ignore", category=UserWarning, module="librosa")
+warnings.filterwarnings("ignore", category=UserWarning, module="albumentations")
+warnings.filterwarnings("ignore", category=FutureWarning, module="huggingface_hub")
+
+# Suppress verbose PyTorch Dynamo compiler bytecode tracing
+logging.getLogger("torch._dynamo").setLevel(logging.WARNING)
+logging.getLogger("torch._inductor").setLevel(logging.WARNING)
+logging.getLogger("torch.fx").setLevel(logging.WARNING)
+try:
+    import torch._dynamo
+    torch._dynamo.config.verbose = False
+    torch._dynamo.config.suppress_errors = True
+except Exception:
+    pass
 
 # ---- logging setup -------------------------------------------------------- #
 try:
@@ -1163,7 +1182,11 @@ if __name__ == "__main__":
         launch_kwargs["favicon_path"] = args.favicon_path
     if args.debug:
         launch_kwargs["debug"] = True
-        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
+        logging.getLogger("fast_float").setLevel(logging.DEBUG)
+        logging.getLogger("torch._dynamo").setLevel(logging.WARNING)
+        logging.getLogger("torch._inductor").setLevel(logging.WARNING)
+        logging.getLogger("torch.fx").setLevel(logging.WARNING)
 
     try:
         if args.queue:

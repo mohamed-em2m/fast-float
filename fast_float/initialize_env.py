@@ -1,6 +1,14 @@
 import os 
 import json
 import asyncio 
+import warnings
+
+# Suppress Albumentations auto-update check and noisy deprecation warnings
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
+warnings.filterwarnings("ignore", category=UserWarning, module="torch._utils")
+warnings.filterwarnings("ignore", category=UserWarning, module="librosa")
+warnings.filterwarnings("ignore", category=UserWarning, module="albumentations")
+warnings.filterwarnings("ignore", category=FutureWarning, module="huggingface_hub")
 
 try:
     import uvloop
