@@ -28,40 +28,86 @@ export function blobToBase64(blob) {
   });
 }
 
+/** Log API failures so they are visible in the browser console, not silent. */
+function logApiError(method, path, err, status) {
+  const url = `${currentApiUrl}${path}`;
+  if (err) {
+    console.error(`[api] ${method} ${url} — network error: ${err.message}. Is the backend running?`);
+  } else {
+    console.error(`[api] ${method} ${url} — HTTP ${status}`);
+  }
+}
+
 /** Check health and model status */
 export async function fetchHealth() {
-  const res = await fetch(`${currentApiUrl}/health`);
-  if (!res.ok) throw new Error(`Health check failed: ${res.statusText}`);
+  let res;
+  try {
+    res = await fetch(`${currentApiUrl}/health`);
+  } catch (err) {
+    logApiError('GET', '/health', err);
+    throw new Error(`Cannot reach backend at ${currentApiUrl} — is it running?`);
+  }
+  if (!res.ok) {
+    logApiError('GET', '/health', null, res.status);
+    throw new Error(`Health check failed: ${res.status} ${res.statusText}`);
+  }
   return await res.json();
 }
 
 /** Get live GPU telemetry */
 export async function fetchGpuMetrics() {
-  const res = await fetch(`${currentApiUrl}/gpu`);
-  if (!res.ok) throw new Error(`GPU metrics failed: ${res.statusText}`);
+  let res;
+  try {
+    res = await fetch(`${currentApiUrl}/gpu`);
+  } catch (err) {
+    logApiError('GET', '/gpu', err);
+    throw new Error(`Cannot reach backend at ${currentApiUrl} — is it running?`);
+  }
+  if (!res.ok) {
+    logApiError('GET', '/gpu', null, res.status);
+    throw new Error(`GPU metrics failed: ${res.status} ${res.statusText}`);
+  }
   return await res.json();
 }
 
 /** Clear GPU CUDA memory cache */
 export async function clearGpuMemory() {
-  const res = await fetch(`${currentApiUrl}/gpu/clear`, { method: 'POST' });
-  if (!res.ok) throw new Error(`Clear GPU cache failed: ${res.statusText}`);
+  let res;
+  try {
+    res = await fetch(`${currentApiUrl}/gpu/clear`, { method: 'POST' });
+  } catch (err) {
+    logApiError('POST', '/gpu/clear', err);
+    throw new Error(`Cannot reach backend at ${currentApiUrl} — is it running?`);
+  }
+  if (!res.ok) {
+    logApiError('POST', '/gpu/clear', null, res.status);
+    throw new Error(`Clear GPU cache failed: ${res.status} ${res.statusText}`);
+  }
   return await res.json();
 }
 
 /** Generate talking portrait video */
 export async function generateVideo(payload) {
-  const res = await fetch(`${currentApiUrl}/generate`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
-  });
+  let res;
+  try {
+    res = await fetch(`${currentApiUrl}/generate`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    logApiError('POST', '/generate', err);
+    throw new Error(`Cannot reach backend at ${currentApiUrl} — is it running?`);
+  }
 
   if (!res.ok) {
     const errorData = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(errorData.detail || 'Video generation failed');
+    const detail = errorData.detail || 'Video generation failed';
+    console.error(`[api] POST ${currentApiUrl}/generate — HTTP ${res.status}: ${detail}`);
+    const prefix = res.status === 429 ? 'Server busy — ' : res.status === 400 ? 'Bad request — ' : '';
+    throw new Error(`${prefix}${detail}`);
   }
 
   return await res.json();
@@ -92,11 +138,18 @@ export async function createWebRtcSession(streamId, onTrackCallback) {
       type: pc.localDescription.type,
       stream_id: streamId,
     }),
+  }).catch((err) => {
+    pc.close();
+    logApiError('POST', '/offer', err);
+    throw new Error(`Cannot reach backend at ${currentApiUrl} — is it running?`);
   });
 
   if (!res.ok) {
     pc.close();
-    throw new Error(`WebRTC negotiation failed: ${res.statusText}`);
+    const errorData = await res.json().catch(() => ({}));
+    const detail = errorData.detail || res.statusText;
+    console.error(`[api] POST ${currentApiUrl}/offer — HTTP ${res.status}: ${detail}`);
+    throw new Error(`WebRTC negotiation failed (${res.status}): ${detail}`);
   }
 
   const answer = await res.json();

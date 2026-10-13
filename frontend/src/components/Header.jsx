@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Sparkles,
   Trash2,
@@ -8,6 +8,11 @@ import {
 } from 'lucide-react';
 import { fetchHealth, fetchGpuMetrics, clearGpuMemory, getApiUrl, setApiUrl } from '../services/api';
 
+// Consecutive failed polls before the pill flips to Disconnected. A single
+// failed poll (e.g. one slow tick while a big upload/generation is in
+// flight) must not flap the UI offline.
+const OFFLINE_AFTER_FAILURES = 3;
+
 export default function Header({ onToast }) {
   const [health, setHealth] = useState(null);
   const [gpu, setGpu] = useState(null);
@@ -15,11 +20,13 @@ export default function Header({ onToast }) {
   const [showSettings, setShowSettings] = useState(false);
   const [apiUrlInput, setApiUrlInput] = useState(getApiUrl());
   const [isClearing, setIsClearing] = useState(false);
+  const failuresRef = useRef(0);
 
   const checkStatus = async () => {
     try {
       const hData = await fetchHealth();
       setHealth(hData);
+      failuresRef.current = 0;
       setIsOnline(true);
       try {
         const gData = await fetchGpuMetrics();
@@ -28,7 +35,14 @@ export default function Header({ onToast }) {
         // GPU endpoint optional or no GPU
       }
     } catch (err) {
-      setIsOnline(false);
+      failuresRef.current += 1;
+      console.warn(`[health] poll failed (${failuresRef.current}/${OFFLINE_AFTER_FAILURES}): ${err.message}`);
+      if (failuresRef.current >= OFFLINE_AFTER_FAILURES) {
+        setIsOnline((prev) => {
+          if (prev && onToast) onToast(`Backend unreachable at ${getApiUrl()} — check connection or Config.`, 'error');
+          return false;
+        });
+      }
     }
   };
 
@@ -54,6 +68,7 @@ export default function Header({ onToast }) {
   const handleSaveApiUrl = (e) => {
     e.preventDefault();
     setApiUrl(apiUrlInput);
+    failuresRef.current = 0;
     setShowSettings(false);
     checkStatus();
     if (onToast) onToast(`API URL updated to ${apiUrlInput}`, 'info');

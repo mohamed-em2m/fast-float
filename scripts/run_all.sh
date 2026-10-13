@@ -23,6 +23,8 @@ PORT="${PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-3000}"
 export VITE_API_URL="${VITE_API_URL:-http://localhost:${PORT}}"
 export CORS_ORIGINS="${CORS_ORIGINS:-http://localhost:${FRONTEND_PORT}}"
+# Unbuffered Python so backend errors appear in the combined log immediately.
+export PYTHONUNBUFFERED=1
 
 # --- Prerequisites -----------------------------------------------------------
 command -v uv >/dev/null 2>&1 || { echo "❌ 'uv' not found on PATH. Run ./scripts/setup.sh first."; exit 1; }
@@ -46,15 +48,16 @@ trap cleanup INT TERM EXIT
 # --- Backend ------------------------------------------------------------------
 echo "🚀 Starting backend  →  http://localhost:${PORT} (docs: http://localhost:${PORT}/docs)"
 echo "   (model load + warmup can take several minutes on first start)"
+# 2>&1 merged and [api]-prefixed so backend errors are visible inline.
 uv run --frozen hypercorn fast_float.main:app \
     --bind "0.0.0.0:${PORT}" \
     --worker-class asyncio \
-    --log-level info &
+    --log-level info 2>&1 | sed -u 's/^/[api] /' &
 BACKEND_PID=$!
 
 # --- Frontend ------------------------------------------------------------------
 echo "🎨 Starting frontend →  http://localhost:${FRONTEND_PORT} (api: ${VITE_API_URL})"
-(cd "${PROJECT_ROOT}/frontend" && npm run dev -- --host 0.0.0.0 --port "${FRONTEND_PORT}") &
+(cd "${PROJECT_ROOT}/frontend" && npm run dev -- --host 0.0.0.0 --port "${FRONTEND_PORT}") 2>&1 | sed -u 's/^/[web] /' &
 FRONTEND_PID=$!
 
 echo ""
