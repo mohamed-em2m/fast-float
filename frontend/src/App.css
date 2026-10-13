@@ -974,6 +974,15 @@
   font-size: 11px;
 }
 
+.btn-sm {
+  padding: 6px 14px;
+  font-size: 13px;
+}
+
+.mp4-player-box {
+  width: 100%;
+}
+
 .stage-toolbar {
   display: flex;
   align-items: center;
@@ -1167,4 +1176,36 @@
   gap: 6px;
   color: var(--text-muted);
   font-family: var(--font-mono);
+}
+
+/* Previously unstyled classes referenced by components */
+.brand-icon {
+  color: #ffffff;
+  flex-shrink: 0;
+}
+
+.status-label {
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.portrait-focus-ring {
+  position: absolute;
+  inset: 14px;
+  border: 1px dashed rgba(255, 255, 255, 0.45);
+  border-radius: var(--radius-md);
+  pointer-events: none;
+}
+
+.sample-audio-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.advanced-toggle-row {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0 2px;
 }

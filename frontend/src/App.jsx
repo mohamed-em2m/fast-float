@@ -1,15 +1,17 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import Header from './components/Header';
 import PortraitCanvas from './components/PortraitCanvas';
 import AudioEngine from './components/AudioEngine';
 import ParameterControls from './components/ParameterControls';
 import StudioStage from './components/StudioStage';
 import TelemetryDashboard from './components/TelemetryDashboard';
-import { generateVideo } from './services/api';
+import { generateVideo, blobToBase64 } from './services/api';
+
+const DEFAULT_PORTRAIT = '/samples/portrait1.jpg';
 
 export default function App() {
   // Input State
-  const [imagePreview, setImagePreview] = useState('/samples/portrait1.jpg');
+  const [imagePreview, setImagePreview] = useState(DEFAULT_PORTRAIT);
   const [imageBase64, setImageBase64] = useState(null);
   const [noCrop, setNoCrop] = useState(false);
 
@@ -39,6 +41,25 @@ export default function App() {
     setToast({ message, type });
     setTimeout(() => setToast(null), 4000);
   };
+
+  // Preload the default sample portrait so the preview the user SEES is the
+  // image the backend RECEIVES. Previously imageBase64 stayed null and the
+  // server silently fell back to its placeholder image.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(DEFAULT_PORTRAIT);
+        if (!res.ok) return;
+        const blob = await res.blob();
+        const base64 = await blobToBase64(blob);
+        if (!cancelled) setImageBase64((prev) => prev ?? base64);
+      } catch (e) {
+        console.error('Failed to preload default portrait', e);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   const handleGenerate = async () => {
     if (!audioBase64) {
@@ -103,12 +124,11 @@ export default function App() {
             setNoCrop={setNoCrop}
           />
 
-          <AudioEngine 
+          <AudioEngine
             audioBlob={audioBlob}
             setAudioBlob={setAudioBlob}
             audioBase64={audioBase64}
             setAudioBase64={setAudioBase64}
-            audioFormat={audioFormat}
             setAudioFormat={setAudioFormat}
           />
 
@@ -125,7 +145,6 @@ export default function App() {
             isGenerating={isGenerating}
             generationResult={generationResult}
             hasAudio={Boolean(audioBase64)}
-            hasImage={Boolean(imagePreview)}
             onToast={showToast}
           />
 

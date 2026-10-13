@@ -1,14 +1,13 @@
 import React, { useState, useEffect } from 'react';
-import { 
-  Activity, 
-  Cpu, 
-  Zap, 
-  Clock, 
-  Timer, 
-  Layers, 
-  Download, 
-  RotateCw,
-  HardDrive 
+import {
+  Activity,
+  Cpu,
+  Zap,
+  Clock,
+  Timer,
+  Layers,
+  Download,
+  RotateCw
 } from 'lucide-react';
 import { fetchGpuMetrics, fetchHealth } from '../services/api';
 

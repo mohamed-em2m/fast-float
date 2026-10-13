@@ -113,6 +113,14 @@ torchaudio = { index = "pytorch-cu118" }
 
 ## 4. How to Run
 
+### 0. Launch Backend + Frontend Together (Recommended for Development)
+```bash
+# Single command, Ctrl+C stops both. Env overrides: PORT, FRONTEND_PORT,
+# VITE_API_URL, CORS_ORIGINS
+./scripts/run_all.sh
+# Backend → http://localhost:8000 | Frontend → http://localhost:3000
+```
+
 ### 1. Launch FastAPI Server
 ```bash
 # Direct run with uv and hypercorn

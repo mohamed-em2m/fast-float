@@ -1,13 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { 
-  Play, 
-  Sparkles, 
-  Download, 
-  Share2, 
-  Radio, 
-  Maximize2, 
-  RotateCcw,
-  CheckCircle2,
+import {
+  Sparkles,
+  Download,
+  Share2,
+  Radio,
   Film,
   Zap,
   Gauge
@@ -26,12 +22,12 @@ export default function StudioStage({
   isGenerating,
   generationResult,
   hasAudio,
-  hasImage,
   onToast,
 }) {
   const [currentStageIndex, setCurrentStageIndex] = useState(0);
   const [useWebRtc, setUseWebRtc] = useState(false);
   const [webRtcConnected, setWebRtcConnected] = useState(false);
+  const [isDownloading, setIsDownloading] = useState(false);
 
   const videoRef = useRef(null);
   const webRtcVideoRef = useRef(null);
@@ -97,13 +93,42 @@ export default function StudioStage({
     if (onToast) onToast('Video download URL copied to clipboard!', 'info');
   };
 
-  const videoUrl = generationResult 
-    ? `${getApiUrl()}/stream/${generationResult.request_id}`
-    : '/samples/sam_altman_result.mp4';
+  // Cross-origin <a download> is ignored by browsers (navigates instead of
+  // downloading), so fetch as blob and trigger a same-origin object URL.
+  const handleDownload = async () => {
+    if (!downloadUrl || !generationResult?.request_id || isDownloading) return;
+    setIsDownloading(true);
+    try {
+      const res = await fetch(downloadUrl);
+      if (!res.ok) throw new Error(`Download failed: ${res.statusText}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `float_talking_portrait_${generationResult.request_id}.mp4`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+      if (onToast) onToast('Video download started!', 'success');
+    } catch (e) {
+      console.error('Download failed', e);
+      // Fall back to plain navigation if the fetch path fails (e.g. CORS).
+      window.open(downloadUrl, '_blank', 'noopener');
+      if (onToast) onToast(`Direct download failed, opened link instead: ${e.message}`, 'info');
+    } finally {
+      setIsDownloading(false);
+    }
+  };
 
-  const downloadUrl = generationResult
-    ? `${getApiUrl()}/download/${generationResult.request_id}`
-    : null;
+  // Single source of truth: the URLs the backend returned. The local API-base
+  // reconstruction is only a fallback for stale results predating stream_url.
+  const videoUrl = generationResult?.stream_url
+    || (generationResult ? `${getApiUrl()}/stream/${generationResult.request_id}` : null)
+    || '/samples/sam_altman_result.mp4';
+
+  const downloadUrl = generationResult?.download_url
+    || (generationResult ? `${getApiUrl()}/download/${generationResult.request_id}` : null);
 
   return (
     <div className="card-section glass-panel stage-panel">
@@ -242,14 +267,15 @@ export default function StudioStage({
               </button>
 
               {/* Download MP4 */}
-              <a 
-                href={downloadUrl} 
-                download={`float_talking_portrait_${generationResult.request_id}.mp4`}
+              <button
+                type="button"
+                onClick={handleDownload}
+                disabled={isDownloading}
                 className="btn-primary btn-sm btn-download"
               >
                 <Download size={15} />
-                <span>Download MP4</span>
-              </a>
+                <span>{isDownloading ? 'Downloading...' : 'Download MP4'}</span>
+              </button>
             </>
           )}
         </div>

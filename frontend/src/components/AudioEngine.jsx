@@ -13,13 +13,12 @@ import {
 } from 'lucide-react';
 import { blobToBase64 } from '../services/api';
 
-export default function AudioEngine({ 
-  audioBlob, 
-  setAudioBlob, 
-  audioBase64, 
-  setAudioBase64, 
-  audioFormat, 
-  setAudioFormat 
+export default function AudioEngine({
+  audioBlob,
+  setAudioBlob,
+  audioBase64,
+  setAudioBase64,
+  setAudioFormat
 }) {
   const [activeTab, setActiveTab] = useState('mic'); // 'mic' | 'upload' | 'samples'
   const [isRecording, setIsRecording] = useState(false);
@@ -37,15 +36,7 @@ export default function AudioEngine({
   const timerIntervalRef = useRef(null);
   const audioElementRef = useRef(null);
   const fileInputRef = useRef(null);
-
-  // Clean up audio context and stream on unmount
-  useEffect(() => {
-    return () => {
-      stopTracks();
-      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-      if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
-    };
-  }, []);
+  const previewUrlRef = useRef(null);
 
   const stopTracks = () => {
     if (streamRef.current) {
@@ -53,6 +44,30 @@ export default function AudioEngine({
       streamRef.current = null;
     }
   };
+
+  const setPreviewSrc = (blob) => {
+    if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
+    previewUrlRef.current = blob ? URL.createObjectURL(blob) : null;
+    if (audioElementRef.current) audioElementRef.current.src = previewUrlRef.current || '';
+  };
+
+  // Map a MediaRecorder MIME type to the container ext the backend understands.
+  const mimeToFormat = (mime) => {
+    if (mime.includes('mp4')) return 'mp4';
+    if (mime.includes('ogg')) return 'ogg';
+    return 'webm';
+  };
+
+  // Clean up audio context and stream on unmount
+  useEffect(() => {
+    return () => {
+      stopTracks();
+      if (audioContextRef.current) audioContextRef.current.close().catch(() => {});
+      if (previewUrlRef.current) URL.revokeObjectURL(previewUrlRef.current);
+      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+      if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
+    };
+  }, []);
 
   // Start live microphone recording
   const startRecording = async () => {
@@ -99,15 +114,19 @@ export default function AudioEngine({
       mediaRecorder.onstop = async () => {
         const recordedBlob = new Blob(chunks, { type: mimeType });
         setAudioBlob(recordedBlob);
-        setAudioFormat('wav'); // FastAPI converts webm/opus/raw seamlessly
+        // Send the REAL container format — the backend transcodes it.
+        // Labeling webm/opus as 'wav' used to silently produce garbage audio.
+        setAudioFormat(mimeToFormat(mimeType));
 
         const base64 = await blobToBase64(recordedBlob);
         setAudioBase64(base64);
 
-        if (audioElementRef.current) {
-          audioElementRef.current.src = URL.createObjectURL(recordedBlob);
-        }
+        setPreviewSrc(recordedBlob);
         stopTracks();
+        if (audioContextRef.current) {
+          audioContextRef.current.close().catch(() => {});
+          audioContextRef.current = null;
+        }
       };
 
       mediaRecorder.start(100);
@@ -179,30 +198,38 @@ export default function AudioEngine({
   const handleFileUpload = async (file) => {
     if (!file) return;
     setAudioBlob(file);
-    const ext = file.name.split('.').pop().toLowerCase() || 'wav';
-    setAudioFormat(ext);
+    // Prefer the real MIME container over the filename; fall back to ext.
+    const mimeExt = file.type.includes('mp4') || file.type.includes('m4a')
+      ? 'mp4'
+      : file.type.includes('mpeg')
+        ? 'mp3'
+        : file.type.includes('ogg')
+          ? 'ogg'
+          : file.type.includes('webm')
+            ? 'webm'
+            : file.type.includes('wav') || file.type.includes('wave')
+              ? 'wav'
+              : (file.name.split('.').pop().toLowerCase() || 'wav');
+    setAudioFormat(mimeExt);
 
     const base64 = await blobToBase64(file);
     setAudioBase64(base64);
 
-    if (audioElementRef.current) {
-      audioElementRef.current.src = URL.createObjectURL(file);
-    }
+    setPreviewSrc(file);
   };
 
   // Select Sample Audio Handler
   const handleSelectSample = async (url) => {
     try {
       const res = await fetch(url);
+      if (!res.ok) throw new Error(`Sample fetch failed: ${res.status}`);
       const blob = await res.blob();
       setAudioBlob(blob);
-      setAudioFormat('wav');
+      setAudioFormat(url.split('.').pop().toLowerCase() || 'wav');
       const base64 = await blobToBase64(blob);
       setAudioBase64(base64);
 
-      if (audioElementRef.current) {
-        audioElementRef.current.src = URL.createObjectURL(blob);
-      }
+      setPreviewSrc(blob);
     } catch (e) {
       console.error('Failed to load sample audio', e);
     }
@@ -406,7 +433,8 @@ export default function AudioEngine({
             onClick={() => {
               setAudioBlob(null);
               setAudioBase64(null);
-              if (audioElementRef.current) audioElementRef.current.src = '';
+              setIsPlaying(false);
+              setPreviewSrc(null);
             }}
           >
             <RotateCcw size={15} />

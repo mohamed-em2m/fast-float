@@ -1,13 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { 
-  Sparkles, 
-  Activity, 
-  Trash2, 
-  Settings, 
-  Cpu, 
-  CheckCircle2, 
-  AlertCircle,
-  RefreshCw 
+import {
+  Sparkles,
+  Trash2,
+  Settings,
+  Cpu,
+  RefreshCw
 } from 'lucide-react';
 import { fetchHealth, fetchGpuMetrics, clearGpuMemory, getApiUrl, setApiUrl } from '../services/api';
 

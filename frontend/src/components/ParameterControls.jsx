@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Sliders, Dna, Shuffle, Zap, ChevronDown, ChevronUp } from 'lucide-react';
+import { Sliders, Shuffle, Zap, ChevronDown, ChevronUp } from 'lucide-react';
 
 const EMOTIONS = [
   { id: 'S2E', label: 'Speech-to-Emotion', icon: '🧠' },

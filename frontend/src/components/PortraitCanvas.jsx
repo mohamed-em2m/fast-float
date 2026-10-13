@@ -1,5 +1,5 @@
-import React, { useRef } from 'react';
-import { Upload, Image as ImageIcon, X, Crop, Check, Sparkles } from 'lucide-react';
+import React, { useRef, useEffect } from 'react';
+import { Upload, Image as ImageIcon, X, Crop } from 'lucide-react';
 import { blobToBase64 } from '../services/api';
 
 const SAMPLE_PORTRAITS = [
@@ -7,19 +7,36 @@ const SAMPLE_PORTRAITS = [
   { id: 'avatar', name: 'Studio Avatar', url: '/samples/portrait2.jpg' },
 ];
 
-export default function PortraitCanvas({ 
-  imagePreview, 
-  setImagePreview, 
-  setImageBase64, 
-  noCrop, 
-  setNoCrop 
+export default function PortraitCanvas({
+  imagePreview,
+  setImagePreview,
+  setImageBase64,
+  noCrop,
+  setNoCrop
 }) {
   const fileInputRef = useRef(null);
+  // Tracks blob: preview URLs we created so we can revoke them (static
+  // /samples/* URLs must NOT be revoked).
+  const blobUrlRef = useRef(null);
+
+  useEffect(() => {
+    return () => {
+      if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+    };
+  }, []);
+
+  const setPreview = (url, { isBlob = false } = {}) => {
+    if (blobUrlRef.current) {
+      URL.revokeObjectURL(blobUrlRef.current);
+      blobUrlRef.current = null;
+    }
+    if (isBlob) blobUrlRef.current = url;
+    setImagePreview(url);
+  };
 
   const handleFileUpload = async (file) => {
     if (!file || !file.type.startsWith('image/')) return;
-    const previewUrl = URL.createObjectURL(file);
-    setImagePreview(previewUrl);
+    setPreview(URL.createObjectURL(file), { isBlob: true });
 
     try {
       const base64 = await blobToBase64(file);
@@ -37,9 +54,10 @@ export default function PortraitCanvas({
   };
 
   const handleSelectSample = async (sample) => {
-    setImagePreview(sample.url);
+    setPreview(sample.url);
     try {
       const response = await fetch(sample.url);
+      if (!response.ok) throw new Error(`Sample fetch failed: ${response.status}`);
       const blob = await response.blob();
       const base64 = await blobToBase64(blob);
       setImageBase64(base64);
@@ -49,7 +67,7 @@ export default function PortraitCanvas({
   };
 
   const handleClearImage = () => {
-    setImagePreview(null);
+    setPreview(null);
     setImageBase64(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
