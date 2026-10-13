@@ -47,12 +47,6 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="huggingface_hu
 logging.getLogger("torch._dynamo").setLevel(logging.WARNING)
 logging.getLogger("torch._inductor").setLevel(logging.WARNING)
 logging.getLogger("torch.fx").setLevel(logging.WARNING)
-try:
-    import torch._dynamo
-    torch._dynamo.config.verbose = False
-    torch._dynamo.config.suppress_errors = True
-except Exception:
-    pass
 
 # ---- logging setup -------------------------------------------------------- #
 try:
@@ -80,6 +74,14 @@ import numpy as np
 import soundfile as sf
 import torch
 import torch.nn.functional as F
+
+try:
+    import torch._dynamo
+    torch._dynamo.config.verbose = False
+    torch._dynamo.config.suppress_errors = True
+except Exception:
+    pass
+
 import gradio as gr
 
 logger = setup_logger("float_live_app")

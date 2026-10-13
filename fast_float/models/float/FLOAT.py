@@ -16,6 +16,11 @@ from typing import Optional
 
 import torch
 
+try:
+    import torch._dynamo as _dynamo
+except ImportError:
+    _dynamo = None
+
 from fast_float.models import BaseModel
 from fast_float.models.float.FMT import FlowMatchingTransformer
 from fast_float.models.float.generator import Generator
@@ -97,15 +102,15 @@ class FLOAT(BaseModel, StreamingVideoSaver, OmniStreamingMixin, FullInferenceMix
             logger.warning("torch.compile is not supported in this PyTorch version.")
             return False
 
-        try:
-            import torch._dynamo
-            torch._dynamo.config.verbose = False
-            torch._dynamo.config.suppress_errors = True
-            logging.getLogger("torch._dynamo").setLevel(logging.WARNING)
-            logging.getLogger("torch._inductor").setLevel(logging.WARNING)
-            logging.getLogger("torch.fx").setLevel(logging.WARNING)
-        except Exception:
-            pass
+        if _dynamo is not None:
+            try:
+                _dynamo.config.verbose = False
+                _dynamo.config.suppress_errors = True
+                logging.getLogger("torch._dynamo").setLevel(logging.WARNING)
+                logging.getLogger("torch._inductor").setLevel(logging.WARNING)
+                logging.getLogger("torch.fx").setLevel(logging.WARNING)
+            except Exception:
+                pass
 
         logger.info(f"Applying torch.compile (mode='{mode}') to FLOAT submodels...")
 
