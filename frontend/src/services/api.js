@@ -1,32 +1,86 @@
 /**
  * FLOAT Studio API Client
+ *
+ * The backend is reached through the same-origin `/api` reverse proxy (see
+ * vite.config.js), so the browser talks to whatever host served the page —
+ * localhost, a LAN IP, or an ngrok tunnel. Hard-coding `http://localhost:8000`
+ * breaks every remote browser: there, `localhost` is the *user's* machine.
  */
 
-export const DEFAULT_API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+/** Path prefix proxied to the FastAPI backend by Vite (and any prod proxy). */
+const API_PROXY_PATH = '/api';
 
-let currentApiUrl = localStorage.getItem('float_api_url') || DEFAULT_API_URL;
+/** Hosts that mean "this very machine" and are useless to a remote browser. */
+const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '0.0.0.0'];
+
+function isLoopbackHost(hostname) {
+  return LOOPBACK_HOSTS.includes(hostname);
+}
+
+function isLoopbackUrl(value) {
+  try {
+    return isLoopbackHost(new URL(value, window.location.origin).hostname);
+  } catch {
+    return false;
+  }
+}
+
+/** Same-origin API base that the dev/prod proxy forwards to the backend. */
+function sameOriginApiBase() {
+  if (typeof window === 'undefined') return 'http://localhost:8000';
+  return `${window.location.origin}${API_PROXY_PATH}`;
+}
+
+/**
+ * Default API base. Prefer the same-origin proxy so a remote browser (ngrok,
+ * LAN) reaches the real server; a loopback VITE_API_URL is ignored because it
+ * would trap the browser on its own machine. A non-loopback VITE_API_URL wins.
+ */
+export const DEFAULT_API_URL =
+  import.meta.env.VITE_API_URL && !isLoopbackUrl(import.meta.env.VITE_API_URL)
+    ? import.meta.env.VITE_API_URL.replace(/\/$/, '')
+    : sameOriginApiBase();
+
+function resolveInitialApiUrl() {
+  const stored = localStorage.getItem('float_api_url');
+  // Drop a stale loopback URL when the page is served from a public host —
+  // it can only ever point back at the user's own machine.
+  if (stored && isLoopbackUrl(stored) && !isLoopbackHost(window.location.hostname)) {
+    localStorage.removeItem('float_api_url');
+    return DEFAULT_API_URL;
+  }
+  return stored || DEFAULT_API_URL;
+}
+
+let currentApiUrl = resolveInitialApiUrl();
 
 export function getApiUrl() {
   return currentApiUrl;
 }
 
+/** Join a backend path onto an API base, preserving any base path prefix. */
+function joinApiBase(base, path) {
+  try {
+    const api = new URL(base, window.location.origin);
+    const prefix = api.pathname.replace(/\/$/, '');
+    return `${api.origin}${prefix}${path.startsWith('/') ? path : `/${path}`}`;
+  } catch {
+    return `${base}${path}`;
+  }
+}
+
 /**
- * Rewrite a backend-returned URL to the currently adopted API base host
- * when both are loopback addresses (localhost / 127.0.0.1 / 0.0.0.0).
- * Keeps port and path — only fixes the host the browser can actually reach.
+ * Rewrite a backend-returned absolute URL to the currently adopted API base.
+ * The backend advertises `http://localhost:8000/...` no matter how the browser
+ * reached us; rerouting loopback URLs through the API base keeps them
+ * reachable — and same-origin via the proxy — for remote clients.
  */
 export function alignUrlToApi(url) {
   if (!url) return url;
   try {
-    const target = new URL(url);
-    const api = new URL(currentApiUrl);
-    if (
-      LOOPBACK_HOSTS.includes(target.hostname) &&
-      LOOPBACK_HOSTS.includes(api.hostname) &&
-      target.hostname !== api.hostname
-    ) {
-      target.hostname = api.hostname;
-      return target.toString();
+    const target = new URL(url, window.location.origin);
+    if (isLoopbackHost(target.hostname)) {
+      return joinApiBase(currentApiUrl, `${target.pathname}${target.search}`);
     }
   } catch {
     // Not an absolute URL — leave untouched.
@@ -44,13 +98,11 @@ export function setApiUrl(url) {
  * Only rewrites loopback-ish hosts (localhost / 127.0.0.1 / 0.0.0.0) —
  * a custom LAN IP or domain is left alone. Port and protocol preserved.
  */
-const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '0.0.0.0'];
-
 export function getApiCandidates() {
   const ordered = [currentApiUrl];
   try {
-    const u = new URL(currentApiUrl);
-    if (LOOPBACK_HOSTS.includes(u.hostname)) {
+    const u = new URL(currentApiUrl, window.location.origin);
+    if (isLoopbackHost(u.hostname)) {
       for (const host of LOOPBACK_HOSTS) {
         if (host === u.hostname) continue;
         const alt = new URL(u.toString());
