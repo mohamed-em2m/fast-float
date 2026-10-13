@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from typing import Any
 
 try:
@@ -62,6 +63,14 @@ class InferenceOptions(BaseOptions):
         )
         parser.add_argument(
             "--use_fp16", action="store_true", help="Use FP16 precision"
+        )
+        parser.add_argument(
+            "--decode_fp32",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Decode face frames in fp32 even under fp16 autocast "
+            "(avoids fp16 demodulation overflow and fp16 grouped-conv faults). "
+            "Use --no-decode_fp32 to decode in fp16.",
         )
         parser.add_argument(
             "--benchmark", action="store_true", help="Run benchmark mode"

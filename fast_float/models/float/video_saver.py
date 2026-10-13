@@ -261,22 +261,47 @@ class StreamingVideoSaver:
                     k.replace("._orig_mod", "").replace("_orig_mod.", ""): v
                     for k, v in raw_sd.items()
                 }
-                ae.load_state_dict(clean_sd, strict=False)
+                incompat = ae.load_state_dict(clean_sd, strict=False)
             except Exception as e:
-                logger.warning(f"[_get_ae] state_dict copy failed for {dev}: {e}, replica may use random weights")
+                raise RuntimeError(
+                    f"[_get_ae] replica weight copy failed for {dev}: {e}. "
+                    "Refusing to decode with random weights."
+                ) from e
+            if incompat.missing_keys:
+                # A replica with missing weights decodes garbage frames.
+                # Fail loudly instead of silently producing a bad video.
+                raise RuntimeError(
+                    f"[_get_ae] replica on {dev} is missing "
+                    f"{len(incompat.missing_keys)} weight tensors "
+                    f"(e.g. {incompat.missing_keys[:3]}). "
+                    "Refusing to decode with random weights."
+                )
             ae.requires_grad_(False)
             reps[idx] = ae
         return reps[idx]
 
     def _decode_u8(self, ae, feats_in, lat, allow_split=True) -> torch.Tensor:
         """lat [b, dim] -> uint8 [b, H, W, C] on lat's device/current stream. Halves batch on OOM."""
+        # StyleGAN synthesis is fragile in fp16 (demodulation overflow ->
+        # black/NaN frames) and fp16 grouped convtranspose trips cuDNN
+        # "misaligned address" faults on some driver/cuDNN combos, so decode
+        # defaults to fp32 even when sampling runs fp16 autocast.
+        # Opt out with --no-decode_fp32 (or opt.decode_fp32 = False).
+        decode_fp32 = bool(getattr(self.opt, "decode_fp32", True))
         b = lat.shape[0]
         feats = [
             f.expand(b, *f.shape[1:]) if (f.shape[0] == 1 and b > 1) else f
             for f in feats_in
         ]
+        if decode_fp32:
+            lat = lat.float()
+            feats = [f.float() for f in feats]
         try:
-            out = ae.dec(lat, alpha=None, feats=feats)
+            if decode_fp32:
+                with torch.autocast(lat.device.type, enabled=False):
+                    out = ae.dec(lat, alpha=None, feats=feats)
+            else:
+                out = ae.dec(lat, alpha=None, feats=feats)
             if isinstance(out, (tuple, list)):
                 out = out[0]
             out = out.float()
