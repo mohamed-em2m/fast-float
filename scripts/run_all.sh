@@ -22,7 +22,8 @@ cd "${PROJECT_ROOT}"
 PORT="${PORT:-8000}"
 FRONTEND_PORT="${FRONTEND_PORT:-3000}"
 export VITE_API_URL="${VITE_API_URL:-http://localhost:${PORT}}"
-export CORS_ORIGINS="${CORS_ORIGINS:-http://localhost:${FRONTEND_PORT}}"
+# Browsers treat localhost and 127.0.0.1 as different origins — allow both.
+export CORS_ORIGINS="${CORS_ORIGINS:-http://localhost:${FRONTEND_PORT},http://127.0.0.1:${FRONTEND_PORT}}"
 # Unbuffered Python so backend errors appear in the combined log immediately.
 export PYTHONUNBUFFERED=1
 

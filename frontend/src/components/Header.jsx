@@ -6,7 +6,7 @@ import {
   Cpu,
   RefreshCw
 } from 'lucide-react';
-import { fetchHealth, fetchGpuMetrics, clearGpuMemory, getApiUrl, setApiUrl } from '../services/api';
+import { fetchHealth, fetchGpuMetrics, clearGpuMemory, getApiUrl, setApiUrl, DEFAULT_API_URL } from '../services/api';
 
 // Consecutive failed polls before the pill flips to Disconnected. A single
 // failed poll (e.g. one slow tick while a big upload/generation is in
@@ -156,6 +156,14 @@ export default function Header({ onToast }) {
               className="settings-input"
             />
             <div className="settings-buttons">
+              <button
+                type="button"
+                className="btn-secondary btn-sm"
+                title={`Reset to default (${DEFAULT_API_URL})`}
+                onClick={() => setApiUrlInput(DEFAULT_API_URL)}
+              >
+                Reset
+              </button>
               <button type="button" className="btn-secondary btn-sm" onClick={() => setShowSettings(false)}>
                 Cancel
               </button>

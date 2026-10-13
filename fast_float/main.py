@@ -48,10 +48,12 @@ OPTIMIZATION_MODE = os.getenv("OPTIMIZATION_MODE", "all")
 USE_FP16 = os.getenv("USE_FP16", "true").lower() in ("true", "1", "yes")
 # Comma-separated list of allowed browser origins, e.g.
 # CORS_ORIGINS=http://localhost:3000,https://studio.example.com
-# Default allows local dev (Vite :3000) plus the configured public URL.
+# localhost and 127.0.0.1 are different origins to a browser, so allow both.
 CORS_ORIGINS = [
     o.strip()
-    for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
+    for o in os.getenv(
+        "CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+    ).split(",")
     if o.strip()
 ]
 
