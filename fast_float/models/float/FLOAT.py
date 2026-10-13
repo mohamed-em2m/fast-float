@@ -84,11 +84,31 @@ class FLOAT(BaseModel, StreamingVideoSaver, OmniStreamingMixin, FullInferenceMix
             "method": self.opt.torchdiffeq_ode_method,
         }
 
+    @staticmethod
+    def _probe_inductor_backend() -> bool:
+        """Check if torch.inductor Triton kernel compilation works in this environment.
+
+        On Kaggle and some Docker images python3-dev headers are absent, causing gcc to
+        fail with 'Python.h: No such file or directory' when Triton tries to build its C
+        extension stub.  We probe with a tiny tensor so the failure happens early and
+        silently, before we waste time on real model compilation.
+        """
+        try:
+            import torch._inductor  # noqa: F401 — confirm inductor is importable
+
+            _t = torch.ones(4, 4, device="cuda" if torch.cuda.is_available() else "cpu")
+            _fn = torch.compile(lambda x: x + 1, backend="inductor", mode="default")
+            _fn(_t)
+            return True
+        except Exception:
+            return False
+
     def compile_models(
         self,
         mode: str = "default",
         fullgraph: bool = False,
         dynamic: Optional[bool] = None,
+        backend: Optional[str] = None,
     ) -> bool:
         """Compile internal PyTorch submodules using torch.compile for high-throughput inference.
 
@@ -97,6 +117,15 @@ class FLOAT(BaseModel, StreamingVideoSaver, OmniStreamingMixin, FullInferenceMix
           2. StyleDecoder (self.motion_autoencoder.dec) - per-frame image synthesis hotspot
           3. Motion Encoder (self.motion_autoencoder.enc) - source image encoder
           4. Audio projection layers (self.audio_encoder.audio_projection)
+
+        Args:
+            mode: torch.compile mode string ('default', 'reduce-overhead', 'max-autotune').
+            fullgraph: If True, require the entire model to be captured in a single graph.
+            dynamic: If True/False, force dynamic/static shape handling; None = auto.
+            backend: Explicitly choose a torch.compile backend. When None (default), the
+                method probes whether 'inductor' (Triton) can compile in the current
+                environment and falls back to 'aot_eager' if gcc/Python.h are unavailable
+                (common on Kaggle and minimal Docker images).
         """
         if not hasattr(torch, "compile"):
             logger.warning("torch.compile is not supported in this PyTorch version.")
@@ -112,12 +141,44 @@ class FLOAT(BaseModel, StreamingVideoSaver, OmniStreamingMixin, FullInferenceMix
             except Exception:
                 pass
 
-        logger.info(f"Applying torch.compile (mode='{mode}') to FLOAT submodels...")
+        # ---- Backend resolution ------------------------------------------ #
+        if backend is None:
+            # When torch.compile uses the "inductor" backend (default) it invokes Triton
+            # which compiles C extension stubs with gcc.  Environments that lack
+            # python3-dev headers (Kaggle, many Docker images) will fail with
+            # "Python.h: No such file or directory".
+            # We probe inductor first; if it fails we degrade to "aot_eager" which
+            # applies graph capture + operator fusion without any C compilation step.
+            if torch.cuda.is_available():
+                _inductor_ok = self._probe_inductor_backend()
+                if not _inductor_ok:
+                    backend = "aot_eager"
+                    logger.warning(
+                        "⚠️  torch.inductor Triton compilation failed (likely missing "
+                        "python3-dev headers). Falling back to backend='aot_eager'. "
+                        "Install python3.10-dev / python3-dev on the host to unlock "
+                        "full Triton JIT compilation and maximum throughput."
+                    )
+                else:
+                    backend = "inductor"
+            else:
+                # CPU path: inductor on CPU is slow; eager is cleaner
+                backend = "aot_eager"
+
+        compile_kwargs: dict = dict(
+            mode=mode,
+            fullgraph=fullgraph,
+            dynamic=dynamic,
+            backend=backend,
+        )
+        logger.info(
+            f"Applying torch.compile (backend='{backend}', mode='{mode}') to FLOAT submodels..."
+        )
 
         # 1. FlowMatchingTransformer (FMT)
         if hasattr(self, "fmt") and self.fmt is not None:
             try:
-                self.fmt = torch.compile(self.fmt, mode=mode, fullgraph=fullgraph, dynamic=dynamic)
+                self.fmt = torch.compile(self.fmt, **compile_kwargs)
                 logger.info("✓ FlowMatchingTransformer compiled successfully")
             except Exception as e:
                 logger.warning(f"! Failed to compile FlowMatchingTransformer: {e}")
@@ -126,7 +187,7 @@ class FLOAT(BaseModel, StreamingVideoSaver, OmniStreamingMixin, FullInferenceMix
         if hasattr(self, "motion_autoencoder") and hasattr(self.motion_autoencoder, "dec"):
             try:
                 self.motion_autoencoder.dec = torch.compile(
-                    self.motion_autoencoder.dec, mode=mode, fullgraph=fullgraph, dynamic=dynamic
+                    self.motion_autoencoder.dec, **compile_kwargs
                 )
                 logger.info("✓ StyleDecoder compiled successfully")
             except Exception as e:
@@ -136,7 +197,7 @@ class FLOAT(BaseModel, StreamingVideoSaver, OmniStreamingMixin, FullInferenceMix
         if hasattr(self, "motion_autoencoder") and hasattr(self.motion_autoencoder, "enc"):
             try:
                 self.motion_autoencoder.enc = torch.compile(
-                    self.motion_autoencoder.enc, mode=mode, fullgraph=fullgraph, dynamic=dynamic
+                    self.motion_autoencoder.enc, **compile_kwargs
                 )
                 logger.info("✓ Motion Encoder compiled successfully")
             except Exception as e:
@@ -146,13 +207,14 @@ class FLOAT(BaseModel, StreamingVideoSaver, OmniStreamingMixin, FullInferenceMix
         if hasattr(self, "audio_encoder") and hasattr(self.audio_encoder, "audio_projection"):
             try:
                 self.audio_encoder.audio_projection = torch.compile(
-                    self.audio_encoder.audio_projection, mode=mode, fullgraph=fullgraph, dynamic=dynamic
+                    self.audio_encoder.audio_projection, **compile_kwargs
                 )
                 logger.info("✓ Audio Projection compiled successfully")
             except Exception as e:
                 logger.warning(f"! Failed to compile Audio Projection: {e}")
 
         return True
+
 
     @torch.no_grad()
     def encode_image_into_latent(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
