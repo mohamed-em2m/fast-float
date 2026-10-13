@@ -39,9 +39,11 @@ source .venv/bin/activate
 uv pip install --python .venv/bin/python -e .
 uv lock
 
-echo "=== Installing optional video codecs (torchcodec) ==="
-# torchcodec is optional; install if compatible binary wheel exists for torch/cuda
-uv pip install --python .venv/bin/python torchcodec || echo "⚠️ torchcodec install skipped or unavailable for current platform/PyTorch version (PyAV and FFmpeg NVENC remain available)."
+# NOTE: torchcodec is intentionally NOT installed. No torchcodec release supports
+# torch 2.0.1 (its native libs need aoti_* symbols from torch>=2.5), so any
+# installed build fails at import with "undefined symbol: aoti_torch_dtype_*".
+# Supported writers: in-process PyAV (pinned `av`) and external FFmpeg/NVENC.
+# The app treats torchcodec as strictly optional with PyAV fallback.
 
 echo "=== Running checkpoint download script ==="
 chmod +x "${SCRIPT_DIR}/download_checkpoints.sh"

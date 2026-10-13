@@ -172,9 +172,19 @@ class OptimizedInferenceAgent:
                 return save_video_pyav(vid, video_path, audio_path=audio_path, fps=fps)
 
             if encoder_choice in ("torchcodec", "torch codec", "tc"):
-                return save_video_torchcodec(
-                    vid, video_path, audio_path=audio_path, fps=fps
-                )
+                try:
+                    return save_video_torchcodec(
+                        vid, video_path, audio_path=audio_path, fps=fps
+                    )
+                except Exception as e:
+                    # torchcodec missing or binary-incompatible with installed
+                    # torch (OSError: undefined symbol) — fall back to PyAV.
+                    logger.warning(
+                        f"⚠️ torchcodec writer failed ({e}); falling back to PyAV."
+                    )
+                    return save_video_pyav(
+                        vid, video_path, audio_path=audio_path, fps=fps
+                    )
 
             # Default: FFmpeg NVENC
             encode_video_nvenc(vid, video_path, fps=fps)

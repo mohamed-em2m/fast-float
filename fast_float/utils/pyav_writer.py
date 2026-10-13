@@ -37,11 +37,15 @@ def is_pyav_available() -> bool:
 
 
 def is_torchcodec_available() -> bool:
-    """Check if torchcodec is installed with VideoEncoder support."""
+    """Check if torchcodec is installed with VideoEncoder support.
+
+    Catches broadly on purpose: a binary-incompatible install raises
+    OSError (broken .so, e.g. built for a newer torch), not ImportError.
+    """
     try:
         from torchcodec.encoders import VideoEncoder  # noqa: F401
         return True
-    except ImportError:
+    except Exception:
         return False
 
 
@@ -394,11 +398,15 @@ def save_video_torchcodec(
     """
     try:
         from torchcodec.encoders import VideoEncoder as _TCEncoder
-    except ImportError:
+    except (ImportError, OSError) as e:
         raise RuntimeError(
-            "torchcodec is not installed. "
-            "Install with: pip install torchcodec"
-        )
+            "torchcodec is not usable: "
+            f"{e}. "
+            "This usually means it is not installed, or its native libraries "
+            "were built for a newer PyTorch than the one installed "
+            "(torchcodec needs torch>=2.5; this project pins torch 2.0.1). "
+            "Use the PyAV writer instead."
+        ) from e
 
     # ------ normalise input to (T, C, H, W) uint8 CPU tensor ------
     if torch is not None and isinstance(vid, torch.Tensor):

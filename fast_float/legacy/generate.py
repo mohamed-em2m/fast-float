@@ -197,12 +197,23 @@ class InferenceAgent:
         )
         if encoder_choice in ("torchcodec", "torch codec", "tc"):
             try:
-                from fast_float.utils.pyav_writer import save_video_torchcodec
+                from fast_float.utils.pyav_writer import (
+                    save_video_torchcodec,
+                    save_video_pyav,
+                )
             except ImportError:
-                from utils.pyav_writer import save_video_torchcodec
-            return save_video_torchcodec(
-                vid_target_recon, video_path, audio_path=audio_path, fps=fps
-            )
+                from utils.pyav_writer import save_video_torchcodec, save_video_pyav
+            try:
+                return save_video_torchcodec(
+                    vid_target_recon, video_path, audio_path=audio_path, fps=fps
+                )
+            except Exception as e:
+                # torchcodec missing or binary-incompatible with installed
+                # torch (OSError: undefined symbol) — fall back to PyAV.
+                print(f"⚠️ torchcodec writer failed ({e}); falling back to PyAV.")
+                return save_video_pyav(
+                    vid_target_recon, video_path, audio_path=audio_path, fps=fps
+                )
 
         if encoder_choice in ("cpu pyav", "pyav", "pyav_cpu"):
             try:

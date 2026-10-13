@@ -144,11 +144,9 @@ def is_torchcodec_ready() -> bool:
 
 
 def get_encoder_choices() -> list[str]:
-    """Return available encoder choices."""
+    """Return available encoder choices (torchcodec only if actually usable)."""
     choices = ["FFmpeg NVENC", "CPU PyAV"]
     if is_torchcodec_ready():
-        choices.append("Torchcodec")
-    else:
         choices.append("Torchcodec")
     return choices
 

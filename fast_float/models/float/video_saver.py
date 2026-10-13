@@ -181,6 +181,26 @@ def _qget(q: queue.Queue, stop: threading.Event):
     return _ABORT
 
 
+def _torchcodec_usable() -> bool:
+    """True only if torchcodec imports AND its native libs load.
+
+    A binary-incompatible install raises OSError at import (broken .so,
+    e.g. built for a newer torch) — not just ImportError — so catch
+    broadly. Never raises.
+    """
+    try:
+        from fast_float.utils.pyav_writer import is_torchcodec_available
+    except ImportError:
+        try:
+            from pyav_writer import is_torchcodec_available
+        except ImportError:
+            return False
+    try:
+        return bool(is_torchcodec_available())
+    except Exception:
+        return False
+
+
 class StreamingVideoSaver:
     """Mixin for multi-stream, multi-GPU decode execution and video encoding pipeline."""
 
@@ -393,6 +413,18 @@ class StreamingVideoSaver:
         encoder_choice = str(video_encoder or getattr(self.opt, "video_encoder", "FFmpeg NVENC")).strip().lower()
         use_pyav = encoder_choice in ("cpu pyav", "pyav", "pyav_cpu")
         use_torchcodec = encoder_choice in ("torchcodec", "torch codec", "tc")
+
+        # Downgrade BEFORE spawning threads: if torchcodec is missing or its
+        # native libs can't load with the installed torch, fall back to PyAV
+        # while decoded frames are still in the queue (post-drain fallback
+        # would have nothing left to write).
+        if use_torchcodec and not _torchcodec_usable():
+            logger.warning(
+                "[inference_and_save] torchcodec requested but not usable "
+                "(missing or binary-incompatible with installed torch); "
+                "falling back to PyAV writer."
+            )
+            use_torchcodec, use_pyav = False, True
 
         if not use_pyav and not use_torchcodec and shutil.which("ffmpeg") is None:
             raise RuntimeError("ffmpeg not found in PATH")
@@ -612,9 +644,9 @@ class StreamingVideoSaver:
         def writer():
             if use_torchcodec:
                 try:
-                    from fast_float.utils.pyav_writer import save_video_torchcodec
+                    from fast_float.utils.pyav_writer import save_video_torchcodec, save_video_pyav
                 except ImportError:
-                    from pyav_writer import save_video_torchcodec
+                    from pyav_writer import save_video_torchcodec, save_video_pyav
 
                 all_frames = []
                 pending, nxt = {}, 0
@@ -641,6 +673,23 @@ class StreamingVideoSaver:
                     frames_np = np.concatenate(all_frames, axis=0)
                     save_video_torchcodec(frames_np, video_path, audio_path=audio_path, fps=fps)
                 except BaseException as e:
+                    # Encode failed after draining: write the buffered frames
+                    # via PyAV instead of losing them.
+                    if all_frames:
+                        logger.warning(
+                            f"[writer] torchcodec encode failed ({e}); "
+                            "writing drained frames via PyAV fallback."
+                        )
+                        try:
+                            save_video_pyav(
+                                np.concatenate(all_frames, axis=0),
+                                video_path,
+                                audio_path=audio_path,
+                                fps=fps,
+                            )
+                        except BaseException as e2:
+                            fail("writer_pyav_fallback", e2)
+                        return
                     fail("writer_torchcodec", e)
                 return
 
