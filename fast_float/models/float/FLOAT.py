@@ -92,7 +92,30 @@ class FLOAT(BaseModel, StreamingVideoSaver, OmniStreamingMixin, FullInferenceMix
         fail with 'Python.h: No such file or directory' when Triton tries to build its C
         extension stub.  We probe with a tiny tensor so the failure happens early and
         silently, before we waste time on real model compilation.
+
+        NOTE: the probe temporarily forces ``suppress_errors=False``. With
+        suppress_errors=True (which compile_models() enables), a broken
+        inductor silently degrades to eager *without raising*, so the probe
+        would wrongly report success and every real frame would then fail
+        noisily under the inductor backend.
         """
+        import logging as _logging
+
+        # Silence dynamo/inductor ERROR spam for the expected probe failure;
+        # compile_models() will log one clean warning + fallback instead.
+        _probed_loggers = ("torch._dynamo", "torch._dynamo.convert_frame", "torch._inductor")
+        _prev_levels = {}
+        for _name in _probed_loggers:
+            _lg = _logging.getLogger(_name)
+            _prev_levels[_name] = _lg.level
+            _lg.setLevel(_logging.CRITICAL)
+        _prev_suppress = None
+        if _dynamo is not None:
+            try:
+                _prev_suppress = _dynamo.config.suppress_errors
+                _dynamo.config.suppress_errors = False
+            except Exception:
+                _prev_suppress = None
         try:
             import torch._inductor  # noqa: F401 — confirm inductor is importable
 
@@ -102,6 +125,14 @@ class FLOAT(BaseModel, StreamingVideoSaver, OmniStreamingMixin, FullInferenceMix
             return True
         except Exception:
             return False
+        finally:
+            if _dynamo is not None and _prev_suppress is not None:
+                try:
+                    _dynamo.config.suppress_errors = _prev_suppress
+                except Exception:
+                    pass
+            for _name, _level in _prev_levels.items():
+                _logging.getLogger(_name).setLevel(_level)
 
     def compile_models(
         self,

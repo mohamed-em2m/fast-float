@@ -23,7 +23,10 @@ echo "=== Updating system packages ==="
 $USE_SUDO apt-get update -y
 
 echo "=== Installing system dependencies ==="
-$USE_SUDO apt-get install -y python3.10 ffmpeg git wget curl
+# python3.10-dev + build-essential: required so torch.compile/Triton can build
+# its C stubs with gcc (else "Python.h: No such file or directory" on Kaggle
+# and minimal images, forcing the slower aot_eager fallback).
+$USE_SUDO apt-get install -y python3.10 python3.10-dev build-essential ffmpeg git wget curl
 
 echo "=== Installing uv (package manager) ==="
 if ! command -v uv >/dev/null 2>&1; then
