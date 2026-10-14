@@ -482,16 +482,28 @@ class StreamingVideoSaver:
             return run
 
         # ---- per-GPU context: model replica, reference features, tuned profile ----
+        # Reference features live on the primary GPU. Copy them to the other GPUs
+        # on a dedicated transfer stream each, so the cross-device move is enqueued
+        # asynchronously and never drains the primary GPU's stream with a full
+        # device synchronize (the old code did synchronize(dev) + synchronize(primary)
+        # for every secondary device).
+        has_secondary = any(dev.index != primary.index for dev in devs)
+        if has_secondary and torch.cuda.is_available():
+            # features are final once the encoder stream is done; wait once total
+            feats_ready = torch.cuda.Event()
+            feats_ready.record(torch.cuda.current_stream(primary))
+            feats_ready.synchronize()
+
         ctx = {}
         for dev in devs:
             ae = self._get_ae(dev, primary)
             if dev.index == primary.index:
                 feats = s_r_feats
             else:
-                feats = [f.to(dev) for f in s_r_feats]
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize(dev)
-                    torch.cuda.synchronize(primary)
+                xfer = torch.cuda.Stream(device=dev)
+                with torch.cuda.stream(xfer):
+                    feats = [f.to(dev, non_blocking=True) for f in s_r_feats]
+                xfer.synchronize()  # drain only this device's transfer stream
             tuner, prof = self._get_decode_profile(dev, primary, ae, feats, s_r.dtype)
             ctx[dev.index] = dict(dev=dev, ae=ae, feats=feats, tuner=tuner, prof=prof)
 
@@ -1398,6 +1410,14 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         else:
             devs = [primary]
 
+        # Reference features live on the primary GPU; move them to any secondary
+        # GPU on a dedicated transfer stream so the cross-device copy is enqueued
+        # asynchronously and the primary GPU's stream is never drained to do it.
+        if torch.cuda.is_available() and len(devs) > 1:
+            feats_ready = torch.cuda.Event()
+            feats_ready.record(torch.cuda.current_stream(primary))
+            feats_ready.synchronize()  # features are final; wait once, not per device
+
         gpu_ctx = []
         for dev in devs:
             ae = self._get_ae(dev, primary)
@@ -1409,11 +1429,15 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                     and dev.index == primary.index
                 )
             )
-            feats = (
-                s_r_feats
-                if is_prim
-                else [f.to(dev) for f in s_r_feats]
-            )
+            if is_prim:
+                feats = s_r_feats
+            elif torch.cuda.is_available():
+                xfer = torch.cuda.Stream(device=dev)
+                with torch.cuda.stream(xfer):
+                    feats = [f.to(dev, non_blocking=True) for f in s_r_feats]
+                xfer.synchronize()  # drain only this device's transfer stream
+            else:
+                feats = [f.to(dev) for f in s_r_feats]
             if is_prim:
                 prim_streams = [
                     st for st in (self.stream_decode, self.stream_decode_2)
