@@ -19,6 +19,8 @@ from fast_float.utils.chunking import (
     split_wav_into_chunks,
     merge_mp4_chunks,
     get_audio_duration_seconds,
+    group_chunks_for_batch,
+    pad_wav_to_duration,
 )
 from fast_float.core.state import app_state
 
@@ -61,6 +63,25 @@ def run_inference_blocking(
     )
 
 
+def run_inference_batched_blocking(
+    agent: Any,
+    items: list,
+    image_path: str,
+    request_data: Dict[str, Any],
+) -> list:
+    """Synchronous batched-chunk inference runner invoked within ThreadPoolExecutor."""
+    return agent.run_inference_batched(
+        items,
+        image_path,
+        a_cfg_scale=request_data.get("a_cfg_scale", 2.0),
+        r_cfg_scale=request_data.get("r_cfg_scale", 1.0),
+        e_cfg_scale=request_data.get("e_cfg_scale", 1.0),
+        emo=request_data.get("emotion", "S2E"),
+        nfe=request_data.get("nfe", 10),
+        no_crop=request_data.get("no_crop", False),
+        seed=request_data.get("seed", 25),
+        verbose=True,
+    )
 def _prepare_image(request_data: Dict[str, Any], temp_files: list) -> str:
     """Decode + resize the reference image (or fall back to the default)."""
     if request_data.get("image_base64"):
@@ -297,25 +318,76 @@ async def _generate_chunked(
     )
     logger.info(f"[{request_id}] 🧩 Chunked generation: {num_chunks} chunks")
 
+    try:
+        batch_size = max(1, int(request_data.get("chunk_batch_size", 1) or 1))
+    except (TypeError, ValueError):
+        batch_size = 1
+    try:
+        pad_cap = max(0.0, float(request_data.get("chunk_pad_seconds", 2.0) or 0.0))
+    except (TypeError, ValueError):
+        pad_cap = 2.0
+    groups = group_chunks_for_batch(chunks, batch_size, pad_cap)
+    if batch_size > 1:
+        batched = sum(1 for g in groups if len(g) > 1)
+        logger.info(
+            f"[{request_id}] 🧪 Batched sampling: {len(groups)} group(s), "
+            f"{batched} batched, pad≤{pad_cap:g}s"
+        )
+
     chunk_videos: list = []
-    for i, ch in enumerate(chunks):
+    done, idx = 0, 0
+    for g in groups:
         state.set_progress(
-            request_id, stage="generating", completed_chunks=i,
-            percent=round(i / num_chunks * 90, 1),
-            message=f"{i}/{num_chunks} chunks",
+            request_id, stage="generating", completed_chunks=done,
+            percent=round(done / num_chunks * 90, 1),
+            message=f"{done}/{num_chunks} chunks",
         )
-        chunk_out = os.path.join(res_dir, f"{stamp}_{request_id}_chunk{i:03d}.mp4")
-        await loop.run_in_executor(
-            state.executor,
-            run_inference_blocking,
-            state.agent,
-            chunk_out,
-            image_path,
-            ch["path"],
-            request_data,
-        )
-        chunk_videos.append(chunk_out)
-        temp_files.append(chunk_out)
+        if len(g) == 1:
+            ch = g[0]
+            chunk_out = os.path.join(res_dir, f"{stamp}_{request_id}_chunk{idx:03d}.mp4")
+            await loop.run_in_executor(
+                state.executor,
+                run_inference_blocking,
+                state.agent,
+                chunk_out,
+                image_path,
+                ch["path"],
+                request_data,
+            )
+            chunk_videos.append(chunk_out)
+            temp_files.append(chunk_out)
+            idx += 1
+            done += 1
+        else:
+            target = max(c["duration"] for c in g)
+            items = []
+            for ch in g:
+                chunk_out = os.path.join(res_dir, f"{stamp}_{request_id}_chunk{idx:03d}.mp4")
+                if target - ch["duration"] > 1e-6:
+                    padded = os.path.join(res_dir, f"{stamp}_{request_id}_pad{idx:03d}.wav")
+                    pad_wav_to_duration(ch["path"], target, padded)
+                    temp_files.append(padded)
+                else:
+                    padded = ch["path"]
+                items.append({
+                    "audio_path": ch["path"],
+                    "padded_path": padded,
+                    "duration": ch["duration"],
+                    "out_path": chunk_out,
+                })
+                idx += 1
+            outs = await loop.run_in_executor(
+                state.executor,
+                run_inference_batched_blocking,
+                state.agent,
+                items,
+                image_path,
+                request_data,
+            )
+            for o in outs:
+                chunk_videos.append(o)
+                temp_files.append(o)
+            done += len(g)
 
     state.set_progress(
         request_id, status="merging", stage="merging",

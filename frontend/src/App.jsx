@@ -32,6 +32,7 @@ export default function App() {
     quality: 'balanced',
     chunk_seconds: 0,
     decode_batch_size: 0,
+    chunk_batch_size: 1,
   });
 
   // Generation & Output State
@@ -116,6 +117,7 @@ export default function App() {
         chunk_seconds: params.chunk_seconds,
         chunk_overlap_seconds: 0.5,
         decode_batch_size: params.decode_batch_size,
+        chunk_batch_size: params.chunk_batch_size,
         client_request_id: clientRequestId,
       };
 

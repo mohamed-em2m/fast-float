@@ -98,6 +98,53 @@ def split_wav_into_chunks(
     return results
 
 
+def pad_wav_to_duration(wav_path: str, target_seconds: float, out_path: str) -> str:
+    """Append silence so the WAV reaches ``target_seconds`` (no-op if already long)."""
+    data, sr = sf.read(wav_path, dtype="float32")
+    if data.ndim > 1:
+        data = data.mean(axis=1).astype(np.float32)
+    cur = len(data) / sr if sr > 0 else 0.0
+    need = int(round((target_seconds - cur) * sr)) if sr > 0 else 0
+    if need > 0:
+        data = np.concatenate([data, np.zeros(need, dtype=np.float32)])
+    sf.write(out_path, data, sr, format="WAV", subtype="PCM_16")
+    return out_path
+
+
+def group_chunks_for_batch(
+    chunks: List[Dict[str, Any]],
+    batch_size: int = 1,
+    max_pad_seconds: float = 2.0,
+) -> List[List[Dict[str, Any]]]:
+    """Greedily group adjacent chunks for batched sampling.
+
+    A chunk joins the current group only if padding it up to the group's max
+    duration needs at most ``max_pad_seconds`` of silence. Chunks that would
+    need more padding run solo so we never burn whole ODE solves on silence.
+    ``batch_size <= 1`` returns every chunk solo (today's sequential path).
+    """
+    if batch_size <= 1 or len(chunks) <= 1:
+        return [[c] for c in chunks]
+    groups: List[List[Dict[str, Any]]] = []
+    cur: List[Dict[str, Any]] = []
+    for ch in chunks:
+        trial = cur + [ch]
+        mx = max(c["duration"] for c in trial)
+        fits = len(trial) <= batch_size and all(
+            mx - c["duration"] <= max_pad_seconds + 1e-9 for c in trial
+        )
+        if fits:
+            cur = trial
+        else:
+            if cur:
+                groups.append(cur)
+            cur = [ch]
+        if len(cur) >= batch_size:
+            groups.append(cur)
+            cur = []
+    if cur:
+        groups.append(cur)
+    return groups
 def _has_audio_stream(path: str) -> bool:
     """True if the file contains at least one audio stream (ffprobe)."""
     try:

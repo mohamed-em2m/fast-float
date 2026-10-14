@@ -141,6 +141,34 @@ export default function ParameterControls({ params, setParams }) {
           Splits long speech into overlapping windows, renders each independently, then
           merges to one MP4. Slide to set the window length, or OFF for a single pass.
         </p>
+        <div className="control-label-row" style={{ marginTop: '8px' }}>
+          <label className="control-label">
+            <span>Chunk Batch Size</span>
+            <span className="control-val-badge">
+              {params.chunk_batch_size > 1 ? `×${params.chunk_batch_size} batched` : 'Sequential'}
+            </span>
+          </label>
+          <span className="control-subtext">
+            {params.chunk_batch_size > 1 ? '🧪 One sample batch' : 'One chunk at a time'}
+          </span>
+        </div>
+        <input
+          type="range"
+          min="1"
+          max="8"
+          step="1"
+          value={params.chunk_batch_size}
+          onChange={(e) => updateParam('chunk_batch_size', parseInt(e.target.value, 10))}
+        />
+        <div className="slider-ticks">
+          <span>1 (Sequential)</span>
+          <span>4</span>
+          <span>8 (Max)</span>
+        </div>
+        <p className="control-subtext" style={{ marginTop: '4px' }}>
+          Samples up to N chunks in a single model batch (short chunks get up to 2s of
+          silence padding). Needs VRAM headroom; keep 1 if the GPU is small.
+        </p>
       </div>
 
       {/* Advanced Toggle */}

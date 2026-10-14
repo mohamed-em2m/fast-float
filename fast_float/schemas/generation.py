@@ -42,6 +42,21 @@ class GenerationRequest(BaseModel):
         description="Frames decoded per micro-batch on the GPU. 0 lets the VRAM "
         "auto-tuner pick the largest size that fits.",
     )
+    chunk_batch_size: int = Field(
+        1,
+        ge=1,
+        le=8,
+        description="How many audio chunks to sample in one model batch. 1 keeps "
+        "today's sequential chunk loop; >1 pads short chunks with silence "
+        "(capped by chunk_pad_seconds) and samples them together.",
+    )
+    chunk_pad_seconds: float = Field(
+        2.0,
+        ge=0.0,
+        le=10.0,
+        description="Max silence padding when equalizing chunk lengths for a "
+        "sample batch. Chunks needing more padding run solo.",
+    )
     client_request_id: Optional[str] = Field(
         None,
         max_length=64,

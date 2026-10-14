@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import logging
+import math
 import os
 import tempfile
 import time
@@ -374,6 +375,106 @@ class OptimizedInferenceAgent:
             logger.info(f"> Result saved at {res_video_path}")
 
         return res_video_path
+
+    @torch.no_grad()
+    def run_inference_batched(
+        self,
+        items: list,
+        ref_path: str,
+        a_cfg_scale: float = 2.0,
+        r_cfg_scale: float = 1.0,
+        e_cfg_scale: float = 1.0,
+        emo: str = "S2E",
+        nfe: int = 10,
+        no_crop: bool = False,
+        seed: int = 25,
+        verbose: bool = True,
+        video_encoder: Optional[str] = None,
+    ) -> list:
+        """Sample several padded audio chunks in ONE model batch, then decode each.
+
+        ``items`` is a list of ``{"audio_path", "padded_path", "duration",
+        "out_path"}`` where every ``padded_path`` WAV has the same length.
+        Returns the output video paths in order.
+
+        Each chunk keeps an independent temporal chain (all start from zero
+        prev-frames, exactly like the sequential path), so batching only shares
+        the ODE solve across items. Per-item latents are trimmed to their real
+        (unpadded) length before decoding. Emotion is predicted per chunk on
+        the UNPADDED audio so silence padding never contaminates it.
+        """
+        G = self.G_opt
+        rank = getattr(self.opt, "rank", 0)
+        device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
+        fps = int(getattr(self.opt, "fps", 25))
+        sr = int(getattr(self.opt, "sampling_rate", 16000))
+
+        # data["a"] is [N, L] (preprocess zero-pads the list to equal length).
+        data = self.data_processor.preprocess(
+            ref_path, [it["padded_path"] for it in items], no_crop=no_crop
+        )
+        s, a = data["s"], data["a"]
+
+        s_r, r_s_lambda, s_r_feats = G.encode_image_into_latent(s.to(device))
+        data["r_s"] = G.motion_autoencoder.dec.direction(r_s_lambda)
+
+        emo_arg = emo
+        if isinstance(emo, str) and emo == "S2E":
+            we_list = []
+            for it in items:
+                a_real = self.data_processor.default_aud_loader(it["audio_path"])
+                we_list.append(
+                    G.emotion_encoder.predict_emotion(
+                        a_real.unsqueeze(0).to(device)
+                    )
+                )
+            emo_arg = torch.cat(we_list, dim=0).unsqueeze(1)  # [N, 1, dim_e]
+
+        def make_amp() -> contextlib.AbstractContextManager[None]:
+            if getattr(self, "use_amp_fp16", False):
+                return torch.autocast("cuda", dtype=torch.float16)
+            return contextlib.nullcontext()
+
+        decode_bs = getattr(self.opt, "decode_batch_size", None)
+        out_paths = []
+        # Sampling AND decoding stay under one autocast context, exactly like the
+        # sequential path (run_inference wraps the whole generate() call). The
+        # latents leave the ODE solve in half precision when AMP is on, so the
+        # decoder must run under autocast too — otherwise half latents hit fp32
+        # weights and torch raises a dtype mismatch.
+        with make_amp():
+            parts = []
+            for piece in G.sample(
+                data,
+                a_cfg_scale=a_cfg_scale,
+                r_cfg_scale=r_cfg_scale,
+                e_cfg_scale=e_cfg_scale,
+                emo=emo_arg,
+                nfe=nfe,
+                seed=seed,
+                s_r=s_r,
+            ):
+                parts.append(piece)  # [N, T_slice, dim_w] (s_r already added)
+            lat_all = torch.cat(parts, dim=1)  # [N, T_full, dim_w]
+
+            for i, it in enumerate(items):
+                t_i = max(1, math.ceil(it["duration"] * fps / sr))
+                lat_i = lat_all[i, :t_i, :]
+                d_hat = G.decode_latent_into_image(
+                    s_r, s_r_feats, lat_i, batch_size=decode_bs
+                )
+                out = self.save_video(
+                    d_hat.float(), it["out_path"], it["audio_path"],
+                    video_encoder=video_encoder,
+                )
+                out_paths.append(out)
+                del d_hat, lat_i
+
+        if verbose:
+            logger.info(
+                f"> [Done] Batched inference: {len(items)} chunk(s) in one sample batch"
+            )
+        return out_paths
 
 
 __all__ = [
