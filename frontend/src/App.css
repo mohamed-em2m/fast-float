@@ -53,6 +53,9 @@
   justify-content: space-between;
   padding: 16px 24px;
   position: relative;
+  /* glass-panel's backdrop-filter makes this a stacking context; raise it so the
+     settings popover paints above the video/stage panels below the header. */
+  z-index: 1000;
 }
 
 .header-brand {
