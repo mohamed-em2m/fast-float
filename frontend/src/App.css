@@ -235,6 +235,51 @@
   margin-bottom: 12px;
 }
 
+.settings-active {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  background: var(--bg-card-inner);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+}
+
+.settings-active-url {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--cyan);
+  word-break: break-all;
+}
+
+.settings-hint {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-faint);
+  margin-bottom: 12px;
+}
+
+.settings-hint code,
+.settings-warning code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.settings-warning {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--warning);
+  margin: -6px 0 12px;
+}
+
+.settings-error {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--danger);
+  margin: -6px 0 12px;
+}
+
 .settings-buttons {
   display: flex;
   justify-content: flex-end;

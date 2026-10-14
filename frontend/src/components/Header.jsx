@@ -6,7 +6,7 @@ import {
   Cpu,
   RefreshCw
 } from 'lucide-react';
-import { fetchHealth, fetchGpuMetrics, clearGpuMemory, getApiUrl, setApiUrl, DEFAULT_API_URL } from '../services/api';
+import { fetchHealth, fetchGpuMetrics, clearGpuMemory, getApiUrl, setApiUrl, resetApiUrl, isDefaultApiUrl, testApiUrl, isLoopbackUrl, isPageOnLoopback, DEFAULT_API_URL } from '../services/api';
 
 // Consecutive failed polls before the pill flips to Disconnected. A single
 // failed poll (e.g. one slow tick while a big upload/generation is in
@@ -19,8 +19,16 @@ export default function Header({ onToast }) {
   const [isOnline, setIsOnline] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [apiUrlInput, setApiUrlInput] = useState(getApiUrl());
+  const [configError, setConfigError] = useState(null);
+  const [isSaving, setIsSaving] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
   const failuresRef = useRef(0);
+
+  const activeUrl = getApiUrl();
+  const trimmedInput = apiUrlInput.trim();
+  const loopbackWarning =
+    trimmedInput && isLoopbackUrl(trimmedInput) && !isPageOnLoopback();
+  const hasOverride = !isDefaultApiUrl();
 
   const checkStatus = async () => {
     try {
@@ -65,13 +73,45 @@ export default function Header({ onToast }) {
     }
   };
 
-  const handleSaveApiUrl = (e) => {
+  const handleSaveApiUrl = async (e) => {
     e.preventDefault();
-    setApiUrl(apiUrlInput);
+    const value = trimmedInput;
+    if (!value) {
+      setConfigError('Enter a URL, or press Reset to use the default.');
+      return;
+    }
+    setIsSaving(true);
+    setConfigError(null);
+    try {
+      // Verify before committing so a typo can't strand the whole studio.
+      const hData = await testApiUrl(value);
+      setApiUrl(value);
+      failuresRef.current = 0;
+      if (hData && typeof hData === 'object') setHealth(hData);
+      setIsOnline(true);
+      setShowSettings(false);
+      if (onToast) onToast(`Connected to ${value}`, 'success');
+      checkStatus();
+    } catch (err) {
+      setConfigError(err.message);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const openSettings = () => {
+    setApiUrlInput(getApiUrl());
+    setConfigError(null);
+    setShowSettings(true);
+  };
+
+  const handleResetApiUrl = () => {
+    const base = resetApiUrl();
+    setApiUrlInput(base);
+    setConfigError(null);
     failuresRef.current = 0;
-    setShowSettings(false);
+    if (onToast) onToast('Reset to default endpoint', 'info');
     checkStatus();
-    if (onToast) onToast(`API URL updated to ${apiUrlInput}`, 'info');
   };
 
   return (
@@ -134,7 +174,7 @@ export default function Header({ onToast }) {
         {/* Settings Toggle */}
         <button 
           className="btn-secondary btn-sm" 
-          onClick={() => setShowSettings(!showSettings)}
+          onClick={openSettings}
           title="Configure API Endpoint"
         >
           <Settings size={15} />
@@ -146,29 +186,59 @@ export default function Header({ onToast }) {
       {showSettings && (
         <div className="settings-popover glass-panel">
           <h3 className="settings-title">Backend Connection</h3>
+
+          <div className="settings-active">
+            <span className="settings-label">
+              Active endpoint {hasOverride ? '(custom override)' : '(default proxy)'}
+            </span>
+            <code className="settings-active-url">{activeUrl}</code>
+          </div>
+
           <form onSubmit={handleSaveApiUrl}>
-            <label className="settings-label">FastAPI Server URL</label>
-            <input 
-              type="text" 
-              value={apiUrlInput} 
-              onChange={(e) => setApiUrlInput(e.target.value)} 
-              placeholder="http://localhost:8000"
+            <label className="settings-label" htmlFor="api-url-input">API base URL</label>
+            <input
+              id="api-url-input"
+              type="text"
+              value={apiUrlInput}
+              onChange={(e) => { setApiUrlInput(e.target.value); setConfigError(null); }}
+              placeholder={DEFAULT_API_URL}
               className="settings-input"
+              spellCheck={false}
+              autoComplete="off"
             />
+
+            {loopbackWarning && (
+              <p className="settings-warning">
+                This page is served from {window.location.host} — <code>localhost</code> there
+                points at the visitor's own machine, so this endpoint may be unreachable remotely.
+              </p>
+            )}
+            {configError && <p className="settings-error">{configError}</p>}
+
+            <p className="settings-hint">
+              Leave as the default to route through the same-origin <code>/api</code> proxy.
+              Set a full URL only to talk to the FastAPI server directly.
+            </p>
+
             <div className="settings-buttons">
               <button
                 type="button"
                 className="btn-secondary btn-sm"
-                title={`Reset to default (${DEFAULT_API_URL})`}
-                onClick={() => setApiUrlInput(DEFAULT_API_URL)}
+                disabled={isSaving}
+                onClick={handleResetApiUrl}
               >
                 Reset
               </button>
-              <button type="button" className="btn-secondary btn-sm" onClick={() => setShowSettings(false)}>
+              <button
+                type="button"
+                className="btn-secondary btn-sm"
+                disabled={isSaving}
+                onClick={() => setShowSettings(false)}
+              >
                 Cancel
               </button>
-              <button type="submit" className="btn-primary btn-sm">
-                Save & Connect
+              <button type="submit" className="btn-primary btn-sm" disabled={isSaving}>
+                {isSaving ? 'Testing…' : 'Test & Save'}
               </button>
             </div>
           </form>

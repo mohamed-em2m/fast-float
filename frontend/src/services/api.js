@@ -17,12 +17,17 @@ function isLoopbackHost(hostname) {
   return LOOPBACK_HOSTS.includes(hostname);
 }
 
-function isLoopbackUrl(value) {
+export function isLoopbackUrl(value) {
   try {
     return isLoopbackHost(new URL(value, window.location.origin).hostname);
   } catch {
     return false;
   }
+}
+
+/** True when the browser tab itself is served from a loopback host. */
+export function isPageOnLoopback() {
+  return isLoopbackHost(window.location.hostname);
 }
 
 /** Same-origin API base that the dev/prod proxy forwards to the backend. */
@@ -91,6 +96,49 @@ export function alignUrlToApi(url) {
 export function setApiUrl(url) {
   currentApiUrl = url.replace(/\/$/, '');
   localStorage.setItem('float_api_url', currentApiUrl);
+}
+
+/** Forget any stored override and fall back to the default (proxy) base. */
+export function resetApiUrl() {
+  localStorage.removeItem('float_api_url');
+  currentApiUrl = DEFAULT_API_URL;
+  return currentApiUrl;
+}
+
+/** True when the active base is the default (no manual override stored). */
+export function isDefaultApiUrl() {
+  return currentApiUrl === DEFAULT_API_URL;
+}
+
+/**
+ * Probe an arbitrary endpoint's /health WITHOUT adopting it, so the Config
+ * panel can validate a URL before committing it. Resolves with the health
+ * payload, or throws a human-readable Error.
+ */
+export async function testApiUrl(base) {
+  const normalized = String(base || '').trim().replace(/\/$/, '');
+  if (!normalized) throw new Error('Enter a URL, or press Reset to use the default.');
+
+  let parsed;
+  try {
+    parsed = new URL(normalized, window.location.origin);
+  } catch {
+    throw new Error('That is not a valid URL.');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Only http:// or https:// endpoints are supported.');
+  }
+
+  let res;
+  try {
+    res = await fetchWithTimeout(`${normalized}/health`, {}, 8000);
+  } catch (err) {
+    throw new Error(
+      err.name === 'AbortError' ? 'Timed out — no response in 8s.' : `Could not connect (${err.message}).`
+    );
+  }
+  if (!res.ok) throw new Error(`Endpoint replied HTTP ${res.status}.`);
+  return await res.json().catch(() => ({}));
 }
 
 /**
@@ -199,6 +247,18 @@ export async function fetchHealth() {
   }
   console.error(`[api] GET /health failed on all candidates: ${errors.join(' | ')}`);
   throw new Error(`Cannot reach backend (tried: ${getApiCandidates().join(', ')}) — is it running?`);
+}
+
+/** Poll generation progress for a request id (chunk-by-chunk). Best-effort. */
+export async function fetchProgress(requestId) {
+  if (!requestId) return null;
+  try {
+    const res = await fetch(`${currentApiUrl}/progress/${encodeURIComponent(requestId)}`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
 }
 
 /** Get live GPU telemetry */
