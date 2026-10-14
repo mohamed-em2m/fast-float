@@ -1,12 +1,18 @@
 import asyncio
 import os
+import re
 import uuid
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
 from fast_float.utils.logger import logger
 from fast_float.utils.media import TARGET_IMAGE_SIZE
-from fast_float.schemas.generation import GenerationRequest, GenerationResponse, PerformanceTimings
+from fast_float.schemas.generation import (
+    GenerationRequest,
+    GenerationResponse,
+    GenerationProgress,
+    PerformanceTimings,
+)
 from fast_float.core.state import app_state
 from fast_float.core.service import generate_video
 
@@ -18,6 +24,16 @@ router = APIRouter(tags=["generation"])
 ACQUIRE_TIMEOUT_S = 5.0
 
 
+def _safe_request_id(client_id: str | None) -> str:
+    """Build a pollable request id, sanitizing any client-supplied value."""
+    if client_id:
+        cleaned = re.sub(r"[^A-Za-z0-9_.-]", "", client_id)[:48]
+        if cleaned:
+            return cleaned
+    app_state.queue_counter += 1
+    return f"req_{app_state.queue_counter}_{uuid.uuid4().hex[:8]}"
+
+
 @router.post("/generate", response_model=GenerationResponse)
 async def generate(request: GenerationRequest):
     """Generate talking-face video from reference image and audio."""
@@ -27,19 +43,26 @@ async def generate(request: GenerationRequest):
     if app_state.request_semaphore is None:
         app_state.initialize_runtime()
 
+    request_id = _safe_request_id(request.client_request_id)
+    app_state.set_progress(
+        request_id, status="queued", stage="queued", percent=0.0,
+        message="Waiting for a free GPU slot",
+    )
+
     try:
         await asyncio.wait_for(
             app_state.request_semaphore.acquire(), timeout=ACQUIRE_TIMEOUT_S
         )
     except asyncio.TimeoutError:
+        app_state.set_progress(
+            request_id, status="error", stage="error",
+            message="Server busy, try again shortly",
+        )
         raise HTTPException(
             status_code=429, detail="Server busy, try again shortly"
         ) from None
 
     try:
-        app_state.queue_counter += 1
-        request_id = f"req_{app_state.queue_counter}_{uuid.uuid4().hex[:8]}"
-
         try:
             req_dict = request.model_dump() if hasattr(request, "model_dump") else request.dict()
             video_path, timings = await generate_video(req_dict, request_id, app_state)
@@ -76,21 +99,35 @@ async def generate(request: GenerationRequest):
                     total_time=round(timings["total"], 3),
                     fps=round(timings["fps"], 2),
                 ),
+                chunks=int(timings.get("chunks", 1)),
             )
 
         except HTTPException:
             raise
         except ValueError as e:
             logger.warning(f"[{request_id}] Bad request: {e}")
+            app_state.set_progress(request_id, status="error", stage="error", message=str(e))
             raise HTTPException(status_code=400, detail=str(e))
         except FileNotFoundError as e:
             logger.error(f"[{request_id}] Generation output missing: {e}")
+            app_state.set_progress(request_id, status="error", stage="error", message="Video generation failed")
             raise HTTPException(status_code=502, detail="Video generation failed")
         except Exception as e:
             logger.error(f"[{request_id}] Generation failed: {e!s}")
+            app_state.set_progress(request_id, status="error", stage="error", message="Video generation failed")
             raise HTTPException(status_code=500, detail="Video generation failed")
     finally:
         app_state.request_semaphore.release()
+
+
+@router.get("/progress/{request_id}", response_model=GenerationProgress)
+async def generation_progress(request_id: str):
+    """Poll the progress of a generation request (chunk-by-chunk)."""
+    record = app_state.get_progress(request_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Unknown request id")
+    allowed = set(GenerationProgress.model_fields)
+    return GenerationProgress(**{k: v for k, v in record.items() if k in allowed})
 
 
 @router.get("/download/{request_id}")

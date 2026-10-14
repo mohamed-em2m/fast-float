@@ -102,6 +102,43 @@ export default function ParameterControls({ params, setParams }) {
         </div>
       </div>
 
+      {/* Chunking */}
+      <div className="control-group">
+        <div className="control-label-row">
+          <label className="control-label">
+            <span>Audio Chunking</span>
+            <span className="control-val-badge">
+              {params.chunk_seconds > 0 ? `${params.chunk_seconds}s windows` : 'Off'}
+            </span>
+          </label>
+          <span className="control-subtext">
+            {params.chunk_seconds > 0 ? '✂️ Batched & progress-tracked' : 'Single pass'}
+          </span>
+        </div>
+        <div className="quality-radio-group">
+          {[
+            { v: 0, label: 'OFF' },
+            { v: 5, label: '5s' },
+            { v: 10, label: '10s' },
+            { v: 20, label: '20s' },
+            { v: 30, label: '30s' },
+          ].map((opt) => (
+            <button
+              key={opt.v}
+              type="button"
+              className={`quality-btn ${params.chunk_seconds === opt.v ? 'active' : ''}`}
+              onClick={() => updateParam('chunk_seconds', opt.v)}
+            >
+              <span>{opt.label}</span>
+            </button>
+          ))}
+        </div>
+        <p className="control-subtext" style={{ marginTop: '4px' }}>
+          Splits long speech into overlapping windows, renders each independently, then
+          merges to one MP4. Reports per-chunk progress.
+        </p>
+      </div>
+
       {/* Advanced Toggle */}
       <div className="advanced-toggle-row">
         <button 

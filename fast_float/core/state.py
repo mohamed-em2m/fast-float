@@ -1,10 +1,15 @@
 import asyncio
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Dict, Set, Any
 
 
 class AppState:
     """Shared application state containing runtime models, locks, and counters."""
+
+    # Cap on retained progress entries so a long-lived server doesn't grow
+    # the registry unbounded (progress is only needed while a request runs).
+    MAX_PROGRESS_ENTRIES = 200
 
     def __init__(self, max_concurrent_requests: int = 10, max_workers: int = 2):
         # NOTE: inference is serialized by inference_lock (one GPU), so a
@@ -18,6 +23,7 @@ class AppState:
         self.pcs: Set[Any] = set()
         self.active_streams: Dict[str, str] = {}
         self.queue_counter: int = 0
+        self.progress: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self.max_concurrent_requests: int = max_concurrent_requests
         self.max_workers: int = max_workers
         self.executor: Optional[ThreadPoolExecutor] = None
@@ -39,6 +45,24 @@ class AppState:
             self.inference_lock = asyncio.Lock()
         if self.executor is None:
             self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
+
+    def set_progress(self, request_id: str, **fields: Any) -> None:
+        """Create or update the progress record for a request (LRU-capped)."""
+        record = self.progress.get(request_id)
+        if record is None:
+            record = {"request_id": request_id}
+            self.progress[request_id] = record
+        record.update(fields)
+        self.progress.move_to_end(request_id)
+        while len(self.progress) > self.MAX_PROGRESS_ENTRIES:
+            self.progress.popitem(last=False)
+
+    def get_progress(self, request_id: str) -> Optional[Dict[str, Any]]:
+        record = self.progress.get(request_id)
+        return dict(record) if record is not None else None
+
+    def clear_progress(self, request_id: str) -> None:
+        self.progress.pop(request_id, None)
 
     def shutdown(self):
         """Release resources on application shutdown."""

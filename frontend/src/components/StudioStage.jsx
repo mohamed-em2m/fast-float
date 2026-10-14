@@ -20,6 +20,7 @@ const GENERATION_STAGES = [
 export default function StudioStage({
   onGenerate,
   isGenerating,
+  progress,
   generationResult,
   hasAudio,
   onToast,
@@ -130,6 +131,19 @@ export default function StudioStage({
   const downloadUrl = generationResult?.download_url
     || (generationResult ? `${getApiUrl()}/download/${generationResult.request_id}` : null);
 
+  // Prefer real server progress when available; otherwise fall back to the
+  // cosmetic stage cycler so the UI still moves during a single-pass run.
+  const hasRealProgress = isGenerating && progress && typeof progress.percent === 'number';
+  const progressPercent = hasRealProgress
+    ? Math.max(0, Math.min(100, progress.percent))
+    : ((currentStageIndex + 1) / GENERATION_STAGES.length) * 100;
+  const progressLabel = hasRealProgress
+    ? (progress.message
+        || (progress.total_chunks > 0
+          ? `${progress.completed_chunks}/${progress.total_chunks} chunks`
+          : progress.stage))
+    : `${GENERATION_STAGES[currentStageIndex].icon} ${GENERATION_STAGES[currentStageIndex].label}`;
+
   return (
     <div className="card-section glass-panel stage-panel">
       {/* Top CTA Banner */}
@@ -164,14 +178,16 @@ export default function StudioStage({
         <div className="generation-progress-box">
           <div className="progress-header">
             <span className="stage-status-text">
-              {GENERATION_STAGES[currentStageIndex].icon} {GENERATION_STAGES[currentStageIndex].label}
+              {progressLabel}
             </span>
-            <span className="stage-step-count">{currentStageIndex + 1} / {GENERATION_STAGES.length}</span>
+            <span className="stage-step-count">
+              {hasRealProgress ? `${Math.round(progressPercent)}%` : `${currentStageIndex + 1} / ${GENERATION_STAGES.length}`}
+            </span>
           </div>
           <div className="progress-track">
             <div 
               className="progress-fill-bar"
-              style={{ width: `${((currentStageIndex + 1) / GENERATION_STAGES.length) * 100}%` }}
+              style={{ width: `${progressPercent}%` }}
             />
           </div>
         </div>

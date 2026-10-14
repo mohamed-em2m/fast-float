@@ -21,6 +21,26 @@ class GenerationRequest(BaseModel):
     no_crop: bool = Field(False, description="Disable automatic face crop")
     compress: bool = Field(True, description="Compress output video using optimized encoder")
     quality: Literal["fast", "balanced", "high"] = Field("balanced", description="Encoding quality (fast, balanced, high)")
+    chunk_seconds: float = Field(
+        0.0,
+        ge=0.0,
+        le=600.0,
+        description="Split the audio into windows of this many seconds and generate "
+        "each independently, then merge. 0 disables chunking (single pass).",
+    )
+    chunk_overlap_seconds: float = Field(
+        0.5,
+        ge=0.0,
+        le=5.0,
+        description="Overlap between consecutive chunks, trimmed from the head of "
+        "each later chunk when merging to avoid duplicated frames.",
+    )
+    client_request_id: Optional[str] = Field(
+        None,
+        max_length=64,
+        description="Client-supplied id so the browser can poll /progress/{id} "
+        "before the long-running /generate call returns.",
+    )
 
 
 class PerformanceTimings(BaseModel):
@@ -41,6 +61,17 @@ class GenerationResponse(BaseModel):
     resolution: str
     encoder: str
     performance: PerformanceTimings
+    chunks: int = Field(1, description="Number of audio chunks generated (1 = no chunking)")
+
+
+class GenerationProgress(BaseModel):
+    request_id: str
+    status: Literal["queued", "processing", "merging", "done", "error"]
+    stage: str = ""
+    total_chunks: int = 0
+    completed_chunks: int = 0
+    percent: float = 0.0
+    message: str = ""
 
 
 class HealthResponse(BaseModel):
