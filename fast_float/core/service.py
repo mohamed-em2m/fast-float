@@ -83,6 +83,37 @@ def _prepare_image(request_data: Dict[str, Any], temp_files: list) -> str:
     return ensure_default_image(DEFAULT_IMAGE_PATH)
 
 
+def _apply_decode_batch_size(state: Any, request_data: Dict[str, Any]) -> None:
+    """Push the client's decode micro-batch override onto the model (0 = auto).
+
+    The model reads ``opt.decode_batch_size`` while planning its decode pipeline,
+    so we set it and drop the memoized tuning profiles only when the requested
+    value actually changes. The caller holds ``state.inference_lock``, so mutating
+    the shared ``opt`` here is safe.
+    """
+    try:
+        value = int(request_data.get("decode_batch_size", 0) or 0)
+    except (TypeError, ValueError):
+        value = 0
+    normalized = value if max(0, value) > 0 else None
+
+    opt = getattr(state, "opt", None)
+    if opt is None or getattr(opt, "decode_batch_size", None) == normalized:
+        return
+    opt.decode_batch_size = normalized
+
+    agent = getattr(state, "agent", None)
+    for model in (
+        getattr(agent, "G", None),
+        getattr(agent, "G_opt", None),
+        getattr(agent, "model", None),
+    ):
+        clear = getattr(model, "clear_decode_cache", None)
+        if callable(clear):
+            clear()
+            break
+
+
 async def generate_video(
     request_data: Dict[str, Any],
     request_id: str,
@@ -153,6 +184,7 @@ async def generate_video(
         num_chunks = 1
 
         async with state.inference_lock:
+            _apply_decode_batch_size(state, request_data)
             if chunk_seconds > 0 and duration > chunk_seconds:
                 num_chunks, output_path = await _generate_chunked(
                     loop, state, request_data, request_id, audio_path, image_path,

@@ -35,6 +35,13 @@ class GenerationRequest(BaseModel):
         description="Overlap between consecutive chunks, trimmed from the head of "
         "each later chunk when merging to avoid duplicated frames.",
     )
+    decode_batch_size: int = Field(
+        0,
+        ge=0,
+        le=64,
+        description="Frames decoded per micro-batch on the GPU. 0 lets the VRAM "
+        "auto-tuner pick the largest size that fits.",
+    )
     client_request_id: Optional[str] = Field(
         None,
         max_length=64,

@@ -81,6 +81,14 @@ async def webrtc_offer(request: WebRTCOfferRequest):
                 logger.warning(
                     f"Failed to attach media player for {request.stream_id}: {e}"
                 )
+                try:
+                    await pc.close()
+                finally:
+                    _cleanup_peer(pc)
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to prepare media for WebRTC stream",
+                )
         else:
             await pc.close()
             app_state.pcs.discard(pc)

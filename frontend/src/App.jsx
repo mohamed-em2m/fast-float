@@ -31,6 +31,7 @@ export default function App() {
     compress: true,
     quality: 'balanced',
     chunk_seconds: 0,
+    decode_batch_size: 0,
   });
 
   // Generation & Output State
@@ -114,6 +115,7 @@ export default function App() {
         quality: params.quality,
         chunk_seconds: params.chunk_seconds,
         chunk_overlap_seconds: 0.5,
+        decode_batch_size: params.decode_batch_size,
         client_request_id: clientRequestId,
       };
 

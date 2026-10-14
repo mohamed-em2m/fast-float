@@ -231,6 +231,38 @@ export default function ParameterControls({ params, setParams }) {
               ))}
             </div>
           </div>
+
+          {/* Decode Batch Size */}
+          <div className="control-group">
+            <div className="control-label-row">
+              <label className="control-label">
+                <span>Decode Batch Size</span>
+                <span className="control-val-badge">
+                  {params.decode_batch_size > 0 ? `${params.decode_batch_size} frames` : 'Auto'}
+                </span>
+              </label>
+              <span className="control-subtext">
+                {params.decode_batch_size > 0 ? '⚠️ Manual VRAM override' : 'VRAM auto-tuned'}
+              </span>
+            </div>
+            <input
+              type="range"
+              min="0"
+              max="64"
+              step="1"
+              value={params.decode_batch_size}
+              onChange={(e) => updateParam('decode_batch_size', parseInt(e.target.value, 10))}
+            />
+            <div className="slider-ticks">
+              <span>0 (Auto)</span>
+              <span>32</span>
+              <span>64 (Max)</span>
+            </div>
+            <p className="control-subtext" style={{ marginTop: '4px' }}>
+              Frames decoded per GPU step. Auto packs as many as fit in VRAM for best
+              throughput; raise it manually only if the tuner under-uses a large GPU.
+            </p>
+          </div>
         </div>
       )}
     </div>
