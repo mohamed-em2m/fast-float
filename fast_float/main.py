@@ -33,7 +33,10 @@ from fast_float.utils.media import (
 )
 from fast_float.utils.video_optimizer import VideoSaveOptimizer
 from fast_float.core.state import app_state
-from fast_float.core.service import run_inference_blocking
+from fast_float.core.service import (
+    run_inference_blocking,
+    run_inference_batched_blocking,
+)
 from fast_float.core.inference_optimized import (
     OptimizedInferenceAgent,
     InferenceOptions,
@@ -134,6 +137,38 @@ async def lifespan(app: FastAPI):
         logger.info(f"✅ Model warmup complete ({time.time() - warmup_start:.2f}s)")
     except Exception as e:
         logger.warning(f"⚠️ Model warmup skipped/failed: {e}")
+
+    # 5b. Batched-shape warmup (B=2 silent clips) so the first real batched
+    # request doesn't pay cuDNN autotuning on unseen batch shapes. Quietly
+    # skipped on any failure — sequential inference is unaffected.
+    try:
+        batch_audios, batch_videos = [], []
+        for _ in range(2):
+            wa = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+            wv = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+            sf.write(wa, np.zeros(32000, dtype=np.float32), 16000)  # 2s silence
+            batch_audios.append(wa)
+            batch_videos.append(wv)
+        await loop.run_in_executor(
+            app_state.executor,
+            run_inference_batched_blocking,
+            app_state.agent,
+            [
+                {"audio_path": wa, "padded_path": wa, "duration": 2.0, "out_path": wv}
+                for wa, wv in zip(batch_audios, batch_videos)
+            ],
+            DEFAULT_IMAGE_PATH,
+            {
+                "a_cfg_scale": 2.0, "r_cfg_scale": 1.0, "e_cfg_scale": 1.0,
+                "emotion": "S2E", "nfe": 2, "no_crop": False, "seed": 25,
+            },
+        )
+        for f in batch_audios + batch_videos:
+            if os.path.exists(f):
+                os.remove(f)
+        logger.info("✅ Batched warmup complete (B=2)")
+    except Exception as e:
+        logger.warning(f"⚠️ Batched warmup skipped: {e}")
 
     # 6. Public URLs setup
     app_state.public_url = os.getenv("AVATER_PUBLIC_URL", f"http://localhost:{PORT}")

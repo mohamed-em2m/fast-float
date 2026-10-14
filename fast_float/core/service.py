@@ -337,10 +337,11 @@ async def _generate_chunked(
     chunk_videos: list = []
     done, idx = 0, 0
     for g in groups:
+        batch_note = f" (sampling batch×{len(g)})" if len(g) > 1 else ""
         state.set_progress(
             request_id, stage="generating", completed_chunks=done,
             percent=round(done / num_chunks * 90, 1),
-            message=f"{done}/{num_chunks} chunks",
+            message=f"{done}/{num_chunks} chunks{batch_note}",
         )
         if len(g) == 1:
             ch = g[0]

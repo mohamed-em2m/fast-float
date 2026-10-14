@@ -400,8 +400,9 @@ class OptimizedInferenceAgent:
         Each chunk keeps an independent temporal chain (all start from zero
         prev-frames, exactly like the sequential path), so batching only shares
         the ODE solve across items. Per-item latents are trimmed to their real
-        (unpadded) length before decoding. Emotion is predicted per chunk on
-        the UNPADDED audio so silence padding never contaminates it.
+        (unpadded) length before decoding. Emotion follows the tail rule: tails
+        longer than 30% of the window are silence-padded into the batched read,
+        shorter tails reuse the previous chunk's emotion.
         """
         G = self.G_opt
         rank = getattr(self.opt, "rank", 0)
@@ -419,15 +420,51 @@ class OptimizedInferenceAgent:
 
         emo_arg = emo
         if isinstance(emo, str) and emo == "S2E":
-            we_list = []
-            for it in items:
-                a_real = self.data_processor.default_aud_loader(it["audio_path"])
-                we_list.append(
-                    G.emotion_encoder.predict_emotion(
-                        a_real.unsqueeze(0).to(device)
+            # Tail rule: chunks longer than 30% of the batch window are padded
+            # with silence up to full length and join the batched forward (they
+            # carry enough real speech to dominate the pooled prediction);
+            # chunks shorter than 30% reuse the previous chunk's emotion — too
+            # little speech for a reliable read, and the feeling rarely flips
+            # inside one window. Full windows are never padded, so their reads
+            # stay exact.
+            auds = [
+                self.data_processor.default_aud_loader(it["audio_path"])
+                for it in items
+            ]
+            full_len = max(a.shape[-1] for a in auds)
+            pct30 = full_len * 0.30
+            use_idx, copy_from, pad_list = [], {}, []
+            for k, a0 in enumerate(auds):
+                L = a0.shape[-1]
+                if L >= full_len:
+                    use_idx.append(k)
+                    pad_list.append(a0)
+                elif L > pct30:
+                    need = full_len - L
+                    pad_list.append(
+                        torch.cat(
+                            [a0, torch.zeros(need, dtype=a0.dtype)], dim=-1
+                        )
                     )
-                )
-            emo_arg = torch.cat(we_list, dim=0).unsqueeze(1)  # [N, 1, dim_e]
+                    use_idx.append(k)
+                else:
+                    copy_from[k] = k - 1  # previous chunk in time order
+            emo_mat = [None] * len(items)
+            if pad_list:
+                batch_a = torch.stack(pad_list, dim=0).to(device)
+                logits = G.emotion_encoder.predict_emotion(batch_a)  # [m, dim_e]
+                for k, m in zip(use_idx, range(len(use_idx))):
+                    emo_mat[k] = logits[m]
+            for k, src in copy_from.items():
+                if src >= 0 and emo_mat[src] is not None:
+                    emo_mat[k] = emo_mat[src]
+                else:
+                    # Defensive: no previous chunk (only a tail can be short) —
+                    # fall back to a solo read of the unpadded audio.
+                    emo_mat[k] = G.emotion_encoder.predict_emotion(
+                        auds[k].unsqueeze(0).to(device)
+                    )[0]
+            emo_arg = torch.stack(emo_mat, dim=0).unsqueeze(1)  # [N, 1, dim_e]
 
         def make_amp() -> contextlib.AbstractContextManager[None]:
             if getattr(self, "use_amp_fp16", False):
