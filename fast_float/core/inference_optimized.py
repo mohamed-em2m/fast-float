@@ -407,7 +407,6 @@ class OptimizedInferenceAgent:
         rank = getattr(self.opt, "rank", 0)
         device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
         fps = int(getattr(self.opt, "fps", 25))
-        sr = int(getattr(self.opt, "sampling_rate", 16000))
 
         # data["a"] is [N, L] (preprocess zero-pads the list to equal length).
         data = self.data_processor.preprocess(
@@ -458,7 +457,8 @@ class OptimizedInferenceAgent:
             lat_all = torch.cat(parts, dim=1)  # [N, T_full, dim_w]
 
             for i, it in enumerate(items):
-                t_i = max(1, math.ceil(it["duration"] * fps / sr))
+                # duration is seconds -> frames (samples*fps/sr == seconds*fps).
+                t_i = max(1, math.ceil(it["duration"] * fps))
                 lat_i = lat_all[i, :t_i, :]
                 d_hat = G.decode_latent_into_image(
                     s_r, s_r_feats, lat_i, batch_size=decode_bs
