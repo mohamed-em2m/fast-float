@@ -115,27 +115,31 @@ export default function ParameterControls({ params, setParams }) {
             {params.chunk_seconds > 0 ? '✂️ Batched & progress-tracked' : 'Single pass'}
           </span>
         </div>
+        <input
+          type="range"
+          min="0.1"
+          max="60"
+          step="0.1"
+          value={params.chunk_seconds > 0 ? params.chunk_seconds : 0.1}
+          onChange={(e) => updateParam('chunk_seconds', parseFloat(e.target.value))}
+        />
+        <div className="slider-ticks">
+          <span>0.1s</span>
+          <span>30s</span>
+          <span>60s</span>
+        </div>
         <div className="quality-radio-group">
-          {[
-            { v: 0, label: 'OFF' },
-            { v: 5, label: '5s' },
-            { v: 10, label: '10s' },
-            { v: 20, label: '20s' },
-            { v: 30, label: '30s' },
-          ].map((opt) => (
-            <button
-              key={opt.v}
-              type="button"
-              className={`quality-btn ${params.chunk_seconds === opt.v ? 'active' : ''}`}
-              onClick={() => updateParam('chunk_seconds', opt.v)}
-            >
-              <span>{opt.label}</span>
-            </button>
-          ))}
+          <button
+            type="button"
+            className={`quality-btn ${params.chunk_seconds === 0 ? 'active' : ''}`}
+            onClick={() => updateParam('chunk_seconds', params.chunk_seconds > 0 ? 0 : 5)}
+          >
+            <span>{params.chunk_seconds > 0 ? 'OFF' : 'ON'}</span>
+          </button>
         </div>
         <p className="control-subtext" style={{ marginTop: '4px' }}>
           Splits long speech into overlapping windows, renders each independently, then
-          merges to one MP4. Reports per-chunk progress.
+          merges to one MP4. Slide to set the window length, or OFF for a single pass.
         </p>
       </div>
 
