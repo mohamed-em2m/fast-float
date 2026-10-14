@@ -61,6 +61,8 @@ dependencies = [
     "pyngrok==7.5.0",
     "brotli==1.2.0",
     "nest-asyncio==1.6.0",
+    "nvidia-cuda-runtime>=13.4.92",
+    "nvidia-cuda-nvrtc>=13.4.92",
 ]
 
 # Flat scripts layout (no installable package) — manage the env only.

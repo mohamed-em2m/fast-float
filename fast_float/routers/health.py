@@ -1,7 +1,12 @@
 from fastapi import APIRouter
 from fast_float.schemas.generation import HealthResponse
 from fast_float.core.state import app_state
-from fast_float.utils.gpu import get_gpu_info, get_current_gpu_memory, clear_gpu_memory
+from fast_float.utils.gpu import (
+    get_gpu_info,
+    get_current_gpu_memory,
+    clear_gpu_memory,
+)
+import torch
 
 router = APIRouter(tags=["system"])
 
@@ -43,6 +48,12 @@ async def gpu_status():
 @router.post("/gpu/clear")
 async def clear_gpu():
     """Manually clear CUDA memory cache and garbage collector."""
+    if not torch.cuda.is_available():
+        return {
+            "status": "no_gpu",
+            "message": "No CUDA GPU available, nothing to clear",
+            "current_memory": None,
+        }
     clear_gpu_memory()
     return {
         "status": "success",

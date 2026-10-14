@@ -35,9 +35,9 @@ def ensure_default_image(image_path: str = DEFAULT_IMAGE_PATH, size: int = TARGE
     return image_path
 
 
-def resize_image_to_256(image_path: str, output_path: Optional[str] = None) -> str:
+def resize_image_to_256(image_path: str, output_path: Optional[str] = None, size: int = TARGET_IMAGE_SIZE) -> str:
     """
-    Load image, convert alpha/RGBA to RGB, and save cleanly as JPEG.
+    Load image, convert alpha/RGBA to RGB, resize to size x size, and save as JPEG.
     """
     try:
         if output_path is None:
@@ -53,12 +53,47 @@ def resize_image_to_256(image_path: str, output_path: Optional[str] = None) -> s
         elif img.mode != "RGB":
             img = img.convert("RGB")
 
+        if img.size != (size, size):
+            img = img.resize((size, size), Image.LANCZOS)
+
         img.save(output_path, "JPEG", quality=95)
         return output_path
 
     except Exception as e:
         logger.error(f"Failed to process image {image_path}: {e}")
         raise
+
+
+def _resample_mono(audio: np.ndarray, src_rate: int, target_rate: int) -> np.ndarray:
+    """Resample mono float32 audio via linear interpolation (no heavy deps)."""
+    if src_rate == target_rate:
+        return audio
+    duration = len(audio) / src_rate
+    target_len = int(round(duration * target_rate))
+    if target_len <= 0:
+        raise ValueError("Audio too short after resampling")
+    src_idx = np.linspace(0, len(audio) - 1, target_len)
+    return np.interp(src_idx, np.arange(len(audio)), audio).astype(np.float32)
+
+
+def _wav_bytes_to_normalized_wav(wav_bytes: bytes, target_rate: int = 16000) -> bytes:
+    """Decode a real WAV container and normalize to 16kHz mono WAV.
+
+    Unlike raw PCM, a WAV container has a RIFF header that must be parsed,
+    not interpreted as samples.
+    """
+    data, src_rate = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+    if data.size == 0:
+        raise ValueError("Empty WAV audio data")
+    if data.ndim > 1:
+        data = data.mean(axis=1).astype(np.float32)
+    data = np.clip(data, -1.0, 1.0).astype(np.float32)
+    data = _resample_mono(data, src_rate, target_rate)
+
+    wav_buffer = io.BytesIO()
+    sf.write(wav_buffer, data, target_rate, format="WAV", subtype="PCM_16")
+    wav_buffer.seek(0)
+    return wav_buffer.read()
 
 
 def convert_pcm_to_wav(
@@ -134,8 +169,11 @@ def process_audio_format(
             f"Processing audio: format={ext}, size={len(audio_bytes)} bytes, sr={sample_rate}, ch={channels}"
         )
 
-        if ext in ["pcm", "raw", "wav"]:
+        if ext in ["pcm", "raw"]:
             wav_bytes = convert_pcm_to_wav(audio_bytes, sample_rate, channels, sample_width)
+        elif ext == "wav":
+            # A WAV container has a RIFF header — parse it, never treat it as raw PCM.
+            wav_bytes = _wav_bytes_to_normalized_wav(audio_bytes, target_rate=sample_rate)
         else:
             try:
                 audio_segment = AudioSegment.from_file(io.BytesIO(audio_bytes), format=ext)
@@ -149,8 +187,9 @@ def process_audio_format(
                 wav_buffer.seek(0)
                 wav_bytes = wav_buffer.read()
             except Exception as e:
-                logger.warning(f"Audio container conversion failed: {e}, attempting raw PCM fallback")
-                wav_bytes = convert_pcm_to_wav(audio_bytes, sample_rate, channels, sample_width)
+                # Never silently reinterpret an encoded container (mp3/webm/ogg/...)
+                # as raw PCM — that yields loud garbage with no error. Fail loudly.
+                raise ValueError(f"Unsupported or corrupt audio format '{ext}': {e}") from e
 
         if len(wav_bytes) < 44 or wav_bytes[:4] != b"RIFF" or wav_bytes[8:12] != b"WAVE":
             raise ValueError("Invalid WAV format after conversion")

@@ -118,6 +118,48 @@ def _coerce_float(value, default):
         return default
 
 
+def is_torchcodec_ready() -> bool:
+    try:
+        from fast_float.utils.pyav_writer import is_torchcodec_available
+        return is_torchcodec_available()
+    except Exception:
+        try:
+            from utils.pyav_writer import is_torchcodec_available
+            return is_torchcodec_available()
+        except Exception:
+            return False
+
+
+def get_encoder_choices() -> list[str]:
+    """Return available encoder choices."""
+    choices = ["FFmpeg NVENC", "CPU PyAV"]
+    if is_torchcodec_ready():
+        choices.append("Torchcodec")
+    else:
+        # Still offer Torchcodec so user knows it's an option (fallback handled gracefully)
+        choices.append("Torchcodec")
+    return choices
+
+
+def detect_default_encoder() -> str:
+    """Auto-detect whether to default to FFmpeg NVENC, CPU PyAV, or Torchcodec."""
+    try:
+        import subprocess
+        res = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if "h264_nvenc" in res.stdout:
+            return "FFmpeg NVENC"
+    except Exception:
+        pass
+    if is_torchcodec_ready():
+        return "Torchcodec"
+    return "CPU PyAV"
+
+
 # --------------------------------------------------------------------------- #
 # Shared model wrapper (one instance, shared across all sessions/users)
 # --------------------------------------------------------------------------- #
@@ -171,6 +213,8 @@ class FloatModel:
         nfe,
         seed,
         no_crop,
+        decode_batch_size=0,
+        video_encoder="FFmpeg NVENC",
     ):
         # Gradio sliders yield floats (sometimes numpy scalars) — normalize
         # to plain Python int/float before anything downstream touches them.
@@ -179,6 +223,23 @@ class FloatModel:
         a_cfg = _coerce_float(a_cfg, 2.0)
         r_cfg = _coerce_float(r_cfg, 1.0)
         e_cfg = _coerce_float(e_cfg, 1.0)
+        dbs = _coerce_int(decode_batch_size, 0)
+
+        # Apply decode batch size override; 0 = Auto (let VRAM tuner decide).
+        # We set / clear on self.opt so the tuner's memoized cache is bypassed
+        # only when an explicit size is requested.
+        target_model = getattr(self.agent, "G_opt", getattr(self.agent, "model", None))
+        if dbs > 0:
+            self.opt.decode_batch_size = dbs
+        else:
+            self.opt.decode_batch_size = None
+
+        if target_model is not None:
+            if hasattr(target_model, "clear_decode_cache"):
+                target_model.clear_decode_cache()
+            elif hasattr(target_model, "_decode_bs_cache"):
+                target_model._decode_bs_cache.clear()
+
         with self.infer_lock:
             return self.agent.run_inference(
                 res_video_path=out_path,
@@ -192,6 +253,7 @@ class FloatModel:
                 no_crop=no_crop,
                 seed=seed,
                 verbose=False,
+                video_encoder=video_encoder,
             )
 
     # ---- batch (original) path, unchanged in spirit from the original app ---
@@ -206,6 +268,8 @@ class FloatModel:
         nfe,
         seed,
         no_crop,
+        decode_batch_size=0,
+        video_encoder="FFmpeg NVENC",
         progress=gr.Progress(),
     ):
         try:
@@ -244,6 +308,8 @@ class FloatModel:
                 nfe,
                 seed,
                 no_crop,
+                decode_batch_size=decode_batch_size,
+                video_encoder=video_encoder,
             )
             progress(1.0, desc="Complete!")
             # Show only the file name — never leak server-side absolute paths.
@@ -298,7 +364,11 @@ def build_interface(
     res_dir="./results",
     wav2vec_model_path=None,
     ngpus=1,
+    default_video_encoder: Optional[str] = None,
 ):
+    if default_video_encoder is None:
+        default_video_encoder = detect_default_encoder()
+
     model = FloatModel(
         ckpt_path=ckpt_path,
         res_dir=res_dir,
@@ -360,6 +430,19 @@ def build_interface(
                             b_seed = gr.Slider(
                                 0, 10000, value=25, step=1, label="Random Seed"
                             )
+                            b_decode_batch = gr.Radio(
+                                choices=["Auto", "1", "2", "4", "8", "16","32","64"],
+                                value="Auto",
+                                label="🗂️ Decode Batch Size",
+                                info="Frames decoded per GPU micro-batch. "
+                                     "'Auto' picks the best size for your VRAM.",
+                            )
+                            b_video_encoder = gr.Radio(
+                                choices=get_encoder_choices(),
+                                value=default_video_encoder,
+                                label="🎬 Video Encoder",
+                                info="FFmpeg NVENC: NVIDIA GPU hardware encoder. CPU PyAV: libx264 software encoder. Torchcodec: PyTorch VideoEncoder.",
+                            )
 
                     with gr.Column(scale=1):
                         gr.Markdown("### 🎛️ Generation Parameters")
@@ -397,6 +480,8 @@ def build_interface(
                         b_nfe,
                         b_seed,
                         b_no_crop,
+                        b_decode_batch,
+                        b_video_encoder,
                     ],
                     outputs=[b_video_out, b_status],
                 )
@@ -471,6 +556,19 @@ def build_interface(
                             )
                             l_e_cfg = gr.Slider(
                                 0.0, 3.0, value=1.0, step=0.1, label="Emotion CFG Scale"
+                            )
+                            l_decode_batch = gr.Radio(
+                                choices=["Auto", "1", "2", "4", "8", "16"],
+                                value="Auto",
+                                label="🗂️ Decode Batch Size",
+                                info="Frames decoded per GPU micro-batch. "
+                                     "'Auto' picks the best size for your VRAM.",
+                            )
+                            l_video_encoder = gr.Radio(
+                                choices=get_encoder_choices(),
+                                value=default_video_encoder,
+                                label="🎬 Video Encoder",
+                                info="FFmpeg NVENC: NVIDIA GPU hardware encoder. CPU PyAV: libx264 software encoder. Torchcodec: PyTorch VideoEncoder.",
                             )
 
                         l_mic = gr.Audio(
@@ -563,6 +661,8 @@ def build_interface(
                     nfe,
                     seed,
                     no_crop,
+                    decode_batch_size,
+                    video_encoder,
                 ):
                     if session is None or not session.running:
                         return gr.update(), session, gr.update()
@@ -622,6 +722,8 @@ def build_interface(
                             nfe=nfe,
                             seed=seed,
                             no_crop=no_crop,
+                            decode_batch_size=decode_batch_size,
+                            video_encoder=video_encoder,
                         )
                     except Exception as e:
                         tb = traceback.format_exc()
@@ -649,7 +751,7 @@ def build_interface(
                     status = (
                         f"🟢 Live — chunk {idx} generated in "
                         f"{session.last_latency:.1f}s "
-                        f"(clip length {CHUNK_SECONDS:.1f}s)"
+                        f"(clip length {CHUNK_SECONDS:.1f}s, encoder {video_encoder})"
                     )
                     return gr.update(value=out_path), session, gr.update(value=status)
 
@@ -664,6 +766,8 @@ def build_interface(
                         l_nfe,
                         l_seed,
                         l_no_crop,
+                        l_decode_batch,
+                        l_video_encoder,
                     ],
                     outputs=[l_video_out, session_state, l_status],
                 )
@@ -738,6 +842,13 @@ def parse_launch_args():
     parser.add_argument("--ssl_keyfile_password", type=str, default=None)
     parser.add_argument("--favicon_path", type=str, default=None)
     parser.add_argument("--ngpus", type=int, default=1)
+    parser.add_argument(
+        "--video_encoder",
+        type=str,
+        default=None,
+        choices=["FFmpeg NVENC", "CPU PyAV", "Torchcodec"],
+        help="Default video encoder ('FFmpeg NVENC', 'CPU PyAV', or 'Torchcodec'). Auto-detected if omitted.",
+    )
     return parser.parse_args()
 
 
@@ -749,6 +860,7 @@ if __name__ == "__main__":
         res_dir=args.res_dir,
         wav2vec_model_path=args.wav2vec_model_path,
         ngpus=args.ngpus,
+        default_video_encoder=args.video_encoder,
     )
 
     auth_tuple = None

@@ -1,5 +1,13 @@
+import sys
 import torch
 import torch.nn.functional as F
+
+try:
+    import torchvision
+except Exception:
+    sys.modules["torchvision"] = None
+    sys.modules["torchvision.io"] = None
+
 from transformers import Wav2Vec2Model
 from transformers.modeling_outputs import BaseModelOutput
 

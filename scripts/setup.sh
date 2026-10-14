@@ -38,6 +38,11 @@ uv venv .venv --python 3.10 --clear
 source .venv/bin/activate 
 uv pip install --python .venv/bin/python -e .
 uv lock
+
+echo "=== Installing optional video codecs (torchcodec) ==="
+# torchcodec is optional; install if compatible binary wheel exists for torch/cuda
+uv pip install --python .venv/bin/python torchcodec || echo "⚠️ torchcodec install skipped or unavailable for current platform/PyTorch version (PyAV and FFmpeg NVENC remain available)."
+
 echo "=== Running checkpoint download script ==="
 chmod +x "${SCRIPT_DIR}/download_checkpoints.sh"
 "${SCRIPT_DIR}/download_checkpoints.sh"

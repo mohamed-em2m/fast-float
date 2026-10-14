@@ -274,11 +274,11 @@ class ModulatedConv2d(nn.Module):
         )
         
         if self.upsample:
-            input = input.view(1, batch * in_channel, height, width)
+            input = input.contiguous().view(1, batch * in_channel, height, width)
             weight = weight.view(
                 batch, self.out_channel, in_channel, self.kernel_size, self.kernel_size
             )
-            weight = weight.transpose(1, 2).reshape(
+            weight = weight.transpose(1, 2).contiguous().reshape(
                 batch * in_channel, self.out_channel, self.kernel_size, self.kernel_size
             )
             out = F.conv_transpose2d(input, weight, padding=0, stride=2, groups=batch)
@@ -288,12 +288,14 @@ class ModulatedConv2d(nn.Module):
         elif self.downsample:
             input = self.blur(input)
             _, _, height, width = input.shape
-            input = input.view(1, batch * in_channel, height, width)
+            input = input.contiguous().view(1, batch * in_channel, height, width)
+            weight = weight.contiguous()
             out = F.conv2d(input, weight, padding=0, stride=2, groups=batch)
             _, _, height, width = out.shape
             out = out.view(batch, self.out_channel, height, width)
         else:
-            input = input.view(1, batch * in_channel, height, width)
+            input = input.contiguous().view(1, batch * in_channel, height, width)
+            weight = weight.contiguous()
             out = F.conv2d(input, weight, padding=self.padding, groups=batch)
             _, _, height, width = out.shape
             out = out.view(batch, self.out_channel, height, width)
@@ -429,24 +431,37 @@ class ToFlow(nn.Module):
         self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))
     
     def forward(self, input, style, feat, skip=None):
-        """Enhanced to handle batch processing with dynamic grid generation"""
+        """Batch-compatible forward with cached coordinate grid.
+
+        The grid is computed once and stored on the module instance,
+        keyed by (h, w, device, dtype).  It is reused on every subsequent
+        call with the same configuration, eliminating the repeated
+        torch.meshgrid + torch.linspace overhead.
+        """
         batch_size = input.size(0)
         h, w = input.size(2), input.size(3)
-        
+
         out = self.conv(input, style)
         out = out + self.bias
-        
-        # Create coordinate grid directly on device - batch compatible
-        grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-1, 1, h, device=input.device, dtype=input.dtype),
-            torch.linspace(-1, 1, w, device=input.device, dtype=input.dtype),
-            indexing="ij",
-        )
-        grid = (
-            torch.stack([grid_x, grid_y], dim=-1)
-            .unsqueeze(0)
-            .expand(batch_size, -1, -1, -1)
-        )
+
+        # Cached coordinate grid — only rebuilt when resolution/device/dtype changes.
+        # Uses a (h, w, device_type, device_index, dtype) key so it is safe across
+        # devices and mixed-precision contexts.
+        cache_key = (h, w, input.device.type,
+                     input.device.index, input.dtype)
+        if getattr(self, "_grid_cache_key", None) != cache_key:
+            grid_y, grid_x = torch.meshgrid(
+                torch.linspace(-1, 1, h, device=input.device, dtype=input.dtype),
+                torch.linspace(-1, 1, w, device=input.device, dtype=input.dtype),
+                indexing="ij",
+            )
+            # Store as [1, H, W, 2] — expand() is a zero-copy view
+            self._cached_grid = (
+                torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+            )
+            self._grid_cache_key = cache_key
+
+        grid = self._cached_grid.expand(batch_size, -1, -1, -1)
         
         if skip is not None:
             skip = self.upsample(skip)

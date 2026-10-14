@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Sliders, Dna, Shuffle, Zap, ChevronDown, ChevronUp } from 'lucide-react';
+import { Sliders, Shuffle, Zap, ChevronDown, ChevronUp } from 'lucide-react';
 
 const EMOTIONS = [
   { id: 'S2E', label: 'Speech-to-Emotion', icon: '🧠' },
@@ -102,6 +102,75 @@ export default function ParameterControls({ params, setParams }) {
         </div>
       </div>
 
+      {/* Chunking */}
+      <div className="control-group">
+        <div className="control-label-row">
+          <label className="control-label">
+            <span>Audio Chunking</span>
+            <span className="control-val-badge">
+              {params.chunk_seconds > 0 ? `${params.chunk_seconds}s windows` : 'Off'}
+            </span>
+          </label>
+          <span className="control-subtext">
+            {params.chunk_seconds > 0 ? '✂️ Batched & progress-tracked' : 'Single pass'}
+          </span>
+        </div>
+        <input
+          type="range"
+          min="0.1"
+          max="60"
+          step="0.1"
+          value={params.chunk_seconds > 0 ? params.chunk_seconds : 0.1}
+          onChange={(e) => updateParam('chunk_seconds', parseFloat(e.target.value))}
+        />
+        <div className="slider-ticks">
+          <span>0.1s</span>
+          <span>30s</span>
+          <span>60s</span>
+        </div>
+        <div className="quality-radio-group">
+          <button
+            type="button"
+            className={`quality-btn ${params.chunk_seconds === 0 ? 'active' : ''}`}
+            onClick={() => updateParam('chunk_seconds', params.chunk_seconds > 0 ? 0 : 5)}
+          >
+            <span>{params.chunk_seconds > 0 ? 'OFF' : 'ON'}</span>
+          </button>
+        </div>
+        <p className="control-subtext" style={{ marginTop: '4px' }}>
+          Splits long speech into overlapping windows, renders each independently, then
+          merges to one MP4. Slide to set the window length, or OFF for a single pass.
+        </p>
+        <div className="control-label-row" style={{ marginTop: '8px' }}>
+          <label className="control-label">
+            <span>Chunk Batch Size</span>
+            <span className="control-val-badge">
+              {params.chunk_batch_size > 1 ? `×${params.chunk_batch_size} batched` : 'Sequential'}
+            </span>
+          </label>
+          <span className="control-subtext">
+            {params.chunk_batch_size > 1 ? '🧪 One sample batch' : 'One chunk at a time'}
+          </span>
+        </div>
+        <input
+          type="range"
+          min="1"
+          max="8"
+          step="1"
+          value={params.chunk_batch_size}
+          onChange={(e) => updateParam('chunk_batch_size', parseInt(e.target.value, 10))}
+        />
+        <div className="slider-ticks">
+          <span>1 (Sequential)</span>
+          <span>4</span>
+          <span>8 (Max)</span>
+        </div>
+        <p className="control-subtext" style={{ marginTop: '4px' }}>
+          Samples up to N chunks in a single model batch (short chunks get up to 2s of
+          silence padding). Needs VRAM headroom; keep 1 if the GPU is small.
+        </p>
+      </div>
+
       {/* Advanced Toggle */}
       <div className="advanced-toggle-row">
         <button 
@@ -189,6 +258,38 @@ export default function ParameterControls({ params, setParams }) {
                 </button>
               ))}
             </div>
+          </div>
+
+          {/* Decode Batch Size */}
+          <div className="control-group">
+            <div className="control-label-row">
+              <label className="control-label">
+                <span>Decode Batch Size</span>
+                <span className="control-val-badge">
+                  {params.decode_batch_size > 0 ? `${params.decode_batch_size} frames` : 'Auto'}
+                </span>
+              </label>
+              <span className="control-subtext">
+                {params.decode_batch_size > 0 ? '⚠️ Manual VRAM override' : 'VRAM auto-tuned'}
+              </span>
+            </div>
+            <input
+              type="range"
+              min="0"
+              max="64"
+              step="1"
+              value={params.decode_batch_size}
+              onChange={(e) => updateParam('decode_batch_size', parseInt(e.target.value, 10))}
+            />
+            <div className="slider-ticks">
+              <span>0 (Auto)</span>
+              <span>32</span>
+              <span>64 (Max)</span>
+            </div>
+            <p className="control-subtext" style={{ marginTop: '4px' }}>
+              Frames decoded per GPU step. Auto packs as many as fit in VRAM for best
+              throughput; raise it manually only if the tuner under-uses a large GPU.
+            </p>
           </div>
         </div>
       )}

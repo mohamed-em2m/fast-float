@@ -1,3 +1,10 @@
+import sys
+try:
+    import torchvision
+except Exception:
+    sys.modules["torchvision"] = None
+    sys.modules["torchvision.io"] = None
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

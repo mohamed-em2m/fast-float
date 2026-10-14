@@ -12,7 +12,6 @@ import soundfile as sf
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
 
 # Ensure current directory and repository root are in sys.path
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -34,7 +33,10 @@ from fast_float.utils.media import (
 )
 from fast_float.utils.video_optimizer import VideoSaveOptimizer
 from fast_float.core.state import app_state
-from fast_float.core.service import run_inference_blocking
+from fast_float.core.service import (
+    run_inference_blocking,
+    run_inference_batched_blocking,
+)
 from fast_float.core.inference_optimized import (
     OptimizedInferenceAgent,
     InferenceOptions,
@@ -47,7 +49,16 @@ RESULTS_DIR = os.getenv("RESULTS_DIR", "./results")
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "10"))
 OPTIMIZATION_MODE = os.getenv("OPTIMIZATION_MODE", "all")
 USE_FP16 = os.getenv("USE_FP16", "true").lower() in ("true", "1", "yes")
-COMPRESS_RESPONSES = True
+# Comma-separated list of allowed browser origins, e.g.
+# CORS_ORIGINS=http://localhost:3000,https://studio.example.com
+# localhost and 127.0.0.1 are different origins to a browser, so allow both.
+CORS_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+    ).split(",")
+    if o.strip()
+]
 
 
 @asynccontextmanager
@@ -127,6 +138,38 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"⚠️ Model warmup skipped/failed: {e}")
 
+    # 5b. Batched-shape warmup (B=2 silent clips) so the first real batched
+    # request doesn't pay cuDNN autotuning on unseen batch shapes. Quietly
+    # skipped on any failure — sequential inference is unaffected.
+    try:
+        batch_audios, batch_videos = [], []
+        for _ in range(2):
+            wa = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+            wv = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+            sf.write(wa, np.zeros(32000, dtype=np.float32), 16000)  # 2s silence
+            batch_audios.append(wa)
+            batch_videos.append(wv)
+        await loop.run_in_executor(
+            app_state.executor,
+            run_inference_batched_blocking,
+            app_state.agent,
+            [
+                {"audio_path": wa, "padded_path": wa, "duration": 2.0, "out_path": wv}
+                for wa, wv in zip(batch_audios, batch_videos)
+            ],
+            DEFAULT_IMAGE_PATH,
+            {
+                "a_cfg_scale": 2.0, "r_cfg_scale": 1.0, "e_cfg_scale": 1.0,
+                "emotion": "S2E", "nfe": 2, "no_crop": False, "seed": 25,
+            },
+        )
+        for f in batch_audios + batch_videos:
+            if os.path.exists(f):
+                os.remove(f)
+        logger.info("✅ Batched warmup complete (B=2)")
+    except Exception as e:
+        logger.warning(f"⚠️ Batched warmup skipped: {e}")
+
     # 6. Public URLs setup
     app_state.public_url = os.getenv("AVATER_PUBLIC_URL", f"http://localhost:{PORT}")
     app_state.public_backup_url = os.getenv("BACKUP_AVATER_PUBLIC_URL")
@@ -143,10 +186,15 @@ async def lifespan(app: FastAPI):
 
     # Shutdown logic
     logger.info("🛑 Shutting down server...")
-    if app_state.pcs:
-        close_coros = [pc.close() for pc in app_state.pcs]
-        await asyncio.gather(*close_coros, return_exceptions=True)
-        app_state.pcs.clear()
+    from fast_float.routers.webrtc import _cleanup_peer
+
+    for pc in list(app_state.pcs):
+        try:
+            await pc.close()
+        except Exception:
+            pass
+        finally:
+            _cleanup_peer(pc)
 
     app_state.shutdown()
     logger.info("👋 Shutdown complete.")
@@ -159,13 +207,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-if COMPRESS_RESPONSES:
-    app.add_middleware(GZipMiddleware, minimum_size=1000)
-
+# NOTE: No GZipMiddleware on purpose. Starlette's GZip compresses every
+# streaming response (including video/mp4, only text/event-stream is
+# excluded), which wastes CPU on already-compressed video and corrupts
+# byte-range streaming. JSON API responses are a few hundred bytes and
+# compress to nothing anyway.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

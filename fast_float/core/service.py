@@ -6,6 +6,8 @@ import datetime
 import asyncio
 from typing import Dict, Tuple, Any
 
+import cv2
+
 from fast_float.utils.logger import logger
 from fast_float.utils.media import (
     DEFAULT_IMAGE_PATH,
@@ -13,7 +15,29 @@ from fast_float.utils.media import (
     resize_image_to_256,
     process_audio_format,
 )
+from fast_float.utils.chunking import (
+    split_wav_into_chunks,
+    merge_mp4_chunks,
+    get_audio_duration_seconds,
+    group_chunks_for_batch,
+    pad_wav_to_duration,
+)
 from fast_float.core.state import app_state
+
+ALLOWED_IMAGE_FORMATS = {"jpg", "jpeg", "png", "webp"}
+
+
+def _probe_frame_count(video_path: str) -> int:
+    """Best-effort frame count probe for fps reporting. Returns 0 on failure."""
+    try:
+        cap = cv2.VideoCapture(video_path)
+        try:
+            count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        finally:
+            cap.release()
+        return max(count, 0)
+    except Exception:
+        return 0
 
 
 def run_inference_blocking(
@@ -39,15 +63,92 @@ def run_inference_blocking(
     )
 
 
+def run_inference_batched_blocking(
+    agent: Any,
+    items: list,
+    image_path: str,
+    request_data: Dict[str, Any],
+) -> list:
+    """Synchronous batched-chunk inference runner invoked within ThreadPoolExecutor."""
+    return agent.run_inference_batched(
+        items,
+        image_path,
+        a_cfg_scale=request_data.get("a_cfg_scale", 2.0),
+        r_cfg_scale=request_data.get("r_cfg_scale", 1.0),
+        e_cfg_scale=request_data.get("e_cfg_scale", 1.0),
+        emo=request_data.get("emotion", "S2E"),
+        nfe=request_data.get("nfe", 10),
+        no_crop=request_data.get("no_crop", False),
+        seed=request_data.get("seed", 25),
+        verbose=True,
+    )
+def _prepare_image(request_data: Dict[str, Any], temp_files: list) -> str:
+    """Decode + resize the reference image (or fall back to the default)."""
+    if request_data.get("image_base64"):
+        image_bytes = base64.b64decode(request_data["image_base64"])
+        image_format = str(request_data.get("image_format", "jpg")).lower().lstrip(".")
+        if image_format not in ALLOWED_IMAGE_FORMATS:
+            raise ValueError(f"Unsupported image_format '{image_format}'")
+        image_path_temp = tempfile.NamedTemporaryFile(
+            delete=False, suffix=f".{image_format}"
+        ).name
+        with open(image_path_temp, "wb") as f:
+            f.write(image_bytes)
+        temp_files.append(image_path_temp)
+
+        image_path = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg").name
+        resize_image_to_256(image_path_temp, image_path)
+        temp_files.append(image_path)
+        return image_path
+
+    return ensure_default_image(DEFAULT_IMAGE_PATH)
+
+
+def _apply_decode_batch_size(state: Any, request_data: Dict[str, Any]) -> None:
+    """Push the client's decode micro-batch override onto the model (0 = auto).
+
+    The model reads ``opt.decode_batch_size`` while planning its decode pipeline,
+    so we set it and drop the memoized tuning profiles only when the requested
+    value actually changes. The caller holds ``state.inference_lock``, so mutating
+    the shared ``opt`` here is safe.
+    """
+    try:
+        value = int(request_data.get("decode_batch_size", 0) or 0)
+    except (TypeError, ValueError):
+        value = 0
+    normalized = value if max(0, value) > 0 else None
+
+    opt = getattr(state, "opt", None)
+    if opt is None or getattr(opt, "decode_batch_size", None) == normalized:
+        return
+    opt.decode_batch_size = normalized
+
+    agent = getattr(state, "agent", None)
+    for model in (
+        getattr(agent, "G", None),
+        getattr(agent, "G_opt", None),
+        getattr(agent, "model", None),
+    ):
+        clear = getattr(model, "clear_decode_cache", None)
+        if callable(clear):
+            clear()
+            break
+
+
 async def generate_video(
     request_data: Dict[str, Any],
     request_id: str,
     state=app_state,
 ) -> Tuple[str, Dict[str, float]]:
-    """Complete pipeline to process inputs, run model inference, and return final video."""
-    temp_files = []
+    """Complete pipeline to process inputs, run model inference, and return final video.
+
+    When ``chunk_seconds`` > 0 and the audio is longer than one window, the audio
+    is sliced into overlapping chunks, each rendered independently (with progress
+    reported to ``state.progress``), then merged back into a single MP4.
+    """
+    temp_files: list = []
     total_start_time = time.time()
-    timings = {}
+    timings: Dict[str, float] = {}
 
     try:
         loop = asyncio.get_running_loop()
@@ -56,6 +157,7 @@ async def generate_video(
 
     try:
         logger.info(f"[{request_id}] 🚀 Starting video generation")
+        state.set_progress(request_id, status="processing", stage="preprocessing", percent=1.0)
 
         # 1. Audio processing
         preprocess_start = time.time()
@@ -73,61 +175,82 @@ async def generate_video(
         temp_files.append(audio_path)
 
         # 2. Image processing
-        if request_data.get("image_base64"):
-            image_bytes = base64.b64decode(request_data["image_base64"])
-            image_path_temp = tempfile.NamedTemporaryFile(
-                delete=False,
-                suffix=f".{request_data.get('image_format', 'jpg')}",
-            ).name
-            with open(image_path_temp, "wb") as f:
-                f.write(image_bytes)
-            temp_files.append(image_path_temp)
-
-            image_path = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg").name
-            resize_image_to_256(image_path_temp, image_path)
-            temp_files.append(image_path)
-        else:
-            image_path = ensure_default_image(DEFAULT_IMAGE_PATH)
-
+        image_path = _prepare_image(request_data, temp_files)
         timings["preprocess"] = time.time() - preprocess_start
 
-        # 3. Model Inference with lock
-        res_dir = getattr(state.opt, "res_dir", "./results") if state.opt else "./results"
-        os.makedirs(res_dir, exist_ok=True)
-        video_path_final = os.path.join(
-            res_dir,
-            f"{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{request_id}.mp4",
+        # 3. Output paths
+        res_dir = (
+            getattr(state.opt, "res_dir", "./results") if state.opt else "./results"
         )
+        os.makedirs(res_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        video_path_final = os.path.join(res_dir, f"{stamp}_{request_id}.mp4")
 
-        inference_start = time.time()
+        fps = int(getattr(state.opt, "fps", 25)) if state.opt else 25
+        encoder = (
+            state.video_optimizer.selected_encoder
+            if state.video_optimizer and state.video_optimizer.selected_encoder
+            else "libx264"
+        )
 
         if state.inference_lock is None:
             state.inference_lock = asyncio.Lock()
 
+        # 4. Decide single-pass vs chunked based on audio length
+        chunk_seconds = float(request_data.get("chunk_seconds", 0.0) or 0.0)
+        overlap_seconds = float(request_data.get("chunk_overlap_seconds", 0.5) or 0.0)
+        duration = get_audio_duration_seconds(audio_path)
+
+        inference_start = time.time()
+        num_chunks = 1
+
         async with state.inference_lock:
-            output_path = await loop.run_in_executor(
-                state.executor,
-                run_inference_blocking,
-                state.agent,
-                video_path_final,
-                image_path,
-                audio_path,
-                request_data,
-            )
+            _apply_decode_batch_size(state, request_data)
+            if chunk_seconds > 0 and duration > chunk_seconds:
+                num_chunks, output_path = await _generate_chunked(
+                    loop, state, request_data, request_id, audio_path, image_path,
+                    res_dir, stamp, chunk_seconds, overlap_seconds, encoder, fps, temp_files,
+                )
+            else:
+                state.set_progress(
+                    request_id, status="processing", stage="generating",
+                    total_chunks=1, completed_chunks=0, percent=5.0,
+                )
+                output_path = await loop.run_in_executor(
+                    state.executor,
+                    run_inference_blocking,
+                    state.agent,
+                    video_path_final,
+                    image_path,
+                    audio_path,
+                    request_data,
+                )
 
         timings["inference"] = time.time() - inference_start
         timings["total"] = time.time() - total_start_time
-        timings["fps"] = 1.0 / timings["inference"] if timings["inference"] > 0 else 0.0
+        timings["chunks"] = num_chunks
 
-        # 4. Update performance stats
+        # Real video fps: encoded frames per second of inference wall time.
+        frame_count = _probe_frame_count(output_path)
+        timings["fps"] = (
+            frame_count / timings["inference"]
+            if frame_count > 0 and timings["inference"] > 0
+            else 0.0
+        )
+
+        # 5. Update performance stats
         stats = state.performance_stats
         stats["total_requests"] += 1
         stats["total_inference_time"] += timings["inference"]
         stats["total_preprocess_time"] += timings["preprocess"]
+        stats["total_frames"] = stats.get("total_frames", 0) + frame_count
         if stats["total_inference_time"] > 0:
-            stats["average_fps"] = stats["total_requests"] / stats["total_inference_time"]
+            stats["average_fps"] = stats["total_frames"] / stats["total_inference_time"]
 
-        # 5. Clean temporary files
+        state.set_progress(request_id, status="done", stage="done", percent=100.0,
+                           total_chunks=num_chunks, completed_chunks=num_chunks)
+
+        # 6. Clean temporary files
         for temp_file in temp_files:
             try:
                 if os.path.exists(temp_file):
@@ -135,21 +258,25 @@ async def generate_video(
             except Exception as cleanup_error:
                 logger.debug(f"[{request_id}] Cleanup warning: {cleanup_error}")
 
-        # 6. Verify final video
+        # 7. Verify final video
         if not os.path.exists(output_path):
             raise FileNotFoundError(f"Final video not found at {output_path}")
 
         file_size = os.path.getsize(output_path) / (1024 * 1024)
         logger.info(
             f"[{request_id}] ✅ Complete: {timings['total']:.2f}s "
-            f"(prep: {timings['preprocess']:.2f}s, inf: {timings['inference']:.2f}s) | "
-            f"{file_size:.2f}MB"
+            f"(prep: {timings['preprocess']:.2f}s, inf: {timings['inference']:.2f}s, "
+            f"chunks: {num_chunks}) | {file_size:.2f}MB"
         )
+
+        state.set_progress(request_id, status="done", stage="done", percent=100.0,
+                           message=f"{num_chunks} chunk(s)")
 
         return output_path, timings
 
     except Exception as e:
         logger.error(f"[{request_id}] ❌ Generation failed: {str(e)}", exc_info=True)
+        state.set_progress(request_id, status="error", stage="error", message=str(e))
         for temp_file in temp_files:
             try:
                 if os.path.exists(temp_file):
@@ -157,3 +284,125 @@ async def generate_video(
             except Exception:
                 pass
         raise
+
+
+async def _generate_chunked(
+    loop,
+    state,
+    request_data: Dict[str, Any],
+    request_id: str,
+    audio_path: str,
+    image_path: str,
+    res_dir: str,
+    stamp: str,
+    chunk_seconds: float,
+    overlap_seconds: float,
+    encoder: str,
+    fps: int,
+    temp_files: list,
+) -> Tuple[int, str]:
+    """Render each audio chunk, then merge. Returns (chunk_count, merged_path)."""
+    chunks = split_wav_into_chunks(
+        audio_path, chunk_seconds, overlap_seconds, out_dir=res_dir
+    )
+    # The original file is only reused when no split happened (single element).
+    for ch in chunks:
+        if ch.get("synthetic"):
+            temp_files.append(ch["path"])
+
+    num_chunks = len(chunks)
+    state.set_progress(
+        request_id, status="processing", stage="generating",
+        total_chunks=num_chunks, completed_chunks=0, percent=0.0,
+        message=f"0/{num_chunks} chunks",
+    )
+    logger.info(f"[{request_id}] 🧩 Chunked generation: {num_chunks} chunks")
+
+    try:
+        batch_size = max(1, int(request_data.get("chunk_batch_size", 1) or 1))
+    except (TypeError, ValueError):
+        batch_size = 1
+    try:
+        pad_cap = max(0.0, float(request_data.get("chunk_pad_seconds", 2.0) or 0.0))
+    except (TypeError, ValueError):
+        pad_cap = 2.0
+    groups = group_chunks_for_batch(chunks, batch_size, pad_cap)
+    if batch_size > 1:
+        batched = sum(1 for g in groups if len(g) > 1)
+        logger.info(
+            f"[{request_id}] 🧪 Batched sampling: {len(groups)} group(s), "
+            f"{batched} batched, pad≤{pad_cap:g}s"
+        )
+
+    chunk_videos: list = []
+    done, idx = 0, 0
+    for g in groups:
+        batch_note = f" (sampling batch×{len(g)})" if len(g) > 1 else ""
+        state.set_progress(
+            request_id, stage="generating", completed_chunks=done,
+            percent=round(done / num_chunks * 90, 1),
+            message=f"{done}/{num_chunks} chunks{batch_note}",
+        )
+        if len(g) == 1:
+            ch = g[0]
+            chunk_out = os.path.join(res_dir, f"{stamp}_{request_id}_chunk{idx:03d}.mp4")
+            await loop.run_in_executor(
+                state.executor,
+                run_inference_blocking,
+                state.agent,
+                chunk_out,
+                image_path,
+                ch["path"],
+                request_data,
+            )
+            chunk_videos.append(chunk_out)
+            temp_files.append(chunk_out)
+            idx += 1
+            done += 1
+        else:
+            target = max(c["duration"] for c in g)
+            items = []
+            for ch in g:
+                chunk_out = os.path.join(res_dir, f"{stamp}_{request_id}_chunk{idx:03d}.mp4")
+                if target - ch["duration"] > 1e-6:
+                    padded = os.path.join(res_dir, f"{stamp}_{request_id}_pad{idx:03d}.wav")
+                    pad_wav_to_duration(ch["path"], target, padded)
+                    temp_files.append(padded)
+                else:
+                    padded = ch["path"]
+                items.append({
+                    "audio_path": ch["path"],
+                    "padded_path": padded,
+                    "duration": ch["duration"],
+                    "out_path": chunk_out,
+                })
+                idx += 1
+            outs = await loop.run_in_executor(
+                state.executor,
+                run_inference_batched_blocking,
+                state.agent,
+                items,
+                image_path,
+                request_data,
+            )
+            for o in outs:
+                chunk_videos.append(o)
+                temp_files.append(o)
+            done += len(g)
+
+    state.set_progress(
+        request_id, status="merging", stage="merging",
+        completed_chunks=num_chunks, percent=92.0, message="Merging chunks",
+    )
+
+    merged_path = os.path.join(res_dir, f"{stamp}_{request_id}.mp4")
+    await loop.run_in_executor(
+        state.executor,
+        merge_mp4_chunks,
+        chunk_videos,
+        merged_path,
+        overlap_seconds,
+        encoder,
+        fps,
+    )
+    return num_chunks, merged_path
