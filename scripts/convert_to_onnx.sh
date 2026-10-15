@@ -43,11 +43,13 @@ onnx_rt_pkg() {
 }
 if ! probe_onnx; then
   echo "installing onnx stack (joint resolve, pin onnx<1.22)"
-  pip install -q --upgrade "onnx<1.22" onnxscript "$(onnx_rt_pkg)" || pip install -q --upgrade "onnx<1.22" onnxscript onnxruntime
+  pip uninstall -q -y onnx onnxscript onnx-ir onnxruntime onnxruntime-gpu 2>/dev/null || true
+  pip install -q --no-cache-dir "onnx<1.22" "onnxscript==0.7.2" "$(onnx_rt_pkg)" || pip install -q --no-cache-dir "onnx<1.22" "onnxscript==0.7.2" onnxruntime
 fi
 if ! probe_onnx; then
   echo "retrying with force-reinstall (clears partial/corrupt installs)"
-  pip install -q --upgrade --force-reinstall --no-cache-dir "onnx<1.22" onnxscript "$(onnx_rt_pkg)" || pip install -q --upgrade --force-reinstall --no-cache-dir "onnx<1.22" onnxscript onnxruntime
+  pip uninstall -q -y onnx onnxscript onnx-ir onnxruntime onnxruntime-gpu 2>/dev/null || true
+  pip install -q --no-cache-dir --force-reinstall "onnx<1.22" "onnxscript==0.7.2" "$(onnx_rt_pkg)" || pip install -q --no-cache-dir --force-reinstall "onnx<1.22" "onnxscript==0.7.2" onnxruntime
 fi
 echo "onnx stack versions:"
 python -c "import importlib.metadata as m
