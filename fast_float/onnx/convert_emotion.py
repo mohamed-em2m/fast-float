@@ -167,6 +167,8 @@ def main(argv=None) -> int:
     ap.add_argument("--skip-parity", action="store_true")
     ap.add_argument("--bench-iters", type=int, default=30,
                     help="warmed benchmark iters per probe (0 = skip)")
+    ap.add_argument("--cpu-ort", action="store_true",
+                    help="allow CPU ORT session on a CUDA box (dev only)")
     args = ap.parse_args(argv)
 
     module = build_emotion_module(args.emo_dir, args.ckpt)
@@ -188,8 +190,8 @@ def main(argv=None) -> int:
     if not args.skip_parity:
         sess = make_ort_session(
             info["path"],
-            use_gpu=torch.cuda.is_available(),
-            require_gpu=torch.cuda.is_available(),
+            use_gpu=torch.cuda.is_available() and not args.cpu_ort,
+            require_gpu=torch.cuda.is_available() and not args.cpu_ort,
         )
         print(f"[ort] providers={sess.get_providers()}")
         with torch.no_grad():

@@ -53,6 +53,20 @@ fi
 echo "=== [2/8] python deps ==="
 python -c "import torch; print('torch', torch.__version__, 'cuda=', torch.cuda.is_available())"
 probe_onnx() { python -c "import onnx.external_data_helper, onnxscript, onnxruntime" 2>/dev/null; }
+# On CUDA boxes the ORT build must ALSO ship a working CUDA EP (a CUDA-13
+# onnxruntime-gpu on a CUDA-12 box imports fine but sessions fall back to
+# CPU). CPU-only torch boxes always pass this probe.
+probe_ort_cuda() {
+  python -c "
+import sys
+import torch
+import onnxruntime as o
+ok = (not torch.cuda.is_available()
+      or 'CUDAExecutionProvider' in o.get_available_providers()
+      or 'TensorrtExecutionProvider' in o.get_available_providers())
+sys.exit(0 if ok else 1)" 2>/dev/null
+}
+probe_stack() { probe_onnx && probe_ort_cuda; }
 onnx_rt_pkg() {
   # onnxruntime>=1.24 dropped cp310 wheels; the box runs CPython 3.10.
   if python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
@@ -61,12 +75,12 @@ onnx_rt_pkg() {
     echo "onnxruntime<1.24"
   fi
 }
-if ! probe_onnx; then
+if ! probe_stack; then
   echo "installing onnx stack (joint resolve, pin onnx<1.22)"
   pip uninstall -q -y onnx onnxscript onnx-ir onnxruntime onnxruntime-gpu 2>/dev/null || true
   pip install -q --no-cache-dir "onnx<1.22" "onnxscript==0.7.2" "$(onnx_rt_pkg)" || pip install -q --no-cache-dir "onnx<1.22" "onnxscript==0.7.2" "onnxruntime<1.24"
 fi
-if ! probe_onnx; then
+if ! probe_stack; then
   echo "retrying with force-reinstall (clears partial/corrupt installs)"
   pip uninstall -q -y onnx onnxscript onnx-ir onnxruntime onnxruntime-gpu 2>/dev/null || true
   pip install -q --no-cache-dir --force-reinstall "onnx<1.22" "onnxscript==0.7.2" "$(onnx_rt_pkg)" || pip install -q --no-cache-dir --force-reinstall "onnx<1.22" "onnxscript==0.7.2" "onnxruntime<1.24"
@@ -76,7 +90,7 @@ python -c "import importlib.metadata as m
 for p in ('onnx','onnxscript','onnx-ir','onnxruntime','onnxruntime-gpu'):
     try: print(' ', p, m.version(p))
     except Exception: print(' ', p, 'MISSING')"
-probe_onnx || { echo "ERROR: onnx stack still broken — export cannot run"; exit 1; }
+probe_stack || { echo "ERROR: onnx stack still broken — export cannot run"; exit 1; }
 
 echo "=== [3/8] convert: emotion (unit 1) ==="
 python -m fast_float.onnx.convert_emotion \
