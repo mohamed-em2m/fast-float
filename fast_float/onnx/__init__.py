@@ -7,5 +7,6 @@ and shares :mod:`fast_float.onnx.export` (dynamo-first export) and
 
 from fast_float.onnx.export import export_module, make_ort_session
 from fast_float.onnx.parity import check_parity
+from fast_float.onnx.runtime import EmotionOnnxBackend
 
-__all__ = ["export_module", "make_ort_session", "check_parity"]
+__all__ = ["export_module", "make_ort_session", "check_parity", "EmotionOnnxBackend"]

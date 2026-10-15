@@ -63,7 +63,6 @@ from transformers import Wav2Vec2Config
 from transformers.modeling_outputs import BaseModelOutput
 
 from fast_float.models.wav2vec2 import Wav2VecModel
-from fast_float.models.wav2vec2_ser import Wav2Vec2ForSpeechClassification
 from fast_float.models import BaseModel
 from fast_float.models.float.generator import Generator
 from fast_float.models.float.FMT import FlowMatchingTransformer
@@ -1774,20 +1773,43 @@ class AudioEncoder(BaseModel):
 
 
 class Audio2Emotion(nn.Module):
+    # ONNX export of this classifier (waveform -> 7-dim probs).
+    # Used first when the file exists; the torch checkpoint is the fallback.
+    DEFAULT_ONNX_PATH = "./onnx/emotion_v1.onnx"
+
     def __init__(self, opt):
         super().__init__()
 
-        # Load pretrained model (local preferred)
-        if os.path.exists(opt.audio2emotion_path):
-            self.wav2vec2_for_emotion = Wav2Vec2ForSpeechClassification.from_pretrained(
-                opt.audio2emotion_path, local_files_only=True
-            )
-        else:
-            self.wav2vec2_for_emotion = Wav2Vec2ForSpeechClassification.from_pretrained(
-                opt.audio2emotion_path
-            )
+        # Prefer the ONNX export (fast, no 1.2 GB torch weight load).
+        # Plain attribute on purpose: nn.Module.to()/compile ignore it,
+        # and the ORT call below is dynamo-disabled for torch.compile safety.
+        self._onnx_backend = None
+        onnx_path = getattr(opt, "emotion_onnx_path", self.DEFAULT_ONNX_PATH)
+        if onnx_path and os.path.exists(onnx_path):
+            try:
+                from fast_float.onnx.runtime import EmotionOnnxBackend
 
-        self.wav2vec2_for_emotion.eval()
+                self._onnx_backend = EmotionOnnxBackend(onnx_path)
+                logger.info(
+                    f"Audio2Emotion: using ONNX backend {onnx_path} "
+                    f"(providers={self._onnx_backend.providers})"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Audio2Emotion: ONNX backend failed ({e}); "
+                    "falling back to torch weights"
+                )
+                self._onnx_backend = None
+
+        # Torch fallback (local preferred). Skipped when ONNX is up.
+        # build_core handles new-transformers incompatibility
+        # (from_pretrained -> manual load with tie_weights no-op).
+        self.wav2vec2_for_emotion = None
+        if self._onnx_backend is None:
+            from fast_float.onnx.convert_emotion import build_core
+
+            self.wav2vec2_for_emotion = build_core(opt.audio2emotion_path)
+            self.wav2vec2_for_emotion.eval()
 
         # seven labels
         self.id2label = {
@@ -1814,5 +1836,12 @@ class Audio2Emotion(nn.Module):
                 prev_a = prev_a.unsqueeze(0)
             a = torch.cat([prev_a, a], dim=1)
 
+        if self._onnx_backend is not None:
+            # ONNX graph already outputs softmax probabilities.
+            return self._onnx_backend.predict_probs(a)
         logits = self.wav2vec2_for_emotion(a).logits
         return F.softmax(logits, dim=1)
+
+    @property
+    def uses_onnx(self) -> bool:
+        return self._onnx_backend is not None

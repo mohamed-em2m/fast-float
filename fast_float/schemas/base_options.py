@@ -44,6 +44,11 @@ class BaseOptions:
             default="./checkpoints/wav2vec-english-speech-emotion-recognition",
         )
         parser.add_argument(
+            "--emotion_onnx_path",
+            default="./onnx/emotion_v1.onnx",
+            help="ONNX S2E classifier (preferred over torch weights when present)",
+        )
+        parser.add_argument(
             "--attention_window",
             default=2,
             type=int,
