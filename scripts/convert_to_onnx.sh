@@ -33,14 +33,28 @@ fi
 
 echo "=== [2/3] python deps ==="
 python -c "import torch; print('torch', torch.__version__, 'cuda=', torch.cuda.is_available())"
-if ! python -c "import onnx, onnxscript, onnxruntime" 2>/dev/null; then
-  echo "installing onnx + onnxscript + onnxruntime (joint upgrade: pip resolves the trio together)"
+probe_onnx() { python -c "import onnx.external_data_helper, onnxscript, onnxruntime" 2>/dev/null; }
+onnx_rt_pkg() {
   if python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-    pip install -q --upgrade onnx onnxscript "onnxruntime-gpu" || pip install -q --upgrade onnx onnxscript onnxruntime
+    echo "onnxruntime-gpu"
   else
-    pip install -q --upgrade onnx onnxscript onnxruntime
+    echo "onnxruntime"
   fi
+}
+if ! probe_onnx; then
+  echo "installing onnx stack (joint resolve)"
+  pip install -q --upgrade onnx onnxscript "$(onnx_rt_pkg)" || pip install -q --upgrade onnx onnxscript onnxruntime
 fi
+if ! probe_onnx; then
+  echo "retrying with force-reinstall (clears partial/corrupt installs)"
+  pip install -q --upgrade --force-reinstall --no-cache-dir onnx onnxscript "$(onnx_rt_pkg)" || pip install -q --upgrade --force-reinstall --no-cache-dir onnx onnxscript onnxruntime
+fi
+echo "onnx stack versions:"
+python -c "import importlib.metadata as m
+for p in ('onnx','onnxscript','onnx-ir','onnxruntime','onnxruntime-gpu'):
+    try: print(' ', p, m.version(p))
+    except Exception: print(' ', p, 'MISSING')"
+probe_onnx || { echo "ERROR: onnx stack still broken — export cannot run"; exit 1; }
 
 echo "=== [3/3] convert: emotion (unit 1) ==="
 python -m fast_float.onnx.convert_emotion \
