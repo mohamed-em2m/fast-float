@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import os
 
-import numpy as np
 import torch
 
 from fast_float.onnx.export import make_ort_session
@@ -34,17 +33,15 @@ class EmotionOnnxBackend:
 
     Keeps torch semantics for callers: torch in (any device/dtype) ->
     float32 probs on the input's device. Always runs fp32 on CPU numpy,
-    so AMP/autocast contexts in the caller are harmless.
+    so AMP/autocast contexts in the caller are harmless. The graph has
+    symbolic batch/length, so one ``sess.run`` covers any ``[B, L]``.
     """
 
     def __init__(self, onnx_path: str, use_gpu: bool | None = None):
         if not os.path.exists(onnx_path):
             raise FileNotFoundError(f"emotion ONNX not found: {onnx_path}")
         if use_gpu is None:
-            # CPU default: the CUDA EP miscomputes conv workspace shapes for
-            # inputs shorter than the 3 s trace length (bogus ~17 GB alloc,
-            # hard FAIL for L<48000). CPU is correct for all tested lengths.
-            use_gpu = False
+            use_gpu = torch.cuda.is_available()
         self.path = os.path.abspath(onnx_path)
         self.session = make_ort_session(self.path, use_gpu=use_gpu)
         self.input_name = self.session.get_inputs()[0].name
@@ -59,18 +56,10 @@ class EmotionOnnxBackend:
 
     @torch.no_grad()
     def predict_probs(self, a: torch.Tensor) -> torch.Tensor:
-        """Waveform ``[L]`` or ``[B, L]`` -> probs ``[B, 7]`` (float32).
-
-        The traced graph bakes batch=1 (a reshape captures the sample
-        batch dim), so B>1 runs row-by-row and stacks. Chunk counts per
-        inference window are small, so this costs nothing measurable.
-        """
+        """Waveform ``[L]`` or ``[B, L]`` -> probs ``[B, 7]`` (float32)."""
         device = a.device
         if a.ndim == 1:
             a = a.unsqueeze(0)
-        rows = [
-            self._run(a[i : i + 1].detach().to("cpu", dtype=torch.float32).numpy())
-            for i in range(a.shape[0])
-        ]
-        probs = np.concatenate(rows, axis=0)
+        wav_np = a.detach().to("cpu", dtype=torch.float32).numpy()
+        probs = self._run(wav_np)
         return torch.from_numpy(probs).to(device=device, dtype=torch.float32)

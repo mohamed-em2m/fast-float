@@ -187,13 +187,26 @@ def main(argv=None) -> int:
         sess = make_ort_session(info["path"], use_gpu=torch.cuda.is_available())
         print(f"[ort] providers={sess.get_providers()}")
         with torch.no_grad():
-            for name, wav in probe_inputs(args.seconds).items():
+            probes = probe_inputs(args.seconds)
+            for name, wav in probes.items():
                 ref = module(wav)
                 ort_out = sess.run(None, {"input_values": wav.numpy()})[0]
                 check_parity(ref, ort_out, name=name, atol=args.atol, rtol=args.rtol)
                 top = int(np.argmax(ort_out[0]))
                 print(f"[probe:{name}] torch_top={LABELS[int(np.argmax(ref.numpy()[0]))]} "
                       f"onnx_top={LABELS[top]}")
+            # Batch>1 and short-length guards: the graph must carry symbolic
+            # batch/length (a batch-1 trace bakes both and hard-fails here).
+            batch_wav = torch.cat(
+                [probes["noise"], probes["sine"]], dim=0
+            )  # [2, L]
+            ref = module(batch_wav)
+            ort_out = sess.run(None, {"input_values": batch_wav.numpy()})[0]
+            check_parity(ref, ort_out, name="batch2", atol=args.atol, rtol=args.rtol)
+            short_wav = torch.randn(1, 16000).clamp(-1, 1)  # 1 s < trace length
+            ref = module(short_wav)
+            ort_out = sess.run(None, {"input_values": short_wav.numpy()})[0]
+            check_parity(ref, ort_out, name="short1s", atol=args.atol, rtol=args.rtol)
     print("[done] emotion converter OK")
     return 0
 
