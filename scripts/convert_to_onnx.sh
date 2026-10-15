@@ -10,6 +10,7 @@ cd "${PROJECT_ROOT}"
 
 OUT_DIR="${OUT_DIR:-./onnx}"
 EMO_OUT="${EMO_OUT:-${OUT_DIR}/emotion_v1.onnx}"
+FMT_OUT="${FMT_OUT:-${OUT_DIR}/fmt_step_v1.onnx}"
 CKPT="${CKPT:-./checkpoints/float.pth}"
 EMO_DIR="${EMO_DIR:-./checkpoints/wav2vec-english-speech-emotion-recognition}"
 mkdir -p "${OUT_DIR}" checkpoints
@@ -58,9 +59,13 @@ for p in ('onnx','onnxscript','onnx-ir','onnxruntime','onnxruntime-gpu'):
     except Exception: print(' ', p, 'MISSING')"
 probe_onnx || { echo "ERROR: onnx stack still broken — export cannot run"; exit 1; }
 
-echo "=== [3/3] convert: emotion (unit 1) ==="
+echo "=== [3/4] convert: emotion (unit 1) ==="
 python -m fast_float.onnx.convert_emotion \
   --ckpt "${CKPT}" --emo-dir "${EMO_DIR}" --out "${EMO_OUT}" "$@"
+
+echo "=== [4/4] convert: fmt step (unit 2) ==="
+python -m fast_float.onnx.convert_fmt \
+  --ckpt "${CKPT}" --out "${FMT_OUT}"
 
 echo "=== artifacts ==="
 ls -la "${OUT_DIR}"
