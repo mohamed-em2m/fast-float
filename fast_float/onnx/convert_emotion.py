@@ -165,6 +165,8 @@ def main(argv=None) -> int:
     ap.add_argument("--atol", type=float, default=2e-4)
     ap.add_argument("--rtol", type=float, default=2e-4)
     ap.add_argument("--skip-parity", action="store_true")
+    ap.add_argument("--bench-iters", type=int, default=30,
+                    help="warmed benchmark iters per probe (0 = skip)")
     args = ap.parse_args(argv)
 
     module = build_emotion_module(args.emo_dir, args.ckpt)
@@ -184,7 +186,11 @@ def main(argv=None) -> int:
         print(f"[export] note: {note}")
 
     if not args.skip_parity:
-        sess = make_ort_session(info["path"], use_gpu=torch.cuda.is_available())
+        sess = make_ort_session(
+            info["path"],
+            use_gpu=torch.cuda.is_available(),
+            require_gpu=torch.cuda.is_available(),
+        )
         print(f"[ort] providers={sess.get_providers()}")
         with torch.no_grad():
             for name, wav in probe_inputs(args.seconds).items():
@@ -194,6 +200,14 @@ def main(argv=None) -> int:
                 top = int(np.argmax(ort_out[0]))
                 print(f"[probe:{name}] torch_top={LABELS[int(np.argmax(ref.numpy()[0]))]} "
                       f"onnx_top={LABELS[top]}")
+                if args.bench_iters > 0:
+                    from fast_float.onnx.parity import benchmark
+                    wav_np = wav.numpy()
+                    benchmark(
+                        lambda: module(wav),
+                        lambda: sess.run(None, {"input_values": wav_np}),
+                        name=name, iters=args.bench_iters,
+                    )
     print("[done] emotion converter OK")
     return 0
 

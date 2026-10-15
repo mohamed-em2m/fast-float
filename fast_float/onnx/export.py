@@ -73,17 +73,36 @@ def export_module(
     }
 
 
-def make_ort_session(onnx_path: str, use_gpu: bool = True):
-    """ORT InferenceSession, CUDA first, CPU fallback. Raises if file missing."""
+def make_ort_session(
+    onnx_path: str, use_gpu: bool = True, require_gpu: bool = False
+):
+    """ORT InferenceSession, CUDA first, CPU fallback.
+
+    With ``require_gpu=True`` (use on CUDA boxes) a missing CUDA/TRT
+    provider raises instead of silently benchmarking CPU — a silent CPU
+    session is the #1 cause of "ONNX is slow" reports.
+    """
     import onnxruntime as ort
 
     if not os.path.exists(onnx_path):
         raise FileNotFoundError(f"ONNX file not found: {onnx_path}")
     available = set(ort.get_available_providers())
-    providers = []
+    gpu_providers = []
     if use_gpu:
         for cand in ("CUDAExecutionProvider", "TensorrtExecutionProvider"):
             if cand in available:
-                providers.append(cand)
-    providers.append("CPUExecutionProvider")
-    return ort.InferenceSession(onnx_path, providers=providers)
+                gpu_providers.append(cand)
+    if use_gpu and require_gpu and not gpu_providers:
+        raise RuntimeError(
+            "GPU requested but no CUDA/TRT execution provider available "
+            f"(available={sorted(available)}). Install onnxruntime-gpu "
+            "matching this box's CUDA instead of plain onnxruntime."
+        )
+    sess = ort.InferenceSession(onnx_path, providers=gpu_providers + ["CPUExecutionProvider"])
+    active = sess.get_providers()
+    if use_gpu and (not active or active[0] == "CPUExecutionProvider"):
+        print(
+            f"[ort] WARNING: session runs on CPU (active={active}, "
+            f"available={sorted(available)}). Expect torch-CUDA to win."
+        )
+    return sess
