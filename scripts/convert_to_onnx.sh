@@ -53,21 +53,22 @@ echo "=== [2/7] python deps ==="
 python -c "import torch; print('torch', torch.__version__, 'cuda=', torch.cuda.is_available())"
 probe_onnx() { python -c "import onnx.external_data_helper, onnxscript, onnxruntime" 2>/dev/null; }
 onnx_rt_pkg() {
+  # onnxruntime>=1.24 dropped cp310 wheels; the box runs CPython 3.10.
   if python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-    echo "onnxruntime-gpu"
+    echo "onnxruntime-gpu<1.24"
   else
-    echo "onnxruntime"
+    echo "onnxruntime<1.24"
   fi
 }
 if ! probe_onnx; then
   echo "installing onnx stack (joint resolve, pin onnx<1.22)"
   pip uninstall -q -y onnx onnxscript onnx-ir onnxruntime onnxruntime-gpu 2>/dev/null || true
-  pip install -q --no-cache-dir "onnx<1.22" "onnxscript==0.7.2" "$(onnx_rt_pkg)" || pip install -q --no-cache-dir "onnx<1.22" "onnxscript==0.7.2" onnxruntime
+  pip install -q --no-cache-dir "onnx<1.22" "onnxscript==0.7.2" "$(onnx_rt_pkg)" || pip install -q --no-cache-dir "onnx<1.22" "onnxscript==0.7.2" "onnxruntime<1.24"
 fi
 if ! probe_onnx; then
   echo "retrying with force-reinstall (clears partial/corrupt installs)"
   pip uninstall -q -y onnx onnxscript onnx-ir onnxruntime onnxruntime-gpu 2>/dev/null || true
-  pip install -q --no-cache-dir --force-reinstall "onnx<1.22" "onnxscript==0.7.2" "$(onnx_rt_pkg)" || pip install -q --no-cache-dir --force-reinstall "onnx<1.22" "onnxscript==0.7.2" onnxruntime
+  pip install -q --no-cache-dir --force-reinstall "onnx<1.22" "onnxscript==0.7.2" "$(onnx_rt_pkg)" || pip install -q --no-cache-dir --force-reinstall "onnx<1.22" "onnxscript==0.7.2" "onnxruntime<1.24"
 fi
 echo "onnx stack versions:"
 python -c "import importlib.metadata as m
