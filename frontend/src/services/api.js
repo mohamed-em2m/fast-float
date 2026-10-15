@@ -324,7 +324,7 @@ export async function generateVideo(payload) {
 }
 
 /** Establish WebRTC peer connection using /offer */
-export async function createWebRtcSession(streamId, onTrackCallback) {
+export async function createWebRtcSession(streamId, onTrackCallback, onStateCallback) {
   const pc = new RTCPeerConnection({
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -332,8 +332,17 @@ export async function createWebRtcSession(streamId, onTrackCallback) {
     ],
   });
 
+  // Recv-only viewer: declare the m-lines BEFORE createOffer. Without these
+  // the offer SDP has zero media sections and the server answers with
+  // nothing to play (black video, ontrack never fires).
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+
   if (onTrackCallback) {
     pc.ontrack = onTrackCallback;
+  }
+  if (onStateCallback) {
+    pc.onconnectionstatechange = () => onStateCallback(pc.connectionState);
   }
 
   // Create local offer
