@@ -49,6 +49,16 @@ class BaseOptions:
             help="ONNX S2E classifier (preferred over torch weights when present)",
         )
         parser.add_argument(
+            "--wav2vec_onnx_path",
+            default="./onnx/wav2vec_v1.onnx",
+            help="ONNX wav2vec2 encoder, inference() only (torch stays the training path)",
+        )
+        parser.add_argument(
+            "--fmt_onnx_path",
+            default="./onnx/fmt_step_v1.onnx",
+            help="ONNX FMT single-step (ODE loop/CFG stay in Python; torch fallback on mismatch)",
+        )
+        parser.add_argument(
             "--attention_window",
             default=2,
             type=int,

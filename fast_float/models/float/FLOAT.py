@@ -1687,6 +1687,12 @@ result_path = model.run_inference(
 
 ################ Condition Encoders ################
 class AudioEncoder(BaseModel):
+    # ONNX export of the transformer + projection head
+    # (conv feats -> [B, T, dim_w]). Used in inference() when the file
+    # exists; the torch module stays the fallback AND the training path
+    # (gradients cannot flow through ORT into audio_projection).
+    DEFAULT_ONNX_PATH = "./onnx/wav2vec_v1.onnx"
+
     def __init__(self, opt):
         super().__init__()
         self.opt = opt
@@ -1712,6 +1718,31 @@ class AudioEncoder(BaseModel):
         self.audio_projection = nn.Sequential(
             nn.Linear(audio_input_dim, opt.dim_w), nn.LayerNorm(opt.dim_w), nn.SiLU()
         )
+
+        # Prefer the ONNX backend for inference (fast, no 362 MB torch
+        # weight load). Skipped when the 12-layer stack is not in use.
+        self._onnx_backend = None
+        onnx_path = getattr(opt, "wav2vec_onnx_path", self.DEFAULT_ONNX_PATH)
+        if onnx_path and os.path.exists(onnx_path) and not opt.only_last_features:
+            try:
+                from fast_float.onnx.runtime import Wav2vecOnnxBackend
+
+                backend = Wav2vecOnnxBackend(onnx_path)
+                if backend.out_dim is not None and backend.out_dim != opt.dim_w:
+                    raise ValueError(
+                        f"ONNX out_dim={backend.out_dim} != dim_w={opt.dim_w}"
+                    )
+                self._onnx_backend = backend
+                logger.info(
+                    f"AudioEncoder: using ONNX backend {onnx_path} "
+                    f"(providers={self._onnx_backend.providers})"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"AudioEncoder: ONNX backend failed ({e}); "
+                    "falling back to torch weights"
+                )
+                self._onnx_backend = None
 
     def get_wav2vec2_feature(self, a: torch.Tensor, seq_len: int) -> torch.Tensor:
         if a.ndim == 1:
@@ -1768,8 +1799,15 @@ class AudioEncoder(BaseModel):
             )
         elif a.shape[1] > expected_len:
             a = a[:, :expected_len]
+        if self._onnx_backend is not None:
+            feats = self.wav2vec2.feature_extract(a, seq_len)
+            return self._onnx_backend.run_features(feats)
         a = self.get_wav2vec2_feature(a, seq_len=seq_len)
         return self.audio_projection(a)
+
+    @property
+    def uses_onnx(self) -> bool:
+        return self._onnx_backend is not None
 
 
 class Audio2Emotion(nn.Module):

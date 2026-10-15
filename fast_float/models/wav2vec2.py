@@ -33,10 +33,40 @@ class Wav2VecModel(Wav2Vec2Model):
         encode(extract_features, attention_mask=None, mask_time_indices=None, output_attentions=None, output_hidden_states=None, return_dict=None):
             Encodes the extracted features using the base model and returns the encoded features.
     """
+    def _encode_with_hidden_states(self, hidden_states):
+        """Run the transformer encoder, collecting per-layer outputs.
+
+        transformers>=5.x removed hidden-state collection from
+        ``Wav2Vec2Encoder`` (it returns only ``last_hidden_state``), which
+        this fork needs for the 12-layer audio feature stack. This loop
+        reproduces the v4 encoder math (same submodules, same order;
+        ``attention_mask`` is always None in this repo) with the v4
+        hidden-states convention: entry 0 is the encoder input
+        (post-projection), entries 1..12 are the layer outputs.
+        """
+        enc = self.encoder
+        stable = type(enc).__name__ == "Wav2Vec2EncoderStableLayerNorm"
+        position_embeddings = enc.pos_conv_embed(hidden_states)
+        hidden_states = hidden_states + position_embeddings.to(
+            hidden_states.device
+        )
+        if not stable:
+            hidden_states = enc.layer_norm(hidden_states)
+        hidden_states = enc.dropout(hidden_states)
+        all_hidden_states = [hidden_states]
+        for layer in enc.layers:
+            hidden_states = layer(hidden_states, attention_mask=None)
+            if isinstance(hidden_states, (tuple, list)):
+                hidden_states = hidden_states[0]
+            all_hidden_states.append(hidden_states)
+        if stable:
+            hidden_states = enc.layer_norm(hidden_states)
+        return hidden_states, all_hidden_states
+
     def forward(
         self,
         input_values,
-        seq_len,
+        seq_len=None,
         attention_mask=None,
         mask_time_indices=None,
         output_attentions=None,
@@ -59,8 +89,9 @@ class Wav2VecModel(Wav2Vec2Model):
         Returns:
             The output of the Wav2Vec model.
         """
-        self.config.output_attentions = True
-
+        # NOTE: the old `self.config.output_attentions = True` line is gone:
+        # on transformers>=4.4x with sdpa kernels that assignment raises, and
+        # nothing downstream consumed attentions anyway.
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -68,7 +99,8 @@ class Wav2VecModel(Wav2Vec2Model):
         with torch.no_grad():
             extract_features = self.feature_extractor(input_values)
         extract_features = extract_features.transpose(1, 2)
-        extract_features = linear_interpolation(extract_features, seq_len=seq_len)
+        if seq_len is not None:
+            extract_features = linear_interpolation(extract_features, seq_len=seq_len)
 
         if attention_mask is not None:
             # compute reduced attention_mask corresponding to feature vectors
@@ -81,26 +113,20 @@ class Wav2VecModel(Wav2Vec2Model):
             hidden_states, mask_time_indices=mask_time_indices, attention_mask=attention_mask
         )
 
-        encoder_outputs = self.encoder(
-            hidden_states,
-            attention_mask=attention_mask,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
+        hidden_states, all_hidden_states = self._encode_with_hidden_states(
+            hidden_states1
         )
-
-        hidden_states = encoder_outputs[0]
 
         if self.adapter is not None:
             hidden_states = self.adapter(hidden_states)
 
         if not return_dict:
-            return (hidden_states, ) + encoder_outputs[1:]
+            return (hidden_states, tuple(all_hidden_states))
 
         return BaseModelOutput(
                     last_hidden_state=hidden_states,
-                    hidden_states=encoder_outputs.hidden_states,
-                    attentions=encoder_outputs.attentions)
+                    hidden_states=tuple(all_hidden_states),
+                    attentions=None)
 
     def feature_extract(
         self,

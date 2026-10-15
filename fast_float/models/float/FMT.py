@@ -1,4 +1,5 @@
 import os, math, torch
+import logging
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -41,6 +42,9 @@ except Exception:
             x = self.fc2(x)
             x = self.drop2(x)
             return x
+
+
+logger = logging.getLogger(__name__)
 
 
 def enc_dec_mask(T, S, frame_width=1, expansion=2):
@@ -314,6 +318,96 @@ class FlowMatchingTransformer(BaseModel):
         ).to(opt.rank)
         self.register_buffer("alignment_mask", alignment_mask)
 
+        # Prefer the ONNX single-step backend (fast). The ODE loop, CFG
+        # combine and chunk autoregression stay in Python; only the inner
+        # vector-field eval is routed through ORT (see _forward_step).
+        # NOTE: the backend self-test runs lazily on the first step, not
+        # here — at construction the weights are still random-init and only
+        # match the export after the deploy checkpoint is loaded.
+        self._onnx_backend = None
+        self._onnx_probed = False
+        onnx_path = getattr(opt, "fmt_onnx_path", "./onnx/fmt_step_v1.onnx")
+        if onnx_path and os.path.exists(onnx_path):
+            try:
+                from fast_float.onnx.runtime import FMTStepBackend
+
+                self._onnx_backend = FMTStepBackend(onnx_path)
+                logger.info(
+                    f"FlowMatchingTransformer: ONNX backend constructed {onnx_path} "
+                    f"(providers={self._onnx_backend.providers}); "
+                    "self-test on first step"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"FlowMatchingTransformer: ONNX backend failed ({e}); "
+                    "falling back to torch weights"
+                )
+                self._onnx_backend = None
+
+    def _probe_onnx_backend(self, backend, tol: float = 1e-3) -> None:
+        """Self-test: one B=1 torch step vs the backend. Raises on mismatch.
+
+        Runs on CUDA when available (deploy device; also unifies the
+        alignment-mask buffer, which is created on ``opt.rank``, with the
+        parameters for the reference eval).
+        """
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.to(device)
+        g = torch.Generator(device="cpu").manual_seed(0)
+        kw = dict(dtype=torch.float32)
+        t = torch.tensor([0.5], **kw)
+        x = torch.randn(1, 50, 512, generator=g, **kw)
+        wa = torch.randn(1, 50, 512, generator=g, **kw)
+        wr = torch.randn(1, 1, 512, generator=g, **kw)
+        we = torch.randn(1, 1, 7, generator=g, **kw)
+        prev_x = torch.randn(1, 10, 512, generator=g, **kw)
+        prev_wa = torch.randn(1, 10, 512, generator=g, **kw)
+        t, x, wa, wr, we, prev_x, prev_wa = (
+            v.to(device) for v in (t, x, wa, wr, we, prev_x, prev_wa)
+        )
+        with torch.no_grad():
+            ref = self.forward(t, x, wa, wr, we, prev_x, prev_wa, train=False)
+            got = backend.run_step(t, x, wa, wr, we, prev_x, prev_wa)
+        err = (ref.float().cpu() - got.float().cpu()).abs().max().item()
+        print(f"[fmt-onnx] init probe max_abs={err:.3e} (tol={tol:g})")
+        if not bool(torch.isfinite(torch.tensor(err))) or err > tol:
+            raise RuntimeError(f"ONNX probe mismatch (max_abs={err:.3e})")
+
+    @property
+    def uses_onnx(self) -> bool:
+        return self._onnx_backend is not None
+
+    def _forward_step(self, t, x, wa, wr, we, prev_x, prev_wa):
+        """Inner vector-field eval: ORT when engaged, else torch."""
+        backend = self._onnx_backend
+        if backend is not None and all(
+            torch.is_tensor(v)
+            for v in (t, x, wa, wr, we, prev_x, prev_wa)
+        ):
+            if not self._onnx_probed:
+                # First-step self-test: structural opt mismatch
+                # (fmt_depth/dims) or stale weights fall back to torch.
+                self._onnx_probed = True
+                try:
+                    self._probe_onnx_backend(backend)
+                except Exception as e:
+                    logger.warning(
+                        f"FlowMatchingTransformer: ONNX self-test failed ({e}); "
+                        "falling back to torch weights"
+                    )
+                    self._onnx_backend = None
+                    backend = None
+            if backend is not None:
+                try:
+                    return backend.run_step(t, x, wa, wr, we, prev_x, prev_wa)
+                except Exception as e:
+                    logger.warning(
+                        f"FlowMatchingTransformer: ONNX step failed ({e}); "
+                        "disabling backend for this run"
+                    )
+                    self._onnx_backend = None
+        return self.forward(t, x, wa, wr, we, prev_x, prev_wa, train=False)
+
     def initialize_weights(self) -> None:
         def _basic_init(module):
             if isinstance(module, nn.Linear):
@@ -546,7 +640,7 @@ class FlowMatchingTransformer(BaseModel):
             else:
                 t_cat = t
 
-            model_output = self.forward(
+            model_output = self._forward_step(
                 t_cat,
                 x_cat,
                 audio_cat,
@@ -554,7 +648,6 @@ class FlowMatchingTransformer(BaseModel):
                 emotion_cat,
                 prev_x_cat,
                 prev_wa_cat,
-                train=False,
             )
             uncond, all_cond, audio_uncond_emotion = torch.chunk(
                 model_output, chunks=3, dim=0
@@ -567,4 +660,4 @@ class FlowMatchingTransformer(BaseModel):
                 + e_cfg_scale * (all_cond - audio_uncond_emotion)
             )
         else:
-            return self.forward(t, x, wa, wr, we, prev_x, prev_wa, train=False)
+            return self._forward_step(t, x, wa, wr, we, prev_x, prev_wa)
