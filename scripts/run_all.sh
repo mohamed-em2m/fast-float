@@ -57,6 +57,7 @@ HYPERCORN_STARTUP_TIMEOUT=300 uv run hypercorn fast_float.main:app \
     --bind "0.0.0.0:${PORT}" \
     --worker-class asyncio \
     --log-level info 2>&1 | sed -u 's/^/[api] /' &
+
 BACKEND_PID=$!
 
 # --- Frontend ------------------------------------------------------------------
