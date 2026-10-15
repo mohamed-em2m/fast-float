@@ -29,6 +29,9 @@ class AppState:
         self.executor: Optional[ThreadPoolExecutor] = None
         self.request_semaphore: Optional[asyncio.Semaphore] = None
         self.inference_lock: Optional[asyncio.Lock] = None
+        # True while background boot warmup runs. /generate answers 503 until
+        # it clears so a real request never contends with warmup on one GPU.
+        self.warming_up: bool = False
         self.performance_stats: Dict[str, Any] = {
             "total_requests": 0,
             "total_inference_time": 0.0,

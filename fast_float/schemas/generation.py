@@ -100,6 +100,7 @@ class HealthResponse(BaseModel):
     model_config = {"protected_namespaces": ()}
     status: str
     model_loaded: bool
+    warming_up: bool = False
     encoder: str
     active_streams: int
     performance_stats: Dict[str, Any]

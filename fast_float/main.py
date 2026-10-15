@@ -61,6 +61,81 @@ CORS_ORIGINS = [
 ]
 
 
+async def _run_boot_warmups():
+    """Boot warmup (single + B=2 batched) in a background task.
+
+    Runs after startup completes so /health answers immediately. Failure is
+    isolated (sequential inference is unaffected). Clears warming_up always.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        logger.info("🔥 Warming up model with minimal inference...")
+        warmup_start = time.time()
+        try:
+            warmup_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+            warmup_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+            silent_audio = np.zeros(8000, dtype=np.float32)  # 0.5s at 16kHz
+            sf.write(warmup_audio, silent_audio, 16000)
+
+            await loop.run_in_executor(
+                app_state.executor,
+                run_inference_blocking,
+                app_state.agent,
+                warmup_video,
+                DEFAULT_IMAGE_PATH,
+                warmup_audio,
+                {
+                    "a_cfg_scale": 2.0,
+                    "r_cfg_scale": 1.0,
+                    "e_cfg_scale": 1.0,
+                    "emotion": "S2E",
+                    "nfe": 10,
+                    "no_crop": False,
+                    "seed": 25,
+                },
+            )
+            for f in (warmup_audio, warmup_video):
+                if os.path.exists(f):
+                    os.remove(f)
+            logger.info(f"✅ Model warmup complete ({time.time() - warmup_start:.2f}s)")
+        except Exception as e:
+            logger.warning(f"⚠️ Model warmup skipped/failed: {e}")
+
+        # Batched-shape warmup (B=2 silent clips) so the first real batched
+        # request doesn't pay cuDNN autotuning on unseen batch shapes.
+        try:
+            batch_audios, batch_videos = [], []
+            for _ in range(2):
+                wa = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+                wv = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+                sf.write(wa, np.zeros(32000, dtype=np.float32), 16000)  # 2s silence
+                batch_audios.append(wa)
+                batch_videos.append(wv)
+            await loop.run_in_executor(
+                app_state.executor,
+                run_inference_batched_blocking,
+                app_state.agent,
+                [
+                    {"audio_path": wa, "padded_path": wa, "duration": 2.0, "out_path": wv}
+                    for wa, wv in zip(batch_audios, batch_videos)
+                ],
+                DEFAULT_IMAGE_PATH,
+                {
+                    "a_cfg_scale": 2.0, "r_cfg_scale": 1.0, "e_cfg_scale": 1.0,
+                    "emotion": "S2E", "nfe": 2, "no_crop": False, "seed": 25,
+                },
+            )
+            for f in batch_audios + batch_videos:
+                if os.path.exists(f):
+                    os.remove(f)
+            logger.info("✅ Batched warmup complete (B=2)")
+        except Exception as e:
+            logger.warning(f"⚠️ Batched warmup skipped: {e}")
+    finally:
+        app_state.warming_up = False
+        logger.info("🏁 Boot warmup done, /generate open")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle manager for model loading, warmup, and resource cleanup."""
@@ -104,71 +179,14 @@ async def lifespan(app: FastAPI):
     app_state.agent = OptimizedInferenceAgent(opt)
     logger.info("✅ Model loaded successfully")
 
-    # 5. Model Warmup (Real minimal inference)
-    logger.info("🔥 Warming up model with minimal inference...")
-    warmup_start = time.time()
-    try:
-        warmup_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
-        warmup_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-        silent_audio = np.zeros(8000, dtype=np.float32)  # 0.5s at 16kHz
-        sf.write(warmup_audio, silent_audio, 16000)
-
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            app_state.executor,
-            run_inference_blocking,
-            app_state.agent,
-            warmup_video,
-            DEFAULT_IMAGE_PATH,
-            warmup_audio,
-            {
-                "a_cfg_scale": 2.0,
-                "r_cfg_scale": 1.0,
-                "e_cfg_scale": 1.0,
-                "emotion": "S2E",
-                "nfe": 10,
-                "no_crop": False,
-                "seed": 25,
-            },
-        )
-        for f in (warmup_audio, warmup_video):
-            if os.path.exists(f):
-                os.remove(f)
-        logger.info(f"✅ Model warmup complete ({time.time() - warmup_start:.2f}s)")
-    except Exception as e:
-        logger.warning(f"⚠️ Model warmup skipped/failed: {e}")
-
-    # 5b. Batched-shape warmup (B=2 silent clips) so the first real batched
-    # request doesn't pay cuDNN autotuning on unseen batch shapes. Quietly
-    # skipped on any failure — sequential inference is unaffected.
-    try:
-        batch_audios, batch_videos = [], []
-        for _ in range(2):
-            wa = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
-            wv = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-            sf.write(wa, np.zeros(32000, dtype=np.float32), 16000)  # 2s silence
-            batch_audios.append(wa)
-            batch_videos.append(wv)
-        await loop.run_in_executor(
-            app_state.executor,
-            run_inference_batched_blocking,
-            app_state.agent,
-            [
-                {"audio_path": wa, "padded_path": wa, "duration": 2.0, "out_path": wv}
-                for wa, wv in zip(batch_audios, batch_videos)
-            ],
-            DEFAULT_IMAGE_PATH,
-            {
-                "a_cfg_scale": 2.0, "r_cfg_scale": 1.0, "e_cfg_scale": 1.0,
-                "emotion": "S2E", "nfe": 2, "no_crop": False, "seed": 25,
-            },
-        )
-        for f in batch_audios + batch_videos:
-            if os.path.exists(f):
-                os.remove(f)
-        logger.info("✅ Batched warmup complete (B=2)")
-    except Exception as e:
-        logger.warning(f"⚠️ Batched warmup skipped: {e}")
+    # 5. Boot warmup runs AFTER startup (background task) so /health answers
+    # immediately. Set SKIP_WARMUP=1 to disable. /generate returns 503
+    # while app_state.warming_up is True.
+    if os.getenv("SKIP_WARMUP", "0") == "1":
+        logger.info("⏭️ Boot warmup skipped (SKIP_WARMUP=1)")
+    else:
+        app_state.warming_up = True
+        asyncio.create_task(_run_boot_warmups())
 
     # 6. Public URLs setup
     app_state.public_url = os.getenv("AVATER_PUBLIC_URL", f"http://localhost:{PORT}")
