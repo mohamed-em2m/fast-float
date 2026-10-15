@@ -33,12 +33,12 @@ fi
 
 echo "=== [2/3] python deps ==="
 python -c "import torch; print('torch', torch.__version__, 'cuda=', torch.cuda.is_available())"
-if ! python -c "import onnx, onnxruntime" 2>/dev/null; then
-  echo "installing onnx + onnxruntime"
+if ! python -c "import onnx, onnxscript, onnxruntime" 2>/dev/null; then
+  echo "installing onnx + onnxscript + onnxruntime"
   if python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-    pip install -q onnx "onnxruntime-gpu" || pip install -q onnx onnxruntime
+    pip install -q onnx onnxscript "onnxruntime-gpu" || pip install -q onnx onnxscript onnxruntime
   else
-    pip install -q onnx onnxruntime
+    pip install -q onnx onnxscript onnxruntime
   fi
 fi
 
