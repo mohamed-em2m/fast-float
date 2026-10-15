@@ -40,6 +40,11 @@ async def generate(request: GenerationRequest):
     if app_state.agent is None:
         raise HTTPException(status_code=503, detail="FLOAT model is not yet loaded")
 
+    if app_state.warming_up:
+        raise HTTPException(
+            status_code=503, detail="Model is warming up, try again shortly"
+        )
+
     if app_state.request_semaphore is None:
         app_state.initialize_runtime()
 

@@ -21,6 +21,7 @@ async def health():
     return HealthResponse(
         status="healthy",
         model_loaded=app_state.agent is not None,
+        warming_up=app_state.warming_up,
         encoder=(
             app_state.video_optimizer.encoder_type
             if app_state.video_optimizer

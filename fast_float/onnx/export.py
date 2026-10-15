@@ -1,13 +1,17 @@
 """Shared torch -> ONNX export helpers.
 
-Strategy: dynamo export first (torch.export + onnx, symbolic batch/length),
-fall back to the classic torchscript exporter (works back to torch 2.0,
-which is what this repo pins).
+Strategy: dynamo export via torch.export (symbolic batch/length), no
+torchscript fallback. ``torch.export`` + ``torch.onnx.export(ExportedProgram)``
+is the modern flow: it decomposes SDPA/LayerNorm/diag_embed natively and
+marks dynamic dims symbolically. Converters keep their export-safe
+substitutions (manual attention, plain norm, matmul reformulation) — all
+dynamo-safe and equivalence-proven — plus static-batch modconv freezing,
+which stays because ONNX Conv ``group`` is static regardless of exporter.
 """
 from __future__ import annotations
 
 import os
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 
@@ -58,17 +62,29 @@ def export_module(
     output_names: Sequence[str],
     dynamic_axes: Optional[Dict[str, Dict[int, str]]] = None,
     opset: int = 17,
+    fixed_batch: bool = False,
+    mark_dims: Tuple[int, ...] = (0, 1),
 ) -> Dict[str, str]:
-    """Export ``module`` to ``out_path``. Returns info dict (path, exporter)."""
+    """Export ``module`` to ``out_path`` via dynamo. Returns info dict.
+
+    ``dynamic_axes``/``opset`` are accepted for API compatibility; dynamism
+    comes from ``mark_dims`` and dynamo's own opset selection.
+    ``fixed_batch=True`` skips sample duplication + dynamic marking (for
+    graphs with baked batch, e.g. static-batch grouped conv).
+    Raises RuntimeError when dynamo export is unavailable/fails.
+    """
     module = module.eval()
     inputs = _as_tuple(sample_inputs)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     notes = []
-
-    # 1) Dynamo exporter (symbolic batch/length via torch.export).
     try:
-        trace_args = _ensure_batch2(inputs)
-        _dynamo_mark(trace_args)
+        if fixed_batch:
+            trace_args = inputs
+            notes.append("fixed batch: no dynamic marking")
+        else:
+            trace_args = _ensure_batch2(inputs)
+            marked = _dynamo_mark(trace_args, dynamic_dims=mark_dims)
+            notes.append(f"dynamo dynamic dims={mark_dims} marked={marked}")
         ep = torch.export.export(module, trace_args, strict=False)
         torch.onnx.export(
             ep,
@@ -77,36 +93,23 @@ def export_module(
             output_names=list(output_names),
             external_data=True,
         )
-        notes.append("dynamo export with symbolic batch/length")
-        return {
-            "path": os.path.abspath(out_path),
-            "exporter": "dynamo",
-            "notes": notes,
-        }
-    except Exception as e:  # noqa: BLE001 - fallback path below
-        notes.append(f"dynamo exporter failed ({e}); falling back to torchscript")
-
-    # 2) Classic torchscript exporter fallback with explicit dynamic axes.
-    with torch.no_grad():
-        torch.onnx.export(
-            module,
-            inputs,
-            out_path,
-            input_names=list(input_names),
-            output_names=list(output_names),
-            dynamic_axes=dynamic_axes or {},
-            opset_version=opset,
-            do_constant_folding=True,
-            dynamo=False,
-        )
+    except Exception as e:  # noqa: BLE001 - no torchscript fallback by design
+        raise RuntimeError(
+            "dynamo ONNX export failed and the torchscript fallback is "
+            f"retired (it cannot translate SDPA/diag_embed): {e}. Fix the "
+            "graph (see converter substitution notes) instead of falling back."
+        ) from e
+    notes.append("dynamo export with symbolic batch/length")
     return {
         "path": os.path.abspath(out_path),
-        "exporter": "torchscript",
+        "exporter": "dynamo",
         "notes": notes,
     }
 
 
-def make_ort_session(onnx_path: str, use_gpu: bool = True):
+def make_ort_session(
+    onnx_path: str, use_gpu: bool = True, require_gpu: bool = False
+):
     """ORT InferenceSession, CUDA first, CPU fallback. Raises if file missing.
 
     CUDA uses ``cudnn_conv_algo_search=DEFAULT``: with dynamic-shape convs
@@ -114,6 +117,10 @@ def make_ort_session(onnx_path: str, use_gpu: bool = True):
     can pick a workspace-hungry algorithm and hard-FAIL allocation
     (observed: bogus ~17 GB request for <3 s inputs). DEFAULT stays correct
     for all lengths at negligible speed cost for auxiliary classifiers.
+
+    With ``require_gpu=True`` (use on CUDA boxes) a missing CUDA/TRT
+    provider raises instead of silently benchmarking CPU — a silent CPU
+    session is the #1 cause of "ONNX is slow" reports.
     """
     import onnxruntime as ort
 
@@ -121,7 +128,25 @@ def make_ort_session(onnx_path: str, use_gpu: bool = True):
         raise FileNotFoundError(f"ONNX file not found: {onnx_path}")
     available = set(ort.get_available_providers())
     providers = []
-    if use_gpu and "CUDAExecutionProvider" in available:
-        providers.append(("CUDAExecutionProvider", {"cudnn_conv_algo_search": "DEFAULT"}))
+    if use_gpu:
+        if "CUDAExecutionProvider" in available:
+            providers.append(
+                ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "DEFAULT"})
+            )
+        if "TensorrtExecutionProvider" in available:
+            providers.append("TensorrtExecutionProvider")
+    if use_gpu and require_gpu and not providers:
+        raise RuntimeError(
+            "GPU requested but no CUDA/TRT execution provider available "
+            f"(available={sorted(available)}). Install onnxruntime-gpu "
+            "matching this box's CUDA instead of plain onnxruntime."
+        )
     providers.append("CPUExecutionProvider")
-    return ort.InferenceSession(onnx_path, providers=providers)
+    sess = ort.InferenceSession(onnx_path, providers=providers)
+    active = sess.get_providers()
+    if use_gpu and (not active or active[0] == "CPUExecutionProvider"):
+        print(
+            f"[ort] WARNING: session runs on CPU (active={active}, "
+            f"available={sorted(available)}). Expect torch-CUDA to win."
+        )
+    return sess

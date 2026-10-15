@@ -27,7 +27,9 @@ dependencies = [
     "pillow>=10.0.0",
     # ONNX Runtime for the S2E emotion classifier (CPU works everywhere;
     # swap for onnxruntime-gpu on CUDA boxes for GPU acceleration)
-    "onnxruntime>=1.17",
+    # <1.24: 1.24+ ships no cp310 wheels AND needs CUDA 13 (this box is
+    # cp310; the GPU box is CUDA 12 — 1.22/1.23 serve both).
+    "onnxruntime>=1.17,<1.24",
     # Video Processing
     "av==14.0.0",
     "torchdiffeq==0.2.5",

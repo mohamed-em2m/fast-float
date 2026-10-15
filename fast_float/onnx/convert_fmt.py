@@ -133,6 +133,10 @@ def main(argv=None) -> int:
     ap.add_argument("--atol", type=float, default=1e-4)
     ap.add_argument("--rtol", type=float, default=1e-4)
     ap.add_argument("--skip-parity", action="store_true")
+    ap.add_argument("--bench-iters", type=int, default=30,
+                    help="warmed benchmark iters on the CFG case (0 = skip)")
+    ap.add_argument("--cpu-ort", action="store_true",
+                    help="allow CPU ORT session on a CUDA box (dev only)")
     args = ap.parse_args(argv)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -163,7 +167,11 @@ def main(argv=None) -> int:
         print(f"[export] note: {note}")
 
     if not args.skip_parity:
-        sess = make_ort_session(info["path"], use_gpu=(device == "cuda"))
+        sess = make_ort_session(
+            info["path"],
+            use_gpu=(device == "cuda") and not args.cpu_ort,
+            require_gpu=(device == "cuda") and not args.cpu_ort,
+        )
         print(f"[ort] providers={sess.get_providers()}")
         names = ["t", "x", "wa", "wr", "we", "prev_x", "prev_wa"]
         with torch.no_grad():
@@ -183,6 +191,13 @@ def main(argv=None) -> int:
                 check_parity(ref, ort_out, name=name, atol=args.atol, rtol=args.rtol)
                 print(f"[probe:{name}] shape torch={tuple(ref.shape)} "
                       f"onnx={tuple(ort_out.shape)}")
+            if args.bench_iters > 0:
+                from fast_float.onnx.parity import benchmark
+                bench_in = sample_inputs(3, 0.5, 99, device)
+                bench_feed = {k: v.cpu().numpy() for k, v in zip(names, bench_in)}
+                benchmark(lambda: module(*bench_in),
+                          lambda: sess.run(None, bench_feed),
+                          name="fmt_cfg_b3", iters=args.bench_iters)
     print("[done] fmt converter OK")
     return 0
 

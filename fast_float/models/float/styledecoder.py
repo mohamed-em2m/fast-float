@@ -512,12 +512,37 @@ class Direction(nn.Module):
     def __init__(self, motion_dim):
         super(Direction, self).__init__()
         self.weight = nn.Parameter(torch.randn(512, motion_dim))
-    
+        # Q depends only on the (frozen) weight, but forward() recomputed
+        # torch.linalg.qr on EVERY call (once per decode micro-batch).
+        # Cache it. Invalidation is a cheap fingerprint (version + data_ptr +
+        # fp32 sum over ~10K elems): .data.copy_ bypasses the version counter,
+        # so version alone is not reliable.
+        self._Q_cache = None
+        self._Q_fp = None
+
+    def _fingerprint(self, w):
+        return (
+            w._version,
+            w.data_ptr(),
+            w.device,
+            w.dtype,
+            w.detach().to(torch.float32).sum().item(),
+        )
+
+    def _orthonormal_basis(self):
+        """Cached Q factor of weight. Recomputed only if weight changed."""
+        w = self.weight
+        fp = self._fingerprint(w)
+        if self._Q_cache is None or self._Q_fp != fp:
+            Q, _ = torch.linalg.qr(w + 1e-8)
+            self._Q_cache = Q
+            self._Q_fp = fp
+        return self._Q_cache
+
     def forward(self, input):
         """Enhanced to handle both single and batch inputs"""
-        weight = self.weight + 1e-8
-        Q, R = torch.linalg.qr(weight)  # Orthogonal eigenvectors
-        
+        Q = self._orthonormal_basis()
+
         if input is None:
             return Q
         else:
