@@ -76,6 +76,18 @@ async def webrtc_offer(request: WebRTCOfferRequest):
                 if player.audio:
                     pc.addTrack(player.audio)
                 _players[id(pc)] = player
+                if player.video is None and player.audio is None:
+                    logger.warning(
+                        f"Media has no playable tracks for {request.stream_id}"
+                    )
+                    try:
+                        await pc.close()
+                    finally:
+                        _cleanup_peer(pc)
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Media file has no playable video/audio tracks",
+                    )
                 logger.info(f"Attached MediaPlayer tracks for {request.stream_id}")
             except Exception as e:
                 logger.warning(

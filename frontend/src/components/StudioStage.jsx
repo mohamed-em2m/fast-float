@@ -48,34 +48,11 @@ export default function StudioStage({
     return () => clearInterval(interval);
   }, [isGenerating]);
 
-  // Clean up WebRTC peer connection
-  useEffect(() => {
-    return () => {
-      if (pcRef.current) {
-        pcRef.current.close();
-        pcRef.current = null;
-      }
-    };
-  }, []);
-
-  const handleStartWebRtc = async () => {
-    if (!generationResult?.request_id) return;
+  const stopTracks = (stream) => {
     try {
-      setUseWebRtc(true);
-      if (pcRef.current) pcRef.current.close();
-
-      const pc = await createWebRtcSession(generationResult.request_id, (event) => {
-        if (webRtcVideoRef.current && event.streams && event.streams[0]) {
-          webRtcVideoRef.current.srcObject = event.streams[0];
-          setWebRtcConnected(true);
-        }
-      });
-      pcRef.current = pc;
-      if (onToast) onToast('WebRTC peer stream established!', 'success');
-    } catch (e) {
-      console.error('WebRTC streaming error', e);
-      if (onToast) onToast(`WebRTC stream failed: ${e.message}`, 'error');
-      setUseWebRtc(false);
+      (stream?.getTracks() || []).forEach((t) => t.stop());
+    } catch {
+      /* ignore */
     }
   };
 
@@ -84,8 +61,61 @@ export default function StudioStage({
       pcRef.current.close();
       pcRef.current = null;
     }
+    stopTracks(webRtcVideoRef.current?.srcObject);
+    if (webRtcVideoRef.current) webRtcVideoRef.current.srcObject = null;
     setUseWebRtc(false);
     setWebRtcConnected(false);
+  };
+
+  // Clean up WebRTC peer connection
+  useEffect(() => {
+    return () => {
+      try {
+        (webRtcVideoRef.current?.srcObject?.getTracks() || []).forEach((t) => t.stop());
+      } catch {
+        /* ignore */
+      }
+      if (pcRef.current) {
+        pcRef.current.close();
+        pcRef.current = null;
+      }
+    };
+  }, []);
+
+  const handleWebRtcState = (state) => {
+    if (state === 'connected') setWebRtcConnected(true);
+    if (state === 'failed' || state === 'disconnected' || state === 'closed') {
+      setWebRtcConnected(false);
+      if (state === 'failed' && onToast) onToast('WebRTC connection failed — back to MP4', 'error');
+      if (state === 'failed') handleStopWebRtc();
+    }
+  };
+
+  const handleStartWebRtc = async () => {
+    if (!generationResult?.request_id) return;
+    try {
+      setUseWebRtc(true);
+      setWebRtcConnected(false);
+      if (pcRef.current) pcRef.current.close();
+      stopTracks(webRtcVideoRef.current?.srcObject);
+
+      const pc = await createWebRtcSession(
+        generationResult.request_id,
+        (event) => {
+          if (webRtcVideoRef.current && event.streams && event.streams[0]) {
+            webRtcVideoRef.current.srcObject = event.streams[0];
+            setWebRtcConnected(true);
+          }
+        },
+        handleWebRtcState,
+      );
+      pcRef.current = pc;
+      if (onToast) onToast('WebRTC peer stream established!', 'success');
+    } catch (e) {
+      console.error('WebRTC streaming error', e);
+      if (onToast) onToast(`WebRTC stream failed: ${e.message}`, 'error');
+      setUseWebRtc(false);
+    }
   };
 
   const handleCopyLink = () => {
