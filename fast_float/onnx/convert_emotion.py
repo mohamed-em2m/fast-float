@@ -19,11 +19,13 @@ import numpy as np
 import torch
 
 # Repo-root bootstrap so this works via `python -m` and as a plain script.
+# NOTE: only REPO_ROOT may be added here. Never add fast_float/ itself:
+# it contains an `onnx/` subpackage that would shadow the pip `onnx`
+# dependency (breaking `import onnx.external_data_helper` via onnxscript).
 CURRENT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CURRENT_DIR.parent.parent
-for path in (str(CURRENT_DIR.parent), str(REPO_ROOT)):
-    if path not in sys.path:
-        sys.path.insert(0, path)
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from fast_float.models.wav2vec2_ser import (  # noqa: E402
     Wav2Vec2ForSpeechClassification,
