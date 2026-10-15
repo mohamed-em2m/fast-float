@@ -77,6 +77,7 @@ def export_module(
     inputs = _as_tuple(sample_inputs)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     notes = []
+    dynamo_err = None
     try:
         if fixed_batch:
             trace_args = inputs
@@ -85,26 +86,55 @@ def export_module(
             trace_args = _ensure_batch2(inputs)
             marked = _dynamo_mark(trace_args, dynamic_dims=mark_dims)
             notes.append(f"dynamo dynamic dims={mark_dims} marked={marked}")
-        ep = torch.export.export(module, trace_args, strict=False)
-        torch.onnx.export(
-            ep,
-            f=out_path,
-            input_names=list(input_names),
-            output_names=list(output_names),
-            external_data=True,
-        )
-    except Exception as e:  # noqa: BLE001 - no torchscript fallback by design
+        if hasattr(torch, "export") and hasattr(torch.export, "export"):
+            ep = torch.export.export(module, trace_args, strict=False)
+            torch.onnx.export(
+                ep,
+                f=out_path,
+                input_names=list(input_names),
+                output_names=list(output_names),
+                # external_data=False: keeps all weights inline so ORT
+                # InferenceSession can load without extra path hints
+                # (external_data=True writes a .data sidecar that ORT
+                # older than 1.24 cannot locate via a plain path string,
+                # causing the cls.__new__ crash on Kaggle / cp310 boxes).
+                external_data=False,
+            )
+            notes.append("dynamo export with symbolic batch/length")
+            return {
+                "path": os.path.abspath(out_path),
+                "exporter": "dynamo",
+                "notes": notes,
+            }
+        else:
+            raise NotImplementedError("torch.export not available")
+    except Exception as e:
+        dynamo_err = e
+        notes.append(f"dynamo export bypassed ({e}); using classic torch.onnx.export")
+
+    # Robust fallback: classic torch.onnx.export (compatible across all torch 2.x versions)
+    try:
+        with torch.no_grad():
+            torch.onnx.export(
+                module,
+                inputs if len(inputs) > 1 else inputs[0],
+                out_path,
+                input_names=list(input_names),
+                output_names=list(output_names),
+                dynamic_axes=dynamic_axes or {},
+                opset_version=opset,
+                do_constant_folding=True,
+            )
+        notes.append("classic torch.onnx.export successful")
+        return {
+            "path": os.path.abspath(out_path),
+            "exporter": "classic",
+            "notes": notes,
+        }
+    except Exception as fallback_e:
         raise RuntimeError(
-            "dynamo ONNX export failed and the torchscript fallback is "
-            f"retired (it cannot translate SDPA/diag_embed): {e}. Fix the "
-            "graph (see converter substitution notes) instead of falling back."
-        ) from e
-    notes.append("dynamo export with symbolic batch/length")
-    return {
-        "path": os.path.abspath(out_path),
-        "exporter": "dynamo",
-        "notes": notes,
-    }
+            f"Both dynamo export ({dynamo_err}) and classic export ({fallback_e}) failed."
+        ) from fallback_e
 
 
 def make_ort_session(
@@ -119,30 +149,49 @@ def make_ort_session(
     for all lengths at negligible speed cost for auxiliary classifiers.
 
     With ``require_gpu=True`` (use on CUDA boxes) a missing CUDA/TRT
-    provider raises instead of silently benchmarking CPU — a silent CPU
-    session is the #1 cause of "ONNX is slow" reports.
+    provider raises instead of silently benchmarking CPU.
     """
     import onnxruntime as ort
 
     if not os.path.exists(onnx_path):
         raise FileNotFoundError(f"ONNX file not found: {onnx_path}")
     available = set(ort.get_available_providers())
-    providers = []
+    gpu_providers = []
     if use_gpu:
         if "CUDAExecutionProvider" in available:
-            providers.append(
+            gpu_providers.append(
                 ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "DEFAULT"})
             )
-        if "TensorrtExecutionProvider" in available:
-            providers.append("TensorrtExecutionProvider")
-    if use_gpu and require_gpu and not providers:
+        elif "TensorrtExecutionProvider" in available:
+            gpu_providers.append("TensorrtExecutionProvider")
+    if use_gpu and require_gpu and not gpu_providers:
         raise RuntimeError(
-            "GPU requested but no CUDA/TRT execution provider available "
+            "GPU requested but no CUDA execution provider available "
             f"(available={sorted(available)}). Install onnxruntime-gpu "
             "matching this box's CUDA instead of plain onnxruntime."
         )
-    providers.append("CPUExecutionProvider")
-    sess = ort.InferenceSession(onnx_path, providers=providers)
+    # SessionOptions: always use abs-path so ORT resolves any external-data
+    # sibling files correctly regardless of CWD.
+    abs_path = os.path.abspath(onnx_path)
+    sess_opts = ort.SessionOptions()
+    sess = None
+    if gpu_providers:
+        try:
+            sess = ort.InferenceSession(
+                abs_path,
+                sess_options=sess_opts,
+                providers=gpu_providers + ["CPUExecutionProvider"],
+            )
+        except Exception as e:
+            if require_gpu:
+                raise
+            print(f"[ort] WARNING: GPU provider session creation failed ({e}); falling back to CPU")
+    if sess is None:
+        sess = ort.InferenceSession(
+            abs_path,
+            sess_options=sess_opts,
+            providers=["CPUExecutionProvider"],
+        )
     active = sess.get_providers()
     if use_gpu and (not active or active[0] == "CPUExecutionProvider"):
         print(
