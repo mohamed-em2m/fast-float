@@ -109,11 +109,20 @@ def build_emotion_module(emo_dir: str, ckpt_path: str) -> EmotionExportWrapper:
     core = build_core(emo_dir)
     if os.path.exists(ckpt_path):
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        from collections import Counter
+
+        tops = Counter(k.split(".")[0] for k in sd.keys())
+        print(f"[weights] ckpt top-level prefixes: {dict(tops.most_common(10))}")
         sub = {
             k[len(EMOTION_PREFIX):]: v
             for k, v in sd.items()
             if k.startswith(EMOTION_PREFIX)
         }
+        if not sub:
+            print(
+                "[weights] WARN: no emotion_encoder.* keys in ckpt — exporting "
+                "base emo-dir weights (same fallback the app uses)"
+            )
         missing, unexpected = core.load_state_dict(sub, strict=False)
         print(
             f"[weights] overlaid {len(sub)} tensors from "

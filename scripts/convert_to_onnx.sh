@@ -34,12 +34,13 @@ fi
 echo "=== [2/3] python deps ==="
 python -c "import torch; print('torch', torch.__version__, 'cuda=', torch.cuda.is_available())"
 if ! python -c "import onnx, onnxscript, onnxruntime" 2>/dev/null; then
-  echo "installing onnx + onnxscript + onnxruntime"
+  echo "installing onnx + onnxscript + onnxruntime (joint upgrade: pip resolves the trio together)"
   if python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-    pip install -q onnx onnxscript "onnxruntime-gpu" || pip install -q onnx onnxscript onnxruntime
+    pip install -q --upgrade onnx onnxscript "onnxruntime-gpu" || pip install -q --upgrade onnx onnxscript onnxruntime
   else
-    pip install -q onnx onnxscript onnxruntime
+    pip install -q --upgrade onnx onnxscript onnxruntime
   fi
+fi
 fi
 
 echo "=== [3/3] convert: emotion (unit 1) ==="
