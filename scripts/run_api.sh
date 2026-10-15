@@ -6,8 +6,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 PORT="${PORT:-8000}"
-# Note: no --startup-timeout flag (hypercorn CLI has no such option).
-# Startup stays fast because boot warmup runs as a background task.
+# Startup timeout via env (honored where hypercorn maps env -> config).
+# Harmless otherwise: startup is fast since warmup runs in the background.
+export HYPERCORN_STARTUP_TIMEOUT="${HYPERCORN_STARTUP_TIMEOUT:-1200}"
 exec uv run --frozen hypercorn fast_float.main:app \
     --bind "0.0.0.0:${PORT}" \
     --worker-class asyncio \
