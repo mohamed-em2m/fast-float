@@ -52,8 +52,9 @@ trap cleanup INT TERM EXIT
 # --- Backend ------------------------------------------------------------------
 echo "🚀 Starting backend  →  http://localhost:${PORT} (docs: http://localhost:${PORT}/docs)"
 echo "   (model load + warmup can take several minutes on first start)"
-# 2>&1 merged and [api]-prefixed so backend errors are visible inline.
-HYPERCORN_STARTUP_TIMEOUT=300 uv run hypercorn fast_float.main:app \
+# Pin to the lockfile: a floating `uv run` re-resolves on a stale lock and can
+# drag in phantom deps (seen: onnxruntime==1.24.3 with no cp310 wheel).
+HYPERCORN_STARTUP_TIMEOUT=1200 uv run --frozen hypercorn fast_float.main:app \
     --bind "0.0.0.0:${PORT}" \
     --worker-class asyncio \
     --log-level info 2>&1 | sed -u 's/^/[api] /' &
