@@ -41,7 +41,6 @@ if ! python -c "import onnx, onnxscript, onnxruntime" 2>/dev/null; then
     pip install -q --upgrade onnx onnxscript onnxruntime
   fi
 fi
-fi
 
 echo "=== [3/3] convert: emotion (unit 1) ==="
 python -m fast_float.onnx.convert_emotion \
