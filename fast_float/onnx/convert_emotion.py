@@ -58,6 +58,12 @@ def load_core_manual(emo_dir: str) -> Wav2Vec2ForSpeechClassification:
     """
     from transformers import Wav2Vec2Config
 
+    # New transformers also call tie_weights() inside __init__/init_weights via
+    # an attribute the fork predates. Every weight is overwritten from disk
+    # right below (plus the float.pth overlay after), so init-time tying is a
+    # safe no-op — and skipping it keeps old transformers behavior identical.
+    Wav2Vec2ForSpeechClassification.tie_weights = lambda self, *a, **k: None
+
     cfg = Wav2Vec2Config.from_pretrained(emo_dir, local_files_only=True)
     core = Wav2Vec2ForSpeechClassification(cfg)
     for name in ("model.safetensors", "pytorch_model.bin"):
