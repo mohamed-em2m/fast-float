@@ -48,15 +48,59 @@ class EmotionExportWrapper(torch.nn.Module):
         return torch.softmax(logits, dim=-1)
 
 
+def load_core_manual(emo_dir: str) -> Wav2Vec2ForSpeechClassification:
+    """Build the classifier without ``from_pretrained``.
+
+    New transformers versions run a finalization step
+    (``_move_missing_keys_from_meta_to_device``) that assumes loader
+    internals our locally-forked SER class predates, crashing the load even
+    though the weights are fine. Manual config + state-dict load sidesteps it.
+    """
+    from transformers import Wav2Vec2Config
+
+    cfg = Wav2Vec2Config.from_pretrained(emo_dir, local_files_only=True)
+    core = Wav2Vec2ForSpeechClassification(cfg)
+    for name in ("model.safetensors", "pytorch_model.bin"):
+        path = os.path.join(emo_dir, name)
+        if os.path.exists(path):
+            if path.endswith(".safetensors"):
+                from safetensors.torch import load_file
+
+                sd = load_file(path, device="cpu")
+            else:
+                sd = torch.load(path, map_location="cpu", weights_only=True)
+            break
+    else:
+        raise FileNotFoundError(f"no weight file in {emo_dir}")
+    missing, unexpected = core.load_state_dict(sd, strict=False)
+    print(
+        f"[weights] manual load: {len(sd)} tensors "
+        f"(missing={len(missing)}, unexpected={len(unexpected)})"
+    )
+    try:
+        core.tie_weights()
+    except Exception:
+        pass
+    return core
+
+
+def build_core(emo_dir: str) -> Wav2Vec2ForSpeechClassification:
+    try:
+        return Wav2Vec2ForSpeechClassification.from_pretrained(
+            emo_dir, local_files_only=True
+        )
+    except AttributeError as e:
+        print(f"[weights] from_pretrained incompatible ({e}); manual load")
+        return load_core_manual(emo_dir)
+
+
 def build_emotion_module(emo_dir: str, ckpt_path: str) -> EmotionExportWrapper:
     if not os.path.isdir(emo_dir):
         raise FileNotFoundError(
             f"emotion dir not found: {emo_dir} "
             "(run scripts/download_checkpoints.sh first)"
         )
-    core = Wav2Vec2ForSpeechClassification.from_pretrained(
-        emo_dir, local_files_only=True
-    )
+    core = build_core(emo_dir)
     if os.path.exists(ckpt_path):
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         sub = {
