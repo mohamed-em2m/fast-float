@@ -162,6 +162,9 @@ async def lifespan(app: FastAPI):
 
     opt = InferenceOptions().parse()
     opt.rank = 0
+    # run_all.sh / run_api.sh export NGPUS (decode GPUs); sys.argv belongs to
+    # hypercorn so the flag can't be passed on the command line.
+    opt.ngpus = int(os.getenv("NGPUS", str(getattr(opt, "ngpus", 1))))
     opt.res_dir = RESULTS_DIR
     opt.no_crop = False
     opt.optimization_mode = OPTIMIZATION_MODE

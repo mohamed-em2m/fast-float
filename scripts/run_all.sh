@@ -13,6 +13,7 @@
 #                   (default http://localhost:${PORT})
 #   CORS_ORIGINS    origins the backend allows
 #                   (default http://localhost:${FRONTEND_PORT})
+#   NGPUS           number of GPUs for decoding (default 1)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,6 +28,7 @@ export VITE_API_URL="${VITE_API_URL:-http://localhost:${PORT}}"
 # for direct backend access. Override CORS_ORIGINS to add public origins
 # (e.g. an ngrok host) when pointing VITE_API_URL straight at the backend.
 export CORS_ORIGINS="${CORS_ORIGINS:-http://localhost:${FRONTEND_PORT},http://127.0.0.1:${FRONTEND_PORT}}"
+export NGPUS="${NGPUS:-1}"
 # Unbuffered Python so backend errors appear in the combined log immediately.
 export PYTHONUNBUFFERED=1
 
