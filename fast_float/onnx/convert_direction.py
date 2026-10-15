@@ -118,6 +118,7 @@ def main(argv=None) -> int:
         output_names=["dir"],
         dynamic_axes={"x": {0: "batch"}, "dir": {0: "batch"}},
         opset=args.opset,
+        mark_dims=(0,),  # M is baked into Q; only batch is dynamic
     )
     print(f"[export] {info['path']} via {info['exporter']}")
     for note in info.get("notes") or []:

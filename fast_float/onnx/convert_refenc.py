@@ -98,6 +98,7 @@ def main(argv=None) -> int:
         output_names=out_names,
         dynamic_axes={"img": {0: "batch"}, **{n: {0: "batch"} for n in out_names}},
         opset=args.opset,
+        mark_dims=(0,),  # spatial dims static; batch only
     )
     print(f"[export] {info['path']} via {info['exporter']}")
     for note in info.get("notes") or []:

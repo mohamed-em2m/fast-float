@@ -188,6 +188,7 @@ def main(argv=None) -> int:
         output_names=["wa"],
         dynamic_axes={"waveform": {0: "batch"}, "wa": {0: "batch"}},
         opset=args.opset,
+        mark_dims=(0,),  # length baked via interpolate size; batch only
     )
     print(f"[export] {info['path']} via {info['exporter']}")
     for note in info.get("notes") or []:

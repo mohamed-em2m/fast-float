@@ -256,6 +256,7 @@ def main(argv=None) -> int:
         output_names=["img"],
         dynamic_axes={},  # static: grouped-conv groups baked per batch
         opset=args.opset,
+        fixed_batch=True,  # skip batch-2 duplication + dynamic marking
     )
     print(f"[export] {info['path']} via {info['exporter']}")
     for note in info.get("notes") or []:
