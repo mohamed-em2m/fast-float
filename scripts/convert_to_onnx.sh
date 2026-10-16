@@ -161,7 +161,7 @@ set +e
 
 run_unit "[3/8] convert: emotion (unit 1)" \
   python -m fast_float.onnx.convert_emotion \
-    --ckpt "${CKPT}" --emo-dir "${EMO_DIR}" --out "${EMO_OUT}" "$@" ${ORT_ARGS}
+    --ckpt "${CKPT}" --emo-dir "${EMO_DIR}" --out "${EMO_OUT}" ${ORT_ARGS}
 
 run_unit "[4/8] convert: fmt step (unit 2)" \
   python -m fast_float.onnx.convert_fmt \
