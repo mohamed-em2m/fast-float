@@ -8,7 +8,7 @@ baseline:
 | --- | --- |
 | `eager` | plain PyTorch (today's default; the fallback for everything) |
 | `compile` | `torch.compile` (inductor) around the torch module |
-| `trt` | the exported ONNX graph on the **TensorRT** execution provider |
+| `onnx` | the exported ONNX graph on an execution provider (`provider: trt \| cuda \| cpu`; TensorRT preferred) |
 
 `eager` is **not** a "mode we pick" — it is the reference and the fallback. The
 converter *compares* the accelerated candidates per component and writes a
@@ -90,6 +90,26 @@ all-`eager` by a threshold (default 3%) or everything falls back to `eager`.
 **Step 5 — emit YAML + wire runtime.** The runtime loads the YAML, routes each
 component, logs the choice, exposes it on `/health`, supports overrides, and
 defaults to all-`eager` when the YAML is missing/unreadable.
+
+## Running the selector
+
+`scripts/convert_to_onnx.sh` runs it automatically after all units pass (set
+`SKIP_SELECT=1` to skip). Directly:
+
+```bash
+python -m fast_float.onnx.select_backends \
+    --onnx-dir ./onnx --out ./onnx/backends.generated.yaml \
+    [--hot-only] [--iters 30] [--min-gain 1.03] [--compile-mode default] \
+    [--no-compile] [--no-onnx] [--no-global] [--dry-run] ${ORT_ARGS}
+```
+
+- `--dry-run` writes the safe all-eager config + env fingerprint only (no model
+  construction) — works on a CPU-only box.
+- A candidate is chosen only if it parity-passes and beats eager by
+  `--min-gain` (default 3%); otherwise the component stays `eager`.
+- The whole-`Generator` compile probe is recorded under `e2e` as advisory; a
+  true end-to-end objective is still validated by the app's own bench (the
+  isolated medians here do **not** compose — see above).
 
 ## Config schema
 

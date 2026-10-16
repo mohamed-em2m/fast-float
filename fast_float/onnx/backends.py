@@ -1,9 +1,10 @@
 """Config-driven per-component backend selection.
 
 FLOAT's inference pipeline is split into named *components*, each of which can
-run in one of two accelerated modes -- ``trt`` (the exported ONNX graph on the
-TensorRT execution provider) or ``compile`` (``torch.compile``) -- with plain
-torch (``eager``) as the always-available baseline and fallback.
+run in one of two accelerated modes -- ``onnx`` (the exported graph on an
+execution provider, TensorRT preferred; ``provider`` records which) or
+``compile`` (``torch.compile``) -- with plain torch (``eager``) as the
+always-available baseline and fallback.
 
 The choice is *hardware-specific* (TensorRT/CUDA availability, GPU model), so
 the config is a build artifact produced on the target box by the selector and
@@ -31,7 +32,8 @@ from typing import Any, Dict, Optional
 
 COMPONENTS = ("emotion", "audio", "direction", "fmt", "decoder", "refenc")
 HOT_COMPONENTS = ("fmt", "decoder", "audio")
-MODES = ("eager", "compile", "trt")
+MODES = ("eager", "compile", "onnx")
+ONNX_PROVIDERS = ("trt", "cuda", "cpu")
 DEFAULT_MODE = "eager"
 
 ENV_CONFIG = "FLOAT_BACKENDS_CONFIG"
@@ -48,6 +50,7 @@ class ComponentConfig:
 
     name: str
     mode: str = DEFAULT_MODE
+    provider: Optional[str] = None
     onnx_path: Optional[str] = None
     metrics: Dict[str, Any] = field(default_factory=dict)
     reason: Optional[str] = None
@@ -90,6 +93,7 @@ class BackendConfig:
             "components": {
                 name: {
                     "mode": c.mode,
+                    **({"provider": c.provider} if c.provider else {}),
                     **({"onnx_path": c.onnx_path} if c.onnx_path else {}),
                     **({"metrics": c.metrics} if c.metrics else {}),
                     **({"reason": c.reason} if c.reason else {}),
@@ -115,6 +119,16 @@ def _coerce_mode(mode: Any, name: str) -> str:
     return mode
 
 
+def _coerce_provider(provider: Any) -> Optional[str]:
+    if provider is None:
+        return None
+    provider = str(provider)
+    if provider not in ONNX_PROVIDERS:
+        print(f"[backends] WARNING: unknown onnx provider {provider!r}; ignoring")
+        return None
+    return provider
+
+
 def _from_dict(data: Dict[str, Any], source: str = "<dict>") -> BackendConfig:
     default_mode = _coerce_mode(data.get("default_mode", DEFAULT_MODE), "default_mode")
     components: Dict[str, ComponentConfig] = {}
@@ -123,6 +137,7 @@ def _from_dict(data: Dict[str, Any], source: str = "<dict>") -> BackendConfig:
         components[name] = ComponentConfig(
             name=name,
             mode=_coerce_mode(cd.get("mode", default_mode), name),
+            provider=_coerce_provider(cd.get("provider")),
             onnx_path=cd.get("onnx_path"),
             metrics=dict(cd.get("metrics") or {}),
             reason=cd.get("reason"),
@@ -236,12 +251,12 @@ def env_fingerprint() -> Dict[str, Any]:
     try:
         import torch
 
-        info["torch"] = torch.__version__
+        info["torch"] = str(torch.__version__)
         info["cuda"] = bool(torch.cuda.is_available())
         if info["cuda"]:
             try:
                 props = torch.cuda.get_device_properties(0)
-                info["gpu"] = props.name
+                info["gpu"] = str(props.name)
                 info["cc"] = f"{props.major}.{props.minor}"
                 info["vram_gb"] = round(props.total_memory / (1 << 30), 1)
             except Exception:
@@ -253,7 +268,7 @@ def env_fingerprint() -> Dict[str, Any]:
     try:
         import onnxruntime as ort
 
-        info["ort"] = ort.__version__
+        info["ort"] = str(ort.__version__)
         available = set(ort.get_available_providers())
         info["trt_ep_listed"] = "TensorrtExecutionProvider" in available
     except Exception as e:
@@ -276,6 +291,7 @@ __all__ = [
     "COMPONENTS",
     "HOT_COMPONENTS",
     "MODES",
+    "ONNX_PROVIDERS",
     "DEFAULT_MODE",
     "DEFAULT_CONFIG",
     "GENERATED_CONFIG",

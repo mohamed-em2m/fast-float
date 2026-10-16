@@ -108,6 +108,52 @@ class AudioExport(nn.Module):
         return self.projection(h)
 
 
+def build_audio_module(
+    ckpt_path: str,
+    w2v_dir: str,
+    frames: int,
+    dim_w: int = DIM_W,
+    only_last: bool = False,
+    device: torch.device | str = "cpu",
+):
+    """Assemble the deployed audio encoder (w2v core + trained projection).
+
+    Shared by ``main`` and the backend selector. Returns
+    ``(module, w2v, projection)``; ``module`` is ``eval()`` and on ``device``.
+    """
+    w2v, n_layers, _ = load_w2v_core(w2v_dir)
+    hid = w2v.config.hidden_size
+    in_dim = hid if only_last else n_layers * hid
+    print(f"[model] w2v layers={n_layers} hid={hid} only_last={only_last} "
+          f"proj_in={in_dim} T={frames}")
+
+    projection = nn.Sequential(
+        nn.Linear(in_dim, dim_w), nn.LayerNorm(dim_w), nn.SiLU()
+    )
+    if os.path.exists(ckpt_path):
+        sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        tops = Counter(k.split(".")[0] for k in sd.keys())
+        print(f"[weights] ckpt top-level prefixes: {dict(tops.most_common(10))}")
+        sub = {k[len(AUDIO_PREFIX):]: v for k, v in sd.items()
+               if k.startswith(AUDIO_PREFIX)}
+        # ckpt carries only the projection (frozen base lives in the HF dir).
+        proj_sub = {k: v for k, v in sub.items() if k.startswith("audio_projection.")}
+        if proj_sub:
+            mapped = {k[len("audio_projection."):]: v for k, v in proj_sub.items()}
+            missing, unexpected = projection.load_state_dict(mapped, strict=False)
+            print(f"[weights] overlaid projection {len(mapped)} tensors "
+                  f"(missing={len(missing)}, unexpected={len(unexpected)})")
+        else:
+            print("[weights] WARN: no audio_encoder.audio_projection.* keys — "
+                  "random projection (parity still valid)")
+    else:
+        print(f"[weights] WARN: {ckpt_path} not found — random projection")
+
+    w2v.to(device).eval()
+    projection.to(device).eval()
+    return AudioExport(w2v, projection, only_last, frames).eval(), w2v, projection
+
+
 def reference_inference(w2v, projection, only_last: bool, a, seq_len: int,
                         sampling_rate: int, fps: float):
     """Mirror of AudioEncoder.inference (pad/trim + same calls)."""
@@ -147,38 +193,10 @@ def main(argv=None) -> int:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[env] device={device}")
-    w2v, n_layers, _ = load_w2v_core(args.w2v_dir)
-    hid = w2v.config.hidden_size
-    in_dim = hid if args.only_last_features else n_layers * hid
-    print(f"[model] w2v layers={n_layers} hid={hid} only_last={args.only_last_features} "
-          f"proj_in={in_dim} T={args.frames}")
-
-    projection = nn.Sequential(
-        nn.Linear(in_dim, args.dim_w), nn.LayerNorm(args.dim_w), nn.SiLU()
+    module, w2v, projection = build_audio_module(
+        args.ckpt, args.w2v_dir, args.frames, args.dim_w,
+        args.only_last_features, device,
     )
-    if os.path.exists(args.ckpt):
-        sd = torch.load(args.ckpt, map_location="cpu", weights_only=True)
-        tops = Counter(k.split(".")[0] for k in sd.keys())
-        print(f"[weights] ckpt top-level prefixes: {dict(tops.most_common(10))}")
-        sub = {k[len(AUDIO_PREFIX):]: v for k, v in sd.items()
-               if k.startswith(AUDIO_PREFIX)}
-        # ckpt carries only the projection (frozen base lives in the HF dir).
-        proj_sub = {k: v for k, v in sub.items() if k.startswith("audio_projection.")}
-        if proj_sub:
-            mapped = {k[len("audio_projection."):]: v for k, v in proj_sub.items()}
-            missing, unexpected = projection.load_state_dict(mapped, strict=False)
-            print(f"[weights] overlaid projection {len(mapped)} tensors "
-                  f"(missing={len(missing)}, unexpected={len(unexpected)})")
-        else:
-            print("[weights] WARN: no audio_encoder.audio_projection.* keys — "
-                  "random projection (parity still valid)")
-    else:
-        print(f"[weights] WARN: {args.ckpt} not found — random projection")
-
-    w2v.to(device).eval()
-    projection.to(device).eval()
-    module = AudioExport(w2v, projection, args.only_last_features,
-                         args.frames).eval()
 
     wav_len = int(args.frames * args.sampling_rate / args.fps)
     print(f"[shapes] waveform_len={wav_len} frames={args.frames}")

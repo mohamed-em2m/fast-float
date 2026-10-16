@@ -204,4 +204,19 @@ if [ "${FAILED}" -gt 0 ]; then
 else
   echo ""
   echo "All units PASSED"
+
+  # Per-component backend selection: compares eager vs torch.compile vs ONNX
+  # and writes onnx/backends.generated.yaml (read at runtime). Set
+  # SKIP_SELECT=1 to skip and let the runtime default to all-eager.
+  echo ""
+  echo "=== [select] per-component backend selection ==="
+  if [ "${SKIP_SELECT:-0}" = "1" ]; then
+    echo "SKIP_SELECT=1 -> skipping (runtime defaults to all-eager)"
+  else
+    python -m fast_float.onnx.select_backends \
+      --onnx-dir "${OUT_DIR}" --out "${OUT_DIR}/backends.generated.yaml" \
+      --ckpt "${CKPT}" --emo-dir "${EMO_DIR}" --w2v-dir "${W2V_DIR}" \
+      --dec-batch "${DEC_BATCH}" --audio-frames "${AUDIO_FRAMES}" \
+      ${ORT_ARGS} || echo "[WARN] backend selection failed -> runtime keeps all-eager"
+  fi
 fi
