@@ -1,4 +1,8 @@
 #!/bin/bash
+
+# --- Automatically inject NVIDIA & CUDA library paths ---
+export LD_LIBRARY_PATH="/usr/local/lib/python3.13/dist-packages/nvidia/cublas/lib:/usr/local/lib/python3.13/dist-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.13/dist-packages/nvidia/cudnn/lib:/usr/lib64-nvidia:/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
+
 set -e
 
 # Always resolve paths relative to the repo root (this script lives in scripts/)
