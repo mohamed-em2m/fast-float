@@ -1,3 +1,7 @@
+from fast_float.utils.decode_tuner import (
+    DecodeAutoTuner,
+    DecodeProfile,
+)
 from fast_float.utils.gpu import (
     clear_gpu_memory,
     get_current_gpu_memory,
@@ -20,14 +24,24 @@ from fast_float.utils.pyav_writer import (
     save_video_pyav,
     save_video_torchcodec,
 )
+from fast_float.utils.stream_utils import (
+    _ABORT,
+    FrameData,
+    _qget,
+)
 from fast_float.utils.video_optimizer import VideoSaveOptimizer
 
 __all__ = [
     "DEFAULT_IMAGE_PATH",
     "TARGET_IMAGE_SIZE",
+    "_ABORT",
     "ColoredFormatter",
+    "DecodeAutoTuner",
+    "DecodeProfile",
+    "FrameData",
     "PyAVVideoWriter",
     "VideoSaveOptimizer",
+    "_qget",
     "clear_gpu_memory",
     "convert_pcm_to_wav",
     "ensure_default_image",
