@@ -5,6 +5,15 @@ and shares :mod:`fast_float.onnx.export` (dynamo-first export) and
 :mod:`fast_float.onnx.parity` (torch-vs-ORT checks).
 """
 
+from fast_float.onnx.backends import (
+    BackendConfig,
+    ComponentConfig,
+    cuda_ep_usable,
+    default_config,
+    env_fingerprint,
+    load_backends,
+    save_backends,
+)
 from fast_float.onnx.export import (
     add_ort_args,
     export_module,
@@ -31,4 +40,11 @@ __all__ = [
     "EmotionOnnxBackend",
     "Wav2vecOnnxBackend",
     "FMTStepBackend",
+    "BackendConfig",
+    "ComponentConfig",
+    "default_config",
+    "load_backends",
+    "save_backends",
+    "cuda_ep_usable",
+    "env_fingerprint",
 ]

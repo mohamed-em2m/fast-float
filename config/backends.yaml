@@ -1,0 +1,12 @@
+# Safe, hardware-independent default for per-component backend selection.
+#
+# Every component runs plain torch (eager) -- i.e. today's behaviour. A
+# target-specific config is generated on the box by the selector and written to
+# onnx/backends.generated.yaml, which takes precedence over this file.
+#
+# See docs/BACKEND_SELECTION.md. Modes: eager | compile | trt.
+version: 2
+target: {}
+objective: end_to_end_ms
+default_mode: eager
+components: {}
