@@ -43,6 +43,44 @@ echo "=== Installing optional video codecs (torchcodec) ==="
 # torchcodec is optional; install if compatible binary wheel exists for torch/cuda
 uv pip install --python .venv/bin/python torchcodec || echo "⚠️ torchcodec install skipped or unavailable for current platform/PyTorch version (PyAV and FFmpeg NVENC remain available)."
 
+echo "=== Installing ONNX export toolchain (onnxscript / ONNX Runtime / TensorRT) ==="
+# onnx + onnxruntime come from pyproject (CPU runtime; the web app uses it). Add
+# onnxscript (required by torch.export's dynamo ONNX exporter) and, on a CUDA
+# box, onnxruntime-gpu + TensorRT so scripts/convert_to_onnx.sh can use the
+# TensorRT EP (FP16). Best-effort: failures here don't block the web app.
+uv pip install --python .venv/bin/python --no-cache-dir onnxscript \
+    || echo "⚠️ onnxscript install failed — ONNX export will need it."
+HAS_CUDA="$(python -c 'import torch;print(torch.cuda.is_available())' 2>/dev/null || echo False)"
+if [ "${HAS_CUDA}" = "True" ]; then
+    echo "CUDA detected → installing onnxruntime-gpu<1.24 + tensorrt (best effort)"
+    uv pip install --python .venv/bin/python --no-cache-dir "onnxruntime-gpu<1.24" \
+        || echo "⚠️ onnxruntime-gpu install skipped — the CUDA EP will be unavailable."
+    uv pip install --python .venv/bin/python --no-cache-dir tensorrt \
+        || echo "⚠️ tensorrt install skipped — the TensorRT EP will be unavailable."
+else
+    echo "No CUDA detected → CPU ONNX Runtime only."
+fi
+
+echo "=== ONNX / ONNX Runtime / TensorRT stack ==="
+python - <<'PY' || true
+import importlib.metadata as m
+try:
+    import torch
+    print("  torch cuda:", torch.cuda.is_available())
+except Exception as e:
+    print("  torch import failed:", e)
+for p in ("onnx", "onnxscript", "onnx-ir", "onnxruntime", "onnxruntime-gpu", "tensorrt"):
+    try:
+        print(f"  {p}: {m.version(p)}")
+    except Exception:
+        pass
+try:
+    import onnxruntime as ort
+    print("  ORT providers:", ort.get_available_providers())
+except Exception as e:
+    print("  onnxruntime import failed:", e)
+PY
+
 echo "=== Running checkpoint download script ==="
 chmod +x "${SCRIPT_DIR}/download_checkpoints.sh"
 "${SCRIPT_DIR}/download_checkpoints.sh"
