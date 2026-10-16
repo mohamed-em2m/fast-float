@@ -172,8 +172,10 @@ and `fast_float/onnx/dispatch.py` (`apply_backends`).
 
 ## Open decisions
 
-1. **CUDA IOBinding** — without it GPU-ONNX inside the ODE loop may never win for
-   `fmt`. Bench in step 3; implement only if it flips a hot component.
+1. **CUDA IOBinding** — implemented in `export.run_ort_iobinding` and used by
+   all six ONNX runners (device-resident I/O, zero host copies) with automatic
+   fallback to the numpy host path. Keep the fallback logs under watch: if a
+   hot component keeps falling back, its shapes need attention.
 2. **Greedy combos vs a global `torch.compile`** — add whole-model compile as one
    extra candidate in step 4. Per-component control caps fusion; accept it?
 3. **Min gain threshold** and the e2e bench budget (a full generation is ~50s).

@@ -7,15 +7,24 @@ time with an ``onnxruntime.InferenceSession`` over ``onnx/emotion_v1.onnx``
 The exported graph already applies softmax, so session outputs are final
 probabilities — no extra normalization needed.
 """
+
 from __future__ import annotations
 
 import os
 
 import torch
 
-from fast_float.onnx.export import make_ort_session
+from fast_float.onnx.export import make_ort_session, run_ort_iobinding
 
 LABELS = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
+
+
+def _gpu_active(session) -> bool:
+    try:
+        provs = session.get_providers()
+    except Exception:
+        return False
+    return bool(provs) and provs[0] != "CPUExecutionProvider"
 
 
 def _dynamo_disable(fn):
@@ -45,6 +54,11 @@ class EmotionOnnxBackend:
         self.path = os.path.abspath(onnx_path)
         self.session = make_ort_session(self.path, use_gpu=use_gpu)
         self.input_name = self.session.get_inputs()[0].name
+        out = self.session.get_outputs()[0]
+        self.output_name = out.name
+        shape = tuple(out.shape or ())
+        self.output_dim = shape[-1] if shape and isinstance(shape[-1], int) else None
+        self._io_failed = False
 
     @property
     def providers(self) -> list:
@@ -60,6 +74,23 @@ class EmotionOnnxBackend:
         device = a.device
         if a.ndim == 1:
             a = a.unsqueeze(0)
+        if (
+            device.type == "cuda"
+            and not self._io_failed
+            and self.output_dim is not None
+            and _gpu_active(self.session)
+        ):
+            try:
+                (out,) = run_ort_iobinding(
+                    self.session,
+                    {self.input_name: a.to(dtype=torch.float32)},
+                    [(self.output_name, (a.shape[0], int(self.output_dim)))],
+                    device=device,
+                )
+                return out.to(device=device, dtype=torch.float32)
+            except Exception as e:  # noqa: BLE001
+                self._io_failed = True
+                print(f"[backends:iobinding] disabled ({e}); using host path")
         wav_np = a.detach().to("cpu", dtype=torch.float32).numpy()
         probs = self._run(wav_np)
         return torch.from_numpy(probs).to(device=device, dtype=torch.float32)
@@ -87,6 +118,13 @@ class Wav2vecOnnxBackend:
         self.path = os.path.abspath(onnx_path)
         self.session = make_ort_session(self.path, use_gpu=use_gpu)
         self.input_name = self.session.get_inputs()[0].name
+        out = self.session.get_outputs()[0]
+        self.output_name = out.name
+        shape = tuple(out.shape or ())
+        self._static_out_dim = (
+            shape[-1] if shape and isinstance(shape[-1], int) else None
+        )
+        self._io_failed = False
 
     @property
     def providers(self) -> list:
@@ -107,6 +145,32 @@ class Wav2vecOnnxBackend:
     def run_features(self, conv_feats: torch.Tensor) -> torch.Tensor:
         """``[B, T, 512]`` -> ``[B, T, dim_w]`` (float32, input device)."""
         device = conv_feats.device
+        if (
+            device.type == "cuda"
+            and not self._io_failed
+            and self._static_out_dim is not None
+            and _gpu_active(self.session)
+        ):
+            try:
+                (out,) = run_ort_iobinding(
+                    self.session,
+                    {self.input_name: conv_feats.to(dtype=torch.float32)},
+                    [
+                        (
+                            self.output_name,
+                            (
+                                conv_feats.shape[0],
+                                conv_feats.shape[1],
+                                int(self._static_out_dim),
+                            ),
+                        )
+                    ],
+                    device=device,
+                )
+                return out.to(device=device, dtype=torch.float32)
+            except Exception as e:  # noqa: BLE001
+                self._io_failed = True
+                print(f"[backends:iobinding] disabled ({e}); using host path")
         feats_np = conv_feats.detach().to("cpu", dtype=torch.float32).numpy()
         out = self._run(feats_np)
         return torch.from_numpy(out).to(device=device, dtype=torch.float32)
@@ -133,6 +197,11 @@ class FMTStepBackend:
             use_gpu = torch.cuda.is_available()
         self.path = os.path.abspath(onnx_path)
         self.session = make_ort_session(self.path, use_gpu=use_gpu)
+        out = self.session.get_outputs()[0]
+        self.output_name = out.name
+        shape = tuple(out.shape or ())
+        self._static_last = shape[-1] if shape and isinstance(shape[-1], int) else None
+        self._io_failed = False
 
     @property
     def providers(self) -> list:
@@ -155,11 +224,40 @@ class FMTStepBackend:
     ) -> torch.Tensor:
         """Single vector-field eval -> ``[B, 60, 512]`` (input device)."""
         device = x.device
+        if (
+            device.type == "cuda"
+            and not self._io_failed
+            and self._static_last is not None
+            and _gpu_active(self.session)
+            and all(
+                torch.is_tensor(v) and v.device.type == "cuda"
+                for v in (t, x, wa, wr, we, prev_x, prev_wa)
+            )
+        ):
+            try:
+                (out,) = run_ort_iobinding(
+                    self.session,
+                    {
+                        name: val.to(dtype=torch.float32)
+                        for name, val in zip(
+                            self.INPUTS, (t, x, wa, wr, we, prev_x, prev_wa)
+                        )
+                    },
+                    [
+                        (
+                            self.output_name,
+                            (x.shape[0], x.shape[1], int(self._static_last)),
+                        )
+                    ],
+                    device=device,
+                )
+                return out.to(device=device, dtype=torch.float32)
+            except Exception as e:  # noqa: BLE001
+                self._io_failed = True
+                print(f"[backends:iobinding] disabled ({e}); using host path")
         feed = {
             name: val.detach().to("cpu", dtype=torch.float32).numpy()
-            for name, val in zip(
-                self.INPUTS, (t, x, wa, wr, we, prev_x, prev_wa)
-            )
+            for name, val in zip(self.INPUTS, (t, x, wa, wr, we, prev_x, prev_wa))
         }
         out = self._run(feed)
         return torch.from_numpy(out).to(device=device, dtype=torch.float32)

@@ -1,8 +1,8 @@
 """Runtime per-component backend dispatch.
 
 Reads the config (see :mod:`fast_float.onnx.backends`) and routes each pipeline
-component to ``eager`` (plain torch, the baseline/fallback), ``compile``
-(``torch.compile``) or ``onnx`` (an exported graph on an execution provider).
+component to ``eager`` (plain torch), ``compile`` (``torch.compile``) or
+``onnx`` (an exported graph on an execution provider).
 
 The three components that already had a runtime backend -- ``emotion``,
 ``audio`` and ``fmt`` -- are wired in their own modules (config-gated there).
@@ -11,17 +11,24 @@ This module wires the remaining three, which had none:
   * ``direction``  -- substitutes ``motion_autoencoder.dec.direction``
   * ``refenc``     -- substitutes ``motion_autoencoder.enc`` (exposes ``.fc``)
   * ``decoder``    -- installed as ``model._decoder_onnx`` and consumed by
-                      ``FLOAT._decode_latent_batched`` (static-batch pad/trim)
+                      ``FLOAT._decode_latent_batched``/``_decode_u8``
+                      (static-batch pad/trim)
 
-Every ONNX substitution runs an init-time parity self-test against the torch
-module and falls back to eager on mismatch, so a missing, stale or
-shape-incompatible artifact can never break inference. With the default
-all-eager config nothing is substituted -- behaviour is unchanged.
+Parity is validated by the converter/selector scripts, never automatically
+here -- the config is the contract (helpers below stay importable for
+scripts). With the default all-eager config nothing is substituted.
+
+ORT runners prefer CUDA IOBinding (device-resident, zero host copies) and
+fall back to the numpy host path on any failure. Runners implement
+``__deepcopy__`` so multi-GPU ``_get_ae`` replicas rebuild clean sessions
+instead of copying live ones.
 
 Call once, after the checkpoint is loaded and the module is on its device.
 """
+
 from __future__ import annotations
 
+import copy
 import logging
 import os
 
@@ -65,15 +72,29 @@ class _CompiledLeaf(nn.Module):
         super().__init__()
         self._orig = module
         self._fn = torch.compile(module)
+        self._extra_keys = list(extra or {})
         for k, v in (extra or {}).items():
             setattr(self, k, v)
 
     def forward(self, *args, **kwargs):
         return self._fn(*args, **kwargs)
 
+    def __deepcopy__(self, memo):
+        # Recompile around a fresh copy; the compiled callable itself is not
+        # copied. Weights are frozen at inference, so duplicated extras (e.g.
+        # enc.fc alongside _orig.fc) cannot diverge.
+        new_mod = copy.deepcopy(self._orig, memo)
+        extra = {k: copy.deepcopy(getattr(self, k), memo) for k in self._extra_keys}
+        return _CompiledLeaf(new_mod, extra=extra)
+
 
 class _OnnxRunner(nn.Module):
-    """Base ONNX session wrapper: torch in (any device/dtype) -> torch out."""
+    """Base ONNX session wrapper: torch in (any device/dtype) -> torch out.
+
+    Prefers CUDA IOBinding (device-resident, zero host copies); falls back to
+    the numpy host path on any failure (flag cached after the first failure so
+    the hot path never pays repeated exception costs).
+    """
 
     def __init__(self, onnx_path: str, use_gpu: bool | None = None):
         super().__init__()
@@ -81,8 +102,10 @@ class _OnnxRunner(nn.Module):
             raise FileNotFoundError(f"ONNX not found: {onnx_path}")
         if use_gpu is None:
             use_gpu = torch.cuda.is_available()
+        self.use_gpu = bool(use_gpu)
         self.path = os.path.abspath(onnx_path)
-        self.session = make_ort_session(self.path, use_gpu=use_gpu)
+        self.session = make_ort_session(self.path, use_gpu=self.use_gpu)
+        self._io_failed = False
 
     @property
     def providers(self) -> list:
@@ -91,6 +114,44 @@ class _OnnxRunner(nn.Module):
     def _np(self, t: torch.Tensor):
         return t.detach().to("cpu", dtype=torch.float32).contiguous().numpy()
 
+    def _gpu_active(self) -> bool:
+        try:
+            provs = self.session.get_providers()
+        except Exception:
+            return False
+        return bool(provs) and provs[0] != "CPUExecutionProvider"
+
+    def _io_shapes(self, *args, **kwargs):
+        """Concrete [(output_name, shape)] for IOBinding, or None to skip it."""
+        raise NotImplementedError
+
+    def _io_run(self, feed, out_shapes):
+        from fast_float.onnx.export import run_ort_iobinding
+
+        dev = next(iter(feed.values())).device
+        return run_ort_iobinding(self.session, feed, out_shapes, device=dev)
+
+    def _try_io(self, feed, out_shapes):
+        """IOBinding attempt; raises (and disables future attempts) on failure."""
+        if self._io_failed or not out_shapes:
+            raise RuntimeError("iobinding unavailable")
+        try:
+            return self._io_run(feed, out_shapes)
+        except Exception as e:  # noqa: BLE001
+            self._io_failed = True
+            print(f"[backends:iobinding] disabled ({e}); using host path")
+            raise
+
+    def _recreate(self):
+        """Fresh equivalent runner (used by __deepcopy__ for GPU replicas)."""
+        raise NotImplementedError
+
+    def __deepcopy__(self, memo):
+        # ORT sessions cannot be deep-copied; rebuild a clean session. The
+        # replica's .to(dev) afterwards is a no-op (no params); the session
+        # runs on its own provider device and outputs are moved by the caller.
+        return self._recreate()
+
 
 class DirectionOnnx(_OnnxRunner):
     """``x [B, M] -> dir [B, 512]`` (dynamic batch)."""
@@ -98,6 +159,18 @@ class DirectionOnnx(_OnnxRunner):
     def __init__(self, onnx_path: str, use_gpu: bool | None = None):
         super().__init__(onnx_path, use_gpu=use_gpu)
         self.input_name = self.session.get_inputs()[0].name
+        out = self.session.get_outputs()[0]
+        self.output_name = out.name
+        shape = tuple(out.shape or ())
+        self.output_dim = shape[-1] if shape and isinstance(shape[-1], int) else None
+
+    def _recreate(self):
+        return DirectionOnnx(self.path, use_gpu=self.use_gpu)
+
+    def _io_shapes(self, b: int):
+        if self.output_dim is None:
+            return None
+        return [(self.output_name, (int(b), int(self.output_dim)))]
 
     @_dynamo_disable
     def _run(self, x_np):
@@ -108,17 +181,64 @@ class DirectionOnnx(_OnnxRunner):
         device = x.device
         if x.ndim == 1:
             x = x.unsqueeze(0)
+        if device.type == "cuda" and self._gpu_active():
+            shapes = self._io_shapes(x.shape[0])
+            if shapes is not None:
+                try:
+                    (out,) = self._try_io(
+                        {self.input_name: x.to(dtype=torch.float32)}, shapes
+                    )
+                    return out.to(device=device, dtype=torch.float32)
+                except Exception:  # noqa: BLE001
+                    pass
         out = self._run(self._np(x))
         return torch.from_numpy(out).to(device=device, dtype=torch.float32)
 
 
 class RefEncOnnx(_OnnxRunner):
-    """``img [B,3,H,W] -> (x_r, x_r_lambda, *feats)``; exposes ``.fc``."""
+    """``img [B,3,H,W] -> (x_r, x_r_lambda, *feats)``; exposes ``.fc``.
 
-    def __init__(self, onnx_path: str, fc: nn.Module, use_gpu: bool | None = None):
+    ``torch_fallback`` is the original torch encoder: it is the single owner
+    of the torch weights (no duplication), serves ``.fc`` for callers, and
+    handles the non-deployed 3-arg path (``input_target is not None``) which
+    the exported graph does not cover.
+    """
+
+    def __init__(
+        self,
+        onnx_path: str,
+        fc: nn.Module,
+        use_gpu: bool | None = None,
+        torch_fallback=None,
+    ):
         super().__init__(onnx_path, use_gpu=use_gpu)
         self.fc = fc
+        self._torch_fallback = torch_fallback
         self.input_name = self.session.get_inputs()[0].name
+
+    def _recreate(self):
+        return RefEncOnnx(
+            self.path,
+            copy.deepcopy(self.fc),
+            use_gpu=self.use_gpu,
+            torch_fallback=(
+                copy.deepcopy(self._torch_fallback)
+                if self._torch_fallback is not None
+                else None
+            ),
+        )
+
+    def _io_shapes(self, b: int):
+        shapes = []
+        for o in self.session.get_outputs():
+            s = list(o.shape or [])
+            if not s:
+                return None
+            s[0] = int(b)
+            if any(not isinstance(d, int) for d in s):
+                return None
+            shapes.append((o.name, tuple(s)))
+        return shapes or None
 
     @_dynamo_disable
     def _run(self, img_np):
@@ -127,12 +247,25 @@ class RefEncOnnx(_OnnxRunner):
     @torch.no_grad()
     def forward(self, x: torch.Tensor, input_target=None, h_start=None):
         if input_target is not None:
+            if self._torch_fallback is not None:
+                return self._torch_fallback(x, input_target, h_start)
             raise RuntimeError(
                 "RefEncOnnx only serves the encode_image_into_latent path"
             )
         device = x.device
         if x.ndim == 3:
             x = x.unsqueeze(0)
+        if device.type == "cuda" and self._gpu_active():
+            shapes = self._io_shapes(x.shape[0])
+            if shapes is not None:
+                try:
+                    outs = self._try_io(
+                        {self.input_name: x.to(dtype=torch.float32)}, shapes
+                    )
+                    outs = [o.to(device=device, dtype=torch.float32) for o in outs]
+                    return outs[0], outs[1], outs[2:]
+                except Exception:  # noqa: BLE001
+                    pass
         outs = self._run(self._np(x))
         outs = [
             torch.from_numpy(o).to(device=device, dtype=torch.float32) for o in outs
@@ -156,6 +289,22 @@ class DecoderOnnx(_OnnxRunner):
         shape0 = ins[0].shape
         b = shape0[0] if shape0 else None
         self.batch = int(b) if isinstance(b, int) else None
+        out = self.session.get_outputs()[0]
+        self.output_name = out.name
+        out_shape = tuple(out.shape or ())
+        self.output_shape = (
+            out_shape
+            if len(out_shape) == 4 and all(isinstance(d, int) for d in out_shape)
+            else None
+        )
+
+    def _recreate(self):
+        return DecoderOnnx(self.path, use_gpu=self.use_gpu)
+
+    def _io_shapes(self):
+        if self.output_shape is None:
+            return None
+        return [(self.output_name, self.output_shape)]
 
     @_dynamo_disable
     def _run(self, feed):
@@ -181,6 +330,22 @@ class DecoderOnnx(_OnnxRunner):
                 else f
                 for f in fs
             ]
+        if (
+            device.type == "cuda"
+            and self._gpu_active()
+            and len(fs) == len(self.feat_names)
+            and self.batch is not None
+        ):
+            shapes = self._io_shapes()
+            if shapes is not None:
+                try:
+                    feed = {self.latent_name: latent.to(dtype=torch.float32)}
+                    for name, f in zip(self.feat_names, fs):
+                        feed[name] = f.to(dtype=torch.float32)
+                    (out,) = self._try_io(feed, shapes)
+                    return out[:m].to(device=device, dtype=torch.float32)
+                except Exception:  # noqa: BLE001
+                    pass
         feed = {self.latent_name: self._np(latent)}
         for name, f in zip(self.feat_names, fs):
             feed[name] = self._np(f)
@@ -189,8 +354,9 @@ class DecoderOnnx(_OnnxRunner):
 
 
 # --------------------------------------------------------------------------- #
-# Self-tests (cosine-gated: robust to fp16 EP kernels and random weights)
+# Parity helpers for scripts/manual use only (never called automatically).
 # --------------------------------------------------------------------------- #
+
 
 def _cosine_ok(ref: torch.Tensor, got: torch.Tensor, name: str) -> bool:
     rep = compare_outputs(ref, got, atol=1.0, rtol=1e-2)
@@ -250,6 +416,7 @@ def _selftest_decoder(ae, runner, image_size: int) -> bool:
 # Wiring
 # --------------------------------------------------------------------------- #
 
+
 def _path(opt, attr: str, default: str) -> str:
     if opt is not None:
         return getattr(opt, attr, default) or default
@@ -278,9 +445,9 @@ def _apply_direction(model, ae, opt) -> None:
         return
     path = _path(opt, "direction_onnx_path", f"{_ONNX_DIR}/direction_v1.onnx")
     try:
+        # No automatic parity probe: the converter/selector scripts validate;
+        # the config is the contract.
         runner = DirectionOnnx(path)
-        if not _selftest_direction(target, runner):
-            raise RuntimeError("parity self-test failed")
         ae.dec.direction = runner
         logger.info(f"backends: direction -> ONNX {path} ({runner.providers})")
     except Exception as e:  # noqa: BLE001
@@ -303,9 +470,9 @@ def _apply_refenc(model, ae, opt) -> None:
         return
     path = _path(opt, "refenc_onnx_path", f"{_ONNX_DIR}/refenc_v1.onnx")
     try:
-        runner = RefEncOnnx(path, enc.fc)
-        if not _selftest_refenc(enc, runner, _image_size(opt)):
-            raise RuntimeError("parity self-test failed")
+        # The original encoder stays owned by the runner (single residency):
+        # it serves .fc and the non-deployed 3-arg path.
+        runner = RefEncOnnx(path, enc.fc, torch_fallback=enc)
         ae.enc = runner
         logger.info(f"backends: refenc -> ONNX {path} ({runner.providers})")
     except Exception as e:  # noqa: BLE001
@@ -326,8 +493,6 @@ def _apply_decoder(model, ae, opt) -> None:
     path = _path(opt, "decoder_onnx_path", f"{_ONNX_DIR}/decoder_v1.onnx")
     try:
         runner = DecoderOnnx(path)
-        if not _selftest_decoder(ae, runner, _image_size(opt)):
-            raise RuntimeError("parity self-test failed")
         model._decoder_onnx = runner
         logger.info(
             f"backends: decoder -> ONNX {path} "

@@ -1,4 +1,6 @@
-import os, math, torch
+import os
+import math
+import torch
 import logging
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,6 +15,7 @@ try:
     from timm.layers import use_fused_attn
     from timm.models.vision_transformer import Mlp
 except Exception:
+
     def use_fused_attn():
         return hasattr(F, "scaled_dot_product_attention")
 
@@ -220,7 +223,10 @@ class FMTBlock(nn.Module):
         )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
+
+        def approx_gelu():
+            return nn.GELU(approximate="tanh")
+
         self.mlp = Mlp(
             in_features=hidden_size,
             hidden_features=mlp_hidden_dim,
@@ -310,22 +316,23 @@ class FlowMatchingTransformer(BaseModel):
         self.initialize_weights()
 
         # define alignment mask
+        _mask_dev = torch.device(
+            f"cuda:{opt.rank}" if torch.cuda.is_available() else "cpu"
+        )
         alignment_mask = enc_dec_mask(
             self.num_total_frames,
             self.num_total_frames,
             1,
             expansion=opt.attention_window,
-        ).to(opt.rank)
+        ).to(_mask_dev)
         self.register_buffer("alignment_mask", alignment_mask)
 
         # Prefer the ONNX single-step backend (fast). The ODE loop, CFG
         # combine and chunk autoregression stay in Python; only the inner
         # vector-field eval is routed through ORT (see _forward_step).
-        # NOTE: the backend self-test runs lazily on the first step, not
-        # here — at construction the weights are still random-init and only
-        # match the export after the deploy checkpoint is loaded.
+        # NOTE: parity is validated by the converter/selector scripts, never
+        # automatically here -- the config is the contract.
         self._onnx_backend = None
-        self._onnx_probed = False
         self._compiled = None
         try:
             from fast_float.onnx.backends import resolve_mode
@@ -341,8 +348,7 @@ class FlowMatchingTransformer(BaseModel):
                 self._onnx_backend = FMTStepBackend(onnx_path)
                 logger.info(
                     f"FlowMatchingTransformer: ONNX backend constructed {onnx_path} "
-                    f"(providers={self._onnx_backend.providers}); "
-                    "self-test on first step"
+                    f"(providers={self._onnx_backend.providers})"
                 )
             except Exception as e:
                 logger.warning(
@@ -352,7 +358,7 @@ class FlowMatchingTransformer(BaseModel):
                 self._onnx_backend = None
 
     def _probe_onnx_backend(self, backend, tol: float = 1e-3) -> None:
-        """Self-test: one B=1 torch step vs the backend. Raises on mismatch.
+        """Self-test helper for scripts/manual use only (never called here).
 
         Runs on CUDA when available (deploy device; also unifies the
         alignment-mask buffer, which is created on ``opt.rank``, with the
@@ -385,34 +391,23 @@ class FlowMatchingTransformer(BaseModel):
         return self._onnx_backend is not None
 
     def _forward_step(self, t, x, wa, wr, we, prev_x, prev_wa):
-        """Inner vector-field eval: ORT when engaged, else torch."""
+        """Inner vector-field eval: ORT when engaged, else torch.
+
+        No automatic parity probe here by design -- validation belongs to the
+        converter/selector scripts; the config is the contract.
+        """
         backend = self._onnx_backend
         if backend is not None and all(
-            torch.is_tensor(v)
-            for v in (t, x, wa, wr, we, prev_x, prev_wa)
+            torch.is_tensor(v) for v in (t, x, wa, wr, we, prev_x, prev_wa)
         ):
-            if not self._onnx_probed:
-                # First-step self-test: structural opt mismatch
-                # (fmt_depth/dims) or stale weights fall back to torch.
-                self._onnx_probed = True
-                try:
-                    self._probe_onnx_backend(backend)
-                except Exception as e:
-                    logger.warning(
-                        f"FlowMatchingTransformer: ONNX self-test failed ({e}); "
-                        "falling back to torch weights"
-                    )
-                    self._onnx_backend = None
-                    backend = None
-            if backend is not None:
-                try:
-                    return backend.run_step(t, x, wa, wr, we, prev_x, prev_wa)
-                except Exception as e:
-                    logger.warning(
-                        f"FlowMatchingTransformer: ONNX step failed ({e}); "
-                        "disabling backend for this run"
-                    )
-                    self._onnx_backend = None
+            try:
+                return backend.run_step(t, x, wa, wr, we, prev_x, prev_wa)
+            except Exception as e:
+                logger.warning(
+                    f"FlowMatchingTransformer: ONNX step failed ({e}); "
+                    "disabling backend for this run"
+                )
+                self._onnx_backend = None
         if self._mode == "compile":
             if self._compiled is None:
                 try:
@@ -426,9 +421,7 @@ class FlowMatchingTransformer(BaseModel):
                     )
                     self._compiled = self
             if self._compiled is not self:
-                return self._compiled(
-                    t, x, wa, wr, we, prev_x, prev_wa, train=False
-                )
+                return self._compiled(t, x, wa, wr, we, prev_x, prev_wa, train=False)
         return self.forward(t, x, wa, wr, we, prev_x, prev_wa, train=False)
 
     def initialize_weights(self) -> None:
@@ -553,8 +546,9 @@ class FlowMatchingTransformer(BaseModel):
             x + self.pos_embed
         )  # (B, L + L', D), where T = opt.wav2vec_sec * opt.fps, D = dim_w
 
-        wr = wr.repeat(1, wa.shape[1], 1)
-        we = we.repeat(1, wa.shape[1], 1)
+        # expand (view, no copy) instead of repeat: the cat below copies once.
+        wr = wr.expand(-1, wa.shape[1], -1)
+        we = we.expand(-1, wa.shape[1], -1)
 
         c = torch.cat([wr, wa, we], dim=-1)
         c = self.c_embedder(c)

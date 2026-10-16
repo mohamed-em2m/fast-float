@@ -72,14 +72,18 @@ class OptimizedInferenceAgent:
 
     def load_weight(self, checkpoint_path: str, rank: int) -> None:
         state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        dev = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
         with torch.no_grad():
             for model_name, model_param in self.G.named_parameters():
                 if model_name in state_dict:
-                    model_param.copy_(state_dict[model_name].to(rank))
+                    model_param.copy_(state_dict[model_name].to(dev))
                 elif "wav2vec2" in model_name:
                     pass
                 else:
                     logger.warning(f"! Warning: {model_name} not found in state_dict.")
+            for buf_name, buf in self.G.named_buffers():
+                if buf_name in state_dict:
+                    buf.copy_(state_dict[buf_name].to(buf.device))
         del state_dict
 
     def apply_optimization(self) -> None:
@@ -104,9 +108,13 @@ class OptimizedInferenceAgent:
         elif self.optimization_mode == "channels_last":
             logger.info("Applying channels_last memory format...")
             try:
+                # NOTE: Module.to() converts params/buffers in place and returns
+                # self; do not rebind the loop variable. Inputs still arrive as
+                # contiguous NCHW, so each conv pays a layout conversion per op
+                # unless the pipeline is fed channels-last end to end.
                 for module in self.G.modules():
                     if isinstance(module, (torch.nn.Conv2d, torch.nn.Conv3d)):
-                        module = module.to(memory_format=torch.channels_last)
+                        module.to(memory_format=torch.channels_last)
                 self.G_opt = self.G
                 logger.info("✓ Channels last format applied")
             except Exception as e:
@@ -129,9 +137,11 @@ class OptimizedInferenceAgent:
         elif self.optimization_mode == "all":
             logger.info("Applying all optimizations...")
             try:
+                # Same caveat as above: in-place conversion, but inputs stay
+                # contiguous NCHW, so mixed layouts convert per op.
                 for module in self.G.modules():
                     if isinstance(module, (torch.nn.Conv2d, torch.nn.Conv3d)):
-                        module = module.to(memory_format=torch.channels_last)
+                        module.to(memory_format=torch.channels_last)
                 logger.info("✓ Channels last applied to conv layers")
             except Exception as e:
                 logger.warning(f"! Channels last skipped: {e}")
@@ -422,7 +432,7 @@ class OptimizedInferenceAgent:
         data = self.data_processor.preprocess(
             ref_path, [it["padded_path"] for it in items], no_crop=no_crop
         )
-        s, a = data["s"], data["a"]
+        s = data["s"]
 
         s_r, r_s_lambda, s_r_feats = G.encode_image_into_latent(s.to(device))
         data["r_s"] = G.motion_autoencoder.dec.direction(r_s_lambda)
@@ -437,8 +447,7 @@ class OptimizedInferenceAgent:
             # inside one window. Full windows are never padded, so their reads
             # stay exact.
             auds = [
-                self.data_processor.default_aud_loader(it["audio_path"])
-                for it in items
+                self.data_processor.default_aud_loader(it["audio_path"]) for it in items
             ]
             full_len = max(a.shape[-1] for a in auds)
             pct30 = full_len * 0.30
@@ -451,9 +460,7 @@ class OptimizedInferenceAgent:
                 elif L > pct30:
                     need = full_len - L
                     pad_list.append(
-                        torch.cat(
-                            [a0, torch.zeros(need, dtype=a0.dtype)], dim=-1
-                        )
+                        torch.cat([a0, torch.zeros(need, dtype=a0.dtype)], dim=-1)
                     )
                     use_idx.append(k)
                 else:
@@ -510,7 +517,9 @@ class OptimizedInferenceAgent:
                     s_r, s_r_feats, lat_i, batch_size=decode_bs
                 )
                 out = self.save_video(
-                    d_hat.float(), it["out_path"], it["audio_path"],
+                    d_hat.float(),
+                    it["out_path"],
+                    it["audio_path"],
                     video_encoder=video_encoder,
                 )
                 out_paths.append(out)

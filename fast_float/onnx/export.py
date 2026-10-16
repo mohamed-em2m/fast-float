@@ -8,6 +8,7 @@ substitutions (manual attention, plain norm, matmul reformulation) — all
 dynamo-safe and equivalence-proven — plus static-batch modconv freezing,
 which stays because ONNX Conv ``group`` is static regardless of exporter.
 """
+
 from __future__ import annotations
 
 import os
@@ -194,6 +195,7 @@ def _trt_provider_options(
         opts["trt_timing_cache_enable"] = True
         opts["trt_timing_cache_path"] = cache_abs
     if min_shapes and opt_shapes and max_shapes:
+
         def _fmt(d):
             return ",".join(f"{k}:{'x'.join(map(str, v))}" for k, v in d.items())
 
@@ -253,8 +255,11 @@ def make_ort_session(
                 (
                     "TensorrtExecutionProvider",
                     _trt_provider_options(
-                        trt_fp16, trt_cache_dir,
-                        trt_min_shapes, trt_opt_shapes, trt_max_shapes,
+                        trt_fp16,
+                        trt_cache_dir,
+                        trt_min_shapes,
+                        trt_opt_shapes,
+                        trt_max_shapes,
                     ),
                 )
             )
@@ -309,7 +314,9 @@ def make_ort_session(
         # Session came back CPU-only: ORT swallowed a provider-load failure.
         requested_trt = any(p[0] == "TensorrtExecutionProvider" for p in provs)
         if requested_trt:
-            print("[ort] NOTE: TensorRT EP failed to initialize — retrying with the CUDA EP.")
+            print(
+                "[ort] NOTE: TensorRT EP failed to initialize — retrying with the CUDA EP."
+            )
         else:
             print("[ort] WARNING: GPU execution providers did not initialize.")
     if sess is None:
@@ -333,23 +340,36 @@ def make_ort_session(
 
 def add_ort_args(ap, default_max_batch: int = 8):
     """Register the shared ORT/TensorRT CLI flags on an argparse parser."""
-    ap.add_argument("--cpu-ort", action="store_true",
-                    help="allow a CPU ORT session on a CUDA box (dev only)")
-    ap.add_argument("--no-trt", action="store_true",
-                    help="disable the TensorRT EP (use the CUDA EP instead)")
-    ap.add_argument("--trt-fp32", action="store_true",
-                    help="TensorRT in FP32 (default FP16)")
-    ap.add_argument("--trt-cache", default=None,
-                    help="TensorRT engine cache dir (default <onnx_dir>/trt_cache)")
-    ap.add_argument("--trt-min-batch", type=int, default=1,
-                    help="TensorRT profile min batch")
-    ap.add_argument("--trt-max-batch", type=int, default=default_max_batch,
-                    help="TensorRT profile max batch")
+    ap.add_argument(
+        "--cpu-ort",
+        action="store_true",
+        help="allow a CPU ORT session on a CUDA box (dev only)",
+    )
+    ap.add_argument(
+        "--no-trt",
+        action="store_true",
+        help="disable the TensorRT EP (use the CUDA EP instead)",
+    )
+    ap.add_argument(
+        "--trt-fp32", action="store_true", help="TensorRT in FP32 (default FP16)"
+    )
+    ap.add_argument(
+        "--trt-cache",
+        default=None,
+        help="TensorRT engine cache dir (default <onnx_dir>/trt_cache)",
+    )
+    ap.add_argument(
+        "--trt-min-batch", type=int, default=1, help="TensorRT profile min batch"
+    )
+    ap.add_argument(
+        "--trt-max-batch",
+        type=int,
+        default=default_max_batch,
+        help="TensorRT profile max batch",
+    )
 
 
-def make_session_from_args(
-    onnx_path: str, args, opt_shapes=None, extra_dynamic=None
-):
+def make_session_from_args(onnx_path: str, args, opt_shapes=None, extra_dynamic=None):
     """Build an ORT session from shared CLI flags (chain TRT -> CUDA -> CPU).
 
     ``opt_shapes`` maps each *dynamic* input to a representative shape so the
@@ -369,10 +389,15 @@ def make_session_from_args(
             extra=extra_dynamic,
         )
     sess = make_ort_session(
-        onnx_path, use_gpu=use_gpu, require_gpu=use_gpu,
-        use_trt=use_trt, trt_fp16=fp16,
+        onnx_path,
+        use_gpu=use_gpu,
+        require_gpu=use_gpu,
+        use_trt=use_trt,
+        trt_fp16=fp16,
         trt_cache_dir=getattr(args, "trt_cache", None),
-        trt_min_shapes=mn, trt_opt_shapes=op, trt_max_shapes=mx,
+        trt_min_shapes=mn,
+        trt_opt_shapes=op,
+        trt_max_shapes=mx,
     )
     return sess, fp16
 
@@ -381,3 +406,42 @@ def fp16_tol(base: float, fp16: bool, factor: float = 40.0) -> float:
     """Relax a parity tolerance when TensorRT runs in FP16 (tensor cores
     trade ~1e-3 relative precision for speed; FP32 keeps the strict gate)."""
     return base * factor if fp16 else base
+
+
+def run_ort_iobinding(session, feed, out_shapes, device=None):
+    """Run an ORT session with CUDA IOBinding: zero host copies.
+
+    ``feed`` maps input name -> CUDA tensor (any dtype; cast to fp32 on
+    device, matching the exported graphs). ``out_shapes`` is a list of
+    ``(output_name, shape)`` with fully concrete ints; outputs are allocated
+    as CUDA fp32 tensors and returned on ``device``. Raises on any failure --
+    callers must fall back to the numpy path.
+    """
+    import numpy as np
+    import onnxruntime as ort  # noqa: F401 (ensures ORT present)
+
+    if not feed:
+        raise ValueError("iobinding needs at least one input")
+    first = next(iter(feed.values()))
+    dev = device if device is not None else first.device
+    if dev.type != "cuda":
+        raise RuntimeError("iobinding requires CUDA tensors")
+    did = dev.index if dev.index is not None else 0
+    refs = []
+    binding = session.io_binding()
+    for name, t in feed.items():
+        if t.device.type != "cuda":
+            raise RuntimeError(f"iobinding input {name!r} is not a CUDA tensor")
+        tc = t.to(dtype=torch.float32).contiguous()
+        refs.append(tc)
+        binding.bind_input(
+            name, "cuda", did, np.float32, tuple(tc.shape), tc.data_ptr()
+        )
+    outs = []
+    for name, shape in out_shapes:
+        shape = tuple(int(d) for d in shape)
+        o = torch.empty(shape, device=dev, dtype=torch.float32)
+        binding.bind_output(name, "cuda", did, np.float32, shape, o.data_ptr())
+        outs.append(o)
+    session.run_with_iobinding(binding)
+    return outs

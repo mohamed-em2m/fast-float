@@ -29,10 +29,7 @@ Usage in your model file:
 import os
 import math
 import time
-import uuid
 import logging
-import struct
-import wave
 import subprocess
 import shutil
 import contextlib
@@ -41,32 +38,39 @@ import queue
 import threading
 import traceback
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Generator, Optional, List
+from typing import Callable, Dict
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 try:
     from torchdiffeq import odeint
 except ImportError:
     odeint = None
 
 try:
-    import torchvision
+    pass
 except Exception:
     import sys
+
     sys.modules["torchvision"] = None
     sys.modules["torchvision.io"] = None
 
-from transformers import Wav2Vec2Config
-from transformers.modeling_outputs import BaseModelOutput
 
 from fast_float.models.wav2vec2 import Wav2VecModel
 from fast_float.models import BaseModel
 from fast_float.models.float.generator import Generator
 from fast_float.models.float.FMT import FlowMatchingTransformer
 
+try:
+    from fast_float.utils.pyav_writer import save_video_torchcodec
+except ImportError:
+    try:
+        from utils.pyav_writer import save_video_torchcodec
+    except ImportError:
+        from pyav_writer import save_video_torchcodec
 torch.backends.cudnn.benchmark = True
 
 logger = logging.getLogger(__name__)
@@ -276,33 +280,56 @@ class StreamingVideoSaver:
         """Motion autoencoder on `dev`: the original on the primary GPU, cached replicas elsewhere.
         If you reload weights into self.motion_autoencoder, call self._ae_replicas.clear().
         """
-        if dev == primary or (dev.index is not None and primary.index is not None and dev.index == primary.index):
+        if dev == primary or (
+            dev.index is not None
+            and primary.index is not None
+            and dev.index == primary.index
+        ):
             return self.motion_autoencoder
-        reps = getattr(self, "_ae_replicas", None)
-        if reps is None:
-            reps = self._ae_replicas = {}
-        idx = dev.index if dev.index is not None else str(dev)
-        if idx not in reps:
-            ae = copy.deepcopy(self.motion_autoencoder).to(dev).eval()
-            ae.requires_grad_(False)
-            reps[idx] = ae
-        return reps[idx]
+        with self._decode_lock:
+            reps = getattr(self, "_ae_replicas", None)
+            if reps is None:
+                reps = self._ae_replicas = {}
+            idx = dev.index if dev.index is not None else str(dev)
+            if idx not in reps:
+                # Runners implement __deepcopy__ (clean session rebuild);
+                # plain modules copy normally.
+                ae = copy.deepcopy(self.motion_autoencoder).to(dev).eval()
+                ae.requires_grad_(False)
+                reps[idx] = ae
+            return reps[idx]
+
+    def _decoder_static_batch(self):
+        """Static ONNX decode batch when the decoder backend is ONNX, else None."""
+        backend = getattr(self, "_decoder_onnx", None)
+        b = getattr(backend, "batch", None) if backend is not None else None
+        return int(b) if isinstance(b, int) and b > 0 else None
 
     # ---------------- decode ---------------- #
     def _decode_u8(self, ae, feats_in, lat, allow_split=True) -> torch.Tensor:
         """lat [b, dim] -> uint8 [b, H, W, C] on lat's device/current stream. Halves batch on OOM."""
         b = lat.shape[0]
-        # expand is a zero-copy view; harmless if the decoder already broadcasts
+        # One explicit contiguous copy of broadcast feats: the decoder touches
+        # them in every layer, so this beats N implicit cuDNN copies of a
+        # stride-0 expanded view.
         feats = [
-            f.expand(b, *f.shape[1:]) if (f.shape[0] == 1 and b > 1) else f
+            f.expand(b, *f.shape[1:]).contiguous() if (f.shape[0] == 1 and b > 1) else f
             for f in feats_in
         ]
+        static_b = self._decoder_static_batch()
         try:
-            out = ae.dec(
-                lat, alpha=None, feats=feats
-            )  # same call as decode_latent_into_image
-            if isinstance(out, (tuple, list)):
-                out = out[0]
+            if static_b is not None and b > static_b:
+                # Static-batch ONNX graph: tile to it (pad/trim inside).
+                parts = []
+                for i in range(0, b, static_b):
+                    m = min(static_b, b - i)
+                    chunk_feats = [
+                        f[i : i + m] if f.shape[0] == b else f for f in feats
+                    ]
+                    parts.append(self._decode_call(ae, lat[i : i + m], chunk_feats))
+                out = torch.cat(parts, dim=0)
+            else:
+                out = self._decode_call(ae, lat, feats)
             out = out.float()
             out = out.add_(1.0).mul_(127.5).clamp_(0.0, 255.0).to(torch.uint8)
             return out.permute(0, 2, 3, 1).contiguous()
@@ -321,13 +348,21 @@ class StreamingVideoSaver:
         )
 
     def _get_decode_profile(self, dev, primary, ae, feats, dtype):
-        if getattr(self, "_decode_profiles", None) is None:
-            self._decode_profiles, self._decode_tuners = {}, {}
-        if dev.index not in self._decode_profiles:
+        with self._decode_lock:
+            if getattr(self, "_decode_profiles", None) is None:
+                self._decode_profiles, self._decode_tuners = {}, {}
+            if dev.index in self._decode_profiles:
+                return self._decode_tuners[dev.index], self._decode_profiles[dev.index]
+            # Cap the tuner at the ONNX static batch when that backend is on:
+            # larger micro-batches would only be tiled back down (B1/B3).
+            max_batch = int(getattr(self.opt, "decode_max_batch", 16))
+            static_b = self._decoder_static_batch()
+            if static_b is not None:
+                max_batch = min(max_batch, static_b)
             tuner = DecodeAutoTuner(
                 dev,
                 primary=(dev.index == primary.index),
-                max_batch=int(getattr(self.opt, "decode_max_batch", 16)),
+                max_batch=max_batch,
                 max_streams=int(getattr(self.opt, "decode_max_streams", 1)),
                 reserve_gib=getattr(self.opt, "decode_reserve_gib", None),
                 opt=self.opt,
@@ -340,7 +375,7 @@ class StreamingVideoSaver:
 
             self._decode_profiles[dev.index] = tuner.tune(fn)
             self._decode_tuners[dev.index] = tuner
-        return self._decode_tuners[dev.index], self._decode_profiles[dev.index]
+            return self._decode_tuners[dev.index], self._decode_profiles[dev.index]
 
     # ---------------- ffmpeg ---------------- #
     def _encoder_args(self):
@@ -432,7 +467,11 @@ class StreamingVideoSaver:
         video_encoder=None,
     ) -> str:
         t_start = time.perf_counter()
-        encoder_choice = str(video_encoder or getattr(self.opt, "video_encoder", "FFmpeg NVENC")).strip().lower()
+        encoder_choice = (
+            str(video_encoder or getattr(self.opt, "video_encoder", "FFmpeg NVENC"))
+            .strip()
+            .lower()
+        )
         use_pyav = encoder_choice in ("cpu pyav", "pyav", "pyav_cpu")
         use_torchcodec = encoder_choice in ("torchcodec", "torch codec", "tc")
 
@@ -513,6 +552,10 @@ class StreamingVideoSaver:
             B = int(override_bs)
         else:
             B = max(c["prof"].batch_size for c in ctx.values())
+        static_b = self._decoder_static_batch()
+        if static_b is not None:
+            # Never serve micro-batches the static ONNX graph cannot take.
+            B = min(B, static_b)
         override = int(getattr(self.opt, "decode_streams", 0))
         for c in ctx.values():
             c["n_streams"] = override or c["tuner"].num_streams(c["prof"], B)
@@ -554,7 +597,7 @@ class StreamingVideoSaver:
         # is identical to the old fixed-slice path. At boundaries we coalesce
         # frames from adjacent chunks instead of dispatching tiny padded batches.
         COALESCE_MS = float(getattr(self.opt, "decode_coalesce_ms", 15.0))
-        COALESCE_S  = COALESCE_MS / 1_000.0
+        COALESCE_S = COALESCE_MS / 1_000.0
 
         def producer():
             try:
@@ -569,7 +612,9 @@ class StreamingVideoSaver:
                     incorrectly racing against the *next* producer step.
                     """
                     if need_host_latents and torch.cuda.is_available():
-                        lat_host = torch.empty(lat_slice.shape, dtype=lat_slice.dtype, pin_memory=True)
+                        lat_host = torch.empty(
+                            lat_slice.shape, dtype=lat_slice.dtype, pin_memory=True
+                        )
                         lat_host.copy_(lat_slice, non_blocking=True)
                     else:
                         lat_host = None
@@ -580,17 +625,17 @@ class StreamingVideoSaver:
                 def flush_carry(carry, seq):
                     """Pad carry to B, emit one work item, return (seq+1, [])."""
                     n_valid = len(carry)
-                    sl = torch.stack(carry, 0)           # [n_valid, dim]
+                    sl = torch.stack(carry, 0)  # [n_valid, dim]
                     if n_valid < B:
                         pad = sl[-1:].expand(B - n_valid, -1)
-                        sl  = torch.cat([sl, pad], 0)   # [B, dim]
+                        sl = torch.cat([sl, pad], 0)  # [B, dim]
                     ev, lat_host = emit_one(sl, n_valid)
                     work_q.put((seq, sl, lat_host, n_valid, ev))
                     return seq + 1, []
 
-                seq   = 0
-                carry: list = []      # accumulate individual latent rows
-                deadline: float = 0.0 # wall-clock deadline for current carry window
+                seq = 0
+                carry: list = []  # accumulate individual latent rows
+                deadline: float = 0.0  # wall-clock deadline for current carry window
 
                 for chunk in self.sample(
                     data,
@@ -605,7 +650,7 @@ class StreamingVideoSaver:
                     if stop.is_set():
                         return
                     lat = chunk.reshape(-1, chunk.shape[-1])  # [n, dim]
-                    for row in lat.unbind(0):                 # iterate frame-by-frame
+                    for row in lat.unbind(0):  # iterate frame-by-frame
                         if not carry:
                             deadline = time.perf_counter() + COALESCE_S
                         carry.append(row)
@@ -673,13 +718,6 @@ class StreamingVideoSaver:
             if use_torchcodec:
                 # torchcodec VideoEncoder needs ALL frames at once, so we
                 # accumulate them in order first, then encode in one shot.
-                try:
-                    from fast_float.utils.pyav_writer import save_video_torchcodec
-                except ImportError:
-                    try:
-                        from utils.pyav_writer import save_video_torchcodec
-                    except ImportError:
-                        from pyav_writer import save_video_torchcodec
 
                 all_frames = []  # list of (n, H, W, C) uint8 numpy arrays
                 pending, nxt = {}, 0
@@ -849,6 +887,9 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         logger.info(opt)
         rank = getattr(self.opt, "rank", 0)
         self.rank = rank
+        # Guards _ae_replicas / _decode_profiles creation (decode worker setup
+        # is single-threaded today, but replicas/profiles persist across calls).
+        self._decode_lock = threading.Lock()
         device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
         if torch.cuda.is_available():
             self.stream_decode_2 = torch.cuda.Stream(device=device)
@@ -921,7 +962,10 @@ class FLOAT(BaseModel, StreamingVideoSaver):
             * >= 0.7 GiB free                                     : batch 2
             * otherwise / CPU                                     : batch 1
         """
-        if hasattr(self, "opt") and getattr(self.opt, "decode_batch_size", None) is not None:
+        if (
+            hasattr(self, "opt")
+            and getattr(self.opt, "decode_batch_size", None) is not None
+        ):
             val = int(self.opt.decode_batch_size)
             if val > 0:
                 return val
@@ -938,7 +982,11 @@ class FLOAT(BaseModel, StreamingVideoSaver):
             if device.type != "cuda":
                 return 4
 
-            idx = device.index if device.index is not None else torch.cuda.current_device()
+            idx = (
+                device.index
+                if device.index is not None
+                else torch.cuda.current_device()
+            )
 
             # Return memoized result to avoid repeated cudaMemGetInfo calls
             cache = getattr(self, "_decode_bs_cache", None)
@@ -949,7 +997,7 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                 return cache[idx]
 
             free_b, total_b = torch.cuda.mem_get_info(idx)
-            gib = 1024 ** 3
+            gib = 1024**3
             free_gib = free_b / gib
             total_gib = total_b / gib
 
@@ -1000,10 +1048,21 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         to prevent OOM and maximize GPU throughput. Supports 2D [N, D] and 3D [B, T, D] latents.
         """
         if device is None:
-            device = r_d.device if (hasattr(r_d, "device") and r_d.device.type == "cuda") else None
+            device = (
+                r_d.device
+                if (hasattr(r_d, "device") and r_d.device.type == "cuda")
+                else None
+            )
 
-        bs = batch_size if batch_size is not None else self.get_optimal_decode_batch_size(device)
+        bs = (
+            batch_size
+            if batch_size is not None
+            else self.get_optimal_decode_batch_size(device)
+        )
         bs = max(1, int(bs))
+        static_b = self._decoder_static_batch()
+        if static_b is not None:
+            bs = min(bs, static_b)
 
         if r_d.ndim == 3:
             b_dim, t_dim, d_dim = r_d.shape
@@ -1015,7 +1074,11 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                 if f.shape[0] == 1:
                     aligned_feats.append(("broadcast", f))
                 elif f.shape[0] == b_dim:
-                    full_f = f.unsqueeze(1).expand(-1, t_dim, *f.shape[1:]).reshape(n_total, *f.shape[1:])
+                    full_f = (
+                        f.unsqueeze(1)
+                        .expand(-1, t_dim, *f.shape[1:])
+                        .reshape(n_total, *f.shape[1:])
+                    )
                     aligned_feats.append(("slice", full_f))
                 elif f.shape[0] == n_total:
                     aligned_feats.append(("slice", f))
@@ -1024,7 +1087,9 @@ class FLOAT(BaseModel, StreamingVideoSaver):
 
             if n_total <= bs:
                 chunk_feats = [
-                    f.expand(n_total, *f.shape[1:]) if mode == "broadcast" else f
+                    f.expand(n_total, *f.shape[1:]).contiguous()
+                    if mode == "broadcast"
+                    else f
                     for mode, f in aligned_feats
                 ]
                 out = self._decode_call(ae, r_d_flat, chunk_feats)
@@ -1035,7 +1100,11 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                     chunk_r_d = r_d_flat[i : i + bs]
                     m = chunk_r_d.shape[0]
                     chunk_feats = [
-                        f.expand(m, *f.shape[1:]) if mode == "broadcast" else f[i : i + m]
+                        (
+                            f.expand(m, *f.shape[1:]).contiguous()
+                            if mode == "broadcast"
+                            else f[i : i + m]
+                        )
                         for mode, f in aligned_feats
                     ]
                     chunk_out = self._decode_call(ae, chunk_r_d, chunk_feats)
@@ -1043,7 +1112,7 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                 out = torch.cat(out_chunks, dim=0)
                 return out.view(b_dim, t_dim, *out.shape[1:])
         else:
-            is_1d = (r_d.ndim == 1)
+            is_1d = r_d.ndim == 1
             if is_1d:
                 r_d = r_d.unsqueeze(0)
             n_total = r_d.shape[0]
@@ -1056,14 +1125,20 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                     aligned_feats.append(("slice", f))
                 elif n_total % f.shape[0] == 0:
                     t = n_total // f.shape[0]
-                    full_f = f.unsqueeze(1).expand(-1, t, *f.shape[1:]).reshape(n_total, *f.shape[1:])
+                    full_f = (
+                        f.unsqueeze(1)
+                        .expand(-1, t, *f.shape[1:])
+                        .reshape(n_total, *f.shape[1:])
+                    )
                     aligned_feats.append(("slice", full_f))
                 else:
                     aligned_feats.append(("broadcast", f[:1]))
 
             if n_total <= bs:
                 chunk_feats = [
-                    f.expand(n_total, *f.shape[1:]) if mode == "broadcast" else f
+                    f.expand(n_total, *f.shape[1:]).contiguous()
+                    if mode == "broadcast"
+                    else f
                     for mode, f in aligned_feats
                 ]
                 out = self._decode_call(ae, r_d, chunk_feats)
@@ -1074,7 +1149,11 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                     chunk_r_d = r_d[i : i + bs]
                     m = chunk_r_d.shape[0]
                     chunk_feats = [
-                        f.expand(m, *f.shape[1:]) if mode == "broadcast" else f[i : i + m]
+                        (
+                            f.expand(m, *f.shape[1:]).contiguous()
+                            if mode == "broadcast"
+                            else f[i : i + m]
+                        )
                         for mode, f in aligned_feats
                     ]
                     chunk_out = self._decode_call(ae, chunk_r_d, chunk_feats)
@@ -1115,10 +1194,20 @@ class FLOAT(BaseModel, StreamingVideoSaver):
     ) -> torch.Tensor:
         rank = getattr(self.opt, "rank", 0)
         device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
-        cur_stream = torch.cuda.current_stream(device) if torch.cuda.is_available() else None
-        encode_stream = self.stream_encode if (self.stream_encode is not None and torch.cuda.is_available()) else None
+        cur_stream = (
+            torch.cuda.current_stream(device) if torch.cuda.is_available() else None
+        )
+        encode_stream = (
+            self.stream_encode
+            if (self.stream_encode is not None and torch.cuda.is_available())
+            else None
+        )
 
-        if cur_stream is not None and encode_stream is not None and cur_stream != encode_stream:
+        if (
+            cur_stream is not None
+            and encode_stream is not None
+            and cur_stream != encode_stream
+        ):
             encode_stream.wait_stream(cur_stream)
 
         encode_ctx = (
@@ -1201,7 +1290,11 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         # Synchronize sampling stream so ODE starts with audio & emotion features ready.
         # This keeps encoding isolated to encode_stream and lets ODE sampling run on cur_stream
         # without interfering with or stalling concurrent decode streams.
-        if cur_stream is not None and encode_stream is not None and cur_stream != encode_stream:
+        if (
+            cur_stream is not None
+            and encode_stream is not None
+            and cur_stream != encode_stream
+        ):
             cur_stream.wait_stream(encode_stream)
 
         decoded_length = 0
@@ -1211,9 +1304,7 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         # steps and ALL chunks (ref / emotion never change during inference).
         # Avoids 2 × torch.cat allocations per ODE step for free.
         # ------------------------------------------------------------------
-        _cfg_active = (
-            a_cfg_scale != 1.0 or r_cfg_scale != 1.0 or e_cfg_scale != 1.0
-        )
+        _cfg_active = a_cfg_scale != 1.0 or r_cfg_scale != 1.0 or e_cfg_scale != 1.0
         _ref_cat = None
         _emotion_cat = None
         if _cfg_active and r_s is not None:
@@ -1268,8 +1359,11 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                     B, self.num_prev_frames, self.opt.dim_w, device=device
                 )
             else:
-                prev_x_t = sample_t[:, -self.num_prev_frames :]
-                prev_wa_t = wa_t[:, -self.num_prev_frames :]
+                # sample_t / wa_t come from the previous chunk iteration; the loop
+                # always starts at t == 0 (which takes the branch above), so both
+                # are defined before any use (ruff cannot see this: noqa F821).
+                prev_x_t = sample_t[:, -self.num_prev_frames :]  # noqa: F821
+                prev_wa_t = wa_t[:, -self.num_prev_frames :]  # noqa: F821
 
             wa_t = wa[
                 :, t * self.num_frames_for_clip : (t + 1) * self.num_frames_for_clip
@@ -1296,16 +1390,18 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                 _null_wa = torch.zeros_like(wa_t_exp)
                 _audio_cat = torch.cat([_null_wa, wa_t_exp, wa_t_exp], dim=0)
 
-                _prev_x_cat = torch.cat(
-                    [prev_x_t, prev_x_t, prev_x_t], dim=0
-                )
-                _prev_wa_cat = torch.cat(
-                    [prev_wa_t, prev_wa_t, prev_wa_t], dim=0
-                )
+                _prev_x_cat = torch.cat([prev_x_t, prev_x_t, prev_x_t], dim=0)
+                _prev_wa_cat = torch.cat([prev_wa_t, prev_wa_t, prev_wa_t], dim=0)
 
-            def sample_chunk(tt, zt,
-                             _ac=_audio_cat, _rc=_ref_cat, _ec=_emotion_cat,
-                             _pxc=_prev_x_cat, _pwc=_prev_wa_cat):
+            def sample_chunk(
+                tt,
+                zt,
+                _ac=_audio_cat,
+                _rc=_ref_cat,
+                _ec=_emotion_cat,
+                _pxc=_prev_x_cat,
+                _pwc=_prev_wa_cat,
+            ):
                 out = self.fmt.forward_with_cfv(
                     t=tt.unsqueeze(0),
                     x=zt,
@@ -1328,7 +1424,9 @@ class FLOAT(BaseModel, StreamingVideoSaver):
 
             # solve ODE
             if odeint is None:
-                raise ImportError("torchdiffeq is required for ODE sampling. Install with: pip install torchdiffeq")
+                raise ImportError(
+                    "torchdiffeq is required for ODE sampling. Install with: pip install torchdiffeq"
+                )
             trajectory_t = odeint(sample_chunk, x0, time, **self.odeint_kwargs)
             sample_t = trajectory_t[-1]
 
@@ -1342,16 +1440,8 @@ class FLOAT(BaseModel, StreamingVideoSaver):
             decoded_length += samples_len
 
             # Add reference and yield chunk
-            s_r_b = (
-                s_r.unsqueeze(1)
-                if (s_r is not None and s_r.ndim == 2)
-                else s_r
-            )
-            s_r_d_t = (
-                (s_r_b + sample_t_trim)
-                if s_r_b is not None
-                else sample_t_trim
-            )
+            s_r_b = s_r.unsqueeze(1) if (s_r is not None and s_r.ndim == 2) else s_r
+            s_r_d_t = (s_r_b + sample_t_trim) if s_r_b is not None else sample_t_trim
             if B == 1:
                 yield s_r_d_t.squeeze(0)  # [T, dim_w]
             else:
@@ -1428,13 +1518,10 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         gpu_ctx = []
         for dev in devs:
             ae = self._get_ae(dev, primary)
-            is_prim = (
-                dev == primary
-                or (
-                    dev.index is not None
-                    and primary.index is not None
-                    and dev.index == primary.index
-                )
+            is_prim = dev == primary or (
+                dev.index is not None
+                and primary.index is not None
+                and dev.index == primary.index
             )
             if is_prim:
                 feats = s_r_feats
@@ -1447,7 +1534,8 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                 feats = [f.to(dev) for f in s_r_feats]
             if is_prim:
                 prim_streams = [
-                    st for st in (self.stream_decode, self.stream_decode_2)
+                    st
+                    for st in (self.stream_decode, self.stream_decode_2)
                     if st is not None
                 ]
                 if not prim_streams and torch.cuda.is_available():
@@ -1456,9 +1544,7 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                     gpu_ctx.append((dev, ae, feats, st))
             else:
                 st = (
-                    torch.cuda.Stream(device=dev)
-                    if torch.cuda.is_available()
-                    else None
+                    torch.cuda.Stream(device=dev) if torch.cuda.is_available() else None
                 )
                 gpu_ctx.append((dev, ae, feats, st))
 
@@ -1573,7 +1659,9 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                 if seq == "ERROR":
                     if prod_error:
                         err, tb = prod_error[0]
-                        raise RuntimeError(f"Error in sampling producer thread:\n{tb}") from err
+                        raise RuntimeError(
+                            f"Error in sampling producer thread:\n{tb}"
+                        ) from err
                     raise RuntimeError("Error in sampling producer thread")
 
                 if seq is None or frame_latent is None:
@@ -1709,7 +1797,6 @@ class AudioEncoder(BaseModel):
         self.num_frames_for_clip = int(opt.wav2vec_sec * self.opt.fps)
         self.num_prev_frames = int(opt.num_prev_frames)
         if os.path.exists(opt.wav2vec_model_path):
-
             self.wav2vec2 = Wav2VecModel.from_pretrained(
                 opt.wav2vec_model_path, local_files_only=True
             )
