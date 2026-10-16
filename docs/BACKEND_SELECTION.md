@@ -166,6 +166,14 @@ and `fast_float/onnx/dispatch.py` (`apply_backends`).
   A missing artifact still can't break startup — construction raises and is
   caught, logging a warning and leaving the component `eager`. ORT provider
   fallback (`trt → cuda → cpu`) happens *inside* `make_ort_session`.
+- **TensorRT profiles are built automatically at runtime**, not read from the
+  config: every ONNX runner goes through `export.make_runtime_session`, which
+  hands the dynamic-shape graph representative TRT profiles (derived from each
+  component's deployment shapes) so the TensorRT EP can build an engine and
+  engage without a per-component hand-tuned profile. Without profiles TRT
+  silently drops to the CUDA EP. The config `provider` key stays **advisory**
+  (what won, for logging/health) — it does not gate provider selection.
+  `max_batch` defaults to `$FLOAT_TRT_MAX_BATCH` (16).
 - `FLOAT_DISABLE_BACKENDS=1` disables the whole dispatch pass.
 
 ## Runtime overrides

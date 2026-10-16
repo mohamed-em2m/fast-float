@@ -59,7 +59,12 @@ class AudioEncoder(BaseModel):
             try:
                 from fast_float.onnx.runtime import Wav2vecOnnxBackend
 
-                backend = Wav2vecOnnxBackend(onnx_path)
+                feat_frames = self.num_frames_for_clip + self.num_prev_frames
+                backend = Wav2vecOnnxBackend(
+                    onnx_path,
+                    opt_shapes={"conv_feats": [1, feat_frames, 512]},
+                    extra_dynamic={"conv_feats": {1: (10, 2000)}},
+                )
                 if backend.out_dim is not None and backend.out_dim != opt.dim_w:
                     raise ValueError(f"ONNX out_dim={backend.out_dim} != dim_w={opt.dim_w}")
                 self._onnx_backend = backend
@@ -164,7 +169,12 @@ class Audio2Emotion(nn.Module):
             try:
                 from fast_float.onnx.runtime import EmotionOnnxBackend
 
-                self._onnx_backend = EmotionOnnxBackend(onnx_path)
+                emo_len = int(16000 * 3.0)
+                self._onnx_backend = EmotionOnnxBackend(
+                    onnx_path,
+                    opt_shapes={"input_values": [1, emo_len]},
+                    extra_dynamic={"input_values": {1: (16000, 160000)}},
+                )
                 logger.info(f"Audio2Emotion: using ONNX backend {onnx_path} (providers={self._onnx_backend.providers})")
             except Exception as e:
                 logger.warning(f"Audio2Emotion: ONNX backend failed ({e}); falling back to torch weights")

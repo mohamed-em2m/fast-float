@@ -19,6 +19,7 @@ from fast_float.onnx.export import (
     export_module,
     fp16_tol,
     make_ort_session,
+    make_runtime_session,
     make_session_from_args,
     trt_optimization_profiles,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "fp16_tol",
     "load_backends",
     "make_ort_session",
+    "make_runtime_session",
     "make_session_from_args",
     "save_backends",
     "trt_optimization_profiles",

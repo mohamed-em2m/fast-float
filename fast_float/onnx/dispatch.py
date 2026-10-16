@@ -36,7 +36,7 @@ import torch
 import torch.nn as nn
 
 from fast_float.onnx.backends import resolve_mode
-from fast_float.onnx.export import make_ort_session
+from fast_float.onnx.export import make_runtime_session
 from fast_float.onnx.parity import compare_outputs
 
 logger = logging.getLogger(__name__)
@@ -96,15 +96,29 @@ class _OnnxRunner(nn.Module):
     the hot path never pays repeated exception costs).
     """
 
-    def __init__(self, onnx_path: str, use_gpu: bool | None = None):
+    def __init__(
+        self,
+        onnx_path: str,
+        use_gpu: bool | None = None,
+        opt_shapes: dict | None = None,
+        extra_dynamic: dict | None = None,
+        max_batch: int | None = None,
+    ):
         super().__init__()
         if not os.path.exists(onnx_path):
             raise FileNotFoundError(f"ONNX not found: {onnx_path}")
-        if use_gpu is None:
-            use_gpu = torch.cuda.is_available()
-        self.use_gpu = bool(use_gpu)
+        self.use_gpu = torch.cuda.is_available() if use_gpu is None else bool(use_gpu)
         self.path = os.path.abspath(onnx_path)
-        self.session = make_ort_session(self.path, use_gpu=self.use_gpu)
+        self._opt_shapes = opt_shapes
+        self._extra_dynamic = extra_dynamic
+        self._max_batch = max_batch
+        self.session, _ = make_runtime_session(
+            self.path,
+            opt_shapes=opt_shapes,
+            extra_dynamic=extra_dynamic,
+            max_batch=max_batch,
+            use_gpu=self.use_gpu,
+        )
         self._io_failed = False
 
     @property
@@ -156,8 +170,21 @@ class _OnnxRunner(nn.Module):
 class DirectionOnnx(_OnnxRunner):
     """``x [B, M] -> dir [B, 512]`` (dynamic batch)."""
 
-    def __init__(self, onnx_path: str, use_gpu: bool | None = None):
-        super().__init__(onnx_path, use_gpu=use_gpu)
+    def __init__(
+        self,
+        onnx_path: str,
+        use_gpu: bool | None = None,
+        opt_shapes: dict | None = None,
+        extra_dynamic: dict | None = None,
+        max_batch: int | None = None,
+    ):
+        super().__init__(
+            onnx_path,
+            use_gpu=use_gpu,
+            opt_shapes=opt_shapes,
+            extra_dynamic=extra_dynamic,
+            max_batch=max_batch,
+        )
         self.input_name = self.session.get_inputs()[0].name
         out = self.session.get_outputs()[0]
         self.output_name = out.name
@@ -165,7 +192,13 @@ class DirectionOnnx(_OnnxRunner):
         self.output_dim = shape[-1] if shape and isinstance(shape[-1], int) else None
 
     def _recreate(self):
-        return DirectionOnnx(self.path, use_gpu=self.use_gpu)
+        return DirectionOnnx(
+            self.path,
+            use_gpu=self.use_gpu,
+            opt_shapes=self._opt_shapes,
+            extra_dynamic=self._extra_dynamic,
+            max_batch=self._max_batch,
+        )
 
     def _io_shapes(self, b: int):
         if self.output_dim is None:
@@ -208,8 +241,17 @@ class RefEncOnnx(_OnnxRunner):
         fc: nn.Module,
         use_gpu: bool | None = None,
         torch_fallback=None,
+        opt_shapes: dict | None = None,
+        extra_dynamic: dict | None = None,
+        max_batch: int | None = None,
     ):
-        super().__init__(onnx_path, use_gpu=use_gpu)
+        super().__init__(
+            onnx_path,
+            use_gpu=use_gpu,
+            opt_shapes=opt_shapes,
+            extra_dynamic=extra_dynamic,
+            max_batch=max_batch,
+        )
         self.fc = fc
         self._torch_fallback = torch_fallback
         self.input_name = self.session.get_inputs()[0].name
@@ -220,6 +262,9 @@ class RefEncOnnx(_OnnxRunner):
             copy.deepcopy(self.fc),
             use_gpu=self.use_gpu,
             torch_fallback=(copy.deepcopy(self._torch_fallback) if self._torch_fallback is not None else None),
+            opt_shapes=self._opt_shapes,
+            extra_dynamic=self._extra_dynamic,
+            max_batch=self._max_batch,
         )
 
     def _io_shapes(self, b: int):
@@ -269,8 +314,21 @@ class DecoderOnnx(_OnnxRunner):
     (replicate) and trims the output back to ``m``.
     """
 
-    def __init__(self, onnx_path: str, use_gpu: bool | None = None):
-        super().__init__(onnx_path, use_gpu=use_gpu)
+    def __init__(
+        self,
+        onnx_path: str,
+        use_gpu: bool | None = None,
+        opt_shapes: dict | None = None,
+        extra_dynamic: dict | None = None,
+        max_batch: int | None = None,
+    ):
+        super().__init__(
+            onnx_path,
+            use_gpu=use_gpu,
+            opt_shapes=opt_shapes,
+            extra_dynamic=extra_dynamic,
+            max_batch=max_batch,
+        )
         ins = self.session.get_inputs()
         self.latent_name = ins[0].name
         self.feat_names = [i.name for i in ins[1:]]
@@ -283,7 +341,13 @@ class DecoderOnnx(_OnnxRunner):
         self.output_shape = out_shape if len(out_shape) == 4 and all(isinstance(d, int) for d in out_shape) else None
 
     def _recreate(self):
-        return DecoderOnnx(self.path, use_gpu=self.use_gpu)
+        return DecoderOnnx(
+            self.path,
+            use_gpu=self.use_gpu,
+            opt_shapes=self._opt_shapes,
+            extra_dynamic=self._extra_dynamic,
+            max_batch=self._max_batch,
+        )
 
     def _io_shapes(self):
         if self.output_shape is None:
@@ -417,7 +481,8 @@ def _apply_direction(model, ae, opt) -> None:
     try:
         # No automatic parity probe: the converter/selector scripts validate;
         # the config is the contract.
-        runner = DirectionOnnx(path)
+        motion_dim = int(target.weight.shape[1])
+        runner = DirectionOnnx(path, opt_shapes={"x": [1, motion_dim]})
         ae.dec.direction = runner
         logger.info(f"backends: direction -> ONNX {path} ({runner.providers})")
     except Exception as e:
@@ -442,7 +507,13 @@ def _apply_refenc(model, ae, opt) -> None:
     try:
         # The original encoder stays owned by the runner (single residency):
         # it serves .fc and the non-deployed 3-arg path.
-        runner = RefEncOnnx(path, enc.fc, torch_fallback=enc)
+        size = _image_size(opt)
+        runner = RefEncOnnx(
+            path,
+            enc.fc,
+            torch_fallback=enc,
+            opt_shapes={"img": [1, 3, size, size]},
+        )
         ae.enc = runner
         logger.info(f"backends: refenc -> ONNX {path} ({runner.providers})")
     except Exception as e:

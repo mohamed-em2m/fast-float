@@ -313,7 +313,20 @@ class FlowMatchingTransformer(BaseModel):
             try:
                 from fast_float.onnx.runtime import FMTStepBackend
 
-                self._onnx_backend = FMTStepBackend(onnx_path)
+                n_clip = int(self.opt.wav2vec_sec * self.opt.fps)
+                n_prev = int(self.opt.num_prev_frames)
+                dim_w = int(self.opt.dim_w)
+                self._onnx_backend = FMTStepBackend(
+                    onnx_path,
+                    opt_shapes={
+                        "x": [1, n_clip, dim_w],
+                        "wa": [1, n_clip, dim_w],
+                        "wr": [1, 1, dim_w],
+                        "we": [1, 1, 7],
+                        "prev_x": [1, n_prev, dim_w],
+                        "prev_wa": [1, n_prev, dim_w],
+                    },
+                )
                 logger.info(
                     f"FlowMatchingTransformer: ONNX backend constructed {onnx_path} "
                     f"(providers={self._onnx_backend.providers})"

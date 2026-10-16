@@ -389,6 +389,55 @@ def make_session_from_args(onnx_path: str, args, opt_shapes=None, extra_dynamic=
     return sess, fp16
 
 
+def make_runtime_session(
+    onnx_path: str,
+    opt_shapes: dict[str, Sequence[int]] | None = None,
+    extra_dynamic: dict[str, dict[int, tuple[int, int]]] | None = None,
+    min_batch: int = 1,
+    max_batch: int | None = None,
+    use_gpu: bool | None = None,
+    fp16: bool = True,
+):
+    """ORT session for a *runtime* component with automatic TensorRT profiles.
+
+    Runtime ONNX backends get the same ``TRT -> CUDA -> CPU`` chain the
+    converters use, so TensorRT engages automatically when its libraries load.
+    TensorRT can only build an engine for a *dynamic-shape* graph once it is
+    handed shape profiles, so ``opt_shapes`` maps every dynamic input to a
+    representative shape: batch (dim 0) is ranged over ``[min_batch, max_batch]``
+    while each other dim is frozen to its representative value unless ranged via
+    ``extra_dynamic={name: {dim: (lo, hi)}}``. Static graphs (the decoder) pass
+    ``None`` and need no profiles.
+
+    ``max_batch`` defaults to ``$FLOAT_TRT_MAX_BATCH`` (or 16). Returns
+    ``(session, fp16_active)``; ``fp16_active`` is True only when the TensorRT
+    EP is actually on. Never raises for GPU setup -- the CUDA/CPU fallback lives
+    inside :func:`make_ort_session`.
+    """
+    if use_gpu is None:
+        use_gpu = torch.cuda.is_available()
+    if max_batch is None:
+        max_batch = int(os.environ.get("FLOAT_TRT_MAX_BATCH", "16"))
+    mn = op = mx = None
+    if use_gpu and opt_shapes:
+        mn, op, mx = trt_optimization_profiles(
+            opt_shapes,
+            min_batch=min_batch,
+            max_batch=max_batch,
+            extra=extra_dynamic,
+        )
+    sess = make_ort_session(
+        onnx_path,
+        use_gpu=use_gpu,
+        use_trt=use_gpu,
+        trt_fp16=fp16,
+        trt_min_shapes=mn,
+        trt_opt_shapes=op,
+        trt_max_shapes=mx,
+    )
+    return sess, ("TensorrtExecutionProvider" in sess.get_providers())
+
+
 def fp16_tol(base: float, fp16: bool, factor: float = 40.0) -> float:
     """Relax a parity tolerance when TensorRT runs in FP16 (tensor cores
     trade ~1e-3 relative precision for speed; FP32 keeps the strict gate)."""

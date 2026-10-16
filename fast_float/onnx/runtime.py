@@ -14,7 +14,7 @@ import os
 
 import torch
 
-from fast_float.onnx.export import make_ort_session, run_ort_iobinding
+from fast_float.onnx.export import make_runtime_session, run_ort_iobinding
 
 LABELS = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
 
@@ -60,13 +60,24 @@ class EmotionOnnxBackend:
     symbolic batch/length, so one ``sess.run`` covers any ``[B, L]``.
     """
 
-    def __init__(self, onnx_path: str, use_gpu: bool | None = None):
+    def __init__(
+        self,
+        onnx_path: str,
+        use_gpu: bool | None = None,
+        opt_shapes: dict | None = None,
+        extra_dynamic: dict | None = None,
+        max_batch: int | None = None,
+    ):
         if not os.path.exists(onnx_path):
             raise FileNotFoundError(f"emotion ONNX not found: {onnx_path}")
-        if use_gpu is None:
-            use_gpu = torch.cuda.is_available()
         self.path = os.path.abspath(onnx_path)
-        self.session = make_ort_session(self.path, use_gpu=use_gpu)
+        self.session, _ = make_runtime_session(
+            self.path,
+            opt_shapes=opt_shapes,
+            extra_dynamic=extra_dynamic,
+            max_batch=max_batch,
+            use_gpu=use_gpu,
+        )
         self.input_name = self.session.get_inputs()[0].name
         out = self.session.get_outputs()[0]
         self.output_name = out.name
@@ -119,13 +130,24 @@ class Wav2vecOnnxBackend:
     so training paths must keep using the torch module.
     """
 
-    def __init__(self, onnx_path: str, use_gpu: bool | None = None):
+    def __init__(
+        self,
+        onnx_path: str,
+        use_gpu: bool | None = None,
+        opt_shapes: dict | None = None,
+        extra_dynamic: dict | None = None,
+        max_batch: int | None = None,
+    ):
         if not os.path.exists(onnx_path):
             raise FileNotFoundError(f"wav2vec ONNX not found: {onnx_path}")
-        if use_gpu is None:
-            use_gpu = torch.cuda.is_available()
         self.path = os.path.abspath(onnx_path)
-        self.session = make_ort_session(self.path, use_gpu=use_gpu)
+        self.session, _ = make_runtime_session(
+            self.path,
+            opt_shapes=opt_shapes,
+            extra_dynamic=extra_dynamic,
+            max_batch=max_batch,
+            use_gpu=use_gpu,
+        )
         self.input_name = self.session.get_inputs()[0].name
         out = self.session.get_outputs()[0]
         self.output_name = out.name
@@ -197,13 +219,24 @@ class FMTStepBackend:
 
     INPUTS = ("t", "x", "wa", "wr", "we", "prev_x", "prev_wa")
 
-    def __init__(self, onnx_path: str, use_gpu: bool | None = None):
+    def __init__(
+        self,
+        onnx_path: str,
+        use_gpu: bool | None = None,
+        opt_shapes: dict | None = None,
+        extra_dynamic: dict | None = None,
+        max_batch: int | None = None,
+    ):
         if not os.path.exists(onnx_path):
             raise FileNotFoundError(f"fmt ONNX not found: {onnx_path}")
-        if use_gpu is None:
-            use_gpu = torch.cuda.is_available()
         self.path = os.path.abspath(onnx_path)
-        self.session = make_ort_session(self.path, use_gpu=use_gpu)
+        self.session, _ = make_runtime_session(
+            self.path,
+            opt_shapes=opt_shapes,
+            extra_dynamic=extra_dynamic,
+            max_batch=max_batch,
+            use_gpu=use_gpu,
+        )
         out = self.session.get_outputs()[0]
         self.output_name = out.name
         shape = tuple(out.shape or ())
