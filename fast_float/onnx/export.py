@@ -150,6 +150,31 @@ def trt_optimization_profiles(opt_shapes, min_batch=1, max_batch=None, extra=Non
     return mn, op, mx
 
 
+def _trt_libs_loadable() -> bool:
+    """True only when ORT's TensorRT EP shared library can actually load.
+
+    ``ort.get_available_providers()`` advertises ``TensorrtExecutionProvider``
+    even when ``libnvinfer`` is absent (it is compiled into onnxruntime-gpu).
+    ORT then fails provider init and — crucially — silently degrades the
+    *entire* session to ``CPUExecutionProvider``, discarding the CUDA EP too.
+    Loading the library up front avoids that and the EP-error log spew.
+    """
+    import ctypes
+
+    for soname in (
+        "libnvinfer.so",
+        "libnvinfer.so.10",
+        "libnvinfer.so.9",
+        "libnvinfer.so.8",
+    ):
+        try:
+            ctypes.CDLL(soname)
+            return True
+        except OSError:
+            continue
+    return False
+
+
 def _trt_provider_options(
     fp16, cache_dir, min_shapes, opt_shapes, max_shapes, workspace_gb=2.0
 ):
@@ -214,8 +239,14 @@ def make_ort_session(
     available = set(ort.get_available_providers())
     if trt_cache_dir is None:
         trt_cache_dir = os.path.join(os.path.dirname(abs_path), "trt_cache")
+    trt_listed = "TensorrtExecutionProvider" in available
+    used_trt = use_trt and trt_listed and _trt_libs_loadable()
+    if use_gpu and use_trt and trt_listed and not used_trt:
+        print(
+            "[ort] NOTE: TensorRT EP is listed but libnvinfer is not loadable "
+            "(pip install tensorrt, or set LD_LIBRARY_PATH) — using the CUDA EP."
+        )
     gpu_providers = []
-    used_trt = use_trt and "TensorrtExecutionProvider" in available
     if use_gpu:
         if used_trt:
             gpu_providers.append(
@@ -237,36 +268,61 @@ def make_ort_session(
             f"(available={sorted(available)}). Install onnxruntime-gpu "
             "matching this box's CUDA instead of plain onnxruntime."
         )
-    if use_gpu and use_trt and not used_trt:
+    if use_gpu and use_trt and not trt_listed:
         print(
             "[ort] NOTE: TensorRT EP not available "
-            f"(available={sorted(available)}); using CUDA EP. Install "
+            f"(available={sorted(available)}); using the CUDA EP. Install "
             "tensorrt / libnvinfer for TRT."
         )
-    sess_opts = ort.SessionOptions()
-    sess = None
-    if gpu_providers:
-        try:
-            sess = ort.InferenceSession(
-                abs_path,
-                sess_options=sess_opts,
-                providers=gpu_providers + ["CPUExecutionProvider"],
-            )
-        except Exception as e:
-            if require_gpu:
-                raise
-            print(f"[ort] WARNING: GPU provider session creation failed ({e}); falling back to CPU")
-    if sess is None:
-        sess = ort.InferenceSession(
+
+    def _new_session(provs):
+        return ort.InferenceSession(
             abs_path,
-            sess_options=sess_opts,
-            providers=["CPUExecutionProvider"],
+            sess_options=ort.SessionOptions(),
+            providers=list(provs) + ["CPUExecutionProvider"],
         )
+
+    def _on_gpu(s):
+        active = s.get_providers()
+        return bool(active) and active[0] != "CPUExecutionProvider"
+
+    # Candidate GPU chains, most-preferred first. A TensorRT build without
+    # libnvinfer (or without matching shape profiles) makes ORT silently drop
+    # ALL GPU providers — so we always keep a CUDA-only retry.
+    attempts = []
+    if gpu_providers:
+        attempts.append(gpu_providers)
+    cuda_only = [p for p in gpu_providers if p[0] == "CUDAExecutionProvider"]
+    if used_trt and cuda_only:
+        attempts.append(cuda_only)
+
+    sess = None
+    for provs in attempts:
+        try:
+            candidate = _new_session(provs)
+        except Exception as e:
+            print(f"[ort] WARNING: GPU provider session creation raised ({e})")
+            continue
+        if _on_gpu(candidate):
+            sess = candidate
+            break
+        # Session came back CPU-only: ORT swallowed a provider-load failure.
+        requested_trt = any(p[0] == "TensorrtExecutionProvider" for p in provs)
+        if requested_trt:
+            print("[ort] NOTE: TensorRT EP failed to initialize — retrying with the CUDA EP.")
+        else:
+            print("[ort] WARNING: GPU execution providers did not initialize.")
+    if sess is None:
+        if use_gpu and require_gpu:
+            raise RuntimeError(
+                "GPU requested but the ORT session fell back to CPU "
+                f"(available={sorted(available)})."
+            )
+        sess = _new_session([])
     active = sess.get_providers()
-    print(
-        f"[ort] providers={active} "
-        f"(trt={'fp16' if trt_fp16 else 'fp32'}/off)"
-    )
+    trt_active = "TensorrtExecutionProvider" in active
+    trt_label = ("fp16" if trt_fp16 else "fp32") if trt_active else "off"
+    print(f"[ort] providers={active} (trt={trt_label})")
     if use_gpu and (not active or active[0] == "CPUExecutionProvider"):
         print(
             f"[ort] WARNING: session runs on CPU (active={active}, "
