@@ -30,7 +30,12 @@ if str(REPO_ROOT) not in sys.path:
 from fast_float.models.wav2vec2_ser import (  # noqa: E402
     Wav2Vec2ForSpeechClassification,
 )
-from fast_float.onnx.export import export_module, make_ort_session  # noqa: E402
+from fast_float.onnx.export import (  # noqa: E402
+    add_ort_args,
+    export_module,
+    fp16_tol,
+    make_session_from_args,
+)
 from fast_float.onnx.parity import check_parity  # noqa: E402
 
 EMOTION_PREFIX = "emotion_encoder.wav2vec2_for_emotion."
@@ -170,8 +175,7 @@ def main(argv=None) -> int:
     ap.add_argument("--skip-parity", action="store_true")
     ap.add_argument("--bench-iters", type=int, default=30,
                     help="warmed benchmark iters per probe (0 = skip)")
-    ap.add_argument("--cpu-ort", action="store_true",
-                    help="allow CPU ORT session on a CUDA box (dev only)")
+    add_ort_args(ap)
     args = ap.parse_args(argv)
 
     module = build_emotion_module(args.emo_dir, args.ckpt)
@@ -191,18 +195,20 @@ def main(argv=None) -> int:
         print(f"[export] note: {note}")
 
     if not args.skip_parity:
-        sess = make_ort_session(
-            info["path"],
-            use_gpu=torch.cuda.is_available() and not args.cpu_ort,
-            require_gpu=torch.cuda.is_available() and not args.cpu_ort,
+        sess, fp16 = make_session_from_args(
+            info["path"], args,
+            opt_shapes={"input_values": [1, int(16000 * args.seconds)]},
+            extra_dynamic={"input_values": {1: (16000, 160000)}},
         )
-        print(f"[ort] providers={sess.get_providers()}")
+        atol, rtol = fp16_tol(args.atol, fp16), fp16_tol(args.rtol, fp16)
+        if fp16:
+            print(f"[parity] TRT FP16 active -> relaxed tol atol={atol:g} rtol={rtol:g}")
         with torch.no_grad():
             probes = probe_inputs(args.seconds)
             for name, wav in probes.items():
                 ref = module(wav)
                 ort_out = sess.run(None, {"input_values": wav.numpy()})[0]
-                check_parity(ref, ort_out, name=name, atol=args.atol, rtol=args.rtol)
+                check_parity(ref, ort_out, name=name, atol=atol, rtol=rtol)
                 top = int(np.argmax(ort_out[0]))
                 print(f"[probe:{name}] torch_top={LABELS[int(np.argmax(ref.numpy()[0]))]} "
                       f"onnx_top={LABELS[top]}")
@@ -221,11 +227,11 @@ def main(argv=None) -> int:
             )  # [2, L]
             ref = module(batch_wav)
             ort_out = sess.run(None, {"input_values": batch_wav.numpy()})[0]
-            check_parity(ref, ort_out, name="batch2", atol=args.atol, rtol=args.rtol)
+            check_parity(ref, ort_out, name="batch2", atol=atol, rtol=rtol)
             short_wav = torch.randn(1, 16000).clamp(-1, 1)  # 1 s < trace length
             ref = module(short_wav)
             ort_out = sess.run(None, {"input_values": short_wav.numpy()})[0]
-            check_parity(ref, ort_out, name="short1s", atol=args.atol, rtol=args.rtol)
+            check_parity(ref, ort_out, name="short1s", atol=atol, rtol=rtol)
     print("[done] emotion converter OK")
     return 0
 

@@ -27,7 +27,12 @@ import torch.nn.functional as F
 
 from fast_float.models.float.generator import Generator
 from fast_float.models.float.styledecoder import ModulatedConv2d
-from fast_float.onnx.export import export_module, make_ort_session
+from fast_float.onnx.export import (
+    add_ort_args,
+    export_module,
+    fp16_tol,
+    make_session_from_args,
+)
 from fast_float.onnx.parity import benchmark, check_parity, compare_outputs
 
 AE_PREFIX = "motion_autoencoder."
@@ -224,7 +229,7 @@ def main(argv=None) -> int:
     ap.add_argument("--max-mean", type=float, default=0.05)
     ap.add_argument("--skip-parity", action="store_true")
     ap.add_argument("--bench-iters", type=int, default=10)
-    ap.add_argument("--cpu-ort", action="store_true")
+    add_ort_args(ap)
     args = ap.parse_args(argv)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -270,12 +275,11 @@ def main(argv=None) -> int:
     module.to(device)
 
     if not args.skip_parity:
-        sess = make_ort_session(
-            info["path"],
-            use_gpu=torch.cuda.is_available() and not args.cpu_ort,
-            require_gpu=torch.cuda.is_available() and not args.cpu_ort,
-        )
-        print(f"[ort] providers={sess.get_providers()}")
+        # Static batch -> fully static graph, no TRT shape profiles needed.
+        sess, fp16 = make_session_from_args(info["path"], args)
+        atol, rtol = fp16_tol(args.atol, fp16), fp16_tol(args.rtol, fp16)
+        min_cos = 0.995 if fp16 else args.min_cosine
+        max_mean = fp16_tol(args.max_mean, fp16)
         with torch.no_grad(), _deterministic_cudnn():
             g = torch.Generator(device="cpu").manual_seed(777)
             lat_t = torch.randn(b, 512, generator=g).to(device)
@@ -285,24 +289,27 @@ def main(argv=None) -> int:
                 "latent": lat_t.detach().cpu().numpy(),
                 **{n: f.detach().cpu().numpy() for n, f in zip(feat_names, feats_b)},
             })[0]
-            rep = compare_outputs(ref_img, ort_img, atol=args.atol, rtol=args.rtol)
-            cos_ok = rep["cosine"] >= args.min_cosine
-            mean_ok = rep["mean_abs"] <= args.max_mean
+            rep = compare_outputs(ref_img, ort_img, atol=atol, rtol=rtol)
+            cos_ok = rep["cosine"] >= min_cos
+            mean_ok = rep["mean_abs"] <= max_mean
             status = "PASS" if (rep["ok"] or (cos_ok and mean_ok)) else "FAIL"
             print(
                 f"[parity:dec_b{b}] {status} "
                 f"max_abs={rep['max_abs']:.3e} mean_abs={rep['mean_abs']:.3e} "
                 f"max_rel={rep['max_rel']:.3e} cosine={rep['cosine']:.6f} "
-                f"(atol={args.atol:g}, rtol={args.rtol:g})"
+                f"(atol={atol:g}, rtol={rtol:g})"
             )
             if not (rep["ok"] or (cos_ok and mean_ok)):
                 raise RuntimeError(
-                    f"decoder parity FAILED: cosine={rep['cosine']:.6f} (min={args.min_cosine}), "
-                    f"mean_abs={rep['mean_abs']:.3e} (max={args.max_mean})"
+                    f"decoder parity FAILED: cosine={rep['cosine']:.6f} (min={min_cos}), "
+                    f"mean_abs={rep['mean_abs']:.3e} (max={max_mean})"
                 )
             print(f"[parity:dec_b{b}] cosine OK ({rep['cosine']:.6f}) "
                   f"mean OK ({rep['mean_abs']:.3e})")
-            if args.bench_iters > 0:
+        # Bench OUTSIDE deterministic cuDNN so torch runs its deployed kernels
+        # (deterministic disables cuDNN autotuning and would inflate speedup).
+        if args.bench_iters > 0:
+            with torch.no_grad():
                 lat_np = lat_t.detach().cpu().numpy()
                 feats_np = {n: f.detach().cpu().numpy()
                             for n, f in zip(feat_names, feats_b)}

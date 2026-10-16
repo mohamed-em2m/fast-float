@@ -20,7 +20,12 @@ from collections import Counter
 import torch
 import torch.nn as nn
 
-from fast_float.onnx.export import export_module, make_ort_session
+from fast_float.onnx.export import (
+    add_ort_args,
+    export_module,
+    fp16_tol,
+    make_session_from_args,
+)
 from fast_float.onnx.parity import benchmark, check_parity
 
 AUDIO_PREFIX = "audio_encoder."
@@ -137,7 +142,7 @@ def main(argv=None) -> int:
     ap.add_argument("--rtol", type=float, default=2e-4)
     ap.add_argument("--skip-parity", action="store_true")
     ap.add_argument("--bench-iters", type=int, default=10)
-    ap.add_argument("--cpu-ort", action="store_true")
+    add_ort_args(ap)
     args = ap.parse_args(argv)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -198,12 +203,10 @@ def main(argv=None) -> int:
     module.to(device)
 
     if not args.skip_parity:
-        sess = make_ort_session(
-            info["path"],
-            use_gpu=torch.cuda.is_available() and not args.cpu_ort,
-            require_gpu=torch.cuda.is_available() and not args.cpu_ort,
+        sess, fp16 = make_session_from_args(
+            info["path"], args, opt_shapes={"waveform": [1, wav_len]},
         )
-        print(f"[ort] providers={sess.get_providers()}")
+        atol, rtol = fp16_tol(args.atol, fp16), fp16_tol(args.rtol, fp16)
         with torch.no_grad():
             for bi, b in enumerate(batches):
                 g = torch.Generator(device="cpu").manual_seed(500 + bi)
@@ -212,7 +215,7 @@ def main(argv=None) -> int:
                                           a, args.frames, args.sampling_rate, args.fps)
                 ort_out = sess.run(None, {"waveform": a.detach().cpu().numpy()})[0]
                 check_parity(ref, ort_out, name=f"audio_b{b}",
-                             atol=args.atol, rtol=args.rtol)
+                             atol=atol, rtol=rtol)
                 if args.bench_iters > 0:
                     a_np = a.detach().cpu().numpy()
                     benchmark(

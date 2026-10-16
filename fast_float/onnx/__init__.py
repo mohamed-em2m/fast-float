@@ -5,7 +5,14 @@ and shares :mod:`fast_float.onnx.export` (dynamo-first export) and
 :mod:`fast_float.onnx.parity` (torch-vs-ORT checks).
 """
 
-from fast_float.onnx.export import export_module, make_ort_session
+from fast_float.onnx.export import (
+    add_ort_args,
+    export_module,
+    fp16_tol,
+    make_ort_session,
+    make_session_from_args,
+    trt_optimization_profiles,
+)
 from fast_float.onnx.parity import check_parity
 from fast_float.onnx.runtime import (
     EmotionOnnxBackend,
@@ -16,6 +23,10 @@ from fast_float.onnx.runtime import (
 __all__ = [
     "export_module",
     "make_ort_session",
+    "make_session_from_args",
+    "add_ort_args",
+    "trt_optimization_profiles",
+    "fp16_tol",
     "check_parity",
     "EmotionOnnxBackend",
     "Wav2vecOnnxBackend",

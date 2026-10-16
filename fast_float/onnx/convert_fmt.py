@@ -38,7 +38,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from fast_float.models.float.FMT import FlowMatchingTransformer  # noqa: E402
-from fast_float.onnx.export import export_module, make_ort_session  # noqa: E402
+from fast_float.onnx.export import (  # noqa: E402
+    add_ort_args,
+    export_module,
+    fp16_tol,
+    make_session_from_args,
+)
 from fast_float.onnx.parity import check_parity  # noqa: E402
 
 FMT_PREFIX = "fmt."
@@ -139,8 +144,7 @@ def main(argv=None) -> int:
     ap.add_argument("--skip-parity", action="store_true")
     ap.add_argument("--bench-iters", type=int, default=30,
                     help="warmed benchmark iters on the CFG case (0 = skip)")
-    ap.add_argument("--cpu-ort", action="store_true",
-                    help="allow CPU ORT session on a CUDA box (dev only)")
+    add_ort_args(ap)
     args = ap.parse_args(argv)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -174,12 +178,16 @@ def main(argv=None) -> int:
         print(f"[export] note: {note}")
 
     if not args.skip_parity:
-        sess = make_ort_session(
-            info["path"],
-            use_gpu=(device == "cuda") and not args.cpu_ort,
-            require_gpu=(device == "cuda") and not args.cpu_ort,
+        sess, fp16 = make_session_from_args(
+            info["path"], args,
+            opt_shapes={
+                "x": [1, CLIP_FRAMES, 512], "wa": [1, CLIP_FRAMES, 512],
+                "wr": [1, 1, 512], "we": [1, 1, 7],
+                "prev_x": [1, PREV_FRAMES, 512],
+                "prev_wa": [1, PREV_FRAMES, 512],
+            },
         )
-        print(f"[ort] providers={sess.get_providers()}")
+        atol, rtol = fp16_tol(args.atol, fp16), fp16_tol(args.rtol, fp16)
         names = ["t", "x", "wa", "wr", "we", "prev_x", "prev_wa"]
         with torch.no_grad():
             # B=1 (plain call) and B=3 (CFG call), t across the trajectory.
@@ -195,7 +203,7 @@ def main(argv=None) -> int:
                 ref = module(*args_in)
                 feed = {k: v.cpu().numpy() for k, v in zip(names, args_in)}
                 ort_out = sess.run(None, feed)[0]
-                check_parity(ref, ort_out, name=name, atol=args.atol, rtol=args.rtol)
+                check_parity(ref, ort_out, name=name, atol=atol, rtol=rtol)
                 print(f"[probe:{name}] shape torch={tuple(ref.shape)} "
                       f"onnx={tuple(ort_out.shape)}")
             if args.bench_iters > 0:

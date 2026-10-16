@@ -27,6 +27,10 @@ W2V_DIR="${W2V_DIR:-./checkpoints/wav2vec2-base-960h}"
 # count T. Runtime must pad/trim to these (documented in the converters).
 DEC_BATCH="${DEC_BATCH:-8}"
 AUDIO_FRAMES="${AUDIO_FRAMES:-300}"
+# Extra flags forwarded to every converter, e.g. ORT_ARGS="--no-trt" to force
+# the CUDA EP, ORT_ARGS="--trt-fp32" for FP32 TensorRT, or
+# ORT_ARGS="--trt-max-batch 16". Default: TensorRT FP16 engine-cached.
+ORT_ARGS="${ORT_ARGS:-}"
 mkdir -p "${OUT_DIR}" checkpoints
 
 echo "=== [1/8] weights ==="
@@ -68,6 +72,15 @@ ok = (not torch.cuda.is_available()
       or 'CUDAExecutionProvider' in o.get_available_providers())
 sys.exit(0 if ok else 1)" 2>/dev/null
 }
+probe_trt() {
+  python -c "
+import sys
+import torch
+import onnxruntime as o
+ok = (not torch.cuda.is_available()
+      or 'TensorrtExecutionProvider' in o.get_available_providers())
+sys.exit(0 if ok else 1)" 2>/dev/null
+}
 probe_stack() { probe_onnx && probe_ort_cuda; }
 onnx_rt_pkg() {
   # onnxruntime>=1.24 dropped cp310 wheels; the box runs CPython 3.10.
@@ -94,6 +107,23 @@ for p in ('onnx','onnxscript','onnx-ir','onnxruntime','onnxruntime-gpu'):
     except Exception: print(' ', p, 'MISSING')"
 probe_stack || { echo "ERROR: onnx stack still broken — export cannot run"; exit 1; }
 
+echo "=== [2.5/8] tensorRT probe ==="
+if [ "$(python -c 'import torch;print(torch.cuda.is_available())' 2>/dev/null)" = "True" ]; then
+  if probe_trt; then
+    echo "TensorRT EP available (engines cached under ${OUT_DIR}/trt_cache)"
+  else
+    echo "TensorRT EP NOT available -> attempting best-effort 'pip install tensorrt'"
+    pip install -q tensorrt 2>/dev/null || true
+    if probe_trt; then
+      echo "TensorRT EP now available"
+    else
+      echo "WARN: TensorRT still unavailable — units fall back to the CUDA EP"
+    fi
+  fi
+else
+  echo "no CUDA on this box — skipping TensorRT"
+fi
+
 
 # Per-unit runner: captures output, records PASS/FAIL, never aborts other units.
 UNIT_RESULTS=()
@@ -114,28 +144,28 @@ set +e
 
 run_unit "[3/8] convert: emotion (unit 1)" \
   python -m fast_float.onnx.convert_emotion \
-    --ckpt "${CKPT}" --emo-dir "${EMO_DIR}" --out "${EMO_OUT}" "$@"
+    --ckpt "${CKPT}" --emo-dir "${EMO_DIR}" --out "${EMO_OUT}" "$@" ${ORT_ARGS}
 
 run_unit "[4/8] convert: fmt step (unit 2)" \
   python -m fast_float.onnx.convert_fmt \
-    --ckpt "${CKPT}" --out "${FMT_OUT}"
+    --ckpt "${CKPT}" --out "${FMT_OUT}" ${ORT_ARGS}
 
 run_unit "[5/8] convert: direction (unit 3)" \
   python -m fast_float.onnx.convert_direction \
-    --ckpt "${CKPT}" --out "${DIR_OUT}"
+    --ckpt "${CKPT}" --out "${DIR_OUT}" ${ORT_ARGS}
 
 run_unit "[6/8] convert: audio encoder (unit 4)" \
   python -m fast_float.onnx.convert_audio \
     --ckpt "${CKPT}" --w2v-dir "${W2V_DIR}" --out "${AUDIO_OUT}" \
-    --frames "${AUDIO_FRAMES}"
+    --frames "${AUDIO_FRAMES}" ${ORT_ARGS}
 
 run_unit "[7/8] convert: frame decoder (unit 5)" \
   python -m fast_float.onnx.convert_decoder \
-    --ckpt "${CKPT}" --out "${DEC_OUT}" --batch "${DEC_BATCH}"
+    --ckpt "${CKPT}" --out "${DEC_OUT}" --batch "${DEC_BATCH}" ${ORT_ARGS}
 
 run_unit "[8/8] convert: reference encoder (unit 6)" \
   python -m fast_float.onnx.convert_refenc \
-    --ckpt "${CKPT}" --out "${REF_OUT}"
+    --ckpt "${CKPT}" --out "${REF_OUT}" ${ORT_ARGS}
 
 set -e
 
