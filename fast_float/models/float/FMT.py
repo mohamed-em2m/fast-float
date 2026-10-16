@@ -326,8 +326,15 @@ class FlowMatchingTransformer(BaseModel):
         # match the export after the deploy checkpoint is loaded.
         self._onnx_backend = None
         self._onnx_probed = False
+        self._compiled = None
+        try:
+            from fast_float.onnx.backends import resolve_mode
+
+            self._mode = resolve_mode("fmt")
+        except Exception:
+            self._mode = "eager"
         onnx_path = getattr(opt, "fmt_onnx_path", "./onnx/fmt_step_v1.onnx")
-        if onnx_path and os.path.exists(onnx_path):
+        if self._mode == "onnx" and onnx_path and os.path.exists(onnx_path):
             try:
                 from fast_float.onnx.runtime import FMTStepBackend
 
@@ -406,6 +413,22 @@ class FlowMatchingTransformer(BaseModel):
                         "disabling backend for this run"
                     )
                     self._onnx_backend = None
+        if self._mode == "compile":
+            if self._compiled is None:
+                try:
+                    from fast_float.onnx.backends import maybe_compile
+
+                    self._compiled = maybe_compile(self, "fmt")
+                except Exception as e:
+                    logger.warning(
+                        f"FlowMatchingTransformer: torch.compile failed ({e}); "
+                        "using eager"
+                    )
+                    self._compiled = self
+            if self._compiled is not self:
+                return self._compiled(
+                    t, x, wa, wr, we, prev_x, prev_wa, train=False
+                )
         return self.forward(t, x, wa, wr, we, prev_x, prev_wa, train=False)
 
     def initialize_weights(self) -> None:

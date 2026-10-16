@@ -146,10 +146,29 @@ components:
     reason: "cold: once per request"
 ```
 
+## Runtime wiring
+
+Implemented in `fast_float/onnx/backends.py` (`resolve_mode`, `maybe_compile`)
+and `fast_float/onnx/dispatch.py` (`apply_backends`).
+
+- `OptimizedInferenceAgent` calls `apply_backends(self.G, self.opt)` right after
+  the checkpoint is loaded and the model is on its device, before the global
+  optimisation pass.
+- `emotion`, `audio`, `fmt` are config-gated in their own modules (the ONNX
+  backend is only built when the mode is `onnx`; `compile` wraps the torch body).
+- `direction`, `refenc`, `decoder` are substituted by `dispatch`:
+  `dec.direction` and `enc` (exposing `.fc`) are replaced, and `decoder` is
+  installed as `model._decoder_onnx` / `model._decoder_compiled` and consumed by
+  `FLOAT._decode_latent_batched` (static-batch pad/trim for ONNX).
+- **Self-test fallback**: every ONNX substitution runs an init-time parity check
+  against the torch module and silently falls back to `eager` on mismatch, so a
+  missing, stale or shape-incompatible artifact can never break inference.
+- `FLOAT_DISABLE_BACKENDS=1` disables the whole dispatch pass.
+
 ## Runtime overrides
 
 - `FLOAT_BACKENDS_CONFIG=<path>` — use a specific config file.
-- `FLOAT_MODE_<COMPONENT>=eager|compile|trt` — force one component (debug).
+- `FLOAT_MODE_<COMPONENT>=eager|compile|onnx` — force one component (debug).
 
 ## Open decisions
 

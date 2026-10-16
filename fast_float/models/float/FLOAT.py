@@ -971,6 +971,22 @@ class FLOAT(BaseModel, StreamingVideoSaver):
         except Exception:
             return 4
 
+    def _decode_call(self, ae, latent: torch.Tensor, feats: list) -> torch.Tensor:
+        """Route the decode call through the configured backend.
+
+        ``_decoder_onnx`` (static-batch ONNX) and ``_decoder_compiled`` are set
+        by ``fast_float.onnx.dispatch`` when the config selects them; otherwise
+        this is the plain ``ae.dec(latent, alpha=None, feats=...)`` path.
+        """
+        backend = getattr(self, "_decoder_onnx", None)
+        if backend is not None:
+            return backend(latent, feats)
+        dec = getattr(self, "_decoder_compiled", None) or ae.dec
+        out = dec(latent, alpha=None, feats=feats)
+        if isinstance(out, (tuple, list)):
+            out = out[0]
+        return out
+
     @torch.no_grad()
     def _decode_latent_batched(
         self,
@@ -1011,9 +1027,7 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                     f.expand(n_total, *f.shape[1:]) if mode == "broadcast" else f
                     for mode, f in aligned_feats
                 ]
-                out = ae.dec(r_d_flat, alpha=None, feats=chunk_feats)
-                if isinstance(out, (tuple, list)):
-                    out = out[0]
+                out = self._decode_call(ae, r_d_flat, chunk_feats)
                 return out.view(b_dim, t_dim, *out.shape[1:])
             else:
                 out_chunks = []
@@ -1024,9 +1038,7 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                         f.expand(m, *f.shape[1:]) if mode == "broadcast" else f[i : i + m]
                         for mode, f in aligned_feats
                     ]
-                    chunk_out = ae.dec(chunk_r_d, alpha=None, feats=chunk_feats)
-                    if isinstance(chunk_out, (tuple, list)):
-                        chunk_out = chunk_out[0]
+                    chunk_out = self._decode_call(ae, chunk_r_d, chunk_feats)
                     out_chunks.append(chunk_out)
                 out = torch.cat(out_chunks, dim=0)
                 return out.view(b_dim, t_dim, *out.shape[1:])
@@ -1054,9 +1066,7 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                     f.expand(n_total, *f.shape[1:]) if mode == "broadcast" else f
                     for mode, f in aligned_feats
                 ]
-                out = ae.dec(r_d, alpha=None, feats=chunk_feats)
-                if isinstance(out, (tuple, list)):
-                    out = out[0]
+                out = self._decode_call(ae, r_d, chunk_feats)
                 return out.squeeze(0) if is_1d else out
             else:
                 out_chunks = []
@@ -1067,9 +1077,7 @@ class FLOAT(BaseModel, StreamingVideoSaver):
                         f.expand(m, *f.shape[1:]) if mode == "broadcast" else f[i : i + m]
                         for mode, f in aligned_feats
                     ]
-                    chunk_out = ae.dec(chunk_r_d, alpha=None, feats=chunk_feats)
-                    if isinstance(chunk_out, (tuple, list)):
-                        chunk_out = chunk_out[0]
+                    chunk_out = self._decode_call(ae, chunk_r_d, chunk_feats)
                     out_chunks.append(chunk_out)
                 out = torch.cat(out_chunks, dim=0)
                 return out.squeeze(0) if is_1d else out
@@ -1720,10 +1728,23 @@ class AudioEncoder(BaseModel):
         )
 
         # Prefer the ONNX backend for inference (fast, no 362 MB torch
-        # weight load). Skipped when the 12-layer stack is not in use.
+        # weight load) when the config selects it. Skipped when the 12-layer
+        # stack is not in use.
         self._onnx_backend = None
+        self._compiled_inference = None
+        try:
+            from fast_float.onnx.backends import resolve_mode
+
+            self._mode = resolve_mode("audio")
+        except Exception:
+            self._mode = "eager"
         onnx_path = getattr(opt, "wav2vec_onnx_path", self.DEFAULT_ONNX_PATH)
-        if onnx_path and os.path.exists(onnx_path) and not opt.only_last_features:
+        if (
+            self._mode == "onnx"
+            and onnx_path
+            and os.path.exists(onnx_path)
+            and not opt.only_last_features
+        ):
             try:
                 from fast_float.onnx.runtime import Wav2vecOnnxBackend
 
@@ -1802,6 +1823,23 @@ class AudioEncoder(BaseModel):
         if self._onnx_backend is not None:
             feats = self.wav2vec2.feature_extract(a, seq_len)
             return self._onnx_backend.run_features(feats)
+        if self._mode == "compile":
+            if self._compiled_inference is None:
+                try:
+                    from fast_float.onnx.backends import maybe_compile
+
+                    self._compiled_inference = maybe_compile(
+                        self._inference_body, "audio"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"AudioEncoder: torch.compile failed ({e}); using eager"
+                    )
+                    self._compiled_inference = self._inference_body
+            return self._compiled_inference(a, seq_len)
+        return self._inference_body(a, seq_len)
+
+    def _inference_body(self, a: torch.Tensor, seq_len: int) -> torch.Tensor:
         a = self.get_wav2vec2_feature(a, seq_len=seq_len)
         return self.audio_projection(a)
 
@@ -1822,8 +1860,15 @@ class Audio2Emotion(nn.Module):
         # Plain attribute on purpose: nn.Module.to()/compile ignore it,
         # and the ORT call below is dynamo-disabled for torch.compile safety.
         self._onnx_backend = None
+        self._compiled_body = None
+        try:
+            from fast_float.onnx.backends import resolve_mode
+
+            self._mode = resolve_mode("emotion")
+        except Exception:
+            self._mode = "eager"
         onnx_path = getattr(opt, "emotion_onnx_path", self.DEFAULT_ONNX_PATH)
-        if onnx_path and os.path.exists(onnx_path):
+        if self._mode == "onnx" and onnx_path and os.path.exists(onnx_path):
             try:
                 from fast_float.onnx.runtime import EmotionOnnxBackend
 
@@ -1877,6 +1922,21 @@ class Audio2Emotion(nn.Module):
         if self._onnx_backend is not None:
             # ONNX graph already outputs softmax probabilities.
             return self._onnx_backend.predict_probs(a)
+        if self._mode == "compile":
+            if self._compiled_body is None:
+                try:
+                    from fast_float.onnx.backends import maybe_compile
+
+                    self._compiled_body = maybe_compile(self._predict_body, "emotion")
+                except Exception as e:
+                    logger.warning(
+                        f"Audio2Emotion: torch.compile failed ({e}); using eager"
+                    )
+                    self._compiled_body = self._predict_body
+            return self._compiled_body(a)
+        return self._predict_body(a)
+
+    def _predict_body(self, a: torch.Tensor) -> torch.Tensor:
         logits = self.wav2vec2_for_emotion(a).logits
         return F.softmax(logits, dim=1)
 

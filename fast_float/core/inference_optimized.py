@@ -50,6 +50,15 @@ class OptimizedInferenceAgent:
         self.G.to(self.rank)
         self.G.eval()
 
+        # Route each component (direction/refenc/decoder) to its configured
+        # backend before the global optimisation pass. All-eager config = no-op.
+        try:
+            from fast_float.onnx.dispatch import apply_backends
+
+            apply_backends(self.G, self.opt)
+        except Exception as e:
+            logger.warning(f"! Per-component backend dispatch skipped: {e}")
+
         # Apply optimization
         self.apply_optimization()
 

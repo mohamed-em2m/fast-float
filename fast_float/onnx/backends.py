@@ -241,6 +241,47 @@ def cuda_ep_usable() -> bool:
         return False
 
 
+_CACHED_CONFIG: Optional[BackendConfig] = None
+
+
+def get_config(reload: bool = False) -> BackendConfig:
+    """Process-wide cached config (env overrides are applied at lookup time)."""
+    global _CACHED_CONFIG
+    if _CACHED_CONFIG is None or reload:
+        _CACHED_CONFIG = load_backends()
+    return _CACHED_CONFIG
+
+
+def resolve_mode(name: str) -> str:
+    """Active mode for ``name`` (config + ``FLOAT_MODE_<NAME>`` override)."""
+    return get_config().mode_for(name)
+
+
+def resolve_provider(name: str) -> Optional[str]:
+    return get_config().component(name).provider
+
+
+def maybe_compile(module, name: str):
+    """Return ``torch.compile(module)`` when the config selects ``compile``.
+
+    Behaviour-preserving; falls back to the eager module when compile is
+    unavailable or raises at wrap time.
+    """
+    if resolve_mode(name) != "compile":
+        return module
+    try:
+        import torch
+
+        if not hasattr(torch, "compile"):
+            print(f"[backends:{name}] torch.compile unavailable; eager")
+            return module
+        print(f"[backends:{name}] torch.compile enabled")
+        return torch.compile(module)
+    except Exception as e:  # noqa: BLE001
+        print(f"[backends:{name}] torch.compile failed ({e}); eager")
+        return module
+
+
 def env_fingerprint() -> Dict[str, Any]:
     """Best-effort hardware/runtime probe; never raises.
 
@@ -300,6 +341,10 @@ __all__ = [
     "default_config",
     "load_backends",
     "save_backends",
+    "get_config",
+    "resolve_mode",
+    "resolve_provider",
+    "maybe_compile",
     "cuda_ep_usable",
     "env_fingerprint",
 ]
