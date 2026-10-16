@@ -148,11 +148,19 @@ class EqualConv2d(nn.Module):
         else:
             self.bias = None
     
+    def fold_weights(self):
+        """Pre-multiply static scale into weight parameter for export/inference."""
+        with torch.no_grad():
+            if self.scale != 1.0:
+                self.weight.copy_(self.weight * self.scale)
+                self.scale = 1.0
+
     def forward(self, input):
         """Already batch-compatible"""
+        w = self.weight * self.scale if self.scale != 1.0 else self.weight
         return F.conv2d(
             input,
-            self.weight * self.scale,
+            w,
             bias=self.bias,
             stride=self.stride,
             padding=self.padding,
@@ -177,16 +185,28 @@ class EqualLinear(nn.Module):
         self.activation = activation
         self.scale = (1 / math.sqrt(in_dim)) * lr_mul
         self.lr_mul = lr_mul
+
+    def fold_weights(self):
+        """Pre-multiply static scale and lr_mul into weight/bias parameters for export/inference."""
+        with torch.no_grad():
+            if self.scale != 1.0:
+                self.weight.copy_(self.weight * self.scale)
+                self.scale = 1.0
+            if self.bias is not None and self.lr_mul != 1.0:
+                self.bias.copy_(self.bias * self.lr_mul)
+                self.lr_mul = 1.0
     
     def forward(self, input):
         """Already batch-compatible"""
+        w = self.weight * self.scale if self.scale != 1.0 else self.weight
+        b = self.bias
+        if b is not None and self.lr_mul != 1.0:
+            b = b * self.lr_mul
         if self.activation:
-            out = F.linear(input, self.weight * self.scale)
-            out = fused_leaky_relu(out, self.bias * self.lr_mul)
+            out = F.linear(input, w)
+            out = fused_leaky_relu(out, b)
         else:
-            out = F.linear(
-                input, self.weight * self.scale, bias=self.bias * self.lr_mul
-            )
+            out = F.linear(input, w, bias=b)
         return out
     
     def __repr__(self):
@@ -449,16 +469,16 @@ class ToFlow(nn.Module):
         # devices and mixed-precision contexts.
         cache_key = (h, w, input.device.type,
                      input.device.index, input.dtype)
-        if getattr(self, "_grid_cache_key", None) != cache_key:
+        cached = getattr(self, "_cached_grid", None)
+        if getattr(self, "_grid_cache_key", None) != cache_key or cached is None:
             grid_y, grid_x = torch.meshgrid(
                 torch.linspace(-1, 1, h, device=input.device, dtype=input.dtype),
                 torch.linspace(-1, 1, w, device=input.device, dtype=input.dtype),
                 indexing="ij",
             )
-            # Store as [1, H, W, 2] — expand() is a zero-copy view
-            self._cached_grid = (
-                torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
-            )
+            # Store as [1, H, W, 2] — registered buffer so it moves across devices and doesn't mutate during export
+            new_grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+            self.register_buffer("_cached_grid", new_grid, persistent=False)
             self._grid_cache_key = cache_key
 
         grid = self._cached_grid.expand(batch_size, -1, -1, -1)

@@ -97,8 +97,11 @@ def build_core(emo_dir: str) -> Wav2Vec2ForSpeechClassification:
         return Wav2Vec2ForSpeechClassification.from_pretrained(
             emo_dir, local_files_only=True
         )
-    except AttributeError as e:
-        print(f"[weights] from_pretrained incompatible ({e}); manual load")
+    except Exception as e:
+        # New transformers (>=4.4x) can raise TypeError, RuntimeError, or
+        # AttributeError depending on the specific finalization step that
+        # our forked SER class predates. Always fall back to manual load.
+        print(f"[weights] from_pretrained incompatible ({type(e).__name__}: {e}); manual load")
         return load_core_manual(emo_dir)
 
 

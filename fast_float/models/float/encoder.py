@@ -113,11 +113,18 @@ class EqualConv2d(nn.Module):
         else:
             self.bias = None
 
-    def forward(self, input):
+    def fold_weights(self):
+        """Pre-multiply static scale into weight parameter for export/inference."""
+        with torch.no_grad():
+            if self.scale != 1.0:
+                self.weight.copy_(self.weight * self.scale)
+                self.scale = 1.0
 
+    def forward(self, input):
+        w = self.weight * self.scale if self.scale != 1.0 else self.weight
         return F.conv2d(
             input,
-            self.weight * self.scale,
+            w,
             bias=self.bias,
             stride=self.stride,
             padding=self.padding,
@@ -148,15 +155,26 @@ class EqualLinear(nn.Module):
         self.scale = (1 / math.sqrt(in_dim)) * lr_mul
         self.lr_mul = lr_mul
 
-    def forward(self, input):
+    def fold_weights(self):
+        """Pre-multiply static scale and lr_mul into weight/bias parameters for export/inference."""
+        with torch.no_grad():
+            if self.scale != 1.0:
+                self.weight.copy_(self.weight * self.scale)
+                self.scale = 1.0
+            if self.bias is not None and self.lr_mul != 1.0:
+                self.bias.copy_(self.bias * self.lr_mul)
+                self.lr_mul = 1.0
 
+    def forward(self, input):
+        w = self.weight * self.scale if self.scale != 1.0 else self.weight
+        b = self.bias
+        if b is not None and self.lr_mul != 1.0:
+            b = b * self.lr_mul
         if self.activation:
-            out = F.linear(input, self.weight * self.scale)
-            out = fused_leaky_relu(out, self.bias * self.lr_mul)
+            out = F.linear(input, w)
+            out = fused_leaky_relu(out, b)
         else:
-            out = F.linear(
-                input, self.weight * self.scale, bias=self.bias * self.lr_mul
-            )
+            out = F.linear(input, w, bias=b)
 
         return out
 

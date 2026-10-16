@@ -49,8 +49,10 @@ def load_w2v_core(w2v_dir: str):
         core = Wav2VecModel.from_pretrained(w2v_dir, local_files_only=True)
         print("[weights] w2v core via from_pretrained")
         return core, core.config.num_hidden_layers, True
-    except AttributeError as e:
-        print(f"[weights] from_pretrained incompatible ({e}); manual load")
+    except Exception as e:
+        # New transformers (>=4.4x) can raise TypeError, RuntimeError, or
+        # AttributeError. Always fall back to manual load.
+        print(f"[weights] from_pretrained incompatible ({type(e).__name__}: {e}); manual load")
         from transformers import Wav2Vec2Config
 
         cfg = Wav2Vec2Config.from_pretrained(w2v_dir, local_files_only=True)

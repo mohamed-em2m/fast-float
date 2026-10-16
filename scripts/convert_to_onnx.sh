@@ -3,7 +3,11 @@
 #   ./scripts/convert_to_onnx.sh
 # Env overrides: OUT_DIR (default ./onnx), EMO_OUT, FMT_OUT, DIR_OUT,
 #   AUDIO_OUT, DEC_OUT, REF_OUT, CKPT, EMO_DIR, W2V_DIR, DEC_BATCH, AUDIO_FRAMES.
-set -e
+#
+# NOTE: We do NOT use set -e globally. Weights/dep sections abort on failure
+# (they are prerequisites). Each converter runs independently so all 6 are
+# always attempted; a summary at the end shows PASS/FAIL per unit.
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -52,18 +56,16 @@ fi
 
 echo "=== [2/8] python deps ==="
 python -c "import torch; print('torch', torch.__version__, 'cuda=', torch.cuda.is_available())"
-probe_onnx() { python -c "import onnx.external_data_helper, onnxscript, onnxruntime" 2>/dev/null; }
-# On CUDA boxes the ORT build must ALSO ship a working CUDA EP (a CUDA-13
-# onnxruntime-gpu on a CUDA-12 box imports fine but sessions fall back to
-# CPU). CPU-only torch boxes always pass this probe.
+probe_onnx() { python -c "import onnx, onnxruntime" 2>/dev/null; }
+# On CUDA boxes the ORT build must ALSO ship a working CUDA EP.
+# CPU-only torch boxes always pass this probe.
 probe_ort_cuda() {
   python -c "
 import sys
 import torch
 import onnxruntime as o
 ok = (not torch.cuda.is_available()
-      or 'CUDAExecutionProvider' in o.get_available_providers()
-      or 'TensorrtExecutionProvider' in o.get_available_providers())
+      or 'CUDAExecutionProvider' in o.get_available_providers())
 sys.exit(0 if ok else 1)" 2>/dev/null
 }
 probe_stack() { probe_onnx && probe_ort_cuda; }
@@ -76,14 +78,14 @@ onnx_rt_pkg() {
   fi
 }
 if ! probe_stack; then
-  echo "installing onnx stack (joint resolve, pin onnx<1.22)"
+  echo "installing onnx stack (pin onnx<1.22, onnxruntime<1.24)"
   pip uninstall -q -y onnx onnxscript onnx-ir onnxruntime onnxruntime-gpu 2>/dev/null || true
-  pip install -q --no-cache-dir "onnx<1.22" "onnxscript==0.7.2" "$(onnx_rt_pkg)" || pip install -q --no-cache-dir "onnx<1.22" "onnxscript==0.7.2" "onnxruntime<1.24"
+  pip install -q --no-cache-dir "onnx<1.22" "$(onnx_rt_pkg)" || pip install -q --no-cache-dir "onnx<1.22" "onnxruntime<1.24"
 fi
 if ! probe_stack; then
   echo "retrying with force-reinstall (clears partial/corrupt installs)"
   pip uninstall -q -y onnx onnxscript onnx-ir onnxruntime onnxruntime-gpu 2>/dev/null || true
-  pip install -q --no-cache-dir --force-reinstall "onnx<1.22" "onnxscript==0.7.2" "$(onnx_rt_pkg)" || pip install -q --no-cache-dir --force-reinstall "onnx<1.22" "onnxscript==0.7.2" "onnxruntime<1.24"
+  pip install -q --no-cache-dir --force-reinstall "onnx<1.22" "$(onnx_rt_pkg)" || pip install -q --no-cache-dir --force-reinstall "onnx<1.22" "onnxruntime<1.24"
 fi
 echo "onnx stack versions:"
 python -c "import importlib.metadata as m
@@ -92,30 +94,67 @@ for p in ('onnx','onnxscript','onnx-ir','onnxruntime','onnxruntime-gpu'):
     except Exception: print(' ', p, 'MISSING')"
 probe_stack || { echo "ERROR: onnx stack still broken — export cannot run"; exit 1; }
 
-echo "=== [3/8] convert: emotion (unit 1) ==="
-python -m fast_float.onnx.convert_emotion \
-  --ckpt "${CKPT}" --emo-dir "${EMO_DIR}" --out "${EMO_OUT}" "$@"
 
-echo "=== [4/8] convert: fmt step (unit 2) ==="
-python -m fast_float.onnx.convert_fmt \
-  --ckpt "${CKPT}" --out "${FMT_OUT}"
+# Per-unit runner: captures output, records PASS/FAIL, never aborts other units.
+UNIT_RESULTS=()
+run_unit() {
+  local label="$1"; shift
+  echo ""
+  echo "=== ${label} ==="
+  if "$@"; then
+    UNIT_RESULTS+=("PASS  ${label}")
+  else
+    UNIT_RESULTS+=("FAIL  ${label}")
+    echo "[WARN] ${label} failed — continuing with remaining units"
+  fi
+}
 
-echo "=== [5/8] convert: direction (unit 3) ==="
-python -m fast_float.onnx.convert_direction \
-  --ckpt "${CKPT}" --out "${DIR_OUT}"
+# Temporarily disable pipefail so per-unit failures don't abort the whole script.
+set +e
 
-echo "=== [6/8] convert: audio encoder (unit 4) ==="
-python -m fast_float.onnx.convert_audio \
-  --ckpt "${CKPT}" --w2v-dir "${W2V_DIR}" --out "${AUDIO_OUT}" \
-  --frames "${AUDIO_FRAMES}"
+run_unit "[3/8] convert: emotion (unit 1)" \
+  python -m fast_float.onnx.convert_emotion \
+    --ckpt "${CKPT}" --emo-dir "${EMO_DIR}" --out "${EMO_OUT}" "$@"
 
-echo "=== [7/8] convert: frame decoder (unit 5) ==="
-python -m fast_float.onnx.convert_decoder \
-  --ckpt "${CKPT}" --out "${DEC_OUT}" --batch "${DEC_BATCH}"
+run_unit "[4/8] convert: fmt step (unit 2)" \
+  python -m fast_float.onnx.convert_fmt \
+    --ckpt "${CKPT}" --out "${FMT_OUT}"
 
-echo "=== [8/8] convert: reference encoder (unit 6) ==="
-python -m fast_float.onnx.convert_refenc \
-  --ckpt "${CKPT}" --out "${REF_OUT}"
+run_unit "[5/8] convert: direction (unit 3)" \
+  python -m fast_float.onnx.convert_direction \
+    --ckpt "${CKPT}" --out "${DIR_OUT}"
 
+run_unit "[6/8] convert: audio encoder (unit 4)" \
+  python -m fast_float.onnx.convert_audio \
+    --ckpt "${CKPT}" --w2v-dir "${W2V_DIR}" --out "${AUDIO_OUT}" \
+    --frames "${AUDIO_FRAMES}"
+
+run_unit "[7/8] convert: frame decoder (unit 5)" \
+  python -m fast_float.onnx.convert_decoder \
+    --ckpt "${CKPT}" --out "${DEC_OUT}" --batch "${DEC_BATCH}"
+
+run_unit "[8/8] convert: reference encoder (unit 6)" \
+  python -m fast_float.onnx.convert_refenc \
+    --ckpt "${CKPT}" --out "${REF_OUT}"
+
+set -e
+
+echo ""
 echo "=== artifacts ==="
-ls -la "${OUT_DIR}"
+ls -la "${OUT_DIR}" 2>/dev/null || echo "(no artifacts dir)"
+
+echo ""
+echo "=== unit summary ==="
+FAILED=0
+for r in "${UNIT_RESULTS[@]}"; do
+  echo "  ${r}"
+  [[ "${r}" == FAIL* ]] && FAILED=$((FAILED + 1))
+done
+if [ "${FAILED}" -gt 0 ]; then
+  echo ""
+  echo "ERROR: ${FAILED} unit(s) failed — see logs above"
+  exit 1
+else
+  echo ""
+  echo "All units PASSED"
+fi
