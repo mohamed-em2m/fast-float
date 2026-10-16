@@ -77,64 +77,45 @@ def export_module(
     inputs = _as_tuple(sample_inputs)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     notes = []
-    dynamo_err = None
-    try:
-        if fixed_batch:
-            trace_args = inputs
-            notes.append("fixed batch: no dynamic marking")
-        else:
-            trace_args = _ensure_batch2(inputs)
-            marked = _dynamo_mark(trace_args, dynamic_dims=mark_dims)
-            notes.append(f"dynamo dynamic dims={mark_dims} marked={marked}")
-        if hasattr(torch, "export") and hasattr(torch.export, "export"):
-            ep = torch.export.export(module, trace_args, strict=False)
-            torch.onnx.export(
-                ep,
-                f=out_path,
-                input_names=list(input_names),
-                output_names=list(output_names),
-                # external_data=False: keeps all weights inline so ORT
-                # InferenceSession can load without extra path hints
-                # (external_data=True writes a .data sidecar that ORT
-                # older than 1.24 cannot locate via a plain path string,
-                # causing the cls.__new__ crash on Kaggle / cp310 boxes).
-                external_data=False,
-            )
-            notes.append("dynamo export with symbolic batch/length")
-            return {
-                "path": os.path.abspath(out_path),
-                "exporter": "dynamo",
-                "notes": notes,
-            }
-        else:
-            raise NotImplementedError("torch.export not available")
-    except Exception as e:
-        dynamo_err = e
-        notes.append(f"dynamo export bypassed ({e}); using classic torch.onnx.export")
-
-    # Robust fallback: classic torch.onnx.export (compatible across all torch 2.x versions)
-    try:
-        with torch.no_grad():
-            torch.onnx.export(
-                module,
-                inputs if len(inputs) > 1 else inputs[0],
-                out_path,
-                input_names=list(input_names),
-                output_names=list(output_names),
-                dynamic_axes=dynamic_axes or {},
-                opset_version=opset,
-                do_constant_folding=True,
-            )
-        notes.append("classic torch.onnx.export successful")
-        return {
-            "path": os.path.abspath(out_path),
-            "exporter": "classic",
-            "notes": notes,
-        }
-    except Exception as fallback_e:
+    if not (hasattr(torch, "export") and hasattr(torch.export, "export")):
         raise RuntimeError(
-            f"Both dynamo export ({dynamo_err}) and classic export ({fallback_e}) failed."
-        ) from fallback_e
+            "torch.export.export is required (torch>=2.1) and the classic "
+            f"torch.onnx.export fallback is retired. This box has torch "
+            f"{torch.__version__}. Run conversion on the GPU box (torch>=2.1)."
+        )
+    if fixed_batch:
+        trace_args = inputs
+        notes.append("fixed batch: no dynamic marking")
+    else:
+        trace_args = _ensure_batch2(inputs)
+        marked = _dynamo_mark(trace_args, dynamic_dims=mark_dims)
+        notes.append(f"dynamo dynamic dims={mark_dims} marked={marked}")
+    try:
+        ep = torch.export.export(module, trace_args, strict=False)
+        torch.onnx.export(
+            ep,
+            f=out_path,
+            input_names=list(input_names),
+            output_names=list(output_names),
+            # external_data=False: keeps all weights inline so ORT
+            # InferenceSession can load without extra path hints
+            # (external_data=True writes a .data sidecar that ORT older
+            # than 1.24 cannot locate via a plain path string).
+            external_data=False,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "dynamo ONNX export failed and the classic torch.onnx.export "
+            "fallback is retired (it cannot translate SDPA/diag_embed, and "
+            f"torch>=2.9 rejects its dynamic_axes): {e}. Fix the graph (see "
+            "the converter substitution notes) instead of falling back."
+        ) from e
+    notes.append("dynamo export with symbolic batch/length")
+    return {
+        "path": os.path.abspath(out_path),
+        "exporter": "dynamo",
+        "notes": notes,
+    }
 
 
 def make_ort_session(
