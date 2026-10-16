@@ -142,12 +142,15 @@ def trt_optimization_profiles(opt_shapes, min_batch=1, max_batch=None, extra=Non
     mn, op, mx = {}, {}, {}
     for name, shape in opt_shapes.items():
         d = _parse_shape(shape)
-        op[name] = d
         lo, hi = list(d), list(d)
         lo[0], hi[0] = min_batch, max_batch
+        d_opt = list(d)
+        d_opt[0] = max(min_batch, min(d_opt[0], max_batch))
         for dim, (a, b) in (extra or {}).get(name, {}).items():
             lo[dim], hi[dim] = int(a), int(b)
+            d_opt[dim] = max(lo[dim], min(d_opt[dim], hi[dim]))
         mn[name], mx[name] = lo, hi
+        op[name] = d_opt
     return mn, op, mx
 
 
@@ -161,13 +164,28 @@ def _trt_libs_loadable() -> bool:
     Loading the library up front avoids that and the EP-error log spew.
     """
     import ctypes
+    import sys
 
-    for soname in (
-        "libnvinfer.so",
-        "libnvinfer.so.10",
-        "libnvinfer.so.9",
-        "libnvinfer.so.8",
-    ):
+    # 1. Best effort: python tensorrt module sets up environment and dll directories
+    try:
+        import tensorrt  # noqa: F401
+
+        return True
+    except Exception:
+        pass
+
+    # 2. Platform-specific sonames / dll names
+    candidates = (
+        ("nvinfer.dll", "nvinfer_10.dll", "nvinfer_9.dll", "nvinfer_8.dll")
+        if sys.platform == "win32"
+        else (
+            "libnvinfer.so",
+            "libnvinfer.so.10",
+            "libnvinfer.so.9",
+            "libnvinfer.so.8",
+        )
+    )
+    for soname in candidates:
         try:
             ctypes.CDLL(soname)
             return True
@@ -176,11 +194,20 @@ def _trt_libs_loadable() -> bool:
     return False
 
 
-def _trt_provider_options(fp16, cache_dir, min_shapes, opt_shapes, max_shapes, workspace_gb=2.0):
+def _trt_provider_options(
+    fp16,
+    cache_dir,
+    min_shapes,
+    opt_shapes,
+    max_shapes,
+    workspace_gb=2.0,
+    device_id: int = 0,
+):
     """OR-TensorRT EP provider options (FP16, on-disk engine+timing cache,
     shape profiles). TRT engine build is minutes-long, so the cache avoids
     rebuilding per process; engines are tied to GPU/TRT/CUDA versions."""
     opts = {
+        "device_id": int(device_id),
         "trt_fp16_enable": bool(fp16),
         "trt_builder_optimization_level": 3,
         "trt_max_workspace_size": int(workspace_gb * (1 << 30)),
@@ -191,7 +218,7 @@ def _trt_provider_options(fp16, cache_dir, min_shapes, opt_shapes, max_shapes, w
         opts["trt_engine_cache_enable"] = True
         opts["trt_engine_cache_path"] = cache_abs
         opts["trt_timing_cache_enable"] = True
-        opts["trt_timing_cache_path"] = cache_abs
+        opts["trt_timing_cache_path"] = os.path.join(cache_abs, "timing.cache")
     if min_shapes and opt_shapes and max_shapes:
 
         def _fmt(d):
@@ -213,6 +240,7 @@ def make_ort_session(
     trt_min_shapes: dict[str, Sequence[int]] | None = None,
     trt_opt_shapes: dict[str, Sequence[int]] | None = None,
     trt_max_shapes: dict[str, Sequence[int]] | None = None,
+    device_id: int | None = None,
 ):
     """ORT InferenceSession, provider chain TRT -> CUDA -> CPU.
 
@@ -246,6 +274,7 @@ def make_ort_session(
             "[ort] NOTE: TensorRT EP is listed but libnvinfer is not loadable "
             "(pip install tensorrt, or set LD_LIBRARY_PATH) — using the CUDA EP."
         )
+    dev_id = device_id if device_id is not None else (torch.cuda.current_device() if torch.cuda.is_available() else 0)
     gpu_providers = []
     if use_gpu:
         if used_trt:
@@ -258,11 +287,17 @@ def make_ort_session(
                         trt_min_shapes,
                         trt_opt_shapes,
                         trt_max_shapes,
+                        device_id=dev_id,
                     ),
                 )
             )
         if "CUDAExecutionProvider" in available:
-            gpu_providers.append(("CUDAExecutionProvider", {"cudnn_conv_algo_search": "DEFAULT"}))
+            gpu_providers.append(
+                (
+                    "CUDAExecutionProvider",
+                    {"device_id": dev_id, "cudnn_conv_algo_search": "DEFAULT"},
+                )
+            )
     if use_gpu and require_gpu and not gpu_providers:
         raise RuntimeError(
             "GPU requested but no CUDA/TRT execution provider available "
@@ -397,6 +432,7 @@ def make_runtime_session(
     max_batch: int | None = None,
     use_gpu: bool | None = None,
     fp16: bool = True,
+    device_id: int | None = None,
 ):
     """ORT session for a *runtime* component with automatic TensorRT profiles.
 
@@ -434,6 +470,7 @@ def make_runtime_session(
         trt_min_shapes=mn,
         trt_opt_shapes=op,
         trt_max_shapes=mx,
+        device_id=device_id,
     )
     return sess, ("TensorrtExecutionProvider" in sess.get_providers())
 

@@ -103,11 +103,13 @@ class _OnnxRunner(nn.Module):
         opt_shapes: dict | None = None,
         extra_dynamic: dict | None = None,
         max_batch: int | None = None,
+        device_id: int | None = None,
     ):
         super().__init__()
         if not os.path.exists(onnx_path):
             raise FileNotFoundError(f"ONNX not found: {onnx_path}")
         self.use_gpu = torch.cuda.is_available() if use_gpu is None else bool(use_gpu)
+        self.device_id = device_id
         self.path = os.path.abspath(onnx_path)
         self._opt_shapes = opt_shapes
         self._extra_dynamic = extra_dynamic
@@ -118,6 +120,7 @@ class _OnnxRunner(nn.Module):
             extra_dynamic=extra_dynamic,
             max_batch=max_batch,
             use_gpu=self.use_gpu,
+            device_id=self.device_id,
         )
         self._io_failed = False
 
@@ -156,15 +159,23 @@ class _OnnxRunner(nn.Module):
             print(f"[backends:iobinding] disabled ({e}); using host path")
             raise
 
-    def _recreate(self):
+    def _recreate(self, device_id: int | None = None):
         """Fresh equivalent runner (used by __deepcopy__ for GPU replicas)."""
         raise NotImplementedError
+
+    def to(self, *args, **kwargs):
+        device = torch._C._nn._parse_to(*args, **kwargs)[0]
+        if device is not None and device.type == "cuda":
+            dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+            if self.device_id != dev_idx:
+                return self._recreate(device_id=dev_idx)
+        return super().to(*args, **kwargs)
 
     def __deepcopy__(self, memo):
         # ORT sessions cannot be deep-copied; rebuild a clean session. The
         # replica's .to(dev) afterwards is a no-op (no params); the session
         # runs on its own provider device and outputs are moved by the caller.
-        return self._recreate()
+        return self._recreate(device_id=self.device_id)
 
 
 class DirectionOnnx(_OnnxRunner):
@@ -177,6 +188,7 @@ class DirectionOnnx(_OnnxRunner):
         opt_shapes: dict | None = None,
         extra_dynamic: dict | None = None,
         max_batch: int | None = None,
+        device_id: int | None = None,
     ):
         super().__init__(
             onnx_path,
@@ -184,6 +196,7 @@ class DirectionOnnx(_OnnxRunner):
             opt_shapes=opt_shapes,
             extra_dynamic=extra_dynamic,
             max_batch=max_batch,
+            device_id=device_id,
         )
         self.input_name = self.session.get_inputs()[0].name
         out = self.session.get_outputs()[0]
@@ -191,13 +204,14 @@ class DirectionOnnx(_OnnxRunner):
         shape = tuple(out.shape or ())
         self.output_dim = shape[-1] if shape and isinstance(shape[-1], int) else None
 
-    def _recreate(self):
+    def _recreate(self, device_id: int | None = None):
         return DirectionOnnx(
             self.path,
             use_gpu=self.use_gpu,
             opt_shapes=self._opt_shapes,
             extra_dynamic=self._extra_dynamic,
             max_batch=self._max_batch,
+            device_id=device_id if device_id is not None else self.device_id,
         )
 
     def _io_shapes(self, b: int):
@@ -244,6 +258,7 @@ class RefEncOnnx(_OnnxRunner):
         opt_shapes: dict | None = None,
         extra_dynamic: dict | None = None,
         max_batch: int | None = None,
+        device_id: int | None = None,
     ):
         super().__init__(
             onnx_path,
@@ -251,12 +266,13 @@ class RefEncOnnx(_OnnxRunner):
             opt_shapes=opt_shapes,
             extra_dynamic=extra_dynamic,
             max_batch=max_batch,
+            device_id=device_id,
         )
         self.fc = fc
         self._torch_fallback = torch_fallback
         self.input_name = self.session.get_inputs()[0].name
 
-    def _recreate(self):
+    def _recreate(self, device_id: int | None = None):
         return RefEncOnnx(
             self.path,
             copy.deepcopy(self.fc),
@@ -265,6 +281,7 @@ class RefEncOnnx(_OnnxRunner):
             opt_shapes=self._opt_shapes,
             extra_dynamic=self._extra_dynamic,
             max_batch=self._max_batch,
+            device_id=device_id if device_id is not None else self.device_id,
         )
 
     def _io_shapes(self, b: int):
@@ -321,6 +338,7 @@ class DecoderOnnx(_OnnxRunner):
         opt_shapes: dict | None = None,
         extra_dynamic: dict | None = None,
         max_batch: int | None = None,
+        device_id: int | None = None,
     ):
         super().__init__(
             onnx_path,
@@ -328,6 +346,7 @@ class DecoderOnnx(_OnnxRunner):
             opt_shapes=opt_shapes,
             extra_dynamic=extra_dynamic,
             max_batch=max_batch,
+            device_id=device_id,
         )
         ins = self.session.get_inputs()
         self.latent_name = ins[0].name
@@ -340,13 +359,14 @@ class DecoderOnnx(_OnnxRunner):
         out_shape = tuple(out.shape or ())
         self.output_shape = out_shape if len(out_shape) == 4 and all(isinstance(d, int) for d in out_shape) else None
 
-    def _recreate(self):
+    def _recreate(self, device_id: int | None = None):
         return DecoderOnnx(
             self.path,
             use_gpu=self.use_gpu,
             opt_shapes=self._opt_shapes,
             extra_dynamic=self._extra_dynamic,
             max_batch=self._max_batch,
+            device_id=device_id if device_id is not None else self.device_id,
         )
 
     def _io_shapes(self):

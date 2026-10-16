@@ -67,16 +67,19 @@ class EmotionOnnxBackend:
         opt_shapes: dict | None = None,
         extra_dynamic: dict | None = None,
         max_batch: int | None = None,
+        device_id: int | None = None,
     ):
         if not os.path.exists(onnx_path):
             raise FileNotFoundError(f"emotion ONNX not found: {onnx_path}")
         self.path = os.path.abspath(onnx_path)
+        self.device_id = device_id
         self.session, _ = make_runtime_session(
             self.path,
             opt_shapes=opt_shapes,
             extra_dynamic=extra_dynamic,
             max_batch=max_batch,
             use_gpu=use_gpu,
+            device_id=device_id,
         )
         self.input_name = self.session.get_inputs()[0].name
         out = self.session.get_outputs()[0]
@@ -99,6 +102,11 @@ class EmotionOnnxBackend:
         device = a.device
         if a.ndim == 1:
             a = a.unsqueeze(0)
+        # Protect against shapes exceeding or falling below TensorRT profile bounds
+        if a.shape[1] < 16000:
+            a = torch.nn.functional.pad(a, (0, 16000 - a.shape[1]), mode="replicate")
+        elif a.shape[1] > 160000:
+            a = a[:, :160000]
         if device.type == "cuda" and not self._io_failed and self.output_dim is not None and _gpu_active(self.session):
             try:
                 (out,) = run_ort_iobinding(
@@ -137,16 +145,19 @@ class Wav2vecOnnxBackend:
         opt_shapes: dict | None = None,
         extra_dynamic: dict | None = None,
         max_batch: int | None = None,
+        device_id: int | None = None,
     ):
         if not os.path.exists(onnx_path):
             raise FileNotFoundError(f"wav2vec ONNX not found: {onnx_path}")
         self.path = os.path.abspath(onnx_path)
+        self.device_id = device_id
         self.session, _ = make_runtime_session(
             self.path,
             opt_shapes=opt_shapes,
             extra_dynamic=extra_dynamic,
             max_batch=max_batch,
             use_gpu=use_gpu,
+            device_id=device_id,
         )
         self.input_name = self.session.get_inputs()[0].name
         out = self.session.get_outputs()[0]
@@ -226,16 +237,19 @@ class FMTStepBackend:
         opt_shapes: dict | None = None,
         extra_dynamic: dict | None = None,
         max_batch: int | None = None,
+        device_id: int | None = None,
     ):
         if not os.path.exists(onnx_path):
             raise FileNotFoundError(f"fmt ONNX not found: {onnx_path}")
         self.path = os.path.abspath(onnx_path)
+        self.device_id = device_id
         self.session, _ = make_runtime_session(
             self.path,
             opt_shapes=opt_shapes,
             extra_dynamic=extra_dynamic,
             max_batch=max_batch,
             use_gpu=use_gpu,
+            device_id=device_id,
         )
         out = self.session.get_outputs()[0]
         self.output_name = out.name

@@ -54,7 +54,18 @@ class AudioEncoder(BaseModel):
             self._mode = resolve_mode("audio")
         except Exception:
             self._mode = "eager"
-        onnx_path = getattr(opt, "wav2vec_onnx_path", self.DEFAULT_ONNX_PATH)
+        onnx_path = getattr(opt, "wav2vec_onnx_path", None)
+        if not onnx_path:
+            try:
+                from fast_float.onnx.backends import get_component
+
+                comp = get_component("audio")
+                if comp and comp.onnx_path:
+                    onnx_path = comp.onnx_path
+            except Exception:
+                pass
+        if not onnx_path:
+            onnx_path = self.DEFAULT_ONNX_PATH
         if self._mode == "onnx" and onnx_path and os.path.exists(onnx_path) and not opt.only_last_features:
             try:
                 from fast_float.onnx.runtime import Wav2vecOnnxBackend
@@ -164,7 +175,18 @@ class Audio2Emotion(nn.Module):
             self._mode = resolve_mode("emotion")
         except Exception:
             self._mode = "eager"
-        onnx_path = getattr(opt, "emotion_onnx_path", self.DEFAULT_ONNX_PATH)
+        onnx_path = getattr(opt, "emotion_onnx_path", None)
+        if not onnx_path:
+            try:
+                from fast_float.onnx.backends import get_component
+
+                comp = get_component("emotion")
+                if comp and comp.onnx_path:
+                    onnx_path = comp.onnx_path
+            except Exception:
+                pass
+        if not onnx_path:
+            onnx_path = self.DEFAULT_ONNX_PATH
         if self._mode == "onnx" and onnx_path and os.path.exists(onnx_path):
             try:
                 from fast_float.onnx.runtime import EmotionOnnxBackend
