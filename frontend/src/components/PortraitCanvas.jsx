@@ -87,17 +87,17 @@ export default function PortraitCanvas({
       </div>
 
       {/* Drag & Drop Canvas */}
-      <div 
+      <div
         className={`portrait-dropzone ${imagePreview ? 'has-image' : ''}`}
         onDragOver={(e) => e.preventDefault()}
         onDrop={handleDrop}
         onClick={() => !imagePreview && fileInputRef.current?.click()}
       >
-        <input 
-          type="file" 
-          ref={fileInputRef} 
-          accept="image/*" 
-          onChange={(e) => handleFileUpload(e.target.files[0])} 
+        <input
+          type="file"
+          ref={fileInputRef}
+          accept="image/*"
+          onChange={(e) => handleFileUpload(e.target.files[0])}
           style={{ display: 'none' }}
         />
 
@@ -106,7 +106,7 @@ export default function PortraitCanvas({
             <img src={imagePreview} alt="Portrait Reference" className="portrait-preview-img" />
             <div className="portrait-overlay">
               <div className="portrait-focus-ring" />
-              <button 
+              <button
                 type="button"
                 className="btn-change-image"
                 onClick={(e) => {
@@ -132,10 +132,10 @@ export default function PortraitCanvas({
       {/* Face Crop Toggle */}
       <div className="crop-toggle-row">
         <label className="crop-toggle-label">
-          <input 
-            type="checkbox" 
-            checked={!noCrop} 
-            onChange={(e) => setNoCrop(!e.target.checked)} 
+          <input
+            type="checkbox"
+            checked={!noCrop}
+            onChange={(e) => setNoCrop(!e.target.checked)}
             className="crop-checkbox"
           />
           <Crop size={15} />

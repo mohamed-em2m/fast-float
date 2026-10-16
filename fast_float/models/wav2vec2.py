@@ -1,9 +1,10 @@
 import sys
+
 import torch
 import torch.nn.functional as F
 
 try:
-    import torchvision
+    pass
 except Exception:
     sys.modules["torchvision"] = None
     sys.modules["torchvision.io"] = None
@@ -14,7 +15,7 @@ from transformers.modeling_outputs import BaseModelOutput
 
 class Wav2VecModel(Wav2Vec2Model):
     """
-    Wav2VecModel is a custom model class that extends the Wav2Vec2Model class from the transformers library. 
+    Wav2VecModel is a custom model class that extends the Wav2Vec2Model class from the transformers library.
     It inherits all the functionality of the Wav2Vec2Model and adds additional methods for feature extraction and encoding.
     ...
 
@@ -24,7 +25,7 @@ class Wav2VecModel(Wav2Vec2Model):
     Methods:
         forward(input_values, seq_len, attention_mask=None, mask_time_indices=None
         , output_attentions=None, output_hidden_states=None, return_dict=None):
-            Forward pass of the Wav2VecModel. 
+            Forward pass of the Wav2VecModel.
             It takes input_values, seq_len, and other optional parameters as input and returns the output of the base model.
 
         feature_extract(input_values, seq_len):
@@ -33,6 +34,7 @@ class Wav2VecModel(Wav2Vec2Model):
         encode(extract_features, attention_mask=None, mask_time_indices=None, output_attentions=None, output_hidden_states=None, return_dict=None):
             Encodes the extracted features using the base model and returns the encoded features.
     """
+
     def _encode_with_hidden_states(self, hidden_states):
         """Run the transformer encoder, collecting per-layer outputs.
 
@@ -47,9 +49,7 @@ class Wav2VecModel(Wav2Vec2Model):
         enc = self.encoder
         stable = type(enc).__name__ == "Wav2Vec2EncoderStableLayerNorm"
         position_embeddings = enc.pos_conv_embed(hidden_states)
-        hidden_states = hidden_states + position_embeddings.to(
-            hidden_states.device
-        )
+        hidden_states = hidden_states + position_embeddings.to(hidden_states.device)
         if not stable:
             hidden_states = enc.layer_norm(hidden_states)
         hidden_states = enc.dropout(hidden_states)
@@ -110,12 +110,12 @@ class Wav2VecModel(Wav2Vec2Model):
 
         hidden_states, extract_features = self.feature_projection(extract_features)
         hidden_states1 = self._mask_hidden_states(
-            hidden_states, mask_time_indices=mask_time_indices, attention_mask=attention_mask
+            hidden_states,
+            mask_time_indices=mask_time_indices,
+            attention_mask=attention_mask,
         )
 
-        hidden_states, all_hidden_states = self._encode_with_hidden_states(
-            hidden_states1
-        )
+        hidden_states, all_hidden_states = self._encode_with_hidden_states(hidden_states1)
 
         if self.adapter is not None:
             hidden_states = self.adapter(hidden_states)
@@ -124,9 +124,10 @@ class Wav2VecModel(Wav2Vec2Model):
             return (hidden_states, tuple(all_hidden_states))
 
         return BaseModelOutput(
-                    last_hidden_state=hidden_states,
-                    hidden_states=tuple(all_hidden_states),
-                    attentions=None)
+            last_hidden_state=hidden_states,
+            hidden_states=tuple(all_hidden_states),
+            attentions=None,
+        )
 
     def feature_extract(
         self,
@@ -187,7 +188,9 @@ class Wav2VecModel(Wav2Vec2Model):
 
         hidden_states, extract_features = self.feature_projection(extract_features)
         hidden_states = self._mask_hidden_states(
-            hidden_states, mask_time_indices=mask_time_indices, attention_mask=attention_mask
+            hidden_states,
+            mask_time_indices=mask_time_indices,
+            attention_mask=attention_mask,
         )
 
         encoder_outputs = self.encoder(
@@ -204,7 +207,7 @@ class Wav2VecModel(Wav2Vec2Model):
             hidden_states = self.adapter(hidden_states)
 
         if not return_dict:
-            return (hidden_states, ) + encoder_outputs[1:]
+            return (hidden_states, *encoder_outputs[1:])
         return BaseModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=encoder_outputs.hidden_states,
@@ -224,5 +227,5 @@ def linear_interpolation(features, seq_len):
         torch.Tensor: The interpolated features.
     """
     features = features.transpose(1, 2)
-    output_features = F.interpolate(features, size=seq_len, align_corners=True, mode='linear')
+    output_features = F.interpolate(features, size=seq_len, align_corners=True, mode="linear")
     return output_features.transpose(1, 2)

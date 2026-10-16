@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import albumentations as A
 import albumentations.pytorch.transforms as A_pytorch
@@ -25,23 +26,15 @@ class DataProcessor:
         self.sampling_rate = opt.sampling_rate
         self.input_size = opt.input_size
 
-        self.fa = face_alignment.FaceAlignment(
-            face_alignment.LandmarksType.TWO_D, flip_input=False
-        )
+        self.fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, flip_input=False)
 
         wav2vec_path = getattr(opt, "wav2vec_model_path", "")
         if wav2vec_path and os.path.exists(wav2vec_path):
-            self.wav2vec_preprocessor = Wav2Vec2FeatureExtractor.from_pretrained(
-                wav2vec_path, local_files_only=True
-            )
+            self.wav2vec_preprocessor = Wav2Vec2FeatureExtractor.from_pretrained(wav2vec_path, local_files_only=True)
         elif wav2vec_path:
-            self.wav2vec_preprocessor = Wav2Vec2FeatureExtractor.from_pretrained(
-                wav2vec_path
-            )
+            self.wav2vec_preprocessor = Wav2Vec2FeatureExtractor.from_pretrained(wav2vec_path)
         else:
-            self.wav2vec_preprocessor = Wav2Vec2FeatureExtractor.from_pretrained(
-                "facebook/wav2vec2-base-960h"
-            )
+            self.wav2vec_preprocessor = Wav2Vec2FeatureExtractor.from_pretrained("facebook/wav2vec2-base-960h")
 
         self.transform = A.Compose(
             [
@@ -99,9 +92,7 @@ class DataProcessor:
 
     def default_aud_loader(self, path: str) -> torch.Tensor:
         speech_array, sampling_rate = librosa.load(path, sr=self.sampling_rate)
-        return self.wav2vec_preprocessor(
-            speech_array, sampling_rate=sampling_rate, return_tensors="pt"
-        ).input_values[0]
+        return self.wav2vec_preprocessor(speech_array, sampling_rate=sampling_rate, return_tensors="pt").input_values[0]
 
     def preprocess(
         self,
@@ -127,11 +118,7 @@ class DataProcessor:
             a_list = [self.default_aud_loader(ap) for ap in audio_path]
             max_len = max(aud.shape[-1] for aud in a_list)
             a_padded = [
-                (
-                    F.pad(aud, (0, max_len - aud.shape[-1]), mode="constant", value=0)
-                    if aud.shape[-1] < max_len
-                    else aud
-                )
+                (F.pad(aud, (0, max_len - aud.shape[-1]), mode="constant", value=0) if aud.shape[-1] < max_len else aud)
                 for aud in a_list
             ]
             a = torch.stack(a_padded, dim=0)

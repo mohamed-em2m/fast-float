@@ -23,12 +23,13 @@ Per-component override for debugging: ``FLOAT_MODE_<COMPONENT>`` (e.g.
 
 See ``docs/BACKEND_SELECTION.md`` for the full design.
 """
+
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 COMPONENTS = ("emotion", "audio", "direction", "fmt", "decoder", "refenc")
 HOT_COMPONENTS = ("fmt", "decoder", "audio")
@@ -50,10 +51,10 @@ class ComponentConfig:
 
     name: str
     mode: str = DEFAULT_MODE
-    provider: Optional[str] = None
-    onnx_path: Optional[str] = None
-    metrics: Dict[str, Any] = field(default_factory=dict)
-    reason: Optional[str] = None
+    provider: str | None = None
+    onnx_path: str | None = None
+    metrics: dict[str, Any] = field(default_factory=dict)
+    reason: str | None = None
 
     @property
     def accelerated(self) -> bool:
@@ -66,12 +67,12 @@ class BackendConfig:
 
     version: int = 2
     source: str = "<default>"
-    target: Dict[str, Any] = field(default_factory=dict)
+    target: dict[str, Any] = field(default_factory=dict)
     objective: str = "end_to_end_ms"
     default_mode: str = DEFAULT_MODE
-    chosen_combo: Dict[str, str] = field(default_factory=dict)
-    e2e: Dict[str, Any] = field(default_factory=dict)
-    components: Dict[str, ComponentConfig] = field(default_factory=dict)
+    chosen_combo: dict[str, str] = field(default_factory=dict)
+    e2e: dict[str, Any] = field(default_factory=dict)
+    components: dict[str, ComponentConfig] = field(default_factory=dict)
 
     def component(self, name: str) -> ComponentConfig:
         return self.components.get(name) or ComponentConfig(name=name, mode=self.default_mode)
@@ -82,7 +83,7 @@ class BackendConfig:
             return override
         return self.component(name).mode
 
-    def as_dict(self) -> Dict[str, Any]:
+    def as_dict(self) -> dict[str, Any]:
         return {
             "version": self.version,
             "target": dict(self.target),
@@ -119,7 +120,7 @@ def _coerce_mode(mode: Any, name: str) -> str:
     return mode
 
 
-def _coerce_provider(provider: Any) -> Optional[str]:
+def _coerce_provider(provider: Any) -> str | None:
     if provider is None:
         return None
     provider = str(provider)
@@ -129,9 +130,9 @@ def _coerce_provider(provider: Any) -> Optional[str]:
     return provider
 
 
-def _from_dict(data: Dict[str, Any], source: str = "<dict>") -> BackendConfig:
+def _from_dict(data: dict[str, Any], source: str = "<dict>") -> BackendConfig:
     default_mode = _coerce_mode(data.get("default_mode", DEFAULT_MODE), "default_mode")
-    components: Dict[str, ComponentConfig] = {}
+    components: dict[str, ComponentConfig] = {}
     for name, cd in (data.get("components") or {}).items():
         cd = cd or {}
         components[name] = ComponentConfig(
@@ -145,9 +146,7 @@ def _from_dict(data: Dict[str, Any], source: str = "<dict>") -> BackendConfig:
     # Every known component is present: unspecified ones default to eager, so
     # a partial/generated config is self-describing at load time.
     for name in COMPONENTS:
-        components.setdefault(
-            name, ComponentConfig(name=name, mode=default_mode, reason="unspecified")
-        )
+        components.setdefault(name, ComponentConfig(name=name, mode=default_mode, reason="unspecified"))
     return BackendConfig(
         version=int(data.get("version", 2)),
         source=source,
@@ -169,7 +168,7 @@ def _from_file(path: Path) -> BackendConfig:
     return _from_dict(data, source=str(path))
 
 
-def load_backends(path: Optional[str] = None) -> BackendConfig:
+def load_backends(path: str | None = None) -> BackendConfig:
     """Load the active backend config (never raises for the implicit search).
 
     An explicit ``path`` that does not exist raises ``FileNotFoundError`` --
@@ -193,7 +192,7 @@ def load_backends(path: Optional[str] = None) -> BackendConfig:
             continue
         try:
             return _from_file(cand)
-        except Exception as e:  # noqa: BLE001 - never let a bad config kill the app
+        except Exception as e:
             print(f"[backends] WARNING: ignoring unreadable config {cand}: {e}")
     return default_config()
 
@@ -219,7 +218,6 @@ def cuda_ep_usable() -> bool:
     missing) and silently run on CPU. Session creation is the only honest test.
     """
     try:
-        import onnx
         import onnxruntime as ort
         from onnx import TensorProto, helper
 
@@ -241,7 +239,7 @@ def cuda_ep_usable() -> bool:
         return False
 
 
-_CACHED_CONFIG: Optional[BackendConfig] = None
+_CACHED_CONFIG: BackendConfig | None = None
 
 
 def get_config(reload: bool = False) -> BackendConfig:
@@ -257,7 +255,7 @@ def resolve_mode(name: str) -> str:
     return get_config().mode_for(name)
 
 
-def resolve_provider(name: str) -> Optional[str]:
+def resolve_provider(name: str) -> str | None:
     return get_config().component(name).provider
 
 
@@ -277,18 +275,18 @@ def maybe_compile(module, name: str):
             return module
         print(f"[backends:{name}] torch.compile enabled")
         return torch.compile(module)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         print(f"[backends:{name}] torch.compile failed ({e}); eager")
         return module
 
 
-def env_fingerprint() -> Dict[str, Any]:
+def env_fingerprint() -> dict[str, Any]:
     """Best-effort hardware/runtime probe; never raises.
 
     ``cuda_ep`` reflects an actual session test (see :func:`cuda_ep_usable`),
     not just whether ORT lists the provider.
     """
-    info: Dict[str, Any] = {}
+    info: dict[str, Any] = {}
     try:
         import torch
 
@@ -330,21 +328,21 @@ def env_fingerprint() -> Dict[str, Any]:
 
 __all__ = [
     "COMPONENTS",
+    "DEFAULT_CONFIG",
+    "DEFAULT_MODE",
+    "GENERATED_CONFIG",
     "HOT_COMPONENTS",
     "MODES",
     "ONNX_PROVIDERS",
-    "DEFAULT_MODE",
-    "DEFAULT_CONFIG",
-    "GENERATED_CONFIG",
-    "ComponentConfig",
     "BackendConfig",
+    "ComponentConfig",
+    "cuda_ep_usable",
     "default_config",
-    "load_backends",
-    "save_backends",
+    "env_fingerprint",
     "get_config",
+    "load_backends",
+    "maybe_compile",
     "resolve_mode",
     "resolve_provider",
-    "maybe_compile",
-    "cuda_ep_usable",
-    "env_fingerprint",
+    "save_backends",
 ]

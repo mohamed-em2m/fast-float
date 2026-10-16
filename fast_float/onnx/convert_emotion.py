@@ -8,6 +8,7 @@ proves torch-vs-ORT parity on two probe inputs.
 Usage (from repo root):
     python -m fast_float.onnx.convert_emotion --out ./onnx/emotion_v1.onnx
 """
+
 from __future__ import annotations
 
 import argparse
@@ -27,16 +28,18 @@ REPO_ROOT = CURRENT_DIR.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from fast_float.models.wav2vec2_ser import (  # noqa: E402
+import contextlib
+
+from fast_float.models.wav2vec2_ser import (
     Wav2Vec2ForSpeechClassification,
 )
-from fast_float.onnx.export import (  # noqa: E402
+from fast_float.onnx.export import (
     add_ort_args,
     export_module,
     fp16_tol,
     make_session_from_args,
 )
-from fast_float.onnx.parity import check_parity  # noqa: E402
+from fast_float.onnx.parity import check_parity
 
 EMOTION_PREFIX = "emotion_encoder.wav2vec2_for_emotion."
 LABELS = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
@@ -86,22 +89,15 @@ def load_core_manual(emo_dir: str) -> Wav2Vec2ForSpeechClassification:
     else:
         raise FileNotFoundError(f"no weight file in {emo_dir}")
     missing, unexpected = core.load_state_dict(sd, strict=False)
-    print(
-        f"[weights] manual load: {len(sd)} tensors "
-        f"(missing={len(missing)}, unexpected={len(unexpected)})"
-    )
-    try:
+    print(f"[weights] manual load: {len(sd)} tensors (missing={len(missing)}, unexpected={len(unexpected)})")
+    with contextlib.suppress(Exception):
         core.tie_weights()
-    except Exception:
-        pass
     return core
 
 
 def build_core(emo_dir: str) -> Wav2Vec2ForSpeechClassification:
     try:
-        return Wav2Vec2ForSpeechClassification.from_pretrained(
-            emo_dir, local_files_only=True
-        )
+        return Wav2Vec2ForSpeechClassification.from_pretrained(emo_dir, local_files_only=True)
     except Exception as e:
         # New transformers (>=4.4x) can raise TypeError, RuntimeError, or
         # AttributeError depending on the specific finalization step that
@@ -112,22 +108,15 @@ def build_core(emo_dir: str) -> Wav2Vec2ForSpeechClassification:
 
 def build_emotion_module(emo_dir: str, ckpt_path: str) -> EmotionExportWrapper:
     if not os.path.isdir(emo_dir):
-        raise FileNotFoundError(
-            f"emotion dir not found: {emo_dir} "
-            "(run scripts/download_checkpoints.sh first)"
-        )
+        raise FileNotFoundError(f"emotion dir not found: {emo_dir} (run scripts/download_checkpoints.sh first)")
     core = build_core(emo_dir)
     if os.path.exists(ckpt_path):
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         from collections import Counter
 
-        tops = Counter(k.split(".")[0] for k in sd.keys())
+        tops = Counter(k.split(".")[0] for k in sd)
         print(f"[weights] ckpt top-level prefixes: {dict(tops.most_common(10))}")
-        sub = {
-            k[len(EMOTION_PREFIX):]: v
-            for k, v in sd.items()
-            if k.startswith(EMOTION_PREFIX)
-        }
+        sub = {k[len(EMOTION_PREFIX) :]: v for k, v in sd.items() if k.startswith(EMOTION_PREFIX)}
         if not sub:
             print(
                 "[weights] WARN: no emotion_encoder.* keys in ckpt — exporting "
@@ -173,8 +162,12 @@ def main(argv=None) -> int:
     ap.add_argument("--atol", type=float, default=2e-4)
     ap.add_argument("--rtol", type=float, default=2e-4)
     ap.add_argument("--skip-parity", action="store_true")
-    ap.add_argument("--bench-iters", type=int, default=30,
-                    help="warmed benchmark iters per probe (0 = skip)")
+    ap.add_argument(
+        "--bench-iters",
+        type=int,
+        default=30,
+        help="warmed benchmark iters per probe (0 = skip)",
+    )
     add_ort_args(ap)
     args = ap.parse_args(argv)
 
@@ -196,7 +189,8 @@ def main(argv=None) -> int:
 
     if not args.skip_parity:
         sess, fp16 = make_session_from_args(
-            info["path"], args,
+            info["path"],
+            args,
             opt_shapes={"input_values": [1, int(16000 * args.seconds)]},
             extra_dynamic={"input_values": {1: (16000, 160000)}},
         )
@@ -210,21 +204,20 @@ def main(argv=None) -> int:
                 ort_out = sess.run(None, {"input_values": wav.numpy()})[0]
                 check_parity(ref, ort_out, name=name, atol=atol, rtol=rtol)
                 top = int(np.argmax(ort_out[0]))
-                print(f"[probe:{name}] torch_top={LABELS[int(np.argmax(ref.numpy()[0]))]} "
-                      f"onnx_top={LABELS[top]}")
+                print(f"[probe:{name}] torch_top={LABELS[int(np.argmax(ref.numpy()[0]))]} onnx_top={LABELS[top]}")
                 if args.bench_iters > 0:
                     from fast_float.onnx.parity import benchmark
+
                     wav_np = wav.numpy()
                     benchmark(
-                        lambda: module(wav),
-                        lambda: sess.run(None, {"input_values": wav_np}),
-                        name=name, iters=args.bench_iters,
+                        lambda wav=wav: module(wav),
+                        lambda wav_np=wav_np: sess.run(None, {"input_values": wav_np}),
+                        name=name,
+                        iters=args.bench_iters,
                     )
             # Batch>1 and short-length guards: the graph must carry symbolic
             # batch/length (a batch-1 trace bakes both and hard-fails here).
-            batch_wav = torch.cat(
-                [probes["noise"], probes["sine"]], dim=0
-            )  # [2, L]
+            batch_wav = torch.cat([probes["noise"], probes["sine"]], dim=0)  # [2, L]
             ref = module(batch_wav)
             ort_out = sess.run(None, {"input_values": batch_wav.numpy()})[0]
             check_parity(ref, ort_out, name="batch2", atol=atol, rtol=rtol)

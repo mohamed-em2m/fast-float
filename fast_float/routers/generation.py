@@ -2,19 +2,20 @@ import asyncio
 import os
 import re
 import uuid
+
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
-from fast_float.utils.logger import logger
-from fast_float.utils.media import TARGET_IMAGE_SIZE
+from fast_float.core.service import generate_video
+from fast_float.core.state import app_state
 from fast_float.schemas.generation import (
+    GenerationProgress,
     GenerationRequest,
     GenerationResponse,
-    GenerationProgress,
     PerformanceTimings,
 )
-from fast_float.core.state import app_state
-from fast_float.core.service import generate_video
+from fast_float.utils.logger import logger
+from fast_float.utils.media import TARGET_IMAGE_SIZE
 
 router = APIRouter(tags=["generation"])
 
@@ -41,31 +42,30 @@ async def generate(request: GenerationRequest):
         raise HTTPException(status_code=503, detail="FLOAT model is not yet loaded")
 
     if app_state.warming_up:
-        raise HTTPException(
-            status_code=503, detail="Model is warming up, try again shortly"
-        )
+        raise HTTPException(status_code=503, detail="Model is warming up, try again shortly")
 
     if app_state.request_semaphore is None:
         app_state.initialize_runtime()
 
     request_id = _safe_request_id(request.client_request_id)
     app_state.set_progress(
-        request_id, status="queued", stage="queued", percent=0.0,
+        request_id,
+        status="queued",
+        stage="queued",
+        percent=0.0,
         message="Waiting for a free GPU slot",
     )
 
     try:
-        await asyncio.wait_for(
-            app_state.request_semaphore.acquire(), timeout=ACQUIRE_TIMEOUT_S
-        )
+        await asyncio.wait_for(app_state.request_semaphore.acquire(), timeout=ACQUIRE_TIMEOUT_S)
     except asyncio.TimeoutError:
         app_state.set_progress(
-            request_id, status="error", stage="error",
+            request_id,
+            status="error",
+            stage="error",
             message="Server busy, try again shortly",
         )
-        raise HTTPException(
-            status_code=429, detail="Server busy, try again shortly"
-        ) from None
+        raise HTTPException(status_code=429, detail="Server busy, try again shortly") from None
 
     try:
         try:
@@ -76,17 +76,9 @@ async def generate(request: GenerationRequest):
             pub_url = app_state.public_url or "http://localhost:8000"
             pub_backup = app_state.public_backup_url or pub_url
 
-            encoder_name = (
-                app_state.video_optimizer.encoder_type
-                if app_state.video_optimizer
-                else "default"
-            )
+            encoder_name = app_state.video_optimizer.encoder_type if app_state.video_optimizer else "default"
 
-            file_size_mb = (
-                round(os.path.getsize(video_path) / (1024 * 1024), 2)
-                if os.path.exists(video_path)
-                else 0.0
-            )
+            file_size_mb = round(os.path.getsize(video_path) / (1024 * 1024), 2) if os.path.exists(video_path) else 0.0
 
             return GenerationResponse(
                 status="success",
@@ -112,15 +104,25 @@ async def generate(request: GenerationRequest):
         except ValueError as e:
             logger.warning(f"[{request_id}] Bad request: {e}")
             app_state.set_progress(request_id, status="error", stage="error", message=str(e))
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(status_code=400, detail=str(e)) from e
         except FileNotFoundError as e:
             logger.error(f"[{request_id}] Generation output missing: {e}")
-            app_state.set_progress(request_id, status="error", stage="error", message="Video generation failed")
-            raise HTTPException(status_code=502, detail="Video generation failed")
+            app_state.set_progress(
+                request_id,
+                status="error",
+                stage="error",
+                message="Video generation failed",
+            )
+            raise HTTPException(status_code=502, detail="Video generation failed") from e
         except Exception as e:
             logger.error(f"[{request_id}] Generation failed: {e!s}")
-            app_state.set_progress(request_id, status="error", stage="error", message="Video generation failed")
-            raise HTTPException(status_code=500, detail="Video generation failed")
+            app_state.set_progress(
+                request_id,
+                status="error",
+                stage="error",
+                message="Video generation failed",
+            )
+            raise HTTPException(status_code=500, detail="Video generation failed") from e
     finally:
         app_state.request_semaphore.release()
 

@@ -7,6 +7,7 @@ frame decoder. All-plain convs (no grouped conv), so batch is dynamic.
 Runs once per request, so the speedup value is ~zero on its own — this unit
 exists to complete torch-free deployment alongside the other five.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -41,33 +42,32 @@ class RefEncExport(nn.Module):
         return (x_r, x_r_lambda, *feats)
 
 
-def build_refenc_module(
-    ckpt_path: str, image_size: int, motion_dim: int, device: torch.device
-):
+def build_refenc_module(ckpt_path: str, image_size: int, motion_dim: int, device: torch.device):
     gen = Generator(size=image_size, style_dim=512, motion_dim=motion_dim).to(device)
     if os.path.exists(ckpt_path):
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        tops = Counter(k.split(".")[0] for k in sd.keys())
+        tops = Counter(k.split(".")[0] for k in sd)
         print(f"[weights] ckpt top-level prefixes: {dict(tops.most_common(10))}")
-        sub = {k[len(AE_PREFIX):]: v for k, v in sd.items()
-               if k.startswith(AE_PREFIX)}
+        sub = {k[len(AE_PREFIX) :]: v for k, v in sd.items() if k.startswith(AE_PREFIX)}
         if not sub:
             print("[weights] WARN: no motion_autoencoder.* keys — random init")
         else:
             missing, unexpected = gen.load_state_dict(sub, strict=False)
-            print(f"[weights] overlaid {len(sub)} tensors from {ckpt_path} "
-                  f"(missing={len(missing)}, unexpected={len(unexpected)})")
+            print(
+                f"[weights] overlaid {len(sub)} tensors from {ckpt_path} "
+                f"(missing={len(missing)}, unexpected={len(unexpected)})"
+            )
         gen.to(device)
     else:
-        print(f"[weights] WARN: {ckpt_path} not found — random init "
-              "(parity still valid)")
+        print(f"[weights] WARN: {ckpt_path} not found — random init (parity still valid)")
     enc = gen.enc.eval()
     with torch.no_grad():
         probe = torch.randn(1, 3, image_size, image_size, device=device)
         x_r, _, feats = enc(probe, None)
         lam = enc.fc(x_r)
-    print(f"[model] x_r {tuple(x_r.shape)} lambda {tuple(lam.shape)} "
-          f"feats {len(feats)} {[tuple(f.shape) for f in feats]}")
+    print(
+        f"[model] x_r {tuple(x_r.shape)} lambda {tuple(lam.shape)} feats {len(feats)} {[tuple(f.shape) for f in feats]}"
+    )
     return RefEncExport(enc).eval(), enc, len(feats)
 
 
@@ -88,8 +88,7 @@ def main(argv=None) -> int:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[env] device={device}")
-    module, enc, n_feats = build_refenc_module(
-        args.ckpt, args.image_size, args.motion_dim, device)
+    module, enc, n_feats = build_refenc_module(args.ckpt, args.image_size, args.motion_dim, device)
     batches = [int(s) for s in args.batches.split(",") if s.strip()]
     out_names = ["x_r", "x_r_lambda", *[f"feat{i}" for i in range(n_feats)]]
 
@@ -112,32 +111,34 @@ def main(argv=None) -> int:
 
     if not args.skip_parity:
         sess, fp16 = make_session_from_args(
-            info["path"], args,
+            info["path"],
+            args,
             opt_shapes={"img": [1, 3, args.image_size, args.image_size]},
         )
         atol, rtol = fp16_tol(args.atol, fp16), fp16_tol(args.rtol, fp16)
         with torch.no_grad():
             for bi, b in enumerate(batches):
                 g = torch.Generator(device="cpu").manual_seed(300 + bi)
-                img = torch.randn(b, 3, args.image_size, args.image_size,
-                                  generator=g).to(device)
+                img = torch.randn(b, 3, args.image_size, args.image_size, generator=g).to(device)
                 x_r, _, feats = enc(img, None)
                 ref = (x_r, enc.fc(x_r), *feats)
                 outs = sess.run(None, {"img": img.detach().cpu().numpy()})
                 assert len(outs) == len(ref), (len(outs), len(ref))
-                for name, r, o in zip(out_names, ref, outs):
-                    check_parity(r, o, name=f"{name}_b{b}",
-                                 atol=atol, rtol=rtol)
+                for name, r, o in zip(out_names, ref, outs, strict=False):
+                    check_parity(r, o, name=f"{name}_b{b}", atol=atol, rtol=rtol)
                 if args.bench_iters > 0:
                     img_np = img.detach().cpu().numpy()
 
-                    def torch_fn():
+                    def torch_fn(img=img):
                         xr, _, fs = enc(img, None)
                         return (xr, enc.fc(xr), *fs)
 
-                    benchmark(torch_fn,
-                              lambda: sess.run(None, {"img": img_np}),
-                              name=f"refenc_b{b}", iters=args.bench_iters)
+                    benchmark(
+                        torch_fn,
+                        lambda img_np=img_np: sess.run(None, {"img": img_np}),
+                        name=f"refenc_b{b}",
+                        iters=args.bench_iters,
+                    )
     print("[done] refenc converter OK")
     return 0
 

@@ -1,22 +1,24 @@
 import sys
+
 try:
-    import torchvision
+    import torchvision  # noqa: F401
 except Exception:
     sys.modules["torchvision"] = None
     sys.modules["torchvision.io"] = None
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
 try:
-    from transformers import Wav2Vec2Config, Wav2Vec2Model
-    from transformers.modeling_outputs import BaseModelOutput
+    from transformers import Wav2Vec2Config, Wav2Vec2Model  # noqa: F401
+    from transformers.modeling_outputs import BaseModelOutput  # noqa: F401
 except Exception:
     pass
 
 
+from collections.abc import Callable
+
 from torch import Tensor
-from typing import Type, Any, Callable, Union, List, Optional
 
 
 class BaseModel(torch.nn.Module):
@@ -25,21 +27,21 @@ class BaseModel(torch.nn.Module):
 
     def print_architecture(self, verbose=False):
         name = type(self).__name__
-        result = '-------------------%s---------------------\n' % name
+        result = f"-------------------{name}---------------------\n"
         total_num_params = 0
-        for i, (name, child) in enumerate(self.named_children()):
-            if 'loss' in name:
+        for _i, (name, child) in enumerate(self.named_children()):
+            if "loss" in name:
                 continue
             num_params = sum([p.numel() for p in child.parameters()])
             total_num_params += num_params
             if verbose:
-                result += "%s: %3.3fM\n" % (name, (num_params / 1e6))
-            for i, (name, grandchild) in enumerate(child.named_children()):
+                result += f"{name}: {num_params / 1e6:3.3f}M\n"
+            for _i, (name, grandchild) in enumerate(child.named_children()):
                 num_params = sum([p.numel() for p in grandchild.parameters()])
                 if verbose:
-                    result += "\t%s: %3.3fM\n" % (name, (num_params / 1e6))
-        result += '[Network %s] Total number of parameters : %.3f M\n' % (name, total_num_params / 1e6)
-        result += '-----------------------------------------------\n'
+                    result += f"\t{name}: {num_params / 1e6:3.3f}M\n"
+        result += f"[Network {name}] Total number of parameters : {total_num_params / 1e6:.3f} M\n"
+        result += "-----------------------------------------------\n"
         print(result)
 
     def set_requires_grad(self, requires_grad):
@@ -51,7 +53,6 @@ class BaseModel(torch.nn.Module):
 
     def forward(self):
         raise NotImplementedError()
-
 
 
 # def linear_interpolation(features, seq_len):
@@ -150,7 +151,7 @@ class BaseModel(torch.nn.Module):
 #             attention_mask = self._get_feature_vector_attention_mask(
 #                 extract_features.shape[1], attention_mask, add_adapter=False
 #             )
-            
+
 
 #         hidden_states, extract_features = self.feature_projection(extract_features)
 #         hidden_states = self._mask_hidden_states(
@@ -179,11 +180,9 @@ class BaseModel(torch.nn.Module):
 #         )
 
 
-
-
-
 def conv3x3(in_planes, out_planes, stride=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
+
 
 def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
@@ -191,13 +190,13 @@ def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
 
 class SELayer(nn.Module):
     def __init__(self, channel, reduction=16):
-        super(SELayer, self).__init__()
+        super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
             nn.Linear(channel, channel // reduction, bias=False),
             nn.ReLU(inplace=True),
             nn.Linear(channel // reduction, channel, bias=False),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
 
     def forward(self, x):
@@ -210,10 +209,20 @@ class SELayer(nn.Module):
 class SEBasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
-                 base_width=64, dilation=1, norm_layer=None,
-                 *, reduction=16):
-        super(SEBasicBlock, self).__init__()
+    def __init__(
+        self,
+        inplanes,
+        planes,
+        stride=1,
+        downsample=None,
+        groups=1,
+        base_width=64,
+        dilation=1,
+        norm_layer=None,
+        *,
+        reduction=16,
+    ):
+        super().__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
         self.conv1 = conv3x3(inplanes, planes, stride)
@@ -247,12 +256,22 @@ class SEBasicBlock(nn.Module):
 class SEBottleneck(nn.Module):
     expansion = 4
 
-    def __init__(self, inplanes, planes, stride=1, downsample=None, groups=1,
-                 base_width=64, dilation=1, norm_layer=None,
-                 *, reduction=16):
-        super(SEBottleneck, self).__init__()
+    def __init__(
+        self,
+        inplanes,
+        planes,
+        stride=1,
+        downsample=None,
+        groups=1,
+        base_width=64,
+        dilation=1,
+        norm_layer=None,
+        *,
+        reduction=16,
+    ):
+        super().__init__()
         if norm_layer is None:
-            norm_layer= nn.BatchNorm2d
+            norm_layer = nn.BatchNorm2d
         self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
         self.bn1 = norm_layer(planes)
         self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
@@ -291,14 +310,14 @@ class SEBottleneck(nn.Module):
 class ResNet(nn.Module):
     def __init__(
         self,
-        block: Type[Union[SEBasicBlock, SEBottleneck]],
-        layers: List[int],
+        block: type[SEBasicBlock | SEBottleneck],
+        layers: list[int],
         num_classes: int = 1000,
         zero_init_residual: bool = False,
         groups: int = 1,
         width_per_group: int = 64,
-        replace_stride_with_dilation: Optional[List[bool]] = None,
-        norm_layer: Optional[Callable[..., nn.Module]] = None,
+        replace_stride_with_dilation: list[bool] | None = None,
+        norm_layer: Callable[..., nn.Module] | None = None,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -313,8 +332,7 @@ class ResNet(nn.Module):
             replace_stride_with_dilation = [False, False, False]
         if len(replace_stride_with_dilation) != 3:
             raise ValueError(
-                "replace_stride_with_dilation should be None "
-                f"or a 3-element tuple, got {replace_stride_with_dilation}"
+                f"replace_stride_with_dilation should be None or a 3-element tuple, got {replace_stride_with_dilation}"
             )
         self.groups = groups
         self.base_width = width_per_group
@@ -323,20 +341,20 @@ class ResNet(nn.Module):
             nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False),
             norm_layer(self.inplanes),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
         )
-        
+
         self.layer1 = self._make_layer(block, 64, layers[0])
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0])
         self.layer3 = self._make_layer(block, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1])
         self.layer4 = self._make_layer(block, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
-        
+
         self.fc = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(512 * block.expansion, num_classes)
+            nn.Linear(512 * block.expansion, num_classes),
         )
-        
+
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
@@ -356,7 +374,7 @@ class ResNet(nn.Module):
 
     def _make_layer(
         self,
-        block: Type[Union[SEBasicBlock, SEBottleneck]],
+        block: type[SEBasicBlock | SEBottleneck],
         planes: int,
         blocks: int,
         stride: int = 1,
@@ -377,21 +395,28 @@ class ResNet(nn.Module):
         layers = []
         layers.append(
             block(
-                self.inplanes, planes, stride, downsample, self.groups, self.base_width, previous_dilation, norm_layer
+                self.inplanes,
+                planes,
+                stride,
+                downsample,
+                self.groups,
+                self.base_width,
+                previous_dilation,
+                norm_layer,
             )
         )
         self.inplanes = planes * block.expansion
-        for _ in range(1, blocks):
-            layers.append(
-                block(
-                    self.inplanes,
-                    planes,
-                    groups=self.groups,
-                    base_width=self.base_width,
-                    dilation=self.dilation,
-                    norm_layer=norm_layer,
-                )
+        layers.extend(
+            block(
+                self.inplanes,
+                planes,
+                groups=self.groups,
+                base_width=self.base_width,
+                dilation=self.dilation,
+                norm_layer=norm_layer,
             )
+            for _ in range(1, blocks)
+        )
 
         return nn.Sequential(*layers)
 
@@ -408,8 +433,6 @@ class ResNet(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self._forward_impl(x)
-
-
 
 
 def se_resnet18(num_classes=1000, norm_layer=None):

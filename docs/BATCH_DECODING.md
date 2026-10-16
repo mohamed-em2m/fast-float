@@ -5,6 +5,7 @@
 During speech-driven facial animation with **FLOAT**, generating long sequences can produce hundreds or thousands of latent frames. Decoding all frames in a single forward pass causes GPU Out-Of-Memory (**OOM**) errors, while decoding frames one-by-one underutilizes GPU Tensor Cores and slows down generation.
 
 To solve this, FLOAT includes **Micro-Batch Frame Gathering & Decoding** with **Dynamic GPU VRAM Auto-Sizing**:
+
 1. **Gathering in Micro-Batches**: Latents are partitioned into chunks (e.g., gathering 4 frames together) and decoded through `Generator.dec` in parallel.
 2. **Dynamic GPU Sizing**: Automatically detects free and total VRAM on the target CUDA device to choose the optimal batch size without manual configuration.
 3. **Zero-Copy Feature Alignment**: Slices and broadcasts multi-resolution identity features (`s_r_feats`) without redundant memory copies.
@@ -32,7 +33,9 @@ The method [`FLOAT.get_optimal_decode_batch_size(device)`](file:///c:/Users/emam
 ## 3. Core Architecture
 
 ### 3.1 Feature Alignment (`_decode_latent_batched`)
+
 The decoder requires feature maps (`s_r_feats`) matching the batch size of the latent input:
+
 - **Single reference image ($f.\text{shape}[0] == 1$)**: Features are expanded dynamically to chunk size $M$ (`f.expand(M, *dims)`), which is a zero-copy strided view.
 - **Per-frame reference features ($f.\text{shape}[0] == N$)**: Features are directly sliced per chunk (`f[i : i + M]`).
 - **Batched identities ($B$ references, $T$ frames each)**: Features are aligned along the identity dimension and sliced across the chunk window.
@@ -69,6 +72,7 @@ Flatten to [B*T, D]                 Direct length N
 ## 4. API Usage Examples
 
 ### Direct Decoding via `decode_latent_into_image`
+
 ```python
 import torch
 from fast_float.models.float.FLOAT import FLOAT
@@ -100,6 +104,7 @@ frames = model.decode_latent_into_image(
 ```
 
 ### Decoding Batched Multi-Identity Latents (3D)
+
 ```python
 # Latents for B=2 identities across T=25 frames each [2, 25, 512]
 latents_3d = torch.randn(2, 25, 512, device="cuda")
@@ -115,6 +120,7 @@ video_tensors = model.decode_latent_into_image(
 ```
 
 ### Configuring via Options
+
 ```python
 opt.decode_batch_size = 4  # Forces 4-frame micro-batch gathering in both sample and inference
 ```
@@ -130,6 +136,7 @@ python "scratch/test_batch_processing.py"
 ```
 
 Verified test results:
+
 - `[PASS] FMT forward multi-batch (B=4)`
 - `[PASS] Synthesis batched frames (B=4)`
 - `[PASS] Auto decode batch size selected based on device: 4`

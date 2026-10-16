@@ -1,0 +1,6 @@
+# shellcheck configuration for the pre-commit hook (bash scripts).
+# Follow `source`d files by path when the target exists in the repo. Files that
+# are generated or live outside the repo are covered by per-file
+# `# shellcheck source=` directives.
+
+external-sources=true

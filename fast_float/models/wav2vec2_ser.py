@@ -1,21 +1,20 @@
-import os, torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
+import torch
+import torch.nn as nn
 from transformers.file_utils import ModelOutput
-from transformers import Wav2Vec2FeatureExtractor
-from transformers.models.wav2vec2.modeling_wav2vec2 import Wav2Vec2PreTrainedModel, Wav2Vec2Model
+from transformers.models.wav2vec2.modeling_wav2vec2 import (
+    Wav2Vec2Model,
+    Wav2Vec2PreTrainedModel,
+)
 
 
 @dataclass
 class SpeechClassifierOutput(ModelOutput):
-    loss: Optional[torch.FloatTensor] = None
+    loss: torch.FloatTensor | None = None
     logits: torch.FloatTensor = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    hidden_states: tuple[torch.FloatTensor] | None = None
+    attentions: tuple[torch.FloatTensor] | None = None
 
 
 class Wav2Vec2ClassificationHead(nn.Module):
@@ -52,11 +51,7 @@ class Wav2Vec2ForSpeechClassification(Wav2Vec2PreTrainedModel):
     def freeze_feature_extractor(self):
         self.wav2vec2.feature_extractor._freeze_parameters()
 
-    def merged_strategy(
-            self,
-            hidden_states,
-            mode="mean"
-    ):
+    def merged_strategy(self, hidden_states, mode="mean"):
         if mode == "mean":
             outputs = torch.mean(hidden_states, dim=1)
         elif mode == "sum":
@@ -65,18 +60,19 @@ class Wav2Vec2ForSpeechClassification(Wav2Vec2PreTrainedModel):
             outputs = torch.max(hidden_states, dim=1)[0]
         else:
             raise Exception(
-                "The pooling method hasn't been defined! Your pooling mode must be one of these ['mean', 'sum', 'max']")
+                "The pooling method hasn't been defined! Your pooling mode must be one of these ['mean', 'sum', 'max']"
+            )
 
         return outputs
 
     def forward(
-            self,
-            input_values,
-            attention_mask=None,
-            output_attentions=None,
-            output_hidden_states=None,
-            return_dict=None,
-            labels=None,
+        self,
+        input_values,
+        attention_mask=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        labels=None,
     ):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         outputs = self.wav2vec2(
@@ -101,18 +97,18 @@ class Wav2Vec2ForSpeechClassification(Wav2Vec2PreTrainedModel):
                     self.config.problem_type = "multi_label_classification"
 
             if self.config.problem_type == "regression":
-                loss_fct = MSELoss()
+                loss_fct = nn.MSELoss()
                 loss = loss_fct(logits.view(-1, self.num_labels), labels)
             elif self.config.problem_type == "single_label_classification":
-                loss_fct = CrossEntropyLoss()
+                loss_fct = nn.CrossEntropyLoss()
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
             elif self.config.problem_type == "multi_label_classification":
-                loss_fct = BCEWithLogitsLoss()
+                loss_fct = nn.BCEWithLogitsLoss()
                 loss = loss_fct(logits, labels)
 
         if not return_dict:
-            output = (logits,) + outputs[2:]
-            return ((loss,) + output) if loss is not None else output
+            output = (logits, *outputs[2:])
+            return ((loss, *output)) if loss is not None else output
 
         return SpeechClassifierOutput(
             loss=loss,
@@ -120,5 +116,3 @@ class Wav2Vec2ForSpeechClassification(Wav2Vec2PreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
-

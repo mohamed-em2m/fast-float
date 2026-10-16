@@ -1,16 +1,14 @@
+import asyncio
 import os
 import sys
-import time
 import tempfile
-import asyncio
-import traceback
-from pathlib import Path
+import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # Ensure current directory and repository root are in sys.path
@@ -20,28 +18,33 @@ for path in (str(CURRENT_DIR), str(REPO_ROOT)):
     if path not in sys.path:
         sys.path.insert(0, path)
 
-from fast_float.initialize_env import initialize_environment
+from fast_float.initialize_env import initialize_environment, initialize_onnx_lib_paths
 
 initialize_environment()
+initialize_onnx_lib_paths()
 
-from fast_float.utils.logger import logger
+from fast_float.core.inference_optimized import (
+    InferenceOptions,
+    OptimizedInferenceAgent,
+)
+from fast_float.core.service import (
+    run_inference_batched_blocking,
+    run_inference_blocking,
+)
+from fast_float.core.state import app_state
+from fast_float.routers import api_router
 from fast_float.utils.gpu import print_gpu_status
+from fast_float.utils.logger import logger
 from fast_float.utils.media import (
     DEFAULT_IMAGE_PATH,
     TARGET_IMAGE_SIZE,
     ensure_default_image,
 )
 from fast_float.utils.video_optimizer import VideoSaveOptimizer
-from fast_float.core.state import app_state
-from fast_float.core.service import (
-    run_inference_blocking,
-    run_inference_batched_blocking,
-)
-from fast_float.core.inference_optimized import (
-    OptimizedInferenceAgent,
-    InferenceOptions,
-)
-from fast_float.routers import api_router
+
+# Keep strong references to fire-and-forget tasks so they are not garbage
+# collected mid-run (RUF006).
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 # Configuration
 PORT = int(os.getenv("PORT", "8000"))
@@ -53,11 +56,7 @@ USE_FP16 = os.getenv("USE_FP16", "true").lower() in ("true", "1", "yes")
 # CORS_ORIGINS=http://localhost:3000,https://studio.example.com
 # localhost and 127.0.0.1 are different origins to a browser, so allow both.
 CORS_ORIGINS = [
-    o.strip()
-    for o in os.getenv(
-        "CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
-    ).split(",")
-    if o.strip()
+    o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if o.strip()
 ]
 
 
@@ -72,8 +71,10 @@ async def _run_boot_warmups():
         logger.info("🔥 Warming up model with minimal inference...")
         warmup_start = time.time()
         try:
-            warmup_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
-            warmup_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as _tmp_wa:
+                warmup_audio = _tmp_wa.name
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as _tmp_wv:
+                warmup_video = _tmp_wv.name
             silent_audio = np.zeros(8000, dtype=np.float32)  # 0.5s at 16kHz
             sf.write(warmup_audio, silent_audio, 16000)
 
@@ -106,8 +107,10 @@ async def _run_boot_warmups():
         try:
             batch_audios, batch_videos = [], []
             for _ in range(2):
-                wa = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
-                wv = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as _tmp_wa:
+                    wa = _tmp_wa.name
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as _tmp_wv:
+                    wv = _tmp_wv.name
                 sf.write(wa, np.zeros(32000, dtype=np.float32), 16000)  # 2s silence
                 batch_audios.append(wa)
                 batch_videos.append(wv)
@@ -116,13 +119,23 @@ async def _run_boot_warmups():
                 run_inference_batched_blocking,
                 app_state.agent,
                 [
-                    {"audio_path": wa, "padded_path": wa, "duration": 2.0, "out_path": wv}
-                    for wa, wv in zip(batch_audios, batch_videos)
+                    {
+                        "audio_path": wa,
+                        "padded_path": wa,
+                        "duration": 2.0,
+                        "out_path": wv,
+                    }
+                    for wa, wv in zip(batch_audios, batch_videos, strict=False)
                 ],
                 DEFAULT_IMAGE_PATH,
                 {
-                    "a_cfg_scale": 2.0, "r_cfg_scale": 1.0, "e_cfg_scale": 1.0,
-                    "emotion": "S2E", "nfe": 2, "no_crop": False, "seed": 25,
+                    "a_cfg_scale": 2.0,
+                    "r_cfg_scale": 1.0,
+                    "e_cfg_scale": 1.0,
+                    "emotion": "S2E",
+                    "nfe": 2,
+                    "no_crop": False,
+                    "seed": 25,
                 },
             )
             for f in batch_audios + batch_videos:
@@ -189,7 +202,9 @@ async def lifespan(app: FastAPI):
         logger.info("⏭️ Boot warmup skipped (SKIP_WARMUP=1)")
     else:
         app_state.warming_up = True
-        asyncio.create_task(_run_boot_warmups())
+        _task = asyncio.create_task(_run_boot_warmups())
+        _BACKGROUND_TASKS.add(_task)
+        _task.add_done_callback(_BACKGROUND_TASKS.discard)
 
     # 6. Public URLs setup
     app_state.public_url = os.getenv("AVATER_PUBLIC_URL", f"http://localhost:{PORT}")

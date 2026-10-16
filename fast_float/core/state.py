@@ -1,7 +1,7 @@
 import asyncio
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Dict, Set, Any
+from typing import Any
 
 
 class AppState:
@@ -15,24 +15,24 @@ class AppState:
         # NOTE: inference is serialized by inference_lock (one GPU), so a
         # large thread pool only wastes RAM. 2 workers cover inference +
         # lifespan warmup overlap.
-        self.agent: Optional[Any] = None
-        self.opt: Optional[Any] = None
-        self.video_optimizer: Optional[Any] = None
-        self.public_url: Optional[str] = None
-        self.public_backup_url: Optional[str] = None
-        self.pcs: Set[Any] = set()
-        self.active_streams: Dict[str, str] = {}
+        self.agent: Any | None = None
+        self.opt: Any | None = None
+        self.video_optimizer: Any | None = None
+        self.public_url: str | None = None
+        self.public_backup_url: str | None = None
+        self.pcs: set[Any] = set()
+        self.active_streams: dict[str, str] = {}
         self.queue_counter: int = 0
-        self.progress: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self.progress: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.max_concurrent_requests: int = max_concurrent_requests
         self.max_workers: int = max_workers
-        self.executor: Optional[ThreadPoolExecutor] = None
-        self.request_semaphore: Optional[asyncio.Semaphore] = None
-        self.inference_lock: Optional[asyncio.Lock] = None
+        self.executor: ThreadPoolExecutor | None = None
+        self.request_semaphore: asyncio.Semaphore | None = None
+        self.inference_lock: asyncio.Lock | None = None
         # True while background boot warmup runs. /generate answers 503 until
         # it clears so a real request never contends with warmup on one GPU.
         self.warming_up: bool = False
-        self.performance_stats: Dict[str, Any] = {
+        self.performance_stats: dict[str, Any] = {
             "total_requests": 0,
             "total_inference_time": 0.0,
             "total_preprocess_time": 0.0,
@@ -60,7 +60,7 @@ class AppState:
         while len(self.progress) > self.MAX_PROGRESS_ENTRIES:
             self.progress.popitem(last=False)
 
-    def get_progress(self, request_id: str) -> Optional[Dict[str, Any]]:
+    def get_progress(self, request_id: str) -> dict[str, Any] | None:
         record = self.progress.get(request_id)
         return dict(record) if record is not None else None
 

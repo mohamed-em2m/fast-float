@@ -60,12 +60,14 @@ steps, seeds, chunking, batch sizes, guidance scales, and encoder quality.
 ## 3. Feature inventory (what the UI must expose)
 
 ### 3.1 Reference portrait
+
 - Drag-and-drop / click-to-browse upload (PNG, JPG, WebP). Default portrait preloaded.
 - Large preview with a "face focus" affordance; **Change Photo** and **Clear**.
 - **Auto face crop & centering** toggle (recommended for non-aligned photos) — maps to `no_crop`.
 - **Quick samples** (thumbnail pills) to load a demo portrait instantly.
 
 ### 3.2 Driving speech audio (three input modes)
+
 - **Microphone**: record with live waveform visualizer, elapsed timer, REC indicator, stop.
 - **Upload**: click or drop a file (WAV, MP3, AAC, PCM; 16 kHz recommended).
 - **Sample speech**: one-click demo clip.
@@ -73,10 +75,12 @@ steps, seeds, chunking, batch sizes, guidance scales, and encoder quality.
 - "Audio Ready" badge; format-aware (the real container is sent, backend transcodes).
 
 ### 3.3 Emotion
+
 - Mode grid: **Speech-to-Emotion (S2E)** plus 7 directed emotions —
   `neutral, happy, sad, angry, surprise, disgust, fear` — with icons.
 
 ### 3.4 Generation parameters
+
 - **Sampling steps (NFE)** slider, 5–25, with helper text (⚡ Ultra-fast / Balanced /
   High Fidelity).
 - **Seed** numeric input + randomize.
@@ -88,6 +92,7 @@ steps, seeds, chunking, batch sizes, guidance scales, and encoder quality.
 - Each control shows a live value badge and a one-line "what this does" hint.
 
 ### 3.5 Generate & progress
+
 - Primary **Generate Portrait Video** CTA (disabled until audio exists; spinner while running).
 - Progress with two sources:
   - **Real** server progress when chunked (`completed_chunks / total_chunks`, percent, stage, message), polled each second.
@@ -95,6 +100,7 @@ steps, seeds, chunking, batch sizes, guidance scales, and encoder quality.
     (Preprocess → Encode motion latent → Solve ODE → NVENC compress).
 
 ### 3.6 Output & playback
+
 - Video viewport: standard **MP4** player (streamed via HTTP range) and an optional
   **WebRTC live** player (peer connection states: negotiating / connected / failed → fallback to MP4).
 - Result stat chips: **FPS**, **inference time**, **file size**, and chunk count.
@@ -102,6 +108,7 @@ steps, seeds, chunking, batch sizes, guidance scales, and encoder quality.
 - WebRTC status overlay with a live dot and a "Switch to Standard MP4" escape hatch.
 
 ### 3.7 Connection & backend config
+
 - Status pill: **Disconnected / Server Online / Model Ready** (tolerant of transient blips).
 - **GPU widget** in the header: allocated / total VRAM, usage bar, clear-cache button.
 - **Config popover**: shows the active API endpoint (default same-origin `/api` proxy vs a
@@ -109,12 +116,14 @@ steps, seeds, chunking, batch sizes, guidance scales, and encoder quality.
   **Test & Save / Reset / Cancel**. Validates before committing.
 
 ### 3.8 Telemetry & history
+
 - **KPI cards**: Inference speed (FPS, with session average), Total latency, Model inference
   time, Prep & audio FFT time.
 - **GPU diagnostics bar**: device name + VRAM utilization track.
 - **Session history**: recent generations with id, FPS, time, size, and download link.
 
 ### 3.9 Notifications
+
 - Toast system (success / error / info), auto-dismissing.
 
 ---
@@ -143,6 +152,7 @@ numerals for data.
 Matching Talking Portrait Generator", badge `v5.1 NVENC`.
 
 **Design tokens (current):**
+
 | Token | Value | Use |
 |---|---|---|
 | `--bg-dark` | `#080a10` | page background |

@@ -12,7 +12,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import numpy as np
 import soundfile as sf
@@ -41,7 +41,7 @@ def split_wav_into_chunks(
     chunk_seconds: float,
     overlap_seconds: float,
     out_dir: str,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Slice a WAV into overlapping windows written as separate WAV files.
 
     Returns a list of ``{"path", "start", "duration", "index"}``. When chunking
@@ -54,12 +54,20 @@ def split_wav_into_chunks(
 
     total = len(data) / sr if sr > 0 else 0.0
     if chunk_seconds <= 0 or total <= chunk_seconds:
-        return [{"path": wav_path, "start": 0.0, "duration": total, "index": 0, "synthetic": False}]
+        return [
+            {
+                "path": wav_path,
+                "start": 0.0,
+                "duration": total,
+                "index": 0,
+                "synthetic": False,
+            }
+        ]
 
     overlap = max(0.0, min(float(overlap_seconds), chunk_seconds - 0.1))
     step = max(chunk_seconds - overlap, 0.1)
 
-    spans: List[List[float]] = []
+    spans: list[list[float]] = []
     start = 0.0
     while start < total - 1e-6:
         end = min(start + chunk_seconds, total)
@@ -73,10 +81,10 @@ def split_wav_into_chunks(
         spans[-2][1] = spans[-1][1]
         spans.pop()
 
-    results: List[Dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
     for i, (s, e) in enumerate(spans):
-        i0 = max(int(round(s * sr)), 0)
-        i1 = min(int(round(e * sr)), len(data))
+        i0 = max(round(s * sr), 0)
+        i1 = min(round(e * sr), len(data))
         if i1 <= i0:
             continue
         out_path = os.path.join(out_dir, f"chunk_{i:03d}.wav")
@@ -91,10 +99,7 @@ def split_wav_into_chunks(
             }
         )
 
-    logger.info(
-        f"✂️  Split {total:.2f}s audio into {len(results)} chunks "
-        f"(window={chunk_seconds}s, overlap={overlap}s)"
-    )
+    logger.info(f"✂️  Split {total:.2f}s audio into {len(results)} chunks (window={chunk_seconds}s, overlap={overlap}s)")
     return results
 
 
@@ -104,7 +109,7 @@ def pad_wav_to_duration(wav_path: str, target_seconds: float, out_path: str) -> 
     if data.ndim > 1:
         data = data.mean(axis=1).astype(np.float32)
     cur = len(data) / sr if sr > 0 else 0.0
-    need = int(round((target_seconds - cur) * sr)) if sr > 0 else 0
+    need = round((target_seconds - cur) * sr) if sr > 0 else 0
     if need > 0:
         data = np.concatenate([data, np.zeros(need, dtype=np.float32)])
     sf.write(out_path, data, sr, format="WAV", subtype="PCM_16")
@@ -112,10 +117,10 @@ def pad_wav_to_duration(wav_path: str, target_seconds: float, out_path: str) -> 
 
 
 def group_chunks_for_batch(
-    chunks: List[Dict[str, Any]],
+    chunks: list[dict[str, Any]],
     batch_size: int = 1,
     max_pad_seconds: float = 2.0,
-) -> List[List[Dict[str, Any]]]:
+) -> list[list[dict[str, Any]]]:
     """Greedily group adjacent chunks for batched sampling.
 
     A chunk joins the current group only if padding it up to the group's max
@@ -125,14 +130,12 @@ def group_chunks_for_batch(
     """
     if batch_size <= 1 or len(chunks) <= 1:
         return [[c] for c in chunks]
-    groups: List[List[Dict[str, Any]]] = []
-    cur: List[Dict[str, Any]] = []
+    groups: list[list[dict[str, Any]]] = []
+    cur: list[dict[str, Any]] = []
     for ch in chunks:
-        trial = cur + [ch]
+        trial = [*cur, ch]
         mx = max(c["duration"] for c in trial)
-        fits = len(trial) <= batch_size and all(
-            mx - c["duration"] <= max_pad_seconds + 1e-9 for c in trial
-        )
+        fits = len(trial) <= batch_size and all(mx - c["duration"] <= max_pad_seconds + 1e-9 for c in trial)
         if fits:
             cur = trial
         else:
@@ -145,13 +148,23 @@ def group_chunks_for_batch(
     if cur:
         groups.append(cur)
     return groups
+
+
 def _has_audio_stream(path: str) -> bool:
     """True if the file contains at least one audio stream (ffprobe)."""
     try:
         res = subprocess.run(
             [
-                "ffprobe", "-v", "error", "-select_streams", "a",
-                "-show_entries", "stream=index", "-of", "csv=p=0", path,
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "csv=p=0",
+                path,
             ],
             capture_output=True,
             text=True,
@@ -162,7 +175,7 @@ def _has_audio_stream(path: str) -> bool:
         return False
 
 
-def _concat_stream_copy(paths: List[str], output_path: str) -> bool:
+def _concat_stream_copy(paths: list[str], output_path: str) -> bool:
     """Concatenate MP4s by stream copy (fast, lossless). False on any failure."""
     list_path = None
     try:
@@ -173,9 +186,22 @@ def _concat_stream_copy(paths: List[str], output_path: str) -> bool:
                 safe = os.path.abspath(p).replace("\\", "/").replace("'", r"'\''")
                 fh.write(f"file '{safe}'\n")
         cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-f", "concat", "-safe", "0", "-i", list_path,
-            "-c", "copy", "-movflags", "+faststart", output_path,
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            list_path,
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            output_path,
         ]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
         ok = res.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0
@@ -191,27 +217,27 @@ def _concat_stream_copy(paths: List[str], output_path: str) -> bool:
 
 
 def _concat_filter(
-    paths: List[str],
+    paths: list[str],
     output_path: str,
     overlap_seconds: float,
-    encoder: Optional[str],
+    encoder: str | None,
     fps: int,
     with_audio: bool,
 ) -> str:
     """Re-encode and concatenate, trimming the overlapping head of later chunks."""
     n = len(paths)
-    inputs: List[str] = []
+    inputs: list[str] = []
     for p in paths:
         inputs += ["-i", p]
 
-    parts: List[str] = []
-    labels: List[str] = []
+    parts: list[str] = []
+    labels: list[str] = []
     for i in range(n):
         trim = overlap_seconds if i > 0 else 0.0
-        v_filter = "trim=start=%.4f,setpts=PTS-STARTPTS" % trim if trim > 0.01 else "setpts=PTS-STARTPTS"
+        v_filter = f"trim=start={trim:.4f},setpts=PTS-STARTPTS" if trim > 0.01 else "setpts=PTS-STARTPTS"
         parts.append(f"[{i}:v]{v_filter}[v{i}];")
         if with_audio:
-            a_filter = "atrim=start=%.4f,asetpts=PTS-STARTPTS" % trim if trim > 0.01 else "asetpts=PTS-STARTPTS"
+            a_filter = f"atrim=start={trim:.4f},asetpts=PTS-STARTPTS" if trim > 0.01 else "asetpts=PTS-STARTPTS"
             parts.append(f"[{i}:a]{a_filter}[a{i}];")
         labels += [f"[v{i}]"] + ([f"[a{i}]"] if with_audio else [])
 
@@ -219,12 +245,42 @@ def _concat_filter(
     filter_complex = "".join(parts) + concat + ("[outa]" if with_audio else "")
 
     if encoder and "nvenc" in encoder.lower():
-        vopts = ["-c:v", encoder, "-preset", "p1", "-rc", "constqp", "-qp", "23", "-pix_fmt", "yuv420p"]
+        vopts = [
+            "-c:v",
+            encoder,
+            "-preset",
+            "p1",
+            "-rc",
+            "constqp",
+            "-qp",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+        ]
     else:
-        vopts = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p"]
+        vopts = [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+        ]
 
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *inputs,
-           "-filter_complex", filter_complex, "-map", "[outv]"]
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        *inputs,
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[outv]",
+    ]
     if with_audio:
         cmd += ["-map", "[outa]", "-c:a", "aac", "-b:a", "128k"]
     cmd += [*vopts, "-r", str(fps), "-movflags", "+faststart", output_path]
@@ -234,10 +290,10 @@ def _concat_filter(
 
 
 def merge_mp4_chunks(
-    chunk_paths: List[str],
+    chunk_paths: list[str],
     output_path: str,
     overlap_seconds: float = 0.0,
-    encoder: Optional[str] = None,
+    encoder: str | None = None,
     fps: int = 25,
 ) -> str:
     """Merge per-chunk MP4s into one file, trimming overlap between chunks."""

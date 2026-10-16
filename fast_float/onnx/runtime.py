@@ -88,12 +88,7 @@ class EmotionOnnxBackend:
         device = a.device
         if a.ndim == 1:
             a = a.unsqueeze(0)
-        if (
-            device.type == "cuda"
-            and not self._io_failed
-            and self.output_dim is not None
-            and _gpu_active(self.session)
-        ):
+        if device.type == "cuda" and not self._io_failed and self.output_dim is not None and _gpu_active(self.session):
             try:
                 (out,) = run_ort_iobinding(
                     self.session,
@@ -102,7 +97,7 @@ class EmotionOnnxBackend:
                     device=device,
                 )
                 return out.to(device=device, dtype=torch.float32)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 self._io_failed = True
                 print(f"[backends:iobinding] disabled ({e}); using host path")
         wav_np = a.detach().to("cpu", dtype=torch.float32).numpy()
@@ -135,9 +130,7 @@ class Wav2vecOnnxBackend:
         out = self.session.get_outputs()[0]
         self.output_name = out.name
         shape = tuple(out.shape or ())
-        self._static_out_dim = (
-            shape[-1] if shape and isinstance(shape[-1], int) else None
-        )
+        self._static_out_dim = shape[-1] if shape and isinstance(shape[-1], int) else None
         self._io_failed = False
 
     @property
@@ -182,7 +175,7 @@ class Wav2vecOnnxBackend:
                     device=device,
                 )
                 return out.to(device=device, dtype=torch.float32)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 self._io_failed = True
                 print(f"[backends:iobinding] disabled ({e}); using host path")
         feats_np = conv_feats.detach().to("cpu", dtype=torch.float32).numpy()
@@ -250,30 +243,25 @@ class FMTStepBackend:
             and not self._io_failed
             and self._static_last is not None
             and _gpu_active(self.session)
-            and all(
-                torch.is_tensor(v) and v.device.type == "cuda"
-                for v in (t, x, wa, wr, we, prev_x, prev_wa)
-            )
+            and all(torch.is_tensor(v) and v.device.type == "cuda" for v in (t, x, wa, wr, we, prev_x, prev_wa))
         ):
             try:
                 (out,) = run_ort_iobinding(
                     self.session,
                     {
                         name: val.to(dtype=torch.float32)
-                        for name, val in zip(
-                            self.INPUTS, (t, x, wa, wr, we, prev_x, prev_wa)
-                        )
+                        for name, val in zip(self.INPUTS, (t, x, wa, wr, we, prev_x, prev_wa), strict=False)
                     },
                     [(self.output_name, (x.shape[0], out_len, int(self._static_last)))],
                     device=device,
                 )
                 return out.to(device=device, dtype=torch.float32)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 self._io_failed = True
                 print(f"[backends:iobinding] disabled ({e}); using host path")
         feed = {
             name: val.detach().to("cpu", dtype=torch.float32).numpy()
-            for name, val in zip(self.INPUTS, (t, x, wa, wr, we, prev_x, prev_wa))
+            for name, val in zip(self.INPUTS, (t, x, wa, wr, we, prev_x, prev_wa), strict=False)
         }
         out = self._run(feed)
         return torch.from_numpy(out).to(device=device, dtype=torch.float32)

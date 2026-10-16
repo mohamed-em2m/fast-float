@@ -115,9 +115,10 @@ Each GPU has **one dedicated worker thread** with its own CUDA stream (`max_stre
 #### CUDA Stream Synchronization
 
 **Primary GPU worker:**
+
 ```python
 with torch.cuda.stream(stream):
-    stream.wait_event(ev)          # GPU-side wait — no CPU stall
+    stream.wait_event(ev)  # GPU-side wait — no CPU stall
     lat_gpu.record_stream(stream)  # Prevent premature buffer deallocation
     u8 = self._decode_u8(ae, feats, lat_gpu)
     buf[:n_valid].copy_(u8[:n_valid], non_blocking=True)
@@ -128,11 +129,12 @@ done_q.put((seq, buf, n_valid, done))  # No done.synchronize() here!
 ```
 
 **Secondary GPU worker:**
+
 ```python
 with torch.cuda.stream(stream):
-    ev.synchronize()               # CPU wait for host copy completion
+    ev.synchronize()  # CPU wait for host copy completion
     lat = lat_host.to(dev, non_blocking=True)
-    lat.record_stream(stream)      # Prevent premature deallocation
+    lat.record_stream(stream)  # Prevent premature deallocation
     u8 = self._decode_u8(ae, feats, lat)
     buf[:n_valid].copy_(u8[:n_valid], non_blocking=True)
     done = torch.cuda.Event()
@@ -187,13 +189,14 @@ The writer maintains a `pending` dictionary keyed by sequence number `seq`, cons
 pending[seq] = (buf, n, done)
 while nxt in pending:
     buf, n, done = pending.pop(nxt)
-    done.synchronize()                        # Wait for GPU → host copy to finish
+    done.synchronize()  # Wait for GPU → host copy to finish
     proc.stdin.write(buf[:n].numpy().reshape(-1))
-    pool.put(buf)                             # Recycle pinned host buffer
+    pool.put(buf)  # Recycle pinned host buffer
     nxt += 1
 ```
 
 This guarantees:
+
 - Output frames are always in correct temporal order.
 - The GPU decode stream is never blocked waiting for the FFmpeg pipe.
 - Pinned host buffers cycle back to `pool`, applying natural backpressure to the producer.

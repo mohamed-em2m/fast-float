@@ -10,7 +10,7 @@ import os
 import tempfile
 import time
 import traceback
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -94,14 +94,10 @@ class OptimizedInferenceAgent:
             try:
                 if hasattr(torch, "compile"):
                     logger.info("Applying torch.compile optimization...")
-                    self.G_opt = torch.compile(
-                        self.G, mode="max-autotune", fullgraph=False
-                    )
+                    self.G_opt = torch.compile(self.G, mode="max-autotune", fullgraph=False)
                     logger.info("✓ torch.compile applied successfully")
                 else:
-                    logger.warning(
-                        "! torch.compile not available (requires PyTorch 2.0+)"
-                    )
+                    logger.warning("! torch.compile not available (requires PyTorch 2.0+)")
                     self.G_opt = self.G
             except Exception as e:
                 logger.warning(f"! torch.compile failed: {e}")
@@ -177,25 +173,19 @@ class OptimizedInferenceAgent:
         vid: torch.Tensor,
         video_path: str,
         audio_path: str,
-        video_encoder: Optional[str] = None,
+        video_encoder: str | None = None,
     ) -> str:
         """Save video supporting FFmpeg NVENC, CPU PyAV, and Torchcodec alternatives."""
         try:
             start_time = time.time()
-            encoder_choice = (
-                str(video_encoder or getattr(self.opt, "video_encoder", "FFmpeg NVENC"))
-                .strip()
-                .lower()
-            )
+            encoder_choice = str(video_encoder or getattr(self.opt, "video_encoder", "FFmpeg NVENC")).strip().lower()
             fps = int(getattr(self.opt, "fps", 25))
 
             if encoder_choice in ("cpu pyav", "pyav", "pyav_cpu"):
                 return save_video_pyav(vid, video_path, audio_path=audio_path, fps=fps)
 
             if encoder_choice in ("torchcodec", "torch codec", "tc"):
-                return save_video_torchcodec(
-                    vid, video_path, audio_path=audio_path, fps=fps
-                )
+                return save_video_torchcodec(vid, video_path, audio_path=audio_path, fps=fps)
 
             # Default: FFmpeg NVENC
             encode_video_nvenc(vid, video_path, fps=fps)
@@ -223,7 +213,7 @@ class OptimizedInferenceAgent:
         seed: int = 25,
         verbose: bool = True,
         benchmark: bool = False,
-        video_encoder: Optional[str] = None,
+        video_encoder: str | None = None,
     ) -> str:
         timings: dict[str, float] = {}
         total_start = time.perf_counter()
@@ -266,9 +256,7 @@ class OptimizedInferenceAgent:
             fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
             os.close(fd)
             try:
-                logger.info(
-                    "Warming up (first run also runs the one-time GPU auto-tune)..."
-                )
+                logger.info("Warming up (first run also runs the one-time GPU auto-tune)...")
                 for _ in range(warmup_runs):
                     generate(tmp_path)
 
@@ -283,9 +271,7 @@ class OptimizedInferenceAgent:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
 
-            logger.info(
-                f"Average generate+encode time: {elapsed / benchmark_runs * 1000:.2f} ms/run"
-            )
+            logger.info(f"Average generate+encode time: {elapsed / benchmark_runs * 1000:.2f} ms/run")
             logger.info(f"Throughput: {frames / elapsed:.2f} frames/s")
 
         # ---- actual run ----
@@ -361,9 +347,7 @@ class OptimizedInferenceAgent:
 
         inference_start = time.time()
         if use_amp or use_amp_fp16:
-            with torch.cuda.amp.autocast(
-                dtype=torch.float16 if use_amp_fp16 else torch.float32
-            ):
+            with torch.cuda.amp.autocast(dtype=torch.float16 if use_amp_fp16 else torch.float32):
                 d_hat = self.G_opt.inference(
                     data=data,
                     a_cfg_scale=a_cfg_scale,
@@ -410,7 +394,7 @@ class OptimizedInferenceAgent:
         no_crop: bool = False,
         seed: int = 25,
         verbose: bool = True,
-        video_encoder: Optional[str] = None,
+        video_encoder: str | None = None,
     ) -> list:
         """Sample several padded audio chunks in ONE model batch, then decode each.
 
@@ -431,9 +415,7 @@ class OptimizedInferenceAgent:
         fps = int(getattr(self.opt, "fps", 25))
 
         # data["a"] is [N, L] (preprocess zero-pads the list to equal length).
-        data = self.data_processor.preprocess(
-            ref_path, [it["padded_path"] for it in items], no_crop=no_crop
-        )
+        data = self.data_processor.preprocess(ref_path, [it["padded_path"] for it in items], no_crop=no_crop)
         s = data["s"]
 
         s_r, r_s_lambda, s_r_feats = G.encode_image_into_latent(s.to(device))
@@ -448,22 +430,18 @@ class OptimizedInferenceAgent:
             # little speech for a reliable read, and the feeling rarely flips
             # inside one window. Full windows are never padded, so their reads
             # stay exact.
-            auds = [
-                self.data_processor.default_aud_loader(it["audio_path"]) for it in items
-            ]
+            auds = [self.data_processor.default_aud_loader(it["audio_path"]) for it in items]
             full_len = max(a.shape[-1] for a in auds)
             pct30 = full_len * 0.30
             use_idx, copy_from, pad_list = [], {}, []
             for k, a0 in enumerate(auds):
                 L = a0.shape[-1]
-                if L >= full_len:
+                if full_len <= L:
                     use_idx.append(k)
                     pad_list.append(a0)
-                elif L > pct30:
+                elif pct30 < L:
                     need = full_len - L
-                    pad_list.append(
-                        torch.cat([a0, torch.zeros(need, dtype=a0.dtype)], dim=-1)
-                    )
+                    pad_list.append(torch.cat([a0, torch.zeros(need, dtype=a0.dtype)], dim=-1))
                     use_idx.append(k)
                 else:
                     copy_from[k] = k - 1  # previous chunk in time order
@@ -471,7 +449,7 @@ class OptimizedInferenceAgent:
             if pad_list:
                 batch_a = torch.stack(pad_list, dim=0).to(device)
                 logits = G.emotion_encoder.predict_emotion(batch_a)  # [m, dim_e]
-                for k, m in zip(use_idx, range(len(use_idx))):
+                for k, m in zip(use_idx, range(len(use_idx)), strict=False):
                     emo_mat[k] = logits[m]
             for k, src in copy_from.items():
                 if src >= 0 and emo_mat[src] is not None:
@@ -479,9 +457,7 @@ class OptimizedInferenceAgent:
                 else:
                     # Defensive: no previous chunk (only a tail can be short) —
                     # fall back to a solo read of the unpadded audio.
-                    emo_mat[k] = G.emotion_encoder.predict_emotion(
-                        auds[k].unsqueeze(0).to(device)
-                    )[0]
+                    emo_mat[k] = G.emotion_encoder.predict_emotion(auds[k].unsqueeze(0).to(device))[0]
             emo_arg = torch.stack(emo_mat, dim=0).unsqueeze(1)  # [N, 1, dim_e]
 
         def make_amp() -> contextlib.AbstractContextManager[None]:
@@ -497,27 +473,25 @@ class OptimizedInferenceAgent:
         # decoder must run under autocast too — otherwise half latents hit fp32
         # weights and torch raises a dtype mismatch.
         with make_amp():
-            parts = []
-            for piece in G.sample(
-                data,
-                a_cfg_scale=a_cfg_scale,
-                r_cfg_scale=r_cfg_scale,
-                e_cfg_scale=e_cfg_scale,
-                emo=emo_arg,
-                nfe=nfe,
-                seed=seed,
-                s_r=s_r,
-            ):
-                parts.append(piece)  # [N, T_slice, dim_w] (s_r already added)
+            parts = list(
+                G.sample(
+                    data,
+                    a_cfg_scale=a_cfg_scale,
+                    r_cfg_scale=r_cfg_scale,
+                    e_cfg_scale=e_cfg_scale,
+                    emo=emo_arg,
+                    nfe=nfe,
+                    seed=seed,
+                    s_r=s_r,
+                )
+            )  # each piece is [N, T_slice, dim_w] (s_r already added)
             lat_all = torch.cat(parts, dim=1)  # [N, T_full, dim_w]
 
             for i, it in enumerate(items):
                 # duration is seconds -> frames (samples*fps/sr == seconds*fps).
                 t_i = max(1, math.ceil(it["duration"] * fps))
                 lat_i = lat_all[i, :t_i, :]
-                d_hat = G.decode_latent_into_image(
-                    s_r, s_r_feats, lat_i, batch_size=decode_bs
-                )
+                d_hat = G.decode_latent_into_image(s_r, s_r_feats, lat_i, batch_size=decode_bs)
                 out = self.save_video(
                     d_hat.float(),
                     it["out_path"],
@@ -528,16 +502,14 @@ class OptimizedInferenceAgent:
                 del d_hat, lat_i
 
         if verbose:
-            logger.info(
-                f"> [Done] Batched inference: {len(items)} chunk(s) in one sample batch"
-            )
+            logger.info(f"> [Done] Batched inference: {len(items)} chunk(s) in one sample batch")
         return out_paths
 
 
 __all__ = [
-    "OptimizedInferenceAgent",
-    "InferenceOptions",
     "DataProcessor",
+    "InferenceOptions",
+    "OptimizedInferenceAgent",
     "SimpleVideoEncoder",
     "encode_video_nvenc",
 ]

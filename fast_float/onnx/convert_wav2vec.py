@@ -15,6 +15,7 @@ file covers every clip length.
 Usage (from repo root):
     python -m fast_float.onnx.convert_wav2vec --out ./onnx/wav2vec_v1.onnx
 """
+
 from __future__ import annotations
 
 import argparse
@@ -32,9 +33,9 @@ REPO_ROOT = CURRENT_DIR.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from fast_float.models.wav2vec2 import Wav2VecModel  # noqa: E402
-from fast_float.onnx.export import export_module, make_ort_session  # noqa: E402
-from fast_float.onnx.parity import check_parity  # noqa: E402
+from fast_float.models.wav2vec2 import Wav2VecModel
+from fast_float.onnx.export import export_module, make_ort_session
+from fast_float.onnx.parity import check_parity
 
 PROJ_PREFIX = "audio_encoder.audio_projection."
 N_LAYERS_STACKED = 12  # only_last_features=False: hidden_states[1:] of base model
@@ -105,16 +106,13 @@ def load_core(w2v_dir: str) -> Wav2VecModel:
     else:
         raise FileNotFoundError(f"no weight file in {w2v_dir}")
     missing, unexpected = core.load_state_dict(sd, strict=False)
-    print(
-        f"[weights] manual load: {len(sd)} tensors "
-        f"(missing={len(missing)}, unexpected={len(unexpected)})"
-    )
+    print(f"[weights] manual load: {len(sd)} tensors (missing={len(missing)}, unexpected={len(unexpected)})")
     return core
 
 
 def build_projection(ckpt_path: str) -> torch.nn.Module:
     sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-    sub = {k[len(PROJ_PREFIX):]: v for k, v in sd.items() if k.startswith(PROJ_PREFIX)}
+    sub = {k[len(PROJ_PREFIX) :]: v for k, v in sd.items() if k.startswith(PROJ_PREFIX)}
     if not sub:
         raise KeyError(f"no {PROJ_PREFIX}* keys in {ckpt_path}")
     w = sub["0.weight"]
@@ -122,8 +120,7 @@ def build_projection(ckpt_path: str) -> torch.nn.Module:
     print(f"[weights] projection: Linear({in_dim}->{dim_w}) + LayerNorm + SiLU")
     if in_dim != N_LAYERS_STACKED * 768:
         raise ValueError(
-            f"ckpt projection expects {in_dim} inputs — this exporter covers "
-            f"only_last_features=False (12x768=9216)"
+            f"ckpt projection expects {in_dim} inputs — this exporter covers only_last_features=False (12x768=9216)"
         )
     proj = torch.nn.Sequential(
         torch.nn.Linear(in_dim, dim_w),
@@ -155,8 +152,12 @@ def main(argv=None) -> int:
     ap.add_argument("--w2v-dir", default="./checkpoints/wav2vec2-base-960h")
     ap.add_argument("--out", default="./onnx/wav2vec_v1.onnx")
     ap.add_argument("--seconds", type=float, default=2.0)
-    ap.add_argument("--seconds-alt", type=float, default=4.0,
-                    help="second clip length proving dynamic seq_len")
+    ap.add_argument(
+        "--seconds-alt",
+        type=float,
+        default=4.0,
+        help="second clip length proving dynamic seq_len",
+    )
     ap.add_argument("--opset", type=int, default=17)
     ap.add_argument("--atol", type=float, default=1e-4)
     ap.add_argument("--rtol", type=float, default=1e-4)
@@ -197,8 +198,7 @@ def main(argv=None) -> int:
                 feats = core.feature_extract(wav, frames)
             ort_out = sess.run(None, {"conv_feats": feats.numpy()})[0]
             check_parity(ref, ort_out, name=name, atol=args.atol, rtol=args.rtol)
-            print(f"[probe:{name}] shape torch={tuple(ref.shape)} "
-                  f"onnx={tuple(ort_out.shape)}")
+            print(f"[probe:{name}] shape torch={tuple(ref.shape)} onnx={tuple(ort_out.shape)}")
 
         import math
 
@@ -211,19 +211,31 @@ def main(argv=None) -> int:
             probes = {
                 "noise": (torch.randn(1, n, generator=g).clamp(-1, 1), t),
                 "sine": (
-                    (0.5 * torch.sin(2 * math.pi * 130 * tt)
-                     + 0.3 * torch.sin(2 * math.pi * 260 * tt)).unsqueeze(0), t),
-                "batch2": (torch.cat(
-                    [torch.randn(1, n, generator=torch.Generator().manual_seed(1)).clamp(-1, 1),
-                     torch.randn(1, n, generator=torch.Generator().manual_seed(2)).clamp(-1, 1)],
-                    dim=0), t),
-                "altlen": (torch.randn(
-                    1, int(sr * args.seconds_alt),
-                    generator=torch.Generator().manual_seed(3)).clamp(-1, 1),
-                    frames_for(args.seconds_alt)),
-                "short1s": (torch.randn(
-                    1, sr, generator=torch.Generator().manual_seed(4)).clamp(-1, 1),
-                    frames_for(1.0)),
+                    (0.5 * torch.sin(2 * math.pi * 130 * tt) + 0.3 * torch.sin(2 * math.pi * 260 * tt)).unsqueeze(0),
+                    t,
+                ),
+                "batch2": (
+                    torch.cat(
+                        [
+                            torch.randn(1, n, generator=torch.Generator().manual_seed(1)).clamp(-1, 1),
+                            torch.randn(1, n, generator=torch.Generator().manual_seed(2)).clamp(-1, 1),
+                        ],
+                        dim=0,
+                    ),
+                    t,
+                ),
+                "altlen": (
+                    torch.randn(
+                        1,
+                        int(sr * args.seconds_alt),
+                        generator=torch.Generator().manual_seed(3),
+                    ).clamp(-1, 1),
+                    frames_for(args.seconds_alt),
+                ),
+                "short1s": (
+                    torch.randn(1, sr, generator=torch.Generator().manual_seed(4)).clamp(-1, 1),
+                    frames_for(1.0),
+                ),
             }
             for name, (wav, frames) in probes.items():
                 run_case(name, wav, frames)

@@ -129,9 +129,9 @@ export default function TelemetryDashboard({ latestResult, history = [] }) {
 
           {gpu.memory && (
             <div className="gpu-vram-track">
-              <div 
-                className="gpu-vram-fill" 
-                style={{ width: `${Math.min(gpu.memory.usage_percent, 100)}%` }} 
+              <div
+                className="gpu-vram-fill"
+                style={{ width: `${Math.min(gpu.memory.usage_percent, 100)}%` }}
               />
             </div>
           )}
@@ -156,9 +156,9 @@ export default function TelemetryDashboard({ latestResult, history = [] }) {
                   <span>•</span>
                   <span>{item.file_size_mb || 0} MB</span>
                 </div>
-                <a 
-                  href={item.download_url} 
-                  download 
+                <a
+                  href={item.download_url}
+                  download
                   className="btn-icon-subtle"
                   title="Download Video"
                 >

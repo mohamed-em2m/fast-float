@@ -1,7 +1,8 @@
-import os
-import math
-import torch
 import logging
+import math
+import os
+
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -53,9 +54,7 @@ logger = logging.getLogger(__name__)
 def enc_dec_mask(T, S, frame_width=1, expansion=2):
     mask = torch.ones(T, S)
     for i in range(T):
-        mask[
-            i, max(0, (i - expansion) * frame_width) : (i + expansion + 1) * frame_width
-        ] = 0
+        mask[i, max(0, (i - expansion) * frame_width) : (i + expansion + 1) * frame_width] = 0
     return mask == 1
 
 
@@ -73,9 +72,7 @@ def get_sinusoid_encoding_table(n_position, d_hid, padding_idx=None):
     def get_posi_angle_vec(position):
         return [cal_angle(position, hid_j) for hid_j in range(d_hid)]
 
-    sinusoid_table = torch.Tensor(
-        [get_posi_angle_vec(pos_i) for pos_i in range(n_position)]
-    )
+    sinusoid_table = torch.Tensor([get_posi_angle_vec(pos_i) for pos_i in range(n_position)])
     sinusoid_table[:, 0::2] = torch.sin(sinusoid_table[:, 0::2])  # dim 2i
     sinusoid_table[:, 1::2] = torch.cos(sinusoid_table[:, 1::2])  # dim 2i+1
     if padding_idx is not None:
@@ -111,11 +108,7 @@ class Attention(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         B, N, C = x.shape
-        qkv = (
-            self.qkv(x)
-            .reshape(B, N, 3, self.num_heads, self.head_dim)
-            .permute(2, 0, 3, 1, 4)
-        )
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
@@ -157,9 +150,7 @@ class TimestepEmbedder(nn.Module):
         self.frequency_embedding_size = frequency_embedding_size
 
     @staticmethod
-    def timestep_embedding(
-        t: torch.Tensor, dim: int, max_period: int = 10000
-    ) -> torch.Tensor:
+    def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
         """
         Create sinusoidal timestep embeddings.
         :param t: a 1-D Tensor of N indices, one per batch element.
@@ -170,17 +161,13 @@ class TimestepEmbedder(nn.Module):
         """
         # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
         half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period)
-            * torch.arange(start=0, end=half, dtype=torch.float32)
-            / half
-        ).to(device=t.device)
+        freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(
+            device=t.device
+        )
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
-            embedding = torch.cat(
-                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
-            )
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
@@ -212,15 +199,13 @@ class SequenceEmbed(nn.Module):
 
 class FMTBlock(nn.Module):
     """
-    A FMT block inspried by DiT Block
+    A FMT block inspired by DiT Block
     """
 
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(
-            hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs
-        )
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
 
@@ -233,24 +218,16 @@ class FMTBlock(nn.Module):
             act_layer=approx_gelu,
             drop=0,
         )
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        )
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
 
     def framewise_modulate(self, x, shift, scale) -> torch.Tensor:
         return x * (1 + scale) + shift
 
     def forward(self, x, c, mask=None) -> torch.Tensor:
         assert mask is not None
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.adaLN_modulation(c).chunk(6, dim=-1)
-        )
-        x = x + gate_msa * self.attn(
-            self.framewise_modulate(self.norm1(x), shift_msa, scale_msa), mask=mask
-        )
-        x = x + gate_mlp * self.mlp(
-            self.framewise_modulate(self.norm2(x), shift_mlp, scale_mlp)
-        )
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
+        x = x + gate_msa * self.attn(self.framewise_modulate(self.norm1(x), shift_msa, scale_msa), mask=mask)
+        x = x + gate_mlp * self.mlp(self.framewise_modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
 
@@ -262,9 +239,7 @@ class Decoder(nn.Module):
     def __init__(self, hidden_size, dim_w):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-        )
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
         self.linear = nn.Linear(hidden_size, dim_w, bias=True)
 
     def framewise_modulate(self, x, shift, scale) -> torch.Tensor:
@@ -297,9 +272,7 @@ class FlowMatchingTransformer(BaseModel):
         self.x_embedder = SequenceEmbed(opt.dim_w, self.hidden_size)
 
         # video time position encoding
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, self.num_total_frames, self.hidden_size), requires_grad=False
-        )
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_total_frames, self.hidden_size), requires_grad=False)
 
         # flow trajectory time encoding
         self.t_embedder = TimestepEmbedder(self.hidden_size)
@@ -307,18 +280,13 @@ class FlowMatchingTransformer(BaseModel):
 
         # define FMT blocks
         self.blocks = nn.ModuleList(
-            [
-                FMTBlock(self.hidden_size, self.num_heads, mlp_ratio=self.mlp_ratio)
-                for _ in range(self.fmt_depth)
-            ]
+            [FMTBlock(self.hidden_size, self.num_heads, mlp_ratio=self.mlp_ratio) for _ in range(self.fmt_depth)]
         )
         self.decoder = Decoder(self.hidden_size, self.opt.dim_w)
         self.initialize_weights()
 
         # define alignment mask
-        _mask_dev = torch.device(
-            f"cuda:{opt.rank}" if torch.cuda.is_available() else "cpu"
-        )
+        _mask_dev = torch.device(f"cuda:{opt.rank}" if torch.cuda.is_available() else "cpu")
         alignment_mask = enc_dec_mask(
             self.num_total_frames,
             self.num_total_frames,
@@ -351,10 +319,7 @@ class FlowMatchingTransformer(BaseModel):
                     f"(providers={self._onnx_backend.providers})"
                 )
             except Exception as e:
-                logger.warning(
-                    f"FlowMatchingTransformer: ONNX backend failed ({e}); "
-                    "falling back to torch weights"
-                )
+                logger.warning(f"FlowMatchingTransformer: ONNX backend failed ({e}); falling back to torch weights")
                 self._onnx_backend = None
 
     def _probe_onnx_backend(self, backend, tol: float = 1e-3) -> None:
@@ -375,9 +340,7 @@ class FlowMatchingTransformer(BaseModel):
         we = torch.randn(1, 1, 7, generator=g, **kw)
         prev_x = torch.randn(1, 10, 512, generator=g, **kw)
         prev_wa = torch.randn(1, 10, 512, generator=g, **kw)
-        t, x, wa, wr, we, prev_x, prev_wa = (
-            v.to(device) for v in (t, x, wa, wr, we, prev_x, prev_wa)
-        )
+        t, x, wa, wr, we, prev_x, prev_wa = (v.to(device) for v in (t, x, wa, wr, we, prev_x, prev_wa))
         with torch.no_grad():
             ref = self.forward(t, x, wa, wr, we, prev_x, prev_wa, train=False)
             got = backend.run_step(t, x, wa, wr, we, prev_x, prev_wa)
@@ -397,16 +360,11 @@ class FlowMatchingTransformer(BaseModel):
         converter/selector scripts; the config is the contract.
         """
         backend = self._onnx_backend
-        if backend is not None and all(
-            torch.is_tensor(v) for v in (t, x, wa, wr, we, prev_x, prev_wa)
-        ):
+        if backend is not None and all(torch.is_tensor(v) for v in (t, x, wa, wr, we, prev_x, prev_wa)):
             try:
                 return backend.run_step(t, x, wa, wr, we, prev_x, prev_wa)
             except Exception as e:
-                logger.warning(
-                    f"FlowMatchingTransformer: ONNX step failed ({e}); "
-                    "disabling backend for this run"
-                )
+                logger.warning(f"FlowMatchingTransformer: ONNX step failed ({e}); disabling backend for this run")
                 self._onnx_backend = None
         if self._mode == "compile":
             if self._compiled is None:
@@ -415,10 +373,7 @@ class FlowMatchingTransformer(BaseModel):
 
                     self._compiled = maybe_compile(self, "fmt")
                 except Exception as e:
-                    logger.warning(
-                        f"FlowMatchingTransformer: torch.compile failed ({e}); "
-                        "using eager"
-                    )
+                    logger.warning(f"FlowMatchingTransformer: torch.compile failed ({e}); using eager")
                     self._compiled = self
             if self._compiled is not self:
                 return self._compiled(t, x, wa, wr, we, prev_x, prev_wa, train=False)
@@ -457,15 +412,11 @@ class FlowMatchingTransformer(BaseModel):
 
     def sequence_embedder(self, sequence, dropout_prob, train=False) -> torch.Tensor:
         if train:
-            batch_id_for_drop = torch.where(
-                torch.rand(sequence.shape[0], device=sequence.device) < dropout_prob
-            )
+            batch_id_for_drop = torch.where(torch.rand(sequence.shape[0], device=sequence.device) < dropout_prob)
             sequence[batch_id_for_drop] = 0
         return sequence
 
-    def forward(
-        self, t, x, wa, wr, we, prev_x=None, prev_wa=None, train=True, **kwargs
-    ) -> torch.Tensor:
+    def forward(self, t, x, wa, wr, we, prev_x=None, prev_wa=None, train=True, **kwargs) -> torch.Tensor:
         """
         Forward pass of ConditionalFlowMatchingTransformer supporting batch size B >= 1.
 
@@ -497,9 +448,7 @@ class FlowMatchingTransformer(BaseModel):
             wa = wa.unsqueeze(0)
         if wa.shape[0] != B:
             wa = wa.expand(B, -1, -1)
-        wa = self.sequence_embedder(
-            wa, dropout_prob=self.opt.audio_dropout_prob, train=train
-        )
+        wa = self.sequence_embedder(wa, dropout_prob=self.opt.audio_dropout_prob, train=train)
 
         if wr.ndim == 1:
             wr = wr.unsqueeze(0).unsqueeze(1)
@@ -507,9 +456,7 @@ class FlowMatchingTransformer(BaseModel):
             wr = wr.unsqueeze(1)
         if wr.shape[0] != B:
             wr = wr.expand(B, -1, -1)
-        wr = self.sequence_embedder(
-            wr, dropout_prob=self.opt.ref_dropout_prob, train=train
-        )
+        wr = self.sequence_embedder(wr, dropout_prob=self.opt.ref_dropout_prob, train=train)
 
         if we.ndim == 1:
             we = we.unsqueeze(0).unsqueeze(1)
@@ -517,9 +464,7 @@ class FlowMatchingTransformer(BaseModel):
             we = we.unsqueeze(1)
         if we.shape[0] != B:
             we = we.expand(B, -1, -1)
-        we = self.sequence_embedder(
-            we, dropout_prob=self.opt.emotion_dropout_prob, train=train
-        )
+        we = self.sequence_embedder(we, dropout_prob=self.opt.emotion_dropout_prob, train=train)
 
         # previous condition encoding
         if prev_x is not None:
@@ -542,9 +487,7 @@ class FlowMatchingTransformer(BaseModel):
             wa = torch.cat([prev_wa, wa], dim=1)
 
         x = self.x_embedder(x)
-        x = (
-            x + self.pos_embed
-        )  # (B, L + L', D), where T = opt.wav2vec_sec * opt.fps, D = dim_w
+        x = x + self.pos_embed  # (B, L + L', D), where T = opt.wav2vec_sec * opt.fps, D = dim_w
 
         # expand (view, no copy) instead of repeat: the cat below copies once.
         wr = wr.expand(-1, wa.shape[1], -1)
@@ -666,15 +609,11 @@ class FlowMatchingTransformer(BaseModel):
                 prev_x_cat,
                 prev_wa_cat,
             )
-            uncond, all_cond, audio_uncond_emotion = torch.chunk(
-                model_output, chunks=3, dim=0
-            )
+            uncond, all_cond, audio_uncond_emotion = torch.chunk(model_output, chunks=3, dim=0)
 
             # Classifier-free vector field (cfv) incremental manner
             return (
-                uncond
-                + a_cfg_scale * (audio_uncond_emotion - uncond)
-                + e_cfg_scale * (all_cond - audio_uncond_emotion)
+                uncond + a_cfg_scale * (audio_uncond_emotion - uncond) + e_cfg_scale * (all_cond - audio_uncond_emotion)
             )
         else:
             return self._forward_step(t, x, wa, wr, we, prev_x, prev_wa)

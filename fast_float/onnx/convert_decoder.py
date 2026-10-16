@@ -14,6 +14,7 @@ Constraints (baked at trace time, verified in parity):
 - ToFlow grid caches are warmed pre-export so meshgrid/linspace freeze as
   constants; pass matching feat batches (runtime expands batch-1 feats).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -33,7 +34,7 @@ from fast_float.onnx.export import (
     fp16_tol,
     make_session_from_args,
 )
-from fast_float.onnx.parity import benchmark, check_parity, compare_outputs
+from fast_float.onnx.parity import benchmark, compare_outputs
 
 AE_PREFIX = "motion_autoencoder."
 
@@ -91,19 +92,30 @@ class _StaticModConv(nn.Module):
             demod = torch.rsqrt(weight.pow(2).sum([2, 3, 4]) + 1e-8)
             weight = weight * demod.view(batch, self.out_channel, 1, 1, 1)
         weight = weight.view(
-            batch * self.out_channel, self.in_channel,
-            self.kernel_size, self.kernel_size,
+            batch * self.out_channel,
+            self.in_channel,
+            self.kernel_size,
+            self.kernel_size,
         )
         _, _, height, width = input.shape
         if self.upsample:
             input = input.contiguous().view(1, batch * self.in_channel, height, width)
             weight = weight.view(
-                batch, self.out_channel, self.in_channel,
-                self.kernel_size, self.kernel_size,
+                batch,
+                self.out_channel,
+                self.in_channel,
+                self.kernel_size,
+                self.kernel_size,
             )
-            weight = weight.transpose(1, 2).contiguous().reshape(
-                batch * self.in_channel, self.out_channel,
-                self.kernel_size, self.kernel_size,
+            weight = (
+                weight.transpose(1, 2)
+                .contiguous()
+                .reshape(
+                    batch * self.in_channel,
+                    self.out_channel,
+                    self.kernel_size,
+                    self.kernel_size,
+                )
             )
             out = F.conv_transpose2d(input, weight, padding=0, stride=2, groups=batch)
             _, _, height, width = out.shape
@@ -156,35 +168,45 @@ class DecoderExport(nn.Module):
 
 
 def build_decoder_module(
-    ckpt_path: str, image_size: int, channel_mult: float, batch: int,
+    ckpt_path: str,
+    image_size: int,
+    channel_mult: float,
+    batch: int,
     device: torch.device,
 ) -> tuple[DecoderExport, object, list]:
-    gen = Generator(size=image_size, style_dim=512, motion_dim=20,
-                    channel_multiplier=channel_mult).to(device).eval()
+    gen = (
+        Generator(
+            size=image_size,
+            style_dim=512,
+            motion_dim=20,
+            channel_multiplier=channel_mult,
+        )
+        .to(device)
+        .eval()
+    )
     if os.path.exists(ckpt_path):
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        tops = Counter(k.split(".")[0] for k in sd.keys())
+        tops = Counter(k.split(".")[0] for k in sd)
         print(f"[weights] ckpt top-level prefixes: {dict(tops.most_common(10))}")
-        sub = {k[len(AE_PREFIX):]: v for k, v in sd.items()
-               if k.startswith(AE_PREFIX)}
+        sub = {k[len(AE_PREFIX) :]: v for k, v in sd.items() if k.startswith(AE_PREFIX)}
         if not sub:
             print("[weights] WARN: no motion_autoencoder.* keys — random init")
         else:
             missing, unexpected = gen.load_state_dict(sub, strict=False)
-            print(f"[weights] overlaid {len(sub)} tensors from {ckpt_path} "
-                  f"(missing={len(missing)}, unexpected={len(unexpected)})")
+            print(
+                f"[weights] overlaid {len(sub)} tensors from {ckpt_path} "
+                f"(missing={len(missing)}, unexpected={len(unexpected)})"
+            )
         gen.to(device)
     else:
-        print(f"[weights] WARN: {ckpt_path} not found — random init "
-              "(parity still valid)")
+        print(f"[weights] WARN: {ckpt_path} not found — random init (parity still valid)")
 
     # Self-discover feats structure from the reference encoder.
     with torch.no_grad():
         probe_img = torch.randn(1, 3, image_size, image_size, device=device)
         _, _, feats1 = gen.enc(probe_img, None)
     dec = gen.dec
-    print(f"[model] feats: {len(feats1)} maps "
-          f"{[tuple(f.shape) for f in feats1]}")
+    print(f"[model] feats: {len(feats1)} maps {[tuple(f.shape) for f in feats1]}")
 
     # Equivalence proof, then freeze grouped-conv batch for export.
     with torch.no_grad(), _deterministic_cudnn():
@@ -198,11 +220,12 @@ def build_decoder_module(
     n = _freeze_modconvs(dec, batch)
     with torch.no_grad(), _deterministic_cudnn():
         out_frozen = dec(lat_b, alpha=None, feats=feats_b)
-        out_frozen = (out_frozen[0] if isinstance(out_frozen, (tuple, list))
-                      else out_frozen)
-    print(f"[model] froze {n} ModulatedConv2d to static batch {batch}; "
-          f"repeat-diff={repeat:.3e} "
-          f"dyn-vs-frozen max_abs={(out_dyn - out_frozen).abs().max().item():.3e}")
+        out_frozen = out_frozen[0] if isinstance(out_frozen, (tuple, list)) else out_frozen
+    print(
+        f"[model] froze {n} ModulatedConv2d to static batch {batch}; "
+        f"repeat-diff={repeat:.3e} "
+        f"dyn-vs-frozen max_abs={(out_dyn - out_frozen).abs().max().item():.3e}"
+    )
     return DecoderExport(gen.dec, len(feats1)).eval(), gen.dec, feats1
 
 
@@ -212,10 +235,18 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default="./onnx/decoder_v1.onnx")
     ap.add_argument("--image-size", type=int, default=512)
     ap.add_argument("--channel-mult", type=float, default=1.0)
-    ap.add_argument("--batch", type=int, default=8,
-                    help="STATIC decode batch (runtime pads/trims to it)")
-    ap.add_argument("--model-seed", type=int, default=0,
-                    help="seed for random init (irrelevant when ckpt overlays all)")
+    ap.add_argument(
+        "--batch",
+        type=int,
+        default=8,
+        help="STATIC decode batch (runtime pads/trims to it)",
+    )
+    ap.add_argument(
+        "--model-seed",
+        type=int,
+        default=0,
+        help="seed for random init (irrelevant when ckpt overlays all)",
+    )
     ap.add_argument("--opset", type=int, default=17)
     # Nondeterminism note: cuDNN conv_transpose2d uses atomic-add kernels, so
     # parity runs under _deterministic_cudnn (repeat-diff must print 0.0).
@@ -238,9 +269,7 @@ def main(argv=None) -> int:
     # Deployed default is int 1; float channel sizes crash randn() exactly
     # like deployed code, so coerce integral values back to int.
     cm = int(args.channel_mult) if float(args.channel_mult).is_integer() else args.channel_mult
-    module, dec, feats1 = build_decoder_module(
-        args.ckpt, args.image_size, cm, args.batch, device
-    )
+    module, dec, feats1 = build_decoder_module(args.ckpt, args.image_size, cm, args.batch, device)
     b = args.batch
     feat_names = [f"feat{i}" for i in range(len(feats1))]
 
@@ -285,10 +314,13 @@ def main(argv=None) -> int:
             lat_t = torch.randn(b, 512, generator=g).to(device)
             ref_out = dec(lat_t, alpha=None, feats=feats_b)
             ref_img = ref_out[0] if isinstance(ref_out, (tuple, list)) else ref_out
-            ort_img = sess.run(None, {
-                "latent": lat_t.detach().cpu().numpy(),
-                **{n: f.detach().cpu().numpy() for n, f in zip(feat_names, feats_b)},
-            })[0]
+            ort_img = sess.run(
+                None,
+                {
+                    "latent": lat_t.detach().cpu().numpy(),
+                    **{n: f.detach().cpu().numpy() for n, f in zip(feat_names, feats_b, strict=False)},
+                },
+            )[0]
             rep = compare_outputs(ref_img, ort_img, atol=atol, rtol=rtol)
             cos_ok = rep["cosine"] >= min_cos
             mean_ok = rep["mean_abs"] <= max_mean
@@ -304,15 +336,13 @@ def main(argv=None) -> int:
                     f"decoder parity FAILED: cosine={rep['cosine']:.6f} (min={min_cos}), "
                     f"mean_abs={rep['mean_abs']:.3e} (max={max_mean})"
                 )
-            print(f"[parity:dec_b{b}] cosine OK ({rep['cosine']:.6f}) "
-                  f"mean OK ({rep['mean_abs']:.3e})")
+            print(f"[parity:dec_b{b}] cosine OK ({rep['cosine']:.6f}) mean OK ({rep['mean_abs']:.3e})")
         # Bench OUTSIDE deterministic cuDNN so torch runs its deployed kernels
         # (deterministic disables cuDNN autotuning and would inflate speedup).
         if args.bench_iters > 0:
             with torch.no_grad():
                 lat_np = lat_t.detach().cpu().numpy()
-                feats_np = {n: f.detach().cpu().numpy()
-                            for n, f in zip(feat_names, feats_b)}
+                feats_np = {n: f.detach().cpu().numpy() for n, f in zip(feat_names, feats_b, strict=False)}
                 benchmark(
                     lambda: dec(lat_t, alpha=None, feats=feats_b),
                     lambda: sess.run(None, {"latent": lat_np, **feats_np}),

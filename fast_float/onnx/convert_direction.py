@@ -4,6 +4,7 @@ Exports the QR-free path: Q is baked as a buffer (same cache the torch
 model uses since the QR fix), forward is diag_embed + matmul + sum.
 Canonical shapes: x (B, M) -> out (B, 512). Dynamic batch.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -40,30 +41,24 @@ class DirectionExport(nn.Module):
             probe = torch.randn(4, self.motion_dim, device=q.device)
             a = (torch.diag_embed(probe) @ q.T).sum(1)
             b = probe @ q.T
-            print(f"[model] diag_embed-form vs matmul max_abs="
-                  f"{(a - b).abs().max().item():.3e}")
+            print(f"[model] diag_embed-form vs matmul max_abs={(a - b).abs().max().item():.3e}")
 
     def forward(self, x):
         return x @ self.Q.T
 
 
-def build_direction_module(
-    ckpt_path: str, motion_dim: int, device: torch.device
-) -> tuple[DirectionExport, Direction]:
+def build_direction_module(ckpt_path: str, motion_dim: int, device: torch.device) -> tuple[DirectionExport, Direction]:
     direction = Direction(motion_dim).to(device).eval()
     if os.path.exists(ckpt_path):
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        tops = Counter(k.split(".")[0] for k in sd.keys())
+        tops = Counter(k.split(".")[0] for k in sd)
         print(f"[weights] ckpt top-level prefixes: {dict(tops.most_common(10))}")
         # Direction lives at motion_autoencoder.dec.direction; fall back to a
         # suffix scan (there is exactly one Direction module in the graph).
-        sub = {
-            "weight": v
-            for k, v in sd.items()
-            if k == "motion_autoencoder.dec.direction.weight"
-        }
+        _dir_key = "motion_autoencoder.dec.direction.weight"
+        sub = {"weight": sd[_dir_key]} if _dir_key in sd else {}
         if not sub:
-            cands = [k for k in sd.keys() if k.endswith("dec.direction.weight")]
+            cands = [k for k in sd if k.endswith("dec.direction.weight")]
             if len(cands) == 1:
                 sub = {"weight": sd[cands[0]]}
                 print(f"[weights] fallback prefix: {cands[0]}")
@@ -87,10 +82,7 @@ def build_direction_module(
             )
         direction.to(device)
     else:
-        print(
-            f"[weights] WARN: {ckpt_path} not found — exporting randomly "
-            "initialized Direction (parity still valid)"
-        )
+        print(f"[weights] WARN: {ckpt_path} not found — exporting randomly initialized Direction (parity still valid)")
     return DirectionExport(direction).eval(), direction
 
 
@@ -131,7 +123,9 @@ def main(argv=None) -> int:
 
     if not args.skip_parity:
         sess, fp16 = make_session_from_args(
-            info["path"], args, opt_shapes={"x": [1, m]},
+            info["path"],
+            args,
+            opt_shapes={"x": [1, m]},
         )
         atol, rtol = fp16_tol(args.atol, fp16), fp16_tol(args.rtol, fp16)
         with torch.no_grad():
@@ -140,13 +134,12 @@ def main(argv=None) -> int:
                 x = torch.randn(b, m, generator=g).to(device)
                 ref = direction(x)
                 ort_out = sess.run(None, {"x": x.detach().cpu().numpy()})[0]
-                check_parity(ref, ort_out, name=f"dir_b{b}",
-                             atol=atol, rtol=rtol)
+                check_parity(ref, ort_out, name=f"dir_b{b}", atol=atol, rtol=rtol)
                 if args.bench_iters > 0:
                     x_np = x.detach().cpu().numpy()
                     benchmark(
-                        lambda: direction(x),
-                        lambda: sess.run(None, {"x": x_np}),
+                        lambda x=x: direction(x),
+                        lambda x_np=x_np: sess.run(None, {"x": x_np}),
                         name=f"dir_b{b}",
                         iters=args.bench_iters,
                     )

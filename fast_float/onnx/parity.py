@@ -1,7 +1,6 @@
 """torch-vs-ONNX parity checks used by every converter."""
-from __future__ import annotations
 
-from typing import Dict
+from __future__ import annotations
 
 import numpy as np
 
@@ -14,7 +13,7 @@ def _to_numpy(x) -> np.ndarray:
     return np.asarray(x, dtype=np.float32)
 
 
-def compare_outputs(a, b, atol: float = 1e-4, rtol: float = 1e-4) -> Dict[str, float]:
+def compare_outputs(a, b, atol: float = 1e-4, rtol: float = 1e-4) -> dict[str, float]:
     """Compare two outputs. Returns metrics dict with an ``ok`` flag."""
     a, b = _to_numpy(a), _to_numpy(b)
     if a.shape != b.shape:
@@ -40,9 +39,7 @@ def compare_outputs(a, b, atol: float = 1e-4, rtol: float = 1e-4) -> Dict[str, f
     }
 
 
-def check_parity(
-    torch_out, ort_out, name: str = "output", atol: float = 1e-4, rtol: float = 1e-4
-) -> Dict[str, float]:
+def check_parity(torch_out, ort_out, name: str = "output", atol: float = 1e-4, rtol: float = 1e-4) -> dict[str, float]:
     """Compare and print one named output pair. Raises on mismatch."""
     rep = compare_outputs(torch_out, ort_out, atol=atol, rtol=rtol)
     status = "PASS" if rep["ok"] else "FAIL"
@@ -57,9 +54,7 @@ def check_parity(
     return rep
 
 
-def benchmark(
-    torch_fn, ort_fn, name: str = "run", iters: int = 50, warmup: int = 10
-) -> Dict[str, float]:
+def benchmark(torch_fn, ort_fn, name: str = "run", iters: int = 50, warmup: int = 10) -> dict[str, float]:
     """Warmed median-latency shootout: torch vs ORT. Returns report dict.
 
     Session-creation cost is excluded by construction (session already

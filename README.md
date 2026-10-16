@@ -4,7 +4,7 @@
 
 > **Attribution — please read.** FLOAT Fast is a community engineering project built on top of the official **FLOAT** research implementation by [Taekyung Ki](https://taekyungki.github.io), [Dongchan Min](https://kevinmin95.github.io), and [Gyeongsu Chae](https://www.aistudios.com/ko) (DeepBrain AI), presented at **ICCV 2025**. The model architecture, trained checkpoints, method, and original inference code are entirely their work, released under a [Creative Commons Attribution-NonCommercial-NoDerivatives 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/) license. This repository adds a serving/inference layer around it and **inherits the same non-commercial license**. If you use it, please cite the original paper — see [Citation](#citation).
 >
-> Upstream project: [deepbrainai-research/float](https://github.com/deepbrainai-research/float) · Project page: https://deepbrainai-research.github.io/float/
+> Upstream project: [deepbrainai-research/float](https://github.com/deepbrainai-research/float) · Project page: <https://deepbrainai-research.github.io/float/>
 
 ---
 
@@ -190,7 +190,7 @@ See [`AGENT.md`](AGENT.md) for a deeper architecture guide.
 
 ## License
 
-This work is licensed under a [Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License](https://creativecommons.org/licenses/by-nc-nd/4.0/), inherited from the upstream FLOAT release. **You may not use this work for commercial purposes and may use it only for research purposes.** For any commercial inquiries or collaboration opportunities, please contact daniel@deepbrain.io.
+This work is licensed under a [Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International License](https://creativecommons.org/licenses/by-nc-nd/4.0/), inherited from the upstream FLOAT release. **You may not use this work for commercial purposes and may use it only for research purposes.** For any commercial inquiries or collaboration opportunities, please contact <daniel@deepbrain.io>.
 
 ## Development note (upstream)
 
@@ -198,7 +198,7 @@ This repository builds on a research demonstration implementation provided as a 
 
 ---
 
-# About FLOAT (upstream)
+## About FLOAT (upstream)
 
 The remainder of this document describes the original FLOAT method, results, and credits.
 
@@ -207,7 +207,7 @@ The remainder of this document describes the original FLOAT method, results, and
 **FLOAT: Generative Motion Latent Flow Matching for Audio-driven Talking Portrait**<br>
 [Taekyung Ki](https://taekyungki.github.io), [Dongchan Min](https://kevinmin95.github.io), [Gyeongsu Chae](https://www.aistudios.com/ko)
 
-Project Page: https://deepbrainai-research.github.io/float/
+Project Page: <https://deepbrainai-research.github.io/float/>
 
 **Abstract**: *With the rapid advancement of diffusion-based generative models, portrait image animation has achieved remarkable results. However, it still faces challenges in temporally consistent video generation and fast sampling due to its iterative sampling nature. This paper presents FLOAT, an audio-driven talking portrait video generation method based on flow matching generative model. Instead of a pixel-based latent space, we take advantage of a learned orthogonal motion latent space, enabling efficient generation and editing of temporally consistent motion. To achieve this, we introduce a transformer-based vector field predictor with an effective frame-wise conditioning mechanism. Additionally, our method supports speech-driven emotion enhancement, enabling a natural incorporation of expressive motions. Extensive experiments demonstrate that our method outperforms state-of-the-art audio-driven talking portrait methods in terms of visual quality, motion fidelity, and efficiency.*
 
@@ -289,7 +289,7 @@ CUDA_VISIBLE_DEVICES=0 python generate.py \
 
 | Before crop | After crop | Result |
 |---------------|---------|--------|
-| ![](assets/sam_altman.webp) | ![](assets/sam_altman_512x512.jpg) | <video src='https://github.com/user-attachments/assets/3353e4e0-00f5-429b-bc66-5db9a72186b8'> </video> |
+| ![Before crop](assets/sam_altman.webp) | ![After crop](assets/sam_altman_512x512.jpg) | <video src='https://github.com/user-attachments/assets/3353e4e0-00f5-429b-bc66-5db9a72186b8'> </video> |
 
 ## Citation
 

@@ -31,6 +31,7 @@ AUDIO_FRAMES="${AUDIO_FRAMES:-300}"
 # the CUDA EP, ORT_ARGS="--trt-fp32" for FP32 TensorRT, or
 # ORT_ARGS="--trt-max-batch 16". Default: TensorRT FP16 engine-cached.
 ORT_ARGS="${ORT_ARGS:-}"
+read -r -a ORT_ARGS_ARR <<< "${ORT_ARGS}" || true
 mkdir -p "${OUT_DIR}" checkpoints
 
 echo "=== [1/8] weights ==="
@@ -161,28 +162,28 @@ set +e
 
 run_unit "[3/8] convert: emotion (unit 1)" \
   python -m fast_float.onnx.convert_emotion \
-    --ckpt "${CKPT}" --emo-dir "${EMO_DIR}" --out "${EMO_OUT}" ${ORT_ARGS}
+    --ckpt "${CKPT}" --emo-dir "${EMO_DIR}" --out "${EMO_OUT}" "${ORT_ARGS_ARR[@]}"
 
 run_unit "[4/8] convert: fmt step (unit 2)" \
   python -m fast_float.onnx.convert_fmt \
-    --ckpt "${CKPT}" --out "${FMT_OUT}" ${ORT_ARGS}
+    --ckpt "${CKPT}" --out "${FMT_OUT}" "${ORT_ARGS_ARR[@]}"
 
 run_unit "[5/8] convert: direction (unit 3)" \
   python -m fast_float.onnx.convert_direction \
-    --ckpt "${CKPT}" --out "${DIR_OUT}" ${ORT_ARGS}
+    --ckpt "${CKPT}" --out "${DIR_OUT}" "${ORT_ARGS_ARR[@]}"
 
 run_unit "[6/8] convert: audio encoder (unit 4)" \
   python -m fast_float.onnx.convert_audio \
     --ckpt "${CKPT}" --w2v-dir "${W2V_DIR}" --out "${AUDIO_OUT}" \
-    --frames "${AUDIO_FRAMES}" ${ORT_ARGS}
+    --frames "${AUDIO_FRAMES}" "${ORT_ARGS_ARR[@]}"
 
 run_unit "[7/8] convert: frame decoder (unit 5)" \
   python -m fast_float.onnx.convert_decoder \
-    --ckpt "${CKPT}" --out "${DEC_OUT}" --batch "${DEC_BATCH}" ${ORT_ARGS}
+    --ckpt "${CKPT}" --out "${DEC_OUT}" --batch "${DEC_BATCH}" "${ORT_ARGS_ARR[@]}"
 
 run_unit "[8/8] convert: reference encoder (unit 6)" \
   python -m fast_float.onnx.convert_refenc \
-    --ckpt "${CKPT}" --out "${REF_OUT}" ${ORT_ARGS}
+    --ckpt "${CKPT}" --out "${REF_OUT}" "${ORT_ARGS_ARR[@]}"
 
 set -e
 
@@ -217,6 +218,6 @@ else
       --onnx-dir "${OUT_DIR}" --out "${OUT_DIR}/backends.generated.yaml" \
       --ckpt "${CKPT}" --emo-dir "${EMO_DIR}" --w2v-dir "${W2V_DIR}" \
       --dec-batch "${DEC_BATCH}" --audio-frames "${AUDIO_FRAMES}" \
-      ${ORT_ARGS} || echo "[WARN] backend selection failed -> runtime keeps all-eager"
+      "${ORT_ARGS_ARR[@]}" || echo "[WARN] backend selection failed -> runtime keeps all-eager"
   fi
 fi

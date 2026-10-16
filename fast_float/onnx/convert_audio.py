@@ -11,9 +11,11 @@ Bakes the ``only_last_features`` flag at build time (deployed default False
 = stack 12 layers). Reuses the emotion converter's manual-load fallback for
 new-transformers incompatibility.
 """
+
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 from collections import Counter
 
@@ -65,8 +67,13 @@ def load_w2v_core(w2v_dir: str):
         core = Wav2VecModel(cfg)
         from transformers.utils import SAFE_WEIGHTS_NAME, WEIGHTS_NAME
 
-        for name in (SAFE_WEIGHTS_NAME, WEIGHTS_NAME, "model.safetensors",
-                     "pytorch_model.bin", "rust_model.ot"):
+        for name in (
+            SAFE_WEIGHTS_NAME,
+            WEIGHTS_NAME,
+            "model.safetensors",
+            "pytorch_model.bin",
+            "rust_model.ot",
+        ):
             path = os.path.join(w2v_dir, name)
             if os.path.exists(path):
                 if path.endswith(".safetensors"):
@@ -79,12 +86,9 @@ def load_w2v_core(w2v_dir: str):
         else:
             raise FileNotFoundError(f"no weight file in {w2v_dir}")
         missing, unexpected = core.load_state_dict(sd, strict=False)
-        print(f"[weights] manual load: {len(sd)} tensors "
-              f"(missing={len(missing)}, unexpected={len(unexpected)})")
-        try:
+        print(f"[weights] manual load: {len(sd)} tensors (missing={len(missing)}, unexpected={len(unexpected)})")
+        with contextlib.suppress(Exception):
             core.tie_weights()
-        except Exception:
-            pass
         return core, cfg.num_hidden_layers, True
 
 
@@ -124,28 +128,25 @@ def build_audio_module(
     w2v, n_layers, _ = load_w2v_core(w2v_dir)
     hid = w2v.config.hidden_size
     in_dim = hid if only_last else n_layers * hid
-    print(f"[model] w2v layers={n_layers} hid={hid} only_last={only_last} "
-          f"proj_in={in_dim} T={frames}")
+    print(f"[model] w2v layers={n_layers} hid={hid} only_last={only_last} proj_in={in_dim} T={frames}")
 
-    projection = nn.Sequential(
-        nn.Linear(in_dim, dim_w), nn.LayerNorm(dim_w), nn.SiLU()
-    )
+    projection = nn.Sequential(nn.Linear(in_dim, dim_w), nn.LayerNorm(dim_w), nn.SiLU())
     if os.path.exists(ckpt_path):
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        tops = Counter(k.split(".")[0] for k in sd.keys())
+        tops = Counter(k.split(".")[0] for k in sd)
         print(f"[weights] ckpt top-level prefixes: {dict(tops.most_common(10))}")
-        sub = {k[len(AUDIO_PREFIX):]: v for k, v in sd.items()
-               if k.startswith(AUDIO_PREFIX)}
+        sub = {k[len(AUDIO_PREFIX) :]: v for k, v in sd.items() if k.startswith(AUDIO_PREFIX)}
         # ckpt carries only the projection (frozen base lives in the HF dir).
         proj_sub = {k: v for k, v in sub.items() if k.startswith("audio_projection.")}
         if proj_sub:
-            mapped = {k[len("audio_projection."):]: v for k, v in proj_sub.items()}
+            mapped = {k[len("audio_projection.") :]: v for k, v in proj_sub.items()}
             missing, unexpected = projection.load_state_dict(mapped, strict=False)
-            print(f"[weights] overlaid projection {len(mapped)} tensors "
-                  f"(missing={len(missing)}, unexpected={len(unexpected)})")
+            print(
+                f"[weights] overlaid projection {len(mapped)} tensors "
+                f"(missing={len(missing)}, unexpected={len(unexpected)})"
+            )
         else:
-            print("[weights] WARN: no audio_encoder.audio_projection.* keys — "
-                  "random projection (parity still valid)")
+            print("[weights] WARN: no audio_encoder.audio_projection.* keys — random projection (parity still valid)")
     else:
         print(f"[weights] WARN: {ckpt_path} not found — random projection")
 
@@ -154,8 +155,7 @@ def build_audio_module(
     return AudioExport(w2v, projection, only_last, frames).eval(), w2v, projection
 
 
-def reference_inference(w2v, projection, only_last: bool, a, seq_len: int,
-                        sampling_rate: int, fps: float):
+def reference_inference(w2v, projection, only_last: bool, a, seq_len: int, sampling_rate: int, fps: float):
     """Mirror of AudioEncoder.inference (pad/trim + same calls)."""
     expected_len = int(seq_len * sampling_rate / fps)
     if a.shape[1] < expected_len:
@@ -176,8 +176,12 @@ def main(argv=None) -> int:
     ap.add_argument("--ckpt", default="./checkpoints/float.pth")
     ap.add_argument("--w2v-dir", default="./checkpoints/wav2vec2-base-960h")
     ap.add_argument("--out", default="./onnx/audio_enc_v1.onnx")
-    ap.add_argument("--frames", type=int, default=300,
-                    help="static output frame count T (runtime pads/trims to it)")
+    ap.add_argument(
+        "--frames",
+        type=int,
+        default=300,
+        help="static output frame count T (runtime pads/trims to it)",
+    )
     ap.add_argument("--sampling-rate", type=int, default=16000)
     ap.add_argument("--fps", type=float, default=25.0)
     ap.add_argument("--dim-w", type=int, default=512)
@@ -194,8 +198,12 @@ def main(argv=None) -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[env] device={device}")
     module, w2v, projection = build_audio_module(
-        args.ckpt, args.w2v_dir, args.frames, args.dim_w,
-        args.only_last_features, device,
+        args.ckpt,
+        args.w2v_dir,
+        args.frames,
+        args.dim_w,
+        args.only_last_features,
+        device,
     )
 
     wav_len = int(args.frames * args.sampling_rate / args.fps)
@@ -222,25 +230,39 @@ def main(argv=None) -> int:
 
     if not args.skip_parity:
         sess, fp16 = make_session_from_args(
-            info["path"], args, opt_shapes={"waveform": [1, wav_len]},
+            info["path"],
+            args,
+            opt_shapes={"waveform": [1, wav_len]},
         )
         atol, rtol = fp16_tol(args.atol, fp16), fp16_tol(args.rtol, fp16)
         with torch.no_grad():
             for bi, b in enumerate(batches):
                 g = torch.Generator(device="cpu").manual_seed(500 + bi)
                 a = torch.randn(b, wav_len, generator=g).clamp(-1, 1).to(device)
-                ref = reference_inference(w2v, projection, args.only_last_features,
-                                          a, args.frames, args.sampling_rate, args.fps)
+                ref = reference_inference(
+                    w2v,
+                    projection,
+                    args.only_last_features,
+                    a,
+                    args.frames,
+                    args.sampling_rate,
+                    args.fps,
+                )
                 ort_out = sess.run(None, {"waveform": a.detach().cpu().numpy()})[0]
-                check_parity(ref, ort_out, name=f"audio_b{b}",
-                             atol=atol, rtol=rtol)
+                check_parity(ref, ort_out, name=f"audio_b{b}", atol=atol, rtol=rtol)
                 if args.bench_iters > 0:
                     a_np = a.detach().cpu().numpy()
                     benchmark(
-                        lambda: reference_inference(
-                            w2v, projection, args.only_last_features, a,
-                            args.frames, args.sampling_rate, args.fps),
-                        lambda: sess.run(None, {"waveform": a_np}),
+                        lambda a=a: reference_inference(
+                            w2v,
+                            projection,
+                            args.only_last_features,
+                            a,
+                            args.frames,
+                            args.sampling_rate,
+                            args.fps,
+                        ),
+                        lambda a_np=a_np: sess.run(None, {"waveform": a_np}),
                         name=f"audio_b{b}",
                         iters=args.bench_iters,
                     )

@@ -39,7 +39,8 @@ echo "uv version: $(uv --version)"
 echo "=== Syncing project environment (uv sync) ==="
 echo "--- Python comes from .python-version, deps from pyproject.toml + uv.lock ---"
 uv venv .venv --python 3.10 --clear
-source .venv/bin/activate 
+# shellcheck source=/dev/null
+source .venv/bin/activate
 uv pip install --python .venv/bin/python -e .
 uv lock
 

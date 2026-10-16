@@ -1,5 +1,6 @@
 import logging
 import sys
+from typing import ClassVar
 
 
 class ColoredFormatter(logging.Formatter):
@@ -13,22 +14,12 @@ class ColoredFormatter(logging.Formatter):
     green = "\x1b[38;5;46m"
     reset = "\x1b[0m"
 
-    FORMATS = {
-        logging.DEBUG: grey
-        + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-        + reset,
-        logging.INFO: green
-        + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-        + reset,
-        logging.WARNING: yellow
-        + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-        + reset,
-        logging.ERROR: red
-        + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-        + reset,
-        logging.CRITICAL: bold_red
-        + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-        + reset,
+    FORMATS: ClassVar[dict[int, str]] = {
+        logging.DEBUG: grey + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s" + reset,
+        logging.INFO: green + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s" + reset,
+        logging.WARNING: yellow + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s" + reset,
+        logging.ERROR: red + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s" + reset,
+        logging.CRITICAL: bold_red + "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s" + reset,
     }
 
     def format(self, record: logging.LogRecord) -> str:

@@ -1,13 +1,13 @@
-import os
-import io
 import base64
+import io
+import os
 import tempfile
-from typing import Optional
-import numpy as np
+
 import cv2
+import numpy as np
+import soundfile as sf
 from PIL import Image
 from pydub import AudioSegment
-import soundfile as sf
 
 from fast_float.utils.logger import logger
 
@@ -35,13 +35,14 @@ def ensure_default_image(image_path: str = DEFAULT_IMAGE_PATH, size: int = TARGE
     return image_path
 
 
-def resize_image_to_256(image_path: str, output_path: Optional[str] = None, size: int = TARGET_IMAGE_SIZE) -> str:
+def resize_image_to_256(image_path: str, output_path: str | None = None, size: int = TARGET_IMAGE_SIZE) -> str:
     """
     Load image, convert alpha/RGBA to RGB, resize to size x size, and save as JPEG.
     """
     try:
         if output_path is None:
-            output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg").name
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as _tmp:
+                output_path = _tmp.name
 
         img = Image.open(image_path)
 
@@ -69,7 +70,7 @@ def _resample_mono(audio: np.ndarray, src_rate: int, target_rate: int) -> np.nda
     if src_rate == target_rate:
         return audio
     duration = len(audio) / src_rate
-    target_len = int(round(duration * target_rate))
+    target_len = round(duration * target_rate)
     if target_len <= 0:
         raise ValueError("Audio too short after resampling")
     src_idx = np.linspace(0, len(audio) - 1, target_len)
@@ -165,9 +166,7 @@ def process_audio_format(
         audio_bytes = base64.b64decode(audio_content)
         ext = ext.lower().lstrip(".")
 
-        logger.debug(
-            f"Processing audio: format={ext}, size={len(audio_bytes)} bytes, sr={sample_rate}, ch={channels}"
-        )
+        logger.debug(f"Processing audio: format={ext}, size={len(audio_bytes)} bytes, sr={sample_rate}, ch={channels}")
 
         if ext in ["pcm", "raw"]:
             wav_bytes = convert_pcm_to_wav(audio_bytes, sample_rate, channels, sample_width)

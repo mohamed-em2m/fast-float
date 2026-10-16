@@ -25,16 +25,18 @@ Usage (from repo root, on the GPU box):
 ``--dry-run`` only writes the safe all-eager config + an env fingerprint
 (no model construction), so it also works on a CPU-only box.
 """
+
 from __future__ import annotations
 
 import argparse
 import os
 import time
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any
 
 import numpy as np
 import torch
@@ -68,13 +70,13 @@ class Case:
     name: str
     module: torch.nn.Module
     inputs: tuple
-    feed: Dict[str, np.ndarray]
+    feed: dict[str, np.ndarray]
     atol: float = 2e-4
     rtol: float = 2e-4
-    opt_shapes: Optional[dict] = None
-    extra_dynamic: Optional[dict] = None
-    min_cosine: Optional[float] = None
-    max_mean: Optional[float] = None
+    opt_shapes: dict | None = None
+    extra_dynamic: dict | None = None
+    min_cosine: float | None = None
+    max_mean: float | None = None
 
     def eager_outs(self) -> list:
         out = self.module(*self.inputs)
@@ -89,13 +91,16 @@ class Case:
 # --dry-run stays importable without the model stack).
 # --------------------------------------------------------------------------- #
 
+
 def _build_emotion(args, device) -> Case:
     from fast_float.onnx.convert_emotion import build_emotion_module, probe_inputs
 
     module = build_emotion_module(args.emo_dir, args.ckpt).to(device)
     wav = probe_inputs(args.seconds)["sine"].to(device)
     return Case(
-        "emotion", module, (wav,),
+        "emotion",
+        module,
+        (wav,),
         {"input_values": wav.detach().cpu().numpy()},
         opt_shapes={"input_values": [1, int(wav.shape[1])]},
         extra_dynamic={"input_values": {1: (16000, 160000)}},
@@ -106,13 +111,21 @@ def _build_audio(args, device) -> Case:
     from fast_float.onnx.convert_audio import build_audio_module
 
     module, _, _ = build_audio_module(
-        args.ckpt, args.w2v_dir, args.audio_frames, 512, False, device,
+        args.ckpt,
+        args.w2v_dir,
+        args.audio_frames,
+        512,
+        False,
+        device,
     )
     wav_len = int(args.audio_frames * 16000 / 25.0)
     g = torch.Generator().manual_seed(11)
     a = torch.randn(1, wav_len, generator=g).clamp(-1, 1).to(device)
     return Case(
-        "audio", module, (a,), {"waveform": a.detach().cpu().numpy()},
+        "audio",
+        module,
+        (a,),
+        {"waveform": a.detach().cpu().numpy()},
         opt_shapes={"waveform": [1, wav_len]},
     )
 
@@ -123,7 +136,10 @@ def _build_direction(args, device) -> Case:
     module, _ = build_direction_module(args.ckpt, args.motion_dim, device)
     x = torch.randn(1, module.motion_dim, device=device)
     return Case(
-        "direction", module, (x,), {"x": x.detach().cpu().numpy()},
+        "direction",
+        module,
+        (x,),
+        {"x": x.detach().cpu().numpy()},
         opt_shapes={"x": [1, module.motion_dim]},
     )
 
@@ -138,8 +154,11 @@ def _build_fmt(args, device) -> Case:
     )
 
     ns = SimpleNamespace(
-        ckpt=args.ckpt, prev_frames=args.prev_frames, dim_h=args.fmt_dim_h,
-        mlp_ratio=args.fmt_mlp_ratio, fmt_depth=args.fmt_depth,
+        ckpt=args.ckpt,
+        prev_frames=args.prev_frames,
+        dim_h=args.fmt_dim_h,
+        mlp_ratio=args.fmt_mlp_ratio,
+        fmt_depth=args.fmt_depth,
         num_heads=args.fmt_heads,
     )
     fmt = build_fmt(ns).to(device)
@@ -149,11 +168,14 @@ def _build_fmt(args, device) -> Case:
     module = FMTStepWrapper(fmt).eval().to(device)
     names = ["t", "x", "wa", "wr", "we", "prev_x", "prev_wa"]
     ins = sample_inputs(3, 0.5, 99, device)  # CFG 3B: the hot call
-    feed = {k: v.detach().cpu().numpy() for k, v in zip(names, ins)}
+    feed = {k: v.detach().cpu().numpy() for k, v in zip(names, ins, strict=False)}
     opt = {
-        "x": [1, CLIP_FRAMES, 512], "wa": [1, CLIP_FRAMES, 512],
-        "wr": [1, 1, 512], "we": [1, 1, 7],
-        "prev_x": [1, PREV_FRAMES, 512], "prev_wa": [1, PREV_FRAMES, 512],
+        "x": [1, CLIP_FRAMES, 512],
+        "wa": [1, CLIP_FRAMES, 512],
+        "wr": [1, 1, 512],
+        "we": [1, 1, 7],
+        "prev_x": [1, PREV_FRAMES, 512],
+        "prev_wa": [1, PREV_FRAMES, 512],
     }
     return Case("fmt", module, tuple(ins), feed, opt_shapes=opt)
 
@@ -162,7 +184,11 @@ def _build_decoder(args, device) -> Case:
     from fast_float.onnx.convert_decoder import build_decoder_module
 
     module, _dec, feats1 = build_decoder_module(
-        args.ckpt, args.image_size, 1.0, args.dec_batch, device,
+        args.ckpt,
+        args.image_size,
+        1.0,
+        args.dec_batch,
+        device,
     )
     b = args.dec_batch
     with torch.no_grad():
@@ -171,8 +197,14 @@ def _build_decoder(args, device) -> Case:
     feed = {"latent": lat.detach().cpu().numpy()}
     feed.update({f"feat{i}": f.detach().cpu().numpy() for i, f in enumerate(feats_b)})
     return Case(
-        "decoder", module, (lat, *feats_b), feed,
-        atol=1.0, rtol=1e-2, min_cosine=0.995, max_mean=0.05,
+        "decoder",
+        module,
+        (lat, *feats_b),
+        feed,
+        atol=1.0,
+        rtol=1e-2,
+        min_cosine=0.995,
+        max_mean=0.05,
     )
 
 
@@ -180,16 +212,22 @@ def _build_refenc(args, device) -> Case:
     from fast_float.onnx.convert_refenc import build_refenc_module
 
     module, _enc, _n = build_refenc_module(
-        args.ckpt, args.image_size, args.motion_dim, device,
+        args.ckpt,
+        args.image_size,
+        args.motion_dim,
+        device,
     )
     img = torch.randn(1, 3, args.image_size, args.image_size, device=device)
     return Case(
-        "refenc", module, (img,), {"img": img.detach().cpu().numpy()},
+        "refenc",
+        module,
+        (img,),
+        {"img": img.detach().cpu().numpy()},
         opt_shapes={"img": [1, 3, args.image_size, args.image_size]},
     )
 
 
-BUILDERS: Dict[str, Callable] = {
+BUILDERS: dict[str, Callable] = {
     "emotion": _build_emotion,
     "audio": _build_audio,
     "direction": _build_direction,
@@ -202,6 +240,7 @@ BUILDERS: Dict[str, Callable] = {
 # --------------------------------------------------------------------------- #
 # Measurement helpers
 # --------------------------------------------------------------------------- #
+
 
 def _median_ms(fn, iters: int, warmup: int) -> float:
     for _ in range(max(0, warmup)):
@@ -219,7 +258,7 @@ def _median_ms(fn, iters: int, warmup: int) -> float:
     return ts[len(ts) // 2]
 
 
-def _provider_label(sess) -> Optional[str]:
+def _provider_label(sess) -> str | None:
     try:
         p = sess.get_providers()[0]
     except Exception:
@@ -231,19 +270,17 @@ def _provider_label(sess) -> Optional[str]:
     return "cpu"
 
 
-def _parity(case: Case, sess, fp16: bool) -> Dict[str, Any]:
+def _parity(case: Case, sess, fp16: bool) -> dict[str, Any]:
     atol, rtol = fp16_tol(case.atol, fp16), fp16_tol(case.rtol, fp16)
     ref, got = case.eager_outs(), case.ort_outs(sess)
     if len(ref) != len(got):
         return {"ok": False, "reason": f"outputs {len(got)} != {len(ref)}"}
     ok, worst = True, {"max_abs": 0.0, "mean_abs": 0.0, "cosine": 1.0}
-    for r, o in zip(ref, got):
+    for r, o in zip(ref, got, strict=False):
         rep = compare_outputs(r, o, atol=atol, rtol=rtol)
         this_ok = rep["ok"]
         if case.min_cosine is not None and case.max_mean is not None:
-            this_ok = this_ok or (
-                rep["cosine"] >= case.min_cosine and rep["mean_abs"] <= case.max_mean
-            )
+            this_ok = this_ok or (rep["cosine"] >= case.min_cosine and rep["mean_abs"] <= case.max_mean)
         ok = ok and this_ok
         worst["max_abs"] = max(worst["max_abs"], rep["max_abs"])
         worst["mean_abs"] = max(worst["mean_abs"], rep["mean_abs"])
@@ -252,19 +289,17 @@ def _parity(case: Case, sess, fp16: bool) -> Dict[str, Any]:
     return worst
 
 
-def _round(metrics: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        k: (round(v, 6) if isinstance(v, float) else v)
-        for k, v in metrics.items()
-    }
+def _round(metrics: dict[str, Any]) -> dict[str, Any]:
+    return {k: (round(v, 6) if isinstance(v, float) else v) for k, v in metrics.items()}
 
 
 # --------------------------------------------------------------------------- #
 # Selection
 # --------------------------------------------------------------------------- #
 
-def _select_component(name, case, args, ort_ns) -> Tuple[ComponentConfig, float, float]:
-    metrics: Dict[str, Any] = {}
+
+def _select_component(name, case, args, ort_ns) -> tuple[ComponentConfig, float, float]:
+    metrics: dict[str, Any] = {}
     eager_ms = _median_ms(lambda: case.module(*case.inputs), args.iters, args.warmup)
     metrics["eager_ms"] = eager_ms
     onnx_path = Path(args.onnx_dir) / ONNX_FILES[name]
@@ -282,15 +317,17 @@ def _select_component(name, case, args, ort_ns) -> Tuple[ComponentConfig, float,
             metrics["compile_s"] = round(compile_s, 3)
             if cms * args.min_gain < best_ms:
                 best_mode, best_provider, best_ms = "compile", None, cms
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             metrics["compile_error"] = f"{type(e).__name__}: {e}"
             print(f"[select:{name}] compile FAILED: {e}")
 
     if not args.no_onnx and onnx_path.exists():
         try:
             sess, fp16 = make_session_from_args(
-                str(onnx_path), ort_ns,
-                opt_shapes=case.opt_shapes, extra_dynamic=case.extra_dynamic,
+                str(onnx_path),
+                ort_ns,
+                opt_shapes=case.opt_shapes,
+                extra_dynamic=case.extra_dynamic,
             )
             par = _parity(case, sess, fp16)
             metrics["onnx_parity"] = _round(par)
@@ -303,7 +340,7 @@ def _select_component(name, case, args, ort_ns) -> Tuple[ComponentConfig, float,
                     best_mode, best_provider, best_ms = "onnx", provider, oms
             else:
                 metrics["onnx_reason"] = "parity failed"
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             metrics["onnx_error"] = f"{type(e).__name__}: {e}"
             print(f"[select:{name}] onnx FAILED: {e}")
 
@@ -312,8 +349,7 @@ def _select_component(name, case, args, ort_ns) -> Tuple[ComponentConfig, float,
     if best_mode == "eager":
         reason = f"no candidate beat eager by {args.min_gain:.2f}x"
     label = f"{best_mode}/{best_provider}" if best_provider else best_mode
-    print(f"[select:{name}] eager={eager_ms:.2f}ms -> {label} "
-          f"({best_ms:.2f}ms, {speedup:.2f}x)")
+    print(f"[select:{name}] eager={eager_ms:.2f}ms -> {label} ({best_ms:.2f}ms, {speedup:.2f}x)")
 
     cfg = ComponentConfig(
         name=name,
@@ -329,19 +365,17 @@ def _select_component(name, case, args, ort_ns) -> Tuple[ComponentConfig, float,
 def _build_generator(args, device):
     from fast_float.models.float.generator import Generator
 
-    gen = Generator(size=args.image_size, style_dim=512,
-                    motion_dim=args.motion_dim).to(device).eval()
+    gen = Generator(size=args.image_size, style_dim=512, motion_dim=args.motion_dim).to(device).eval()
     if os.path.exists(args.ckpt):
         sd = torch.load(args.ckpt, map_location="cpu", weights_only=True)
-        sub = {k[len(AE_PREFIX):]: v for k, v in sd.items()
-               if k.startswith(AE_PREFIX)}
+        sub = {k[len(AE_PREFIX) :]: v for k, v in sd.items() if k.startswith(AE_PREFIX)}
         if sub:
             gen.load_state_dict(sub, strict=False)
     img = torch.randn(1, 3, args.image_size, args.image_size, device=device)
     return gen, (img, img)
 
 
-def _select_global(args, device) -> Optional[Dict[str, Any]]:
+def _select_global(args, device) -> dict[str, Any] | None:
     """Advisory whole-Generator compile vs eager (enc+dec fused)."""
     if args.no_compile or args.no_global or not hasattr(torch, "compile"):
         return None
@@ -361,7 +395,7 @@ def _select_global(args, device) -> Optional[Dict[str, Any]]:
             "compile_s": round(compile_s, 3),
             "speedup": eager_ms / max(cms, 1e-9),
         }
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         print(f"[select:global] global compile FAILED: {e}")
         return {"kind": "global_generator", "error": f"{type(e).__name__}: {e}"}
 
@@ -392,28 +426,35 @@ def _assemble(components, args, fingerprint, glob) -> BackendConfig:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(
-        description="Select per-component inference backends (writes a config YAML)"
-    )
+    ap = argparse.ArgumentParser(description="Select per-component inference backends (writes a config YAML)")
     ap.add_argument("--onnx-dir", default="./onnx")
     ap.add_argument("--out", default="./onnx/backends.generated.yaml")
     ap.add_argument("--ckpt", default="./checkpoints/float.pth")
-    ap.add_argument("--emo-dir",
-                    default="./checkpoints/wav2vec-english-speech-emotion-recognition")
+    ap.add_argument("--emo-dir", default="./checkpoints/wav2vec-english-speech-emotion-recognition")
     ap.add_argument("--w2v-dir", default="./checkpoints/wav2vec2-base-960h")
     ap.add_argument("--components", default=",".join(COMPONENTS))
-    ap.add_argument("--hot-only", action="store_true",
-                    help="only measure the hot components (fmt, decoder, audio)")
+    ap.add_argument(
+        "--hot-only",
+        action="store_true",
+        help="only measure the hot components (fmt, decoder, audio)",
+    )
     ap.add_argument("--iters", type=int, default=30)
     ap.add_argument("--warmup", type=int, default=5)
-    ap.add_argument("--min-gain", type=float, default=1.03,
-                    help="candidate must beat eager by this factor to be chosen")
+    ap.add_argument(
+        "--min-gain",
+        type=float,
+        default=1.03,
+        help="candidate must beat eager by this factor to be chosen",
+    )
     ap.add_argument("--compile-mode", default="default")
     ap.add_argument("--no-compile", action="store_true")
     ap.add_argument("--no-onnx", action="store_true")
     ap.add_argument("--no-global", action="store_true")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="write the safe all-eager config + fingerprint only")
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="write the safe all-eager config + fingerprint only",
+    )
     # component shape params (must match the deployed config)
     ap.add_argument("--seconds", type=float, default=3.0)
     ap.add_argument("--image-size", type=int, default=512)
@@ -456,7 +497,7 @@ def main(argv=None) -> int:
     if args.hot_only:
         names = [n for n in names if n in HOT_COMPONENTS]
 
-    components: Dict[str, ComponentConfig] = {}
+    components: dict[str, ComponentConfig] = {}
     for name in names:
         builder = BUILDERS.get(name)
         if builder is None:
@@ -464,12 +505,10 @@ def main(argv=None) -> int:
             continue
         try:
             case = builder(args, device)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             print(f"[select:{name}] build FAILED: {e}")
             traceback.print_exc()
-            components[name] = ComponentConfig(
-                name=name, mode="eager", reason=f"build failed: {type(e).__name__}"
-            )
+            components[name] = ComponentConfig(name=name, mode="eager", reason=f"build failed: {type(e).__name__}")
             continue
         try:
             cfg, _best, _eager = _select_component(name, case, args, ort_ns)
@@ -484,9 +523,11 @@ def main(argv=None) -> int:
         print(f"[select:global] {glob}")
         # Advisory heuristic: a whole-Generator compile win promotes the two
         # components it fuses, when they were left eager.
-        if (glob.get("speedup", 1.0) >= args.min_gain
-                and components.get("refenc", ComponentConfig("refenc")).mode == "eager"
-                and components.get("decoder", ComponentConfig("decoder")).mode == "eager"):
+        if (
+            glob.get("speedup", 1.0) >= args.min_gain
+            and components.get("refenc", ComponentConfig("refenc")).mode == "eager"
+            and components.get("decoder", ComponentConfig("decoder")).mode == "eager"
+        ):
             for n in ("refenc", "decoder"):
                 if n in components:
                     components[n].mode = "compile"

@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import threading
 import time
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -66,9 +66,7 @@ def encode_video_nvenc(
         raise ValueError(f"Expected 3 or 4 channels, got {C}")
 
     tensor_prep_time = time.time() - t0
-    logger.info(
-        f"⏱️ Tensor -> numpy: {tensor_prep_time:.3f}s (T={T}, H={H}, W={W}, C={C})"
-    )
+    logger.info(f"⏱️ Tensor -> numpy: {tensor_prep_time:.3f}s (T={T}, H={H}, W={W}, C={C})")
 
     pix_fmt_in = "rgba" if C == 4 else "rgb24"
     size_str = f"{W}x{H}"
@@ -117,7 +115,7 @@ def encode_video_nvenc(
     encode_start = time.time()
 
     for retry_count in range(max_retries):
-        proc: Optional[subprocess.Popen] = None
+        proc: subprocess.Popen | None = None
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -129,8 +127,9 @@ def encode_video_nvenc(
 
             stderr_lines: list[str] = []
 
-            def read_stderr() -> None:
-                assert proc is not None and proc.stderr is not None
+            def read_stderr(proc=proc, stderr_lines=stderr_lines) -> None:
+                assert proc is not None
+                assert proc.stderr is not None
                 for line in proc.stderr:
                     line_str = line.decode(errors="ignore")
                     stderr_lines.append(line_str)
@@ -151,9 +150,7 @@ def encode_video_nvenc(
                     full_stderr = "".join(stderr_lines)
                     logger.error(f"❌ FFmpeg died at frame {i}/{T}")
                     logger.error(f"FFmpeg stderr:\n{full_stderr[-1000:]}")
-                    raise RuntimeError(
-                        f"FFmpeg broken pipe at frame {i}: {full_stderr[-500:]}"
-                    )
+                    raise RuntimeError(f"FFmpeg broken pipe at frame {i}: {full_stderr[-500:]}") from None
 
                 if i % 100 == 0:
                     assert proc.stdin is not None
@@ -167,18 +164,17 @@ def encode_video_nvenc(
             full_stderr = "".join(stderr_lines)
 
             if ret != 0:
-                if "CUDA_ERROR" in full_stderr or "initialization error" in full_stderr:
-                    if retry_count < max_retries - 1:
-                        logger.warning(
-                            f"⚠️ NVENC init error, retry {retry_count + 1}/{max_retries}"
-                        )
-                        time.sleep(0.5)
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
-                        continue
+                if (
+                    "CUDA_ERROR" in full_stderr or "initialization error" in full_stderr
+                ) and retry_count < max_retries - 1:
+                    logger.warning(f"⚠️ NVENC init error, retry {retry_count + 1}/{max_retries}")
+                    time.sleep(0.5)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    continue
 
                 logger.error(f"FFmpeg stderr:\n{full_stderr[-1000:]}")
-                raise RuntimeError(f"ffmpeg exited with code {ret}")
+                raise RuntimeError(f"ffmpeg exited with code {ret}") from None
 
             encode_time = time.time() - encode_start
             logger.info(f"✅ Direct FFmpeg encode: {encode_time:.3f}s")
@@ -190,15 +186,13 @@ def encode_video_nvenc(
             logger.error("❌ FFmpeg encoding timeout")
             if retry_count < max_retries - 1:
                 continue
-            raise RuntimeError("FFmpeg encoding timeout")
+            raise RuntimeError("FFmpeg encoding timeout") from None
 
         except Exception as e:
             if proc and proc.poll() is None:
                 proc.kill()
             if retry_count < max_retries - 1:
-                logger.warning(
-                    f"⚠️ Encoding attempt {retry_count + 1} failed, retrying: {e}"
-                )
+                logger.warning(f"⚠️ Encoding attempt {retry_count + 1} failed, retrying: {e}")
                 time.sleep(0.5)
                 continue
             logger.error(f"❌ Encoding failed after {max_retries} retries: {e}")

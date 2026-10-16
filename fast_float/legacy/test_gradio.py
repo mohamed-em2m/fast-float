@@ -1,33 +1,31 @@
-import os
-import gradio as gr
-import datetime
+import argparse  # Moved from parse_args into the top-level imports
 import base64
-import requests
-import json
+import datetime
+import io
+import os
+import tempfile
 import time
 import wave
-import io
 from pathlib import Path
-from typing import Optional, Dict, Tuple
-import tempfile
-import argparse  # Moved from parse_args into the top-level imports
 
+import gradio as gr
+import requests
 
 try:
     from fast_float.core.inference_optimized import (
-        OptimizedInferenceAgent,
         InferenceOptions,
+        OptimizedInferenceAgent,
     )
 
     LOCAL_MODE_AVAILABLE = True
 except ImportError:
     try:
-        from core.inference_optimized import OptimizedInferenceAgent, InferenceOptions
+        from core.inference_optimized import InferenceOptions, OptimizedInferenceAgent
 
         LOCAL_MODE_AVAILABLE = True
     except ImportError:
         try:
-            from inference_optimized import OptimizedInferenceAgent, InferenceOptions
+            from inference_optimized import InferenceOptions, OptimizedInferenceAgent
 
             LOCAL_MODE_AVAILABLE = True
         except ImportError:
@@ -73,7 +71,7 @@ class GradioAPIInterface:
         except Exception as e:
             print(f"❌ Cannot reach API at {self.api_url}: {e}")
 
-    def _encode_audio_to_base64(self, audio_path: str) -> Tuple[str, Dict]:
+    def _encode_audio_to_base64(self, audio_path: str) -> tuple[str, dict]:
         """Encode audio file to base64 with metadata and validation"""
         try:
             # First, try to read as WAV
@@ -98,9 +96,7 @@ class GradioAPIInterface:
                     "format": "wav",
                 }
 
-                print(
-                    f"✅ Audio encoded: {len(audio_data)} bytes, {sample_rate}Hz, {channels}ch"
-                )
+                print(f"✅ Audio encoded: {len(audio_data)} bytes, {sample_rate}Hz, {channels}ch")
                 return audio_base64, metadata
 
             except Exception as wav_error:
@@ -152,7 +148,7 @@ class GradioAPIInterface:
                 audio_data = f.read()
 
             if len(audio_data) == 0:
-                raise ValueError("Audio file is empty")
+                raise ValueError("Audio file is empty") from e
 
             audio_base64 = base64.b64encode(audio_data).decode("utf-8")
             return audio_base64, {
@@ -262,9 +258,8 @@ class GradioAPIInterface:
                 )
 
             # Save video locally
-            temp_video_path = tempfile.NamedTemporaryFile(
-                delete=False, suffix=".mp4"
-            ).name
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as _tmp:
+                temp_video_path = _tmp.name
             with open(temp_video_path, "wb") as f:
                 f.write(video_response.content)
 
@@ -274,21 +269,21 @@ class GradioAPIInterface:
             perf = result.get("performance", {})
             status_msg = f"""✅ Video generated successfully via API!
 
-  
+
 
 📊 Performance Metrics:
 ├─ Request Time: {request_time:.2f}s
-├─ Preprocessing: {perf.get('preprocess_time', 0):.2f}s
-├─ Inference: {perf.get('inference_time', 0):.2f}s
-├─ Postprocessing: {perf.get('postprocess_time', 0):.2f}s
-└─ Total Time: {perf.get('total_time', 0):.2f}s
+├─ Preprocessing: {perf.get("preprocess_time", 0):.2f}s
+├─ Inference: {perf.get("inference_time", 0):.2f}s
+├─ Postprocessing: {perf.get("postprocess_time", 0):.2f}s
+└─ Total Time: {perf.get("total_time", 0):.2f}s
 
-⚡ Optimization: {result.get('optimization', 'N/A')}
-🚀 FPS: {perf.get('fps', 0):.2f}
-📁 File Size: {result.get('file_size_mb', 0):.2f} MB
-📐 Resolution: {result.get('resolution', 'N/A')}
+⚡ Optimization: {result.get("optimization", "N/A")}
+🚀 FPS: {perf.get("fps", 0):.2f}
+📁 File Size: {result.get("file_size_mb", 0):.2f} MB
+📐 Resolution: {result.get("resolution", "N/A")}
 
-🔗 Stream URL: {result.get('stream_url', 'N/A')}
+🔗 Stream URL: {result.get("stream_url", "N/A")}
 """
 
             # WebRTC embed HTML
@@ -306,7 +301,7 @@ class GradioAPIInterface:
         except requests.exceptions.Timeout:
             return None, None, "❌ Request timeout. API might be overloaded."
         except Exception as e:
-            return None, None, f"❌ Error: {str(e)}"
+            return None, None, f"❌ Error: {e!s}"
 
     def generate_via_local(
         self,
@@ -339,9 +334,7 @@ class GradioAPIInterface:
             audio_name = Path(audio_file).stem
             call_time = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 
-            res_video_path = os.path.join(
-                self.opt.res_dir, f"{call_time}-{video_name}-{audio_name}-local.mp4"
-            )
+            res_video_path = os.path.join(self.opt.res_dir, f"{call_time}-{video_name}-{audio_name}-local.mp4")
 
             progress(0.3, desc="Running local inference...")
 
@@ -372,7 +365,7 @@ class GradioAPIInterface:
             image_used = "Custom" if ref_image else "Default (img.jpg)"
             status_msg = f"""✅ Video generated successfully (LOCAL)!
 
-  
+
 
 ⏱️ Total Time: {total_time:.2f}s
 📁 Saved to: {output_path}
@@ -383,14 +376,14 @@ class GradioAPIInterface:
             return output_path, status_msg  # Cleaned up indentation and structure
 
         except Exception as e:
-            return None, f"❌ Error: {str(e)}"
+            return None, f"❌ Error: {e!s}"
 
     def _generate_webrtc_player(self, stream_id: str) -> str:
         """Generate WebRTC player HTML"""
         return f"""
         <div style="width: 100%; max-width: 640px; margin: 0 auto;">
             <h3 style="text-align: center;">🎥 WebRTC Live Stream</h3>
-            <video id="webrtc-video" autoplay playsinline controls 
+            <video id="webrtc-video" autoplay playsinline controls
                    style="width: 100%; border-radius: 8px; background: #000;">
             </video>
             <div style="text-align: center; margin-top: 10px;">
@@ -405,15 +398,15 @@ class GradioAPIInterface:
                 Stream ID: <code>{stream_id}</code>
             </p>
         </div>
-        
+
         <script>
         let pc = null;
         const API_URL = '{self.api_url}';
         const STREAM_ID = '{stream_id}';
-        
+
         async function startWebRTC() {{
             const video = document.getElementById('webrtc-video');
-            
+
             // Create peer connection
             pc = new RTCPeerConnection({{
                 iceServers: [
@@ -421,7 +414,7 @@ class GradioAPIInterface:
                     {{ urls: 'stun:stun1.l.google.com:19302' }}
                 ]
             }});
-            
+
             // Handle incoming tracks
             pc.ontrack = (event) => {{
                 console.log('Received track:', event.track.kind);
@@ -429,11 +422,11 @@ class GradioAPIInterface:
                     video.srcObject = event.streams[0];
                 }}
             }};
-            
+
             // Create offer
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
-            
+
             // Send offer to server
             const response = await fetch(API_URL + '/offer', {{
                 method: 'POST',
@@ -444,13 +437,13 @@ class GradioAPIInterface:
                     stream_id: STREAM_ID
                 }})
             }});
-            
+
             const answer = await response.json();
             await pc.setRemoteDescription(new RTCSessionDescription(answer));
-            
+
             console.log('WebRTC connection established');
         }}
-        
+
         function stopWebRTC() {{
             if (pc) {{
                 pc.close();
@@ -470,14 +463,10 @@ class GradioAPIInterface:
         """
 
 
-def create_interface(
-    api_url: str = "https://colab.him-world.com", use_local: bool = False
-):
+def create_interface(api_url: str = "https://colab.him-world.com", use_local: bool = False):
     """Create Gradio interface with API support"""
 
-    interface = GradioAPIInterface(
-        api_url=api_url, use_local=use_local
-    )  # Fixed: Indentation
+    interface = GradioAPIInterface(api_url=api_url, use_local=use_local)  # Fixed: Indentation
     mode_text = "LOCAL" if use_local else "API"
 
     custom_css = """
@@ -497,16 +486,15 @@ def create_interface(
     """
 
     with gr.Blocks(css=custom_css, title="FLOAT - API Client") as demo:
-
         mode_badge = f"<span class='mode-badge'>⚡ {mode_text} MODE</span>"
 
         gr.Markdown(
             f"""
             # 🎭 FLOAT: Audio-Driven Talking Face Generation {mode_badge}
-            
-            Generate realistic talking face videos using {'optimized local inference' if use_local else 'the API backend'}.
-            {'WebRTC streaming available for real-time playback!' if not use_local else ''}
-            
+
+            Generate realistic talking face videos using {"optimized local inference" if use_local else "the API backend"}.
+            {"WebRTC streaming available for real-time playback!" if not use_local else ""}
+
             💡 **Tip**: Reference image is optional - if not provided, `img.jpg` will be used as default.
             """
         )
@@ -524,9 +512,7 @@ def create_interface(
                 )
                 gr.Markdown("*Upload a face image or leave empty to use default*")
 
-                audio_file = gr.Audio(
-                    label="Audio File", type="filepath", sources=["upload"]
-                )
+                audio_file = gr.Audio(label="Audio File", type="filepath", sources=["upload"])
 
                 with gr.Accordion("⚙️ Generation Parameters", open=True):
                     emotion = gr.Dropdown(
@@ -545,15 +531,9 @@ def create_interface(
                     )
 
                     nfe = gr.Slider(1, 50, value=10, step=1, label="NFE")
-                    a_cfg_scale = gr.Slider(
-                        0.0, 5.0, value=2.0, step=0.1, label="Audio CFG"
-                    )
-                    r_cfg_scale = gr.Slider(
-                        0.0, 3.0, value=1.0, step=0.1, label="Reference CFG"
-                    )
-                    e_cfg_scale = gr.Slider(
-                        0.0, 3.0, value=1.0, step=0.1, label="Emotion CFG"
-                    )
+                    a_cfg_scale = gr.Slider(0.0, 5.0, value=2.0, step=0.1, label="Audio CFG")
+                    r_cfg_scale = gr.Slider(0.0, 3.0, value=1.0, step=0.1, label="Reference CFG")
+                    e_cfg_scale = gr.Slider(0.0, 3.0, value=1.0, step=0.1, label="Emotion CFG")
                     seed = gr.Slider(0, 10000, value=25, step=1, label="Seed")
                     no_crop = gr.Checkbox(label="Skip Face Cropping", value=False)
 
@@ -574,9 +554,7 @@ def create_interface(
             with gr.Column(scale=1):
                 gr.Markdown("### 🎬 Output")
 
-                generate_btn = gr.Button(
-                    f"🚀 Generate Video ({mode_text})", variant="primary", size="lg"
-                )
+                generate_btn = gr.Button(f"🚀 Generate Video ({mode_text})", variant="primary", size="lg")
 
                 status_output = gr.Textbox(
                     label="Status",
@@ -595,22 +573,22 @@ def create_interface(
                 gr.Markdown(
                     f"""
                     ### API Configuration
-                    
+
                     - **API URL**: `{api_url}`
                     - **Mode**: Remote API
                     - **WebRTC**: Supported
                     - **Optimizations**: Server-side
-                    
+
                     ### Features
-                    
+
                     - ⚡ Optimized inference backend
                     - 🎥 WebRTC real-time streaming
                     - 📊 Performance metrics
                     - 🗜️ Video compression
                     - 📐 Auto-resize to 256x256
-                    
+
                     ### How to Use
-                    
+
                     1. Upload reference image and audio
                     2. Adjust parameters as needed
                     3. Enable WebRTC for live streaming (optional)
@@ -623,13 +601,13 @@ def create_interface(
                 gr.Markdown(
                     """
                     ### Local Configuration
-                    
+
                     - **Mode**: Local Inference
                     - **Optimizations**: torch.compile + FP16
                     - **WebRTC**: Not available in local mode
-                    
+
                     ### Benefits
-                    
+
                     - ⚡ No network latency
                     - 🔒 Complete privacy
                     - 🚀 Direct GPU access
@@ -678,9 +656,7 @@ def create_interface(
 def parse_args():
     """Parse command line arguments"""
 
-    parser = argparse.ArgumentParser(
-        description="FLOAT Gradio Interface"
-    )  # Fixed: Indentation
+    parser = argparse.ArgumentParser(description="FLOAT Gradio Interface")  # Fixed: Indentation
 
     parser.add_argument(
         "--api_url",
@@ -688,12 +664,8 @@ def parse_args():
         default="https://colab.him-world.com",
         help="API URL (default: https://colab.him-world.com",
     )
-    parser.add_argument(
-        "--use_local", action="store_true", help="Use local inference instead of API"
-    )
-    parser.add_argument(
-        "--port", type=int, default=7860, help="Gradio port (default: 7860)"
-    )
+    parser.add_argument("--use_local", action="store_true", help="Use local inference instead of API")
+    parser.add_argument("--port", type=int, default=7860, help="Gradio port (default: 7860)")
     parser.add_argument("--share", action="store_true", help="Create public share link")
     parser.add_argument(
         "--server_name",

@@ -137,7 +137,7 @@ class _OnnxRunner(nn.Module):
             raise RuntimeError("iobinding unavailable")
         try:
             return self._io_run(feed, out_shapes)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self._io_failed = True
             print(f"[backends:iobinding] disabled ({e}); using host path")
             raise
@@ -185,11 +185,9 @@ class DirectionOnnx(_OnnxRunner):
             shapes = self._io_shapes(x.shape[0])
             if shapes is not None:
                 try:
-                    (out,) = self._try_io(
-                        {self.input_name: x.to(dtype=torch.float32)}, shapes
-                    )
+                    (out,) = self._try_io({self.input_name: x.to(dtype=torch.float32)}, shapes)
                     return out.to(device=device, dtype=torch.float32)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
         out = self._run(self._np(x))
         return torch.from_numpy(out).to(device=device, dtype=torch.float32)
@@ -221,11 +219,7 @@ class RefEncOnnx(_OnnxRunner):
             self.path,
             copy.deepcopy(self.fc),
             use_gpu=self.use_gpu,
-            torch_fallback=(
-                copy.deepcopy(self._torch_fallback)
-                if self._torch_fallback is not None
-                else None
-            ),
+            torch_fallback=(copy.deepcopy(self._torch_fallback) if self._torch_fallback is not None else None),
         )
 
     def _io_shapes(self, b: int):
@@ -249,9 +243,7 @@ class RefEncOnnx(_OnnxRunner):
         if input_target is not None:
             if self._torch_fallback is not None:
                 return self._torch_fallback(x, input_target, h_start)
-            raise RuntimeError(
-                "RefEncOnnx only serves the encode_image_into_latent path"
-            )
+            raise RuntimeError("RefEncOnnx only serves the encode_image_into_latent path")
         device = x.device
         if x.ndim == 3:
             x = x.unsqueeze(0)
@@ -259,17 +251,13 @@ class RefEncOnnx(_OnnxRunner):
             shapes = self._io_shapes(x.shape[0])
             if shapes is not None:
                 try:
-                    outs = self._try_io(
-                        {self.input_name: x.to(dtype=torch.float32)}, shapes
-                    )
+                    outs = self._try_io({self.input_name: x.to(dtype=torch.float32)}, shapes)
                     outs = [o.to(device=device, dtype=torch.float32) for o in outs]
                     return outs[0], outs[1], outs[2:]
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
         outs = self._run(self._np(x))
-        outs = [
-            torch.from_numpy(o).to(device=device, dtype=torch.float32) for o in outs
-        ]
+        outs = [torch.from_numpy(o).to(device=device, dtype=torch.float32) for o in outs]
         return outs[0], outs[1], outs[2:]
 
 
@@ -292,11 +280,7 @@ class DecoderOnnx(_OnnxRunner):
         out = self.session.get_outputs()[0]
         self.output_name = out.name
         out_shape = tuple(out.shape or ())
-        self.output_shape = (
-            out_shape
-            if len(out_shape) == 4 and all(isinstance(d, int) for d in out_shape)
-            else None
-        )
+        self.output_shape = out_shape if len(out_shape) == 4 and all(isinstance(d, int) for d in out_shape) else None
 
     def _recreate(self):
         return DecoderOnnx(self.path, use_gpu=self.use_gpu)
@@ -321,33 +305,21 @@ class DecoderOnnx(_OnnxRunner):
         fs = [f.expand(big_b, *f.shape[1:]) if f.shape[0] == 1 else f for f in fs]
         if m < big_b:
             pad = big_b - m
-            latent = torch.cat(
-                [latent, latent[-1:].expand(pad, *latent.shape[1:])], dim=0
-            )
-            fs = [
-                torch.cat([f, f[-1:].expand(pad, *f.shape[1:])], dim=0)
-                if f.shape[0] == m
-                else f
-                for f in fs
-            ]
-        if (
-            device.type == "cuda"
-            and self._gpu_active()
-            and len(fs) == len(self.feat_names)
-            and self.batch is not None
-        ):
+            latent = torch.cat([latent, latent[-1:].expand(pad, *latent.shape[1:])], dim=0)
+            fs = [torch.cat([f, f[-1:].expand(pad, *f.shape[1:])], dim=0) if f.shape[0] == m else f for f in fs]
+        if device.type == "cuda" and self._gpu_active() and len(fs) == len(self.feat_names) and self.batch is not None:
             shapes = self._io_shapes()
             if shapes is not None:
                 try:
                     feed = {self.latent_name: latent.to(dtype=torch.float32)}
-                    for name, f in zip(self.feat_names, fs):
+                    for name, f in zip(self.feat_names, fs, strict=False):
                         feed[name] = f.to(dtype=torch.float32)
                     (out,) = self._try_io(feed, shapes)
                     return out[:m].to(device=device, dtype=torch.float32)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
         feed = {self.latent_name: self._np(latent)}
-        for name, f in zip(self.feat_names, fs):
+        for name, f in zip(self.feat_names, fs, strict=False):
             feed[name] = self._np(f)
         out = self._run(feed)
         return torch.from_numpy(out[:m]).to(device=device, dtype=torch.float32)
@@ -388,10 +360,8 @@ def _selftest_refenc(ref, runner, image_size: int) -> bool:
     if len(got[2]) != len(feats):
         print(f"[backends:refenc] feat count {len(got[2])} != {len(feats)}")
         return False
-    ok = _cosine_ok(x_r, got[0], "refenc.x_r") and _cosine_ok(
-        lam, got[1], "refenc.lambda"
-    )
-    for i, (a, b) in enumerate(zip(feats, got[2])):
+    ok = _cosine_ok(x_r, got[0], "refenc.x_r") and _cosine_ok(lam, got[1], "refenc.lambda")
+    for i, (a, b) in enumerate(zip(feats, got[2], strict=False)):
         ok = _cosine_ok(a, b, f"refenc.feat{i}") and ok
     return ok
 
@@ -440,7 +410,7 @@ def _apply_direction(model, ae, opt) -> None:
         try:
             ae.dec.direction = _CompiledLeaf(target)
             logger.info("backends: direction -> torch.compile")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning(f"backends: direction compile failed ({e}); eager")
         return
     path = _path(opt, "direction_onnx_path", f"{_ONNX_DIR}/direction_v1.onnx")
@@ -450,7 +420,7 @@ def _apply_direction(model, ae, opt) -> None:
         runner = DirectionOnnx(path)
         ae.dec.direction = runner
         logger.info(f"backends: direction -> ONNX {path} ({runner.providers})")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning(f"backends: direction ONNX skipped ({e}); eager")
 
 
@@ -465,7 +435,7 @@ def _apply_refenc(model, ae, opt) -> None:
         try:
             ae.enc = _CompiledLeaf(enc, extra={"fc": enc.fc})
             logger.info("backends: refenc -> torch.compile")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning(f"backends: refenc compile failed ({e}); eager")
         return
     path = _path(opt, "refenc_onnx_path", f"{_ONNX_DIR}/refenc_v1.onnx")
@@ -475,7 +445,7 @@ def _apply_refenc(model, ae, opt) -> None:
         runner = RefEncOnnx(path, enc.fc, torch_fallback=enc)
         ae.enc = runner
         logger.info(f"backends: refenc -> ONNX {path} ({runner.providers})")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning(f"backends: refenc ONNX skipped ({e}); eager")
 
 
@@ -487,18 +457,15 @@ def _apply_decoder(model, ae, opt) -> None:
         try:
             model._decoder_compiled = torch.compile(ae.dec)
             logger.info("backends: decoder -> torch.compile")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning(f"backends: decoder compile failed ({e}); eager")
         return
     path = _path(opt, "decoder_onnx_path", f"{_ONNX_DIR}/decoder_v1.onnx")
     try:
         runner = DecoderOnnx(path)
         model._decoder_onnx = runner
-        logger.info(
-            f"backends: decoder -> ONNX {path} "
-            f"(static batch {runner.batch}, {runner.providers})"
-        )
-    except Exception as e:  # noqa: BLE001
+        logger.info(f"backends: decoder -> ONNX {path} (static batch {runner.batch}, {runner.providers})")
+    except Exception as e:
         logger.warning(f"backends: decoder ONNX skipped ({e}); eager")
 
 
@@ -516,14 +483,14 @@ def apply_backends(model, opt=None):
     for fn in (_apply_direction, _apply_refenc, _apply_decoder):
         try:
             fn(model, ae, opt)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.warning(f"backends: {fn.__name__} failed ({e}); eager")
     return model
 
 
 __all__ = [
-    "apply_backends",
+    "DecoderOnnx",
     "DirectionOnnx",
     "RefEncOnnx",
-    "DecoderOnnx",
+    "apply_backends",
 ]

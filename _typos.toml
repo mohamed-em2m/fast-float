@@ -3,6 +3,9 @@
 [default.extend-words]
 # wav2vec2_ser.py / speech-emotion-recognition acronym
 ser = "ser"
+# rust_model.ot -> legacy PyTorch/HF weight filename extension
+ot = "ot"
 
 [default.extend-identifiers]
 ser = "ser"
+"rust_model.ot" = "rust_model.ot"

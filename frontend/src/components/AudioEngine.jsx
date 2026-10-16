@@ -1,15 +1,15 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { 
-  Mic, 
-  Square, 
-  Upload, 
-  Play, 
-  Pause, 
-  Volume2, 
-  RotateCcw, 
+import {
+  Mic,
+  Square,
+  Upload,
+  Play,
+  Pause,
+  Volume2,
+  RotateCcw,
   FileAudio,
   Music,
-  CheckCircle2 
+  CheckCircle2
 } from 'lucide-react';
 import { blobToBase64 } from '../services/api';
 
@@ -72,12 +72,12 @@ export default function AudioEngine({
   // Start live microphone recording
   const startRecording = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        audio: { 
-          channelCount: 1, 
-          sampleRate: 16000, 
-          echoCancellation: true 
-        } 
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          sampleRate: 16000,
+          echoCancellation: true
+        }
       });
       streamRef.current = stream;
 
@@ -264,10 +264,10 @@ export default function AudioEngine({
   return (
     <div className="card-section glass-panel">
       {/* Hidden audio element for preview playback */}
-      <audio 
-        ref={audioElementRef} 
-        onTimeUpdate={handleAudioTimeUpdate} 
-        onEnded={() => setIsPlaying(false)} 
+      <audio
+        ref={audioElementRef}
+        onTimeUpdate={handleAudioTimeUpdate}
+        onEnded={() => setIsPlaying(false)}
         onLoadedMetadata={handleAudioTimeUpdate}
       />
 
@@ -286,21 +286,21 @@ export default function AudioEngine({
 
       {/* Tabs */}
       <div className="audio-tab-nav">
-        <button 
+        <button
           className={`tab-btn ${activeTab === 'mic' ? 'active' : ''}`}
           onClick={() => setActiveTab('mic')}
         >
           <Mic size={15} />
           <span>Microphone</span>
         </button>
-        <button 
+        <button
           className={`tab-btn ${activeTab === 'upload' ? 'active' : ''}`}
           onClick={() => setActiveTab('upload')}
         >
           <Upload size={15} />
           <span>Upload File</span>
         </button>
-        <button 
+        <button
           className={`tab-btn ${activeTab === 'samples' ? 'active' : ''}`}
           onClick={() => setActiveTab('samples')}
         >
@@ -314,10 +314,10 @@ export default function AudioEngine({
         <div className="mic-record-panel">
           {/* Canvas Waveform Display */}
           <div className="waveform-canvas-box">
-            <canvas 
-              ref={canvasRef} 
-              width={420} 
-              height={90} 
+            <canvas
+              ref={canvasRef}
+              width={420}
+              height={90}
               className="waveform-canvas"
             />
             {!isRecording && !audioBlob && (
@@ -330,8 +330,8 @@ export default function AudioEngine({
           {/* Controls Bar */}
           <div className="record-controls-row">
             {!isRecording ? (
-              <button 
-                type="button" 
+              <button
+                type="button"
                 className="btn-record"
                 onClick={startRecording}
               >
@@ -339,8 +339,8 @@ export default function AudioEngine({
                 <span>Start Recording</span>
               </button>
             ) : (
-              <button 
-                type="button" 
+              <button
+                type="button"
                 className="btn-stop-record recording-pulse"
                 onClick={stopRecording}
               >
@@ -361,7 +361,7 @@ export default function AudioEngine({
 
       {/* TAB 2: UPLOAD AUDIO */}
       {activeTab === 'upload' && (
-        <div 
+        <div
           className="audio-dropzone"
           onClick={() => fileInputRef.current?.click()}
           onDragOver={(e) => e.preventDefault()}
@@ -370,11 +370,11 @@ export default function AudioEngine({
             if (e.dataTransfer.files[0]) handleFileUpload(e.dataTransfer.files[0]);
           }}
         >
-          <input 
-            type="file" 
-            ref={fileInputRef} 
-            accept="audio/*" 
-            onChange={(e) => handleFileUpload(e.target.files[0])} 
+          <input
+            type="file"
+            ref={fileInputRef}
+            accept="audio/*"
+            onChange={(e) => handleFileUpload(e.target.files[0])}
             style={{ display: 'none' }}
           />
           <FileAudio size={28} className="upload-audio-icon" />
@@ -391,8 +391,8 @@ export default function AudioEngine({
               <span className="sample-audio-name">Sample Speech Clip 1</span>
               <span className="sample-audio-desc">Natural English conversation clip (0.5s - 4s)</span>
             </div>
-            <button 
-              type="button" 
+            <button
+              type="button"
               className="btn-secondary btn-sm"
               onClick={() => handleSelectSample('/samples/speech1.wav')}
             >
@@ -405,20 +405,20 @@ export default function AudioEngine({
       {/* PREVIEW PLAYER ROW (if audio is available) */}
       {audioBase64 && (
         <div className="audio-preview-row">
-          <button 
-            type="button" 
-            className="btn-play-toggle" 
+          <button
+            type="button"
+            className="btn-play-toggle"
             onClick={togglePlayAudio}
           >
             {isPlaying ? <Pause size={16} /> : <Play size={16} />}
           </button>
           <div className="audio-timeline-wrap">
             <div className="audio-progress-bar">
-              <div 
-                className="audio-progress-fill" 
-                style={{ 
-                  width: `${audioDuration > 0 ? (playbackTime / audioDuration) * 100 : 0}%` 
-                }} 
+              <div
+                className="audio-progress-fill"
+                style={{
+                  width: `${audioDuration > 0 ? (playbackTime / audioDuration) * 100 : 0}%`
+                }}
               />
             </div>
             <div className="audio-time-labels">
@@ -426,9 +426,9 @@ export default function AudioEngine({
               <span>{formatSeconds(audioDuration || recordDuration)}</span>
             </div>
           </div>
-          <button 
-            type="button" 
-            className="btn-icon-subtle" 
+          <button
+            type="button"
+            className="btn-icon-subtle"
             title="Re-record / Clear"
             onClick={() => {
               setAudioBlob(null);

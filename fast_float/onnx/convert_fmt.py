@@ -19,6 +19,7 @@ torch on any mismatch.
 Usage (from repo root):
     python -m fast_float.onnx.convert_fmt --out ./onnx/fmt_step_v1.onnx
 """
+
 from __future__ import annotations
 
 import argparse
@@ -37,14 +38,14 @@ REPO_ROOT = CURRENT_DIR.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from fast_float.models.float.FMT import FlowMatchingTransformer  # noqa: E402
-from fast_float.onnx.export import (  # noqa: E402
+from fast_float.models.float.FMT import FlowMatchingTransformer
+from fast_float.onnx.export import (
     add_ort_args,
     export_module,
     fp16_tol,
     make_session_from_args,
 )
-from fast_float.onnx.parity import check_parity  # noqa: E402
+from fast_float.onnx.parity import check_parity
 
 FMT_PREFIX = "fmt."
 CLIP_FRAMES = 50
@@ -69,9 +70,7 @@ class FMTStepWrapper(torch.nn.Module):
         prev_x: torch.Tensor,
         prev_wa: torch.Tensor,
     ) -> torch.Tensor:
-        return self.fmt.forward(
-            t, x, wa, wr, we, prev_x, prev_wa, train=False
-        )
+        return self.fmt.forward(t, x, wa, wr, we, prev_x, prev_wa, train=False)
 
 
 def build_fmt(args) -> FlowMatchingTransformer:
@@ -96,7 +95,7 @@ def build_fmt(args) -> FlowMatchingTransformer:
     fmt = FlowMatchingTransformer(opt)
     if os.path.exists(args.ckpt):
         sd = torch.load(args.ckpt, map_location="cpu", weights_only=True)
-        sub = {k[len(FMT_PREFIX):]: v for k, v in sd.items() if k.startswith(FMT_PREFIX)}
+        sub = {k[len(FMT_PREFIX) :]: v for k, v in sd.items() if k.startswith(FMT_PREFIX)}
         if not sub:
             print(f"[weights] WARN: no {FMT_PREFIX}* keys in {args.ckpt}")
         else:
@@ -123,9 +122,7 @@ def sample_inputs(batch: int, t_val: float, seed: int, device: str):
     prev_x = torch.randn(batch, PREV_FRAMES, 512, generator=g, **kw).clamp(-1, 1)
     prev_wa = torch.randn(batch, PREV_FRAMES, 512, generator=g, **kw).clamp(-1, 1)
     if device == "cuda":
-        t, x, wa, wr, we, prev_x, prev_wa = (
-            v.cuda() for v in (t, x, wa, wr, we, prev_x, prev_wa)
-        )
+        t, x, wa, wr, we, prev_x, prev_wa = (v.cuda() for v in (t, x, wa, wr, we, prev_x, prev_wa))
     return t, x, wa, wr, we, prev_x, prev_wa
 
 
@@ -142,8 +139,12 @@ def main(argv=None) -> int:
     ap.add_argument("--atol", type=float, default=1e-4)
     ap.add_argument("--rtol", type=float, default=1e-4)
     ap.add_argument("--skip-parity", action="store_true")
-    ap.add_argument("--bench-iters", type=int, default=30,
-                    help="warmed benchmark iters on the CFG case (0 = skip)")
+    ap.add_argument(
+        "--bench-iters",
+        type=int,
+        default=30,
+        help="warmed benchmark iters on the CFG case (0 = skip)",
+    )
     add_ort_args(ap)
     args = ap.parse_args(argv)
 
@@ -179,10 +180,13 @@ def main(argv=None) -> int:
 
     if not args.skip_parity:
         sess, fp16 = make_session_from_args(
-            info["path"], args,
+            info["path"],
+            args,
             opt_shapes={
-                "x": [1, CLIP_FRAMES, 512], "wa": [1, CLIP_FRAMES, 512],
-                "wr": [1, 1, 512], "we": [1, 1, 7],
+                "x": [1, CLIP_FRAMES, 512],
+                "wa": [1, CLIP_FRAMES, 512],
+                "wr": [1, 1, 512],
+                "we": [1, 1, 7],
                 "prev_x": [1, PREV_FRAMES, 512],
                 "prev_wa": [1, PREV_FRAMES, 512],
             },
@@ -201,18 +205,21 @@ def main(argv=None) -> int:
             for name, batch, t_val, seed in cases:
                 args_in = sample_inputs(batch, t_val, seed, device)
                 ref = module(*args_in)
-                feed = {k: v.cpu().numpy() for k, v in zip(names, args_in)}
+                feed = {k: v.cpu().numpy() for k, v in zip(names, args_in, strict=False)}
                 ort_out = sess.run(None, feed)[0]
                 check_parity(ref, ort_out, name=name, atol=atol, rtol=rtol)
-                print(f"[probe:{name}] shape torch={tuple(ref.shape)} "
-                      f"onnx={tuple(ort_out.shape)}")
+                print(f"[probe:{name}] shape torch={tuple(ref.shape)} onnx={tuple(ort_out.shape)}")
             if args.bench_iters > 0:
                 from fast_float.onnx.parity import benchmark
+
                 bench_in = sample_inputs(3, 0.5, 99, device)
-                bench_feed = {k: v.cpu().numpy() for k, v in zip(names, bench_in)}
-                benchmark(lambda: module(*bench_in),
-                          lambda: sess.run(None, bench_feed),
-                          name="fmt_cfg_b3", iters=args.bench_iters)
+                bench_feed = {k: v.cpu().numpy() for k, v in zip(names, bench_in, strict=False)}
+                benchmark(
+                    lambda: module(*bench_in),
+                    lambda: sess.run(None, bench_feed),
+                    name="fmt_cfg_b3",
+                    iters=args.bench_iters,
+                )
     print("[done] fmt converter OK")
     return 0
 

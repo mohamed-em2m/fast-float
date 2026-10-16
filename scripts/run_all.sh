@@ -42,6 +42,8 @@ if [ ! -d "${PROJECT_ROOT}/frontend/node_modules" ]; then
     (cd "${PROJECT_ROOT}/frontend" && npm install)
 fi
 
+# shellcheck source=/dev/null
+source "${PROJECT_ROOT}/scripts/setup_cuda_libs.sh"
 # --- Cleanup: Ctrl+C (or TERM) stops both servers -----------------------------
 cleanup() {
     echo ""

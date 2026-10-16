@@ -1,6 +1,6 @@
-import math, torch
-import numpy as np
+import math
 
+import torch
 from torch import nn
 from torch.nn import functional as F
 
@@ -9,9 +9,7 @@ def fused_leaky_relu(input, bias, negative_slope=0.2, scale=2**0.5):
     return F.leaky_relu(input + bias, negative_slope) * scale
 
 
-def upfirdn2d_native(
-    input, kernel, up_x, up_y, down_x, down_y, pad_x0, pad_x1, pad_y0, pad_y1
-):
+def upfirdn2d_native(input, kernel, up_x, up_y, down_x, down_y, pad_x0, pad_x1, pad_y0, pad_y1):
     _, minor, in_h, in_w = input.shape
     kernel_h, kernel_w = kernel.shape
 
@@ -27,9 +25,7 @@ def upfirdn2d_native(
         max(-pad_x0, 0) : out.shape[3] - max(-pad_x1, 0),
     ]
 
-    out = out.reshape(
-        [-1, 1, in_h * up_y + pad_y0 + pad_y1, in_w * up_x + pad_x0 + pad_x1]
-    )
+    out = out.reshape([-1, 1, in_h * up_y + pad_y0 + pad_y1, in_w * up_x + pad_x0 + pad_x1])
     w = torch.flip(kernel, [0, 1]).view(1, 1, kernel_h, kernel_w)
     out = F.conv2d(out, w)
     out = out.reshape(
@@ -42,9 +38,7 @@ def upfirdn2d_native(
 
 
 def upfirdn2d(input, kernel, up=1, down=1, pad=(0, 0)):
-    return upfirdn2d_native(
-        input, kernel, up, up, down, down, pad[0], pad[1], pad[0], pad[1]
-    )
+    return upfirdn2d_native(input, kernel, up, up, down, down, pad[0], pad[1], pad[0], pad[1])
 
 
 def make_kernel(k):
@@ -95,14 +89,10 @@ class ScaledLeakyReLU(nn.Module):
 
 
 class EqualConv2d(nn.Module):
-    def __init__(
-        self, in_channel, out_channel, kernel_size, stride=1, padding=0, bias=True
-    ):
+    def __init__(self, in_channel, out_channel, kernel_size, stride=1, padding=0, bias=True):
         super().__init__()
 
-        self.weight = nn.Parameter(
-            torch.randn(out_channel, in_channel, kernel_size, kernel_size)
-        )
+        self.weight = nn.Parameter(torch.randn(out_channel, in_channel, kernel_size, kernel_size))
         self.scale = 1 / math.sqrt(in_channel * kernel_size**2)
 
         self.stride = stride
@@ -138,9 +128,7 @@ class EqualConv2d(nn.Module):
 
 
 class EqualLinear(nn.Module):
-    def __init__(
-        self, in_dim, out_dim, bias=True, bias_init=0, lr_mul=1, activation=None
-    ):
+    def __init__(self, in_dim, out_dim, bias=True, bias_init=0, lr_mul=1, activation=None):
         super().__init__()
 
         self.weight = nn.Parameter(torch.randn(out_dim, in_dim).div_(lr_mul))
@@ -179,9 +167,7 @@ class EqualLinear(nn.Module):
         return out
 
     def __repr__(self):
-        return (
-            f"{self.__class__.__name__}({self.weight.shape[1]}, {self.weight.shape[0]})"
-        )
+        return f"{self.__class__.__name__}({self.weight.shape[1]}, {self.weight.shape[0]})"
 
 
 class ConvLayer(nn.Sequential):
@@ -191,10 +177,12 @@ class ConvLayer(nn.Sequential):
         out_channel,
         kernel_size,
         downsample=False,
-        blur_kernel=[1, 3, 3, 1],
+        blur_kernel=None,
         bias=True,
         activate=True,
     ):
+        if blur_kernel is None:
+            blur_kernel = [1, 3, 3, 1]
         layers = []
 
         if downsample:
@@ -233,15 +221,15 @@ class ConvLayer(nn.Sequential):
 
 
 class ResBlock(nn.Module):
-    def __init__(self, in_channel, out_channel, blur_kernel=[1, 3, 3, 1]):
+    def __init__(self, in_channel, out_channel, blur_kernel=None):
+        if blur_kernel is None:
+            blur_kernel = [1, 3, 3, 1]
         super().__init__()
 
         self.conv1 = ConvLayer(in_channel, in_channel, 3)
         self.conv2 = ConvLayer(in_channel, out_channel, 3, downsample=True)
 
-        self.skip = ConvLayer(
-            in_channel, out_channel, 1, downsample=True, activate=False, bias=False
-        )
+        self.skip = ConvLayer(in_channel, out_channel, 1, downsample=True, activate=False, bias=False)
 
     def forward(self, input):
         out = self.conv1(input)
@@ -255,7 +243,7 @@ class ResBlock(nn.Module):
 
 class EncoderApp(nn.Module):
     def __init__(self, size, w_dim=512):
-        super(EncoderApp, self).__init__()
+        super().__init__()
 
         channels = {
             4: 512,
@@ -296,15 +284,14 @@ class EncoderApp(nn.Module):
 
 class Encoder(nn.Module):
     def __init__(self, size, dim=512, dim_motion=20):
-        super(Encoder, self).__init__()
+        super().__init__()
 
         # appearance netmork
         self.net_app = EncoderApp(size, dim)
 
         # motion network
         fc = [EqualLinear(dim, dim)]
-        for i in range(3):
-            fc.append(EqualLinear(dim, dim))
+        fc.extend(EqualLinear(dim, dim) for _ in range(3))
 
         fc.append(EqualLinear(dim, dim_motion))
         self.fc = nn.Sequential(*fc)
@@ -325,7 +312,6 @@ class Encoder(nn.Module):
     def forward(self, input_source, input_target, h_start=None):
 
         if input_target is not None:
-
             h_source, feats = self.net_app(input_source)
             h_target, _ = self.net_app(input_target)
 

@@ -159,10 +159,13 @@ and `fast_float/onnx/dispatch.py` (`apply_backends`).
 - `direction`, `refenc`, `decoder` are substituted by `dispatch`:
   `dec.direction` and `enc` (exposing `.fc`) are replaced, and `decoder` is
   installed as `model._decoder_onnx` / `model._decoder_compiled` and consumed by
-  `FLOAT._decode_latent_batched` (static-batch pad/trim for ONNX).
-- **Self-test fallback**: every ONNX substitution runs an init-time parity check
-  against the torch module and silently falls back to `eager` on mismatch, so a
-  missing, stale or shape-incompatible artifact can never break inference.
+  `FLOAT._decode_call` (which `_decode_latent_batched` and the streaming
+  `_decode_u8` path both route through; static-batch pad/trim for ONNX).
+- **No automatic runtime self-test / fallback**: the config is the contract.
+  Parity and selection are validated only by the converter/selector scripts.
+  A missing artifact still can't break startup — construction raises and is
+  caught, logging a warning and leaving the component `eager`. ORT provider
+  fallback (`trt → cuda → cpu`) happens *inside* `make_ort_session`.
 - `FLOAT_DISABLE_BACKENDS=1` disables the whole dispatch pass.
 
 ## Runtime overrides

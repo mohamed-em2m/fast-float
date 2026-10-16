@@ -12,7 +12,7 @@ which stays because ONNX Conv ``group`` is static regardless of exporter.
 from __future__ import annotations
 
 import os
-from typing import Dict, Optional, Sequence, Tuple
+from collections.abc import Sequence
 
 import torch
 
@@ -61,11 +61,11 @@ def export_module(
     out_path: str,
     input_names: Sequence[str],
     output_names: Sequence[str],
-    dynamic_axes: Optional[Dict[str, Dict[int, str]]] = None,
+    dynamic_axes: dict[str, dict[int, str]] | None = None,
     opset: int = 17,
     fixed_batch: bool = False,
-    mark_dims: Tuple[int, ...] = (0, 1),
-) -> Dict[str, str]:
+    mark_dims: tuple[int, ...] = (0, 1),
+) -> dict[str, str]:
     """Export ``module`` to ``out_path`` via dynamo. Returns info dict.
 
     ``dynamic_axes``/``opset`` are accepted for API compatibility; dynamism
@@ -176,9 +176,7 @@ def _trt_libs_loadable() -> bool:
     return False
 
 
-def _trt_provider_options(
-    fp16, cache_dir, min_shapes, opt_shapes, max_shapes, workspace_gb=2.0
-):
+def _trt_provider_options(fp16, cache_dir, min_shapes, opt_shapes, max_shapes, workspace_gb=2.0):
     """OR-TensorRT EP provider options (FP16, on-disk engine+timing cache,
     shape profiles). TRT engine build is minutes-long, so the cache avoids
     rebuilding per process; engines are tied to GPU/TRT/CUDA versions."""
@@ -211,10 +209,10 @@ def make_ort_session(
     require_gpu: bool = False,
     use_trt: bool = True,
     trt_fp16: bool = True,
-    trt_cache_dir: Optional[str] = None,
-    trt_min_shapes: Optional[Dict[str, Sequence[int]]] = None,
-    trt_opt_shapes: Optional[Dict[str, Sequence[int]]] = None,
-    trt_max_shapes: Optional[Dict[str, Sequence[int]]] = None,
+    trt_cache_dir: str | None = None,
+    trt_min_shapes: dict[str, Sequence[int]] | None = None,
+    trt_opt_shapes: dict[str, Sequence[int]] | None = None,
+    trt_max_shapes: dict[str, Sequence[int]] | None = None,
 ):
     """ORT InferenceSession, provider chain TRT -> CUDA -> CPU.
 
@@ -264,9 +262,7 @@ def make_ort_session(
                 )
             )
         if "CUDAExecutionProvider" in available:
-            gpu_providers.append(
-                ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "DEFAULT"})
-            )
+            gpu_providers.append(("CUDAExecutionProvider", {"cudnn_conv_algo_search": "DEFAULT"}))
     if use_gpu and require_gpu and not gpu_providers:
         raise RuntimeError(
             "GPU requested but no CUDA/TRT execution provider available "
@@ -284,7 +280,7 @@ def make_ort_session(
         return ort.InferenceSession(
             abs_path,
             sess_options=ort.SessionOptions(),
-            providers=list(provs) + ["CPUExecutionProvider"],
+            providers=[*list(provs), "CPUExecutionProvider"],
         )
 
     def _on_gpu(s):
@@ -314,17 +310,12 @@ def make_ort_session(
         # Session came back CPU-only: ORT swallowed a provider-load failure.
         requested_trt = any(p[0] == "TensorrtExecutionProvider" for p in provs)
         if requested_trt:
-            print(
-                "[ort] NOTE: TensorRT EP failed to initialize — retrying with the CUDA EP."
-            )
+            print("[ort] NOTE: TensorRT EP failed to initialize — retrying with the CUDA EP.")
         else:
             print("[ort] WARNING: GPU execution providers did not initialize.")
     if sess is None:
         if use_gpu and require_gpu:
-            raise RuntimeError(
-                "GPU requested but the ORT session fell back to CPU "
-                f"(available={sorted(available)})."
-            )
+            raise RuntimeError(f"GPU requested but the ORT session fell back to CPU (available={sorted(available)}).")
         sess = _new_session([])
     active = sess.get_providers()
     trt_active = "TensorrtExecutionProvider" in active
@@ -350,17 +341,13 @@ def add_ort_args(ap, default_max_batch: int = 8):
         action="store_true",
         help="disable the TensorRT EP (use the CUDA EP instead)",
     )
-    ap.add_argument(
-        "--trt-fp32", action="store_true", help="TensorRT in FP32 (default FP16)"
-    )
+    ap.add_argument("--trt-fp32", action="store_true", help="TensorRT in FP32 (default FP16)")
     ap.add_argument(
         "--trt-cache",
         default=None,
         help="TensorRT engine cache dir (default <onnx_dir>/trt_cache)",
     )
-    ap.add_argument(
-        "--trt-min-batch", type=int, default=1, help="TensorRT profile min batch"
-    )
+    ap.add_argument("--trt-min-batch", type=int, default=1, help="TensorRT profile min batch")
     ap.add_argument(
         "--trt-max-batch",
         type=int,
@@ -434,9 +421,7 @@ def run_ort_iobinding(session, feed, out_shapes, device=None):
             raise RuntimeError(f"iobinding input {name!r} is not a CUDA tensor")
         tc = t.to(dtype=torch.float32).contiguous()
         refs.append(tc)
-        binding.bind_input(
-            name, "cuda", did, np.float32, tuple(tc.shape), tc.data_ptr()
-        )
+        binding.bind_input(name, "cuda", did, np.float32, tuple(tc.shape), tc.data_ptr())
     outs = []
     for name, shape in out_shapes:
         shape = tuple(int(d) for d in shape)

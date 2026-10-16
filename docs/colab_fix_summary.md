@@ -10,6 +10,7 @@
 6. **ORT session crash**: `return cls.__new__(cls, *args)` — root cause was dynamo export using `external_data=True`, writing a `.data` sidecar that ORT<1.24 cannot resolve from a plain path string. **Fixed in commit `da6c4c1`**: changed to `external_data=False` + always uses abs-path in `InferenceSession`.
 
 ## Current state (pushed to `feat/onnx-supporting`, commit `da6c4c1`)
+
 - `fast_float/onnx/export.py`: `external_data=False` in dynamo path; `make_ort_session` uses abs-path + `SessionOptions`
 - All other converters unchanged.
 
@@ -45,7 +46,8 @@ If a unit fails parity, report the exact error. Do not skip parity checks.
 ```
 
 ## Known issues resolved
+
 - `onnx.external_data_helper` removed in onnx>=1.22 → pin onnx<1.22
-- ORT cls.__new__ crash → external_data=False (commit da6c4c1)
+- ORT cls.**new** crash → external_data=False (commit da6c4c1)
 - transformers from_pretrained crash → manual load + tie_weights no-op
 - onnxruntime cp310 missing wheel → pin onnxruntime<1.24

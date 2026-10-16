@@ -5,7 +5,6 @@ Inference Stage 2
 import datetime
 import os
 import subprocess
-from typing import Optional
 
 import albumentations as A
 import albumentations.pytorch.transforms as A_pytorch
@@ -38,9 +37,7 @@ class DataProcessor:
         self.sampling_rate = opt.sampling_rate
         self.input_size = opt.input_size
 
-        self.fa = face_alignment.FaceAlignment(
-            face_alignment.LandmarksType.TWO_D, flip_input=False
-        )
+        self.fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, flip_input=False)
 
         # wav2vec2 audio preprocessor
         if os.path.exists(opt.wav2vec_model_path):
@@ -48,9 +45,7 @@ class DataProcessor:
                 opt.wav2vec_model_path, local_files_only=True
             )
         else:
-            self.wav2vec_preprocessor = Wav2Vec2FeatureExtractor.from_pretrained(
-                opt.wav2vec_model_path
-            )
+            self.wav2vec_preprocessor = Wav2Vec2FeatureExtractor.from_pretrained(opt.wav2vec_model_path)
 
         # image transform
         self.transform = A.Compose(
@@ -83,9 +78,7 @@ class DataProcessor:
             if score > 0.95
         ]
         if len(bboxes) == 0:
-            raise ValueError(
-                "No face detected (score > 0.95). Try --no_crop or a clearer frontal image."
-            )
+            raise ValueError("No face detected (score > 0.95). Try --no_crop or a clearer frontal image.")
         bboxes = bboxes[0]  # Just use first bbox
 
         bsy = int((bboxes[3] - bboxes[1]) / 2)
@@ -113,9 +106,7 @@ class DataProcessor:
 
     def default_aud_loader(self, path: str) -> torch.Tensor:
         speech_array, sampling_rate = librosa.load(path, sr=self.sampling_rate)
-        return self.wav2vec_preprocessor(
-            speech_array, sampling_rate=sampling_rate, return_tensors="pt"
-        ).input_values[0]
+        return self.wav2vec_preprocessor(speech_array, sampling_rate=sampling_rate, return_tensors="pt").input_values[0]
 
     def preprocess(self, ref_path, audio_path, no_crop: bool = False) -> dict:
         if isinstance(ref_path, (list, tuple)):
@@ -136,9 +127,7 @@ class DataProcessor:
             a_list = [self.default_aud_loader(ap) for ap in audio_path]
             max_len = max(aud.shape[-1] for aud in a_list)
             a_padded = [
-                F.pad(aud, (0, max_len - aud.shape[-1]), mode="constant", value=0)
-                if aud.shape[-1] < max_len
-                else aud
+                F.pad(aud, (0, max_len - aud.shape[-1]), mode="constant", value=0) if aud.shape[-1] < max_len else aud
                 for aud in a_list
             ]
             a = torch.stack(a_padded, dim=0)
@@ -189,34 +178,28 @@ class InferenceAgent:
         vid_target_recon: torch.Tensor,
         video_path: str,
         audio_path: str,
-        video_encoder: Optional[str] = None,
+        video_encoder: str | None = None,
     ) -> str:
         fps = int(self.opt.fps)
-        encoder_choice = (
-            str(video_encoder or getattr(self.opt, "video_encoder", "")).strip().lower()
-        )
+        encoder_choice = str(video_encoder or getattr(self.opt, "video_encoder", "")).strip().lower()
         if encoder_choice in ("torchcodec", "torch codec", "tc"):
             try:
                 from fast_float.utils.pyav_writer import save_video_torchcodec
             except ImportError:
                 from utils.pyav_writer import save_video_torchcodec
-            return save_video_torchcodec(
-                vid_target_recon, video_path, audio_path=audio_path, fps=fps
-            )
+            return save_video_torchcodec(vid_target_recon, video_path, audio_path=audio_path, fps=fps)
 
         if encoder_choice in ("cpu pyav", "pyav", "pyav_cpu"):
             try:
                 from fast_float.utils.pyav_writer import save_video_pyav
             except ImportError:
                 from utils.pyav_writer import save_video_pyav
-            return save_video_pyav(
-                vid_target_recon, video_path, audio_path=audio_path, fps=fps
-            )
+            return save_video_pyav(vid_target_recon, video_path, audio_path=audio_path, fps=fps)
 
         vid = vid_target_recon.permute(0, 2, 3, 1)
         vid = vid.detach().clamp(-1, 1).cpu()
         vid = ((vid + 1) / 2 * 255).to(torch.uint8).contiguous()
-        T, H, W, _ = vid.shape
+        _T, H, W, _ = vid.shape
 
         # Encode and mux audio in one ffmpeg call (no temp file needed)
         cmd = [
@@ -268,7 +251,7 @@ class InferenceAgent:
         no_crop: bool = False,
         seed: int = 25,
         verbose: bool = False,
-        video_encoder: Optional[str] = None,
+        video_encoder: str | None = None,
     ) -> str:
 
         # Callers (Gradio sliders, API payloads) may hand over floats or numpy
@@ -296,9 +279,7 @@ class InferenceAgent:
             seed=seed,
         )["d_hat"]
 
-        res_video_path = self.save_video(
-            d_hat, res_video_path, audio_path, video_encoder=video_encoder
-        )
+        res_video_path = self.save_video(d_hat, res_video_path, audio_path, video_encoder=video_encoder)
         if verbose:
             print(f"> [Done] result saved at {res_video_path}")
         return res_video_path
@@ -329,18 +310,14 @@ class InferenceOptions(BaseOptions):
             ],
         )
         parser.add_argument("--no_crop", action="store_true", help="not using crop")
-        parser.add_argument(
-            "--res_video_path", default=None, type=str, help="res video path"
-        )
+        parser.add_argument("--res_video_path", default=None, type=str, help="res video path")
         parser.add_argument(
             "--ckpt_path",
             default="./checkpoints/float.pth",
             type=str,
             help="checkpoint path",
         )
-        parser.add_argument(
-            "--res_dir", default="./results", type=str, help="result dir"
-        )
+        parser.add_argument("--res_dir", default="./results", type=str, help="result dir")
         parser.add_argument(
             "--video_encoder",
             default="FFmpeg NVENC",
@@ -370,17 +347,7 @@ if __name__ == "__main__":
         call_time = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
         res_video_path = os.path.join(
             opt.res_dir,
-            "%s-%s-%s-nfe%s-seed%s-acfg%s-ecfg%s-%s.mp4"
-            % (
-                call_time,
-                video_name,
-                audio_name,
-                opt.nfe,
-                opt.seed,
-                opt.a_cfg_scale,
-                opt.e_cfg_scale,
-                opt.emo,
-            ),
+            f"{call_time}-{video_name}-{audio_name}-nfe{opt.nfe}-seed{opt.seed}-acfg{opt.a_cfg_scale}-ecfg{opt.e_cfg_scale}-{opt.emo}.mp4",
         )
     else:
         res_video_path = opt.res_video_path

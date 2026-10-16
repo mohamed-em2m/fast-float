@@ -215,7 +215,7 @@ export default function StudioStage({
             </span>
           </div>
           <div className="progress-track">
-            <div 
+            <div
               className="progress-fill-bar"
               style={{ width: `${progressPercent}%` }}
             />
@@ -227,11 +227,11 @@ export default function StudioStage({
       <div className="video-viewport-wrapper">
         {useWebRtc ? (
           <div className="webrtc-player-box">
-            <video 
-              ref={webRtcVideoRef} 
-              autoPlay 
-              playsInline 
-              controls 
+            <video
+              ref={webRtcVideoRef}
+              autoPlay
+              playsInline
+              controls
               className="stage-video"
             />
             <div className="webrtc-status-overlay">
@@ -244,11 +244,11 @@ export default function StudioStage({
           </div>
         ) : (
           <div className="mp4-player-box">
-            <video 
+            <video
               ref={videoRef}
               src={videoUrl}
-              controls 
-              autoPlay 
+              controls
+              autoPlay
               loop
               playsInline
               className="stage-video"
@@ -283,8 +283,8 @@ export default function StudioStage({
             <>
               {/* WebRTC Live Stream Toggle */}
               {!useWebRtc ? (
-                <button 
-                  type="button" 
+                <button
+                  type="button"
                   className="btn-secondary btn-sm"
                   onClick={handleStartWebRtc}
                   title="Stream video via WebRTC peer connection"
@@ -293,8 +293,8 @@ export default function StudioStage({
                   <span>WebRTC Stream</span>
                 </button>
               ) : (
-                <button 
-                  type="button" 
+                <button
+                  type="button"
                   className="btn-secondary btn-sm"
                   onClick={handleStopWebRtc}
                 >
@@ -303,9 +303,9 @@ export default function StudioStage({
               )}
 
               {/* Copy URL */}
-              <button 
-                type="button" 
-                className="btn-icon" 
+              <button
+                type="button"
+                className="btn-icon"
                 onClick={handleCopyLink}
                 title="Copy Video Stream Link"
               >
