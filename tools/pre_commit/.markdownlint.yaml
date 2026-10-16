@@ -1,0 +1,12 @@
+# markdownlint config used by the markdownlint-cli2 pre-commit hook.
+# Kept intentionally lenient: this repo has long-form docs and code trees
+# where strict line-length / HTML / heading rules create noise.
+default: true
+MD013: false # line length
+MD024: false # duplicate headings (multiple "Examples" sections)
+MD029: false # ordered list prefix style
+MD033: false # inline HTML (badges, <details>, tables)
+MD036: false # emphasis used instead of a heading
+MD040: false # fenced code language (directory trees have no language)
+MD041: false # first line in file should be a top-level heading
+MD060: false # table column style

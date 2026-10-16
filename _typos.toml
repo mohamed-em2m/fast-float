@@ -1,0 +1,8 @@
+# typos (crate-ci/typos) configuration.
+# Allowlist legitimate project identifiers that the dictionary flags as typos.
+[default.extend-words]
+# wav2vec2_ser.py / speech-emotion-recognition acronym
+ser = "ser"
+
+[default.extend-identifiers]
+ser = "ser"
