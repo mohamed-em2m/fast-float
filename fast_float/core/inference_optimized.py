@@ -84,6 +84,8 @@ class OptimizedInferenceAgent:
             for buf_name, buf in self.G.named_buffers():
                 if buf_name in state_dict:
                     buf.copy_(state_dict[buf_name].to(buf.device))
+                elif "wav2vec2" in buf_name:
+                    pass
         del state_dict
 
     def apply_optimization(self) -> None:

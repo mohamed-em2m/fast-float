@@ -37,6 +37,20 @@ def _dynamo_disable(fn):
         return fn
 
 
+def _vec_out_len(x: torch.Tensor, prev_x) -> int:
+    """Sequence length of one FMT step's output.
+
+    The graph concatenates ``prev_x``/``prev_wa`` onto ``x``/``wa`` before the
+    transformer (see ``FlowMatchingTransformer.forward``), so the vector field
+    is ``x.shape[1] + prev_x.shape[1]`` long — not ``x.shape[1]``. Binding the
+    IOBinding output at ``x.shape[1]`` alone under-sizes the buffer.
+    """
+    n = int(x.shape[1])
+    if prev_x is not None and torch.is_tensor(prev_x):
+        n += int(prev_x.shape[1])
+    return n
+
+
 class EmotionOnnxBackend:
     """Thin wrapper around an ORT session for emotion probabilities.
 
@@ -222,8 +236,15 @@ class FMTStepBackend:
         prev_x: torch.Tensor,
         prev_wa: torch.Tensor,
     ) -> torch.Tensor:
-        """Single vector-field eval -> ``[B, 60, 512]`` (input device)."""
+        """Single vector-field eval -> ``[B, L+Lp, 512]`` (input device).
+
+        The graph concatenates ``prev_x``/``prev_wa`` onto ``x``/``wa`` before
+        the transformer (see ``FlowMatchingTransformer.forward``), so the output
+        length is ``x.shape[1] + prev_x.shape[1]`` — not ``x.shape[1]``. Bind the
+        output at that length or the IOBinding buffer is too small.
+        """
         device = x.device
+        out_len = _vec_out_len(x, prev_x)
         if (
             device.type == "cuda"
             and not self._io_failed
@@ -243,12 +264,7 @@ class FMTStepBackend:
                             self.INPUTS, (t, x, wa, wr, we, prev_x, prev_wa)
                         )
                     },
-                    [
-                        (
-                            self.output_name,
-                            (x.shape[0], x.shape[1], int(self._static_last)),
-                        )
-                    ],
+                    [(self.output_name, (x.shape[0], out_len, int(self._static_last)))],
                     device=device,
                 )
                 return out.to(device=device, dtype=torch.float32)
