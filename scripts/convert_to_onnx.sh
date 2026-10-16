@@ -60,7 +60,7 @@ fi
 
 echo "=== [2/8] python deps ==="
 python -c "import torch; print('torch', torch.__version__, 'cuda=', torch.cuda.is_available())"
-probe_onnx() { python -c "import onnx, onnxruntime" 2>/dev/null; }
+probe_onnx() { python -c "import onnx.external_data_helper, onnxscript, onnxruntime" 2>/dev/null; }
 # On CUDA boxes the ORT build must ALSO ship a working CUDA EP.
 # CPU-only torch boxes always pass this probe.
 probe_ort_cuda() {
@@ -91,14 +91,14 @@ onnx_rt_pkg() {
   fi
 }
 if ! probe_stack; then
-  echo "installing onnx stack (pin onnx<1.22, onnxruntime<1.24)"
+  echo "installing onnx stack (pin onnx<1.22, onnxscript 0.7.2, onnxruntime<1.24)"
   pip uninstall -q -y onnx onnxscript onnx-ir onnxruntime onnxruntime-gpu 2>/dev/null || true
-  pip install -q --no-cache-dir "onnx<1.22" "$(onnx_rt_pkg)" || pip install -q --no-cache-dir "onnx<1.22" "onnxruntime<1.24"
+  pip install -q --no-cache-dir "onnx<1.22" "onnxscript==0.7.2" "$(onnx_rt_pkg)" || pip install -q --no-cache-dir "onnx<1.22" "onnxscript==0.7.2" "onnxruntime<1.24"
 fi
 if ! probe_stack; then
   echo "retrying with force-reinstall (clears partial/corrupt installs)"
   pip uninstall -q -y onnx onnxscript onnx-ir onnxruntime onnxruntime-gpu 2>/dev/null || true
-  pip install -q --no-cache-dir --force-reinstall "onnx<1.22" "$(onnx_rt_pkg)" || pip install -q --no-cache-dir --force-reinstall "onnx<1.22" "onnxruntime<1.24"
+  pip install -q --no-cache-dir --force-reinstall "onnx<1.22" "onnxscript==0.7.2" "$(onnx_rt_pkg)" || pip install -q --no-cache-dir --force-reinstall "onnx<1.22" "onnxscript==0.7.2" "onnxruntime<1.24"
 fi
 echo "onnx stack versions:"
 python -c "import importlib.metadata as m
@@ -106,6 +106,23 @@ for p in ('onnx','onnxscript','onnx-ir','onnxruntime','onnxruntime-gpu'):
     try: print(' ', p, m.version(p))
     except Exception: print(' ', p, 'MISSING')"
 probe_stack || { echo "ERROR: onnx stack still broken — export cannot run"; exit 1; }
+
+# ORT's CUDA EP dlopens libcublas/libcudnn by soname at session init. When
+# those come from pip `nvidia-*` wheels — and especially when torch bundles a
+# *different* CUDA major than the onnxruntime-gpu wheel (e.g. torch cu130 with
+# ORT cu12) — the loader cannot find them, ORT silently drops the GPU EP, and
+# every parity check dies with "fell back to CPU". Prepend the pip nvidia lib
+# dirs so libonnxruntime_providers_cuda.so resolves its CUDA deps (a no-op when
+# the libs already live on the default path, e.g. torch bundles matching CUDA).
+if [ "$(python -c 'import torch;print(torch.cuda.is_available())' 2>/dev/null)" = "True" ]; then
+  NV_LIB_DIRS="$(python -c 'import glob,os,site; d=set();
+[d.update(glob.glob(os.path.join(b,"nvidia","*","lib"))) for b in site.getsitepackages()+[site.getusersitepackages()]];
+print(":".join(sorted(d)))' 2>/dev/null || true)"
+  if [ -n "${NV_LIB_DIRS}" ]; then
+    export LD_LIBRARY_PATH="${NV_LIB_DIRS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    echo "ORT loader path += pip nvidia libs (${NV_LIB_DIRS//:/ })"
+  fi
+fi
 
 echo "=== [2.5/8] tensorRT probe ==="
 if [ "$(python -c 'import torch;print(torch.cuda.is_available())' 2>/dev/null)" = "True" ]; then
