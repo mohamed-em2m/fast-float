@@ -3,6 +3,7 @@ __pycache__/
 venv/
 .venv/
 /onnx/
+/temp/
 results/
 experiments/
 tmp/
