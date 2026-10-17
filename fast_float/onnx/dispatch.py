@@ -160,21 +160,44 @@ class _OnnxRunner(nn.Module):
             raise
 
     def _recreate(self, device_id: int | None = None):
-        """Fresh equivalent runner (used by __deepcopy__ for GPU replicas)."""
+        """Fresh equivalent runner (used for GPU replicas / device rebind)."""
         raise NotImplementedError
 
-    def to(self, *args, **kwargs):
-        device = torch._C._nn._parse_to(*args, **kwargs)[0]
-        if device is not None and device.type == "cuda":
-            dev_idx = device.index if device.index is not None else torch.cuda.current_device()
-            if self.device_id != dev_idx:
-                return self._recreate(device_id=dev_idx)
-        return super().to(*args, **kwargs)
+    def _refresh_io(self) -> None:
+        """Re-cache input/output names after the session is (re)built."""
+
+    def _rebind(self, device_id: int) -> None:
+        """Rebuild this runner's ORT session on ``device_id``, in place."""
+        self.device_id = int(device_id)
+        self.session, _ = make_runtime_session(
+            self.path,
+            opt_shapes=self._opt_shapes,
+            extra_dynamic=self._extra_dynamic,
+            max_batch=self._max_batch,
+            use_gpu=self.use_gpu,
+            device_id=self.device_id,
+        )
+        self._io_failed = False
+        self._refresh_io()
+
+    def _apply(self, fn, recurse=True):
+        # ``Module.to(device)`` recurses through ``_apply`` (never ``to``), so
+        # this is the only hook that observes a parent module's device move;
+        # rebind the ORT session so replicas run on their own GPU.
+        super()._apply(fn, recurse)
+        try:
+            target = fn(torch.empty(0)).device
+        except Exception:
+            return self
+        if target.type == "cuda":
+            idx = target.index if target.index is not None else torch.cuda.current_device()
+            if self.device_id != idx:
+                self._rebind(idx)
+        return self
 
     def __deepcopy__(self, memo):
-        # ORT sessions cannot be deep-copied; rebuild a clean session. The
-        # replica's .to(dev) afterwards is a no-op (no params); the session
-        # runs on its own provider device and outputs are moved by the caller.
+        # ORT sessions cannot be deep-copied; rebuild a clean session. Replicas
+        # are moved with ``.to(dev)`` afterwards, which rebinds via ``_apply``.
         return self._recreate(device_id=self.device_id)
 
 
@@ -198,6 +221,9 @@ class DirectionOnnx(_OnnxRunner):
             max_batch=max_batch,
             device_id=device_id,
         )
+        self._refresh_io()
+
+    def _refresh_io(self) -> None:
         self.input_name = self.session.get_inputs()[0].name
         out = self.session.get_outputs()[0]
         self.output_name = out.name
@@ -270,6 +296,9 @@ class RefEncOnnx(_OnnxRunner):
         )
         self.fc = fc
         self._torch_fallback = torch_fallback
+        self._refresh_io()
+
+    def _refresh_io(self) -> None:
         self.input_name = self.session.get_inputs()[0].name
 
     def _recreate(self, device_id: int | None = None):
@@ -348,6 +377,9 @@ class DecoderOnnx(_OnnxRunner):
             max_batch=max_batch,
             device_id=device_id,
         )
+        self._refresh_io()
+
+    def _refresh_io(self) -> None:
         ins = self.session.get_inputs()
         self.latent_name = ins[0].name
         self.feat_names = [i.name for i in ins[1:]]
@@ -483,6 +515,18 @@ def _image_size(opt) -> int:
     return 512
 
 
+def _primary_device_id(opt) -> int:
+    """Rank the primary runner sessions bind to (mirrors the model's device)."""
+    rank = getattr(opt, "rank", 0) if opt is not None else 0
+    if isinstance(rank, int):
+        return rank
+    try:
+        dev = torch.device(rank)
+        return dev.index if dev.index is not None else 0
+    except Exception:
+        return 0
+
+
 def _apply_direction(model, ae, opt) -> None:
     mode = resolve_mode("direction")
     if mode == "eager":
@@ -502,7 +546,7 @@ def _apply_direction(model, ae, opt) -> None:
         # No automatic parity probe: the converter/selector scripts validate;
         # the config is the contract.
         motion_dim = int(target.weight.shape[1])
-        runner = DirectionOnnx(path, opt_shapes={"x": [1, motion_dim]})
+        runner = DirectionOnnx(path, opt_shapes={"x": [1, motion_dim]}, device_id=_primary_device_id(opt))
         ae.dec.direction = runner
         logger.info(f"backends: direction -> ONNX {path} ({runner.providers})")
     except Exception as e:
@@ -533,6 +577,7 @@ def _apply_refenc(model, ae, opt) -> None:
             enc.fc,
             torch_fallback=enc,
             opt_shapes={"img": [1, 3, size, size]},
+            device_id=_primary_device_id(opt),
         )
         ae.enc = runner
         logger.info(f"backends: refenc -> ONNX {path} ({runner.providers})")
@@ -553,7 +598,7 @@ def _apply_decoder(model, ae, opt) -> None:
         return
     path = _path(opt, "decoder_onnx_path", f"{_ONNX_DIR}/decoder_v1.onnx")
     try:
-        runner = DecoderOnnx(path)
+        runner = DecoderOnnx(path, device_id=_primary_device_id(opt))
         model._decoder_onnx = runner
         logger.info(f"backends: decoder -> ONNX {path} (static batch {runner.batch}, {runner.providers})")
     except Exception as e:

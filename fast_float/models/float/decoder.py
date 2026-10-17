@@ -71,14 +71,40 @@ class DecoderMixin:
         return int(b) if isinstance(b, int) and b > 0 else None
 
     # ---------------- decode ---------------- #
+    def _decoder_for(self, device):
+        """ONNX decoder session bound to ``device`` (primary proto, replicas elsewhere).
+
+        The ONNX decoder lives on the model, not on the motion autoencoder, so
+        ``_get_ae`` replicas do not carry one. Without this, every decode worker
+        -- including secondary GPUs -- would call the single primary-pinned
+        session and all decode work would run on the primary GPU.
+        """
+        proto = getattr(self, "_decoder_onnx", None)
+        if proto is None:
+            return None
+        if not torch.cuda.is_available() or getattr(device, "type", None) != "cuda":
+            return proto
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        primary = self._cuda_device()
+        if primary.index is None or idx == primary.index:
+            return proto
+        with self._decode_lock:
+            reps = getattr(self, "_decoder_onnx_replicas", None)
+            if reps is None:
+                reps = self._decoder_onnx_replicas = {}
+            if idx not in reps:
+                reps[idx] = proto._recreate(device_id=idx)
+            return reps[idx]
+
     def _decode_call(self, ae, latent: torch.Tensor, feats: list) -> torch.Tensor:
         """Route the decode call through the configured backend.
 
-        ``_decoder_onnx`` (static-batch ONNX) and ``_decoder_compiled`` are set
-        by ``fast_float.onnx.dispatch`` when the config selects them; otherwise
-        this is the plain ``ae.dec(latent, alpha=None, feats=...)`` path.
+        ``_decoder_onnx`` (static-batch ONNX, one session per GPU) and
+        ``_decoder_compiled`` are set by ``fast_float.onnx.dispatch`` when the
+        config selects them; otherwise this is the plain
+        ``ae.dec(latent, alpha=None, feats=...)`` path on the per-device replica.
         """
-        backend = getattr(self, "_decoder_onnx", None)
+        backend = self._decoder_for(latent.device)
         if backend is not None:
             return backend(latent, feats)
         dec = getattr(self, "_decoder_compiled", None) or ae.dec
