@@ -49,39 +49,102 @@ echo "=== Installing optional video codecs (torchcodec) ==="
 uv pip install --python .venv/bin/python torchcodec || echo "⚠️ torchcodec install skipped or unavailable for current platform/PyTorch version (PyAV and FFmpeg NVENC remain available)."
 
 echo "=== Installing ONNX export toolchain (onnxscript / ONNX Runtime / TensorRT) ==="
-# onnx + onnxruntime come from pyproject (CPU runtime; the web app uses it). Add
-# onnxscript (required by torch.export's dynamo ONNX exporter) and, on a CUDA
-# box, onnxruntime-gpu + TensorRT so scripts/convert_to_onnx.sh can use the
-# TensorRT EP (FP16). Best-effort: failures here don't block the web app.
+# onnx + onnxruntime come from pyproject (a CPU wheel; the web app uses it).
+# Add onnxscript (required by torch.export's dynamo ONNX exporter). On a CUDA
+# box the CPU onnxruntime wheel must be *replaced* by onnxruntime-gpu -- both
+# provide the ``onnxruntime`` module, and layering one over the other leaves a
+# mixed tree where the CUDA EP silently never initializes.
 uv pip install --python .venv/bin/python --no-cache-dir onnxscript \
     || echo "⚠️ onnxscript install failed — ONNX export will need it."
 HAS_CUDA="$(python -c 'import torch;print(torch.cuda.is_available())' 2>/dev/null || echo False)"
 if [ "${HAS_CUDA}" = "True" ]; then
-    echo "CUDA detected → installing onnxruntime-gpu<1.24 + tensorrt (best effort)"
+    echo "CUDA detected → onnxruntime-gpu<1.24 + TensorRT (CUDA 12); best effort"
+    # Replace, never overlay: uninstall the CPU wheel first.
+    uv pip uninstall --python .venv/bin/python onnxruntime 2>/dev/null || true
     uv pip install --python .venv/bin/python --no-cache-dir "onnxruntime-gpu<1.24" \
-        || echo "⚠️ onnxruntime-gpu install skipped — the CUDA EP will be unavailable."
-    uv pip install --python .venv/bin/python --no-cache-dir tensorrt \
-        || echo "⚠️ tensorrt install skipped — the TensorRT EP will be unavailable."
+        || echo "⚠️ onnxruntime-gpu install failed — the CUDA EP will be unavailable."
+    # TensorRT for CUDA 12: the versioned metapackage pulls the matching
+    # tensorrt_libs; fall back to the unversioned wheel (older layout).
+    if ! uv pip install --python .venv/bin/python --no-cache-dir "tensorrt-cu12"; then
+        uv pip install --python .venv/bin/python --no-cache-dir tensorrt \
+            || echo "⚠️ tensorrt install skipped — the TensorRT EP will be unavailable."
+    fi
+    # ORT dlopens libnvinfer/libcublas by soname; put the pip lib dirs on the
+    # loader path for this shell (the app repeats this at runtime, see
+    # fast_float/initialize_env.py).
+    NV_LIB_DIRS="$(python -c 'import glob,os,site; d=set()
+for b in site.getsitepackages()+[site.getusersitepackages()]:
+    for p in [os.path.join(b,"nvidia"), *glob.glob(os.path.join(b,"tensorrt*"))]:
+        for r,_,fs in os.walk(p):
+            if any(f.endswith((".so",".dll")) or ".so." in f for f in fs): d.add(r)
+print(":".join(sorted(d)))' 2>/dev/null || true)"
+    if [ -n "${NV_LIB_DIRS}" ]; then
+        export LD_LIBRARY_PATH="${NV_LIB_DIRS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        echo "ORT loader path += pip CUDA/TensorRT libs"
+    fi
 else
     echo "No CUDA detected → CPU ONNX Runtime only."
 fi
 
 echo "=== ONNX / ONNX Runtime / TensorRT stack ==="
 python - <<'PY' || true
+import ctypes
 import importlib.metadata as m
-try:
-    import torch
-    print("  torch cuda:", torch.cuda.is_available())
-except Exception as e:
-    print("  torch import failed:", e)
-for p in ("onnx", "onnxscript", "onnx-ir", "onnxruntime", "onnxruntime-gpu", "tensorrt"):
+
+for p in ("onnx", "onnxscript", "onnx-ir", "onnxruntime", "onnxruntime-gpu", "tensorrt", "tensorrt-cu12"):
     try:
         print(f"  {p}: {m.version(p)}")
     except Exception:
         pass
 try:
+    import torch
+    print("  torch cuda:", torch.cuda.is_available(), torch.__version__)
+except Exception as e:
+    print("  torch import failed:", e)
+
+try:
     import onnxruntime as ort
-    print("  ORT providers:", ort.get_available_providers())
+    provs = ort.get_available_providers()
+    print("  ORT providers (listed):", provs)
+
+    # A listed CUDA EP can still fail to load (e.g. ORT cu12 wheel vs torch
+    # cu13); only a real session shows what actually initializes.
+    from onnx import TensorProto, helper
+    node = helper.make_node("Identity", ["x"], ["y"])
+    graph = helper.make_graph(
+        [node],
+        "probe",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    sess = ort.InferenceSession(
+        model.SerializeToString(),
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    active = sess.get_providers()
+    print("  CUDA EP effective:", active)
+    if torch.cuda.is_available() and active[0] == "CPUExecutionProvider":
+        print("  ⚠️ CUDA EP dropped to CPU — onnxruntime-gpu CUDA major != torch CUDA.")
+        print("     Install an onnxruntime-gpu built for torch's CUDA major.")
+
+    trt_listed = "TensorrtExecutionProvider" in provs
+    trt_ok = False
+    try:
+        import tensorrt  # noqa: F401
+        trt_ok = True
+    except Exception:
+        for so in ("libnvinfer.so.10", "libnvinfer.so.9", "libnvinfer.so"):
+            try:
+                ctypes.CDLL(so)
+                trt_ok = True
+                break
+            except OSError:
+                continue
+    print(f"  TensorRT EP listed: {trt_listed} | libnvinfer loadable: {trt_ok}")
+    if trt_listed and not trt_ok:
+        print("  ⚠️ TensorRT EP listed but libnvinfer missing: pip install 'tensorrt-cu12',")
+        print("     then re-run: source scripts/setup_cuda_libs.sh")
 except Exception as e:
     print("  onnxruntime import failed:", e)
 PY

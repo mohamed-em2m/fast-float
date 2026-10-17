@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import glob
 import json
 import os
 import site
@@ -51,33 +53,72 @@ def initialize_environment():
     return False
 
 
+_SYSTEM_CUDA_LIB_DIRS = ("/usr/local/cuda/lib64", "/usr/lib64-nvidia")
+_SHARED_LIB_EXTS = (".so", ".dll")
+
+
+def _is_shared_lib(name: str) -> bool:
+    return name.endswith(_SHARED_LIB_EXTS) or ".so." in name
+
+
+def _dedupe(items):
+    """Order-preserving dedupe."""
+    seen = set()
+    out = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _discover_gpu_lib_dirs(package_paths):
+    """Directories under pip ``nvidia``/``tensorrt*`` packages that hold shared libs.
+
+    ORT's CUDA EP dlopens ``libcublas``/``libcudnn`` and the TensorRT EP
+    dlopens ``libnvinfer`` by soname; when those ship as pip wheels
+    (``nvidia-*``, ``tensorrt``, ``tensorrt_libs``, ``tensorrt_cu12_libs``)
+    they are not on the default loader path, so ORT silently degrades the
+    session to CPU (discarding the CUDA EP too).
+    """
+    lib_dirs = []
+    for base_path in package_paths:
+        roots = [os.path.join(base_path, name) for name in ("nvidia", "tensorrt", "tensorrt_libs")]
+        roots += glob.glob(os.path.join(base_path, "tensorrt*"))
+        for root_dir in roots:
+            if not os.path.isdir(root_dir):
+                continue
+            for root, _dirs, files in os.walk(root_dir):
+                if any(_is_shared_lib(f) for f in files):
+                    lib_dirs.append(root)
+    lib_dirs.extend(path for path in _SYSTEM_CUDA_LIB_DIRS if os.path.isdir(path))
+    return _dedupe(lib_dirs)
+
+
 def initialize_onnx_lib_paths():
-    # Get all site-packages directories
+    """Put pip-provided CUDA / TensorRT libraries on the loader path.
+
+    Without this, ``onnxruntime``'s CUDA EP cannot resolve ``libcublas`` /
+    ``libcudnn`` and the TensorRT EP cannot resolve ``libnvinfer``, so ORT
+    drops every GPU provider and silently runs on CPU.
+    """
     package_paths = site.getsitepackages()
     if hasattr(site, "getusersitepackages"):
         package_paths.append(site.getusersitepackages())
 
-    # Find all subdirectories containing .so files under nvidia/ packages
-    nvidia_lib_paths = []
-    for base_path in package_paths:
-        nvidia_dir = os.path.join(base_path, "nvidia")
-        if os.path.exists(nvidia_dir):
-            for root, _dirs, files in os.walk(nvidia_dir):
-                if any(f.endswith(".so") or ".so." in f for f in files):
-                    nvidia_lib_paths.append(root)
+    lib_dirs = _discover_gpu_lib_dirs(package_paths)
 
-    # Also check common system library paths
-    system_cuda_paths = ["/usr/local/cuda/lib64", "/usr/lib64-nvidia"]
-    nvidia_lib_paths.extend(path for path in system_cuda_paths if os.path.exists(path))
+    if os.name == "nt":
+        for path in lib_dirs:
+            with contextlib.suppress(AttributeError, OSError):
+                os.add_dll_directory(path)
+        os.environ["PATH"] = os.pathsep.join([*lib_dirs, os.environ.get("PATH", "")])
+    else:
+        current_ld = os.environ.get("LD_LIBRARY_PATH", "")
+        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(lib_dirs) + (os.pathsep + current_ld if current_ld else "")
 
-    # Deduplicate and update LD_LIBRARY_PATH
-    nvidia_lib_paths = list(set(nvidia_lib_paths))
-    current_ld = os.environ.get("LD_LIBRARY_PATH", "")
-    new_ld = ":".join(nvidia_lib_paths) + (":" + current_ld if current_ld else "")
-    os.environ["LD_LIBRARY_PATH"] = new_ld
-
-    print("Discovered and added CUDA/NVIDIA library paths:")
-    for path in nvidia_lib_paths:
+    print("Discovered and added CUDA/NVIDIA/TensorRT library paths:")
+    for path in lib_dirs:
         print(f" - {path}")
 
     # Quick validation inside Python

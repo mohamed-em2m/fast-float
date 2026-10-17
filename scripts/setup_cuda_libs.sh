@@ -14,20 +14,26 @@ if hasattr(site, "getusersitepackages"):
 
 NVIDIA_LIB_PATHS=()
 
-# Search NVIDIA packages for shared libraries
+# Search NVIDIA and TensorRT packages for shared libraries. ORT's CUDA EP
+# needs libcublas/libcudnn and the TensorRT EP needs libnvinfer; the pip
+# wheels place them under nvidia/*, tensorrt*/ and tensorrt_libs/.
 for BASE_PATH in "${PACKAGE_PATHS[@]}"; do
-    NVIDIA_DIR="${BASE_PATH}/nvidia"
+    PACKAGE_DIRS=("${BASE_PATH}/nvidia" "${BASE_PATH}/tensorrt" "${BASE_PATH}/tensorrt_libs")
+    for EXTRA_DIR in "${BASE_PATH}"/tensorrt*; do
+        [[ -d "${EXTRA_DIR}" ]] && PACKAGE_DIRS+=("${EXTRA_DIR}")
+    done
 
-    if [[ -d "$NVIDIA_DIR" ]]; then
+    for PKG_DIR in "${PACKAGE_DIRS[@]}"; do
+        [[ -d "${PKG_DIR}" ]] || continue
         while IFS= read -r -d '' LIB_DIR; do
             NVIDIA_LIB_PATHS+=("$LIB_DIR")
         done < <(
-            find "$NVIDIA_DIR" -type f \
+            find "${PKG_DIR}" -type f \
                 \( -name '*.so' -o -name '*.so.*' \) \
                 -printf '%h\0' |
             sort -zu
         )
-    fi
+    done
 done
 
 # Check common system CUDA library directories
