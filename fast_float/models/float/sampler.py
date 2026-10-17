@@ -10,6 +10,8 @@ import traceback
 import torch
 import torch.nn.functional as F
 
+from fast_float.utils.timing import timed
+
 try:
     from torchdiffeq import odeint
 except ImportError:
@@ -71,7 +73,8 @@ class SamplerMixin:
             # encoding audio first with whole audio
             a = a.to(device)
             T = math.ceil(a.shape[-1] * self.opt.fps / self.opt.sampling_rate)
-            wa = self.audio_encoder.inference(a, seq_len=T)
+            with timed("audio_encode", gpu=True):
+                wa = self.audio_encoder.inference(a, seq_len=T)
 
             # encoding emotion first
             if isinstance(emo, torch.Tensor):
@@ -110,7 +113,8 @@ class SamplerMixin:
                     .expand(B, -1, -1)
                 )
             else:
-                we = self.emotion_encoder.predict_emotion(a).unsqueeze(1)
+                with timed("emotion_encode", gpu=True):
+                    we = self.emotion_encoder.predict_emotion(a).unsqueeze(1)
                 if we.shape[0] != B and we.shape[0] == 1:
                     we = we.expand(B, -1, -1)
 
@@ -245,7 +249,8 @@ class SamplerMixin:
             # solve ODE
             if odeint is None:
                 raise ImportError("torchdiffeq is required for ODE sampling. Install with: pip install torchdiffeq")
-            trajectory_t = odeint(sample_chunk, x0, time, **self.odeint_kwargs)
+            with timed("ode_solve", gpu=True, chunk=t, batch=B):
+                trajectory_t = odeint(sample_chunk, x0, time, **self.odeint_kwargs)
             sample_t = trajectory_t[-1]
 
             # Trim to exact length T on the last chunk
@@ -478,13 +483,14 @@ class SamplerMixin:
                     if stream is not None and torch.cuda.is_available():
                         lat.record_stream(stream)
 
-                    out = self._decode_latent_batched(
-                        ae,
-                        lat,
-                        feats,
-                        batch_size=getattr(self.opt, "decode_batch_size", None),
-                        device=dev,
-                    )
+                    with timed("decode", gpu=True, device=str(dev)):
+                        out = self._decode_latent_batched(
+                            ae,
+                            lat,
+                            feats,
+                            batch_size=getattr(self.opt, "decode_batch_size", None),
+                            device=dev,
+                        )
                     if (not out.is_cuda and torch.cuda.is_available()) or out.device != primary:
                         out = out.to(device=primary, non_blocking=True)
 

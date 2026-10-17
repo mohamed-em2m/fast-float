@@ -47,10 +47,10 @@ from pathlib import Path
 # logging during its import, we re-attach via setup_logger() which uses
 # propagate=False — making our named logger immune to root-logger rewiring.
 try:
-    from fast_float.utils.logger import setup_logger
+    from fast_float.utils.logger import set_log_level, setup_logger
 except ImportError:
     try:
-        from utils.logger import setup_logger
+        from utils.logger import set_log_level, setup_logger
     except ImportError:
         # Fallback: self-contained logger that doesn't rely on the root logger.
         def setup_logger(name="float_fast", **_):
@@ -67,6 +67,9 @@ except ImportError:
             _log.addHandler(_h)
             _log.propagate = False
             return _log
+
+        def set_log_level(level):
+            logging.getLogger().setLevel(level)
 
 
 import contextlib
@@ -869,7 +872,9 @@ if __name__ == "__main__":
         launch_kwargs["favicon_path"] = args.favicon_path
     if args.debug:
         launch_kwargs["debug"] = True
-        logging.getLogger().setLevel(logging.DEBUG)  # verbose mode
+        # Flip OUR loggers (fast_float.* + float_live_app); they use
+        # propagate=False, so the root logger alone never shows DEBUG lines.
+        set_log_level(logging.DEBUG)
 
     try:
         if args.queue:

@@ -28,6 +28,7 @@ from fast_float.core.data_processor import DataProcessor
 from fast_float.core.nvenc_encoder import encode_video_nvenc
 from fast_float.core.options import InferenceOptions
 from fast_float.core.simple_encoder import SimpleVideoEncoder
+from fast_float.utils.timing import timed, timing_scope
 
 torch.backends.cudnn.benchmark = True
 
@@ -182,13 +183,16 @@ class OptimizedInferenceAgent:
             fps = int(getattr(self.opt, "fps", 25))
 
             if encoder_choice in ("cpu pyav", "pyav", "pyav_cpu"):
-                return save_video_pyav(vid, video_path, audio_path=audio_path, fps=fps)
+                with timed("save"):
+                    return save_video_pyav(vid, video_path, audio_path=audio_path, fps=fps)
 
             if encoder_choice in ("torchcodec", "torch codec", "tc"):
-                return save_video_torchcodec(vid, video_path, audio_path=audio_path, fps=fps)
+                with timed("save"):
+                    return save_video_torchcodec(vid, video_path, audio_path=audio_path, fps=fps)
 
             # Default: FFmpeg NVENC
-            encode_video_nvenc(vid, video_path, fps=fps)
+            with timed("save"):
+                encode_video_nvenc(vid, video_path, fps=fps)
 
             total_time = time.time() - start_time
             logger.info(f"✅ Total save: {total_time:.3f}s -> {video_path}")
@@ -199,6 +203,7 @@ class OptimizedInferenceAgent:
             raise
 
     @torch.no_grad()
+    @timing_scope("run_inference")
     def run_inference(
         self,
         res_video_path: str,
@@ -220,7 +225,8 @@ class OptimizedInferenceAgent:
 
         # ---- preprocess ----
         t0 = time.perf_counter()
-        data = self.data_processor.preprocess(ref_path, audio_path, no_crop=no_crop)
+        with timed("preprocess"):
+            data = self.data_processor.preprocess(ref_path, audio_path, no_crop=no_crop)
         timings["preprocess"] = time.perf_counter() - t0
         if verbose:
             logger.info(f"> [Done] Preprocess ({timings['preprocess']:.3f}s)")
@@ -277,7 +283,8 @@ class OptimizedInferenceAgent:
         # ---- actual run ----
         first_run = getattr(self.G_opt, "_decode_profiles", None) is None
         t0 = time.perf_counter()
-        res_video_path = generate(res_video_path)
+        with timed("generate_and_save"):
+            res_video_path = generate(res_video_path)
         timings["generate_and_save"] = time.perf_counter() - t0
         timings["total"] = time.perf_counter() - total_start
 
@@ -382,6 +389,7 @@ class OptimizedInferenceAgent:
         return res_video_path
 
     @torch.no_grad()
+    @timing_scope("run_inference_batched")
     def run_inference_batched(
         self,
         items: list,
@@ -415,7 +423,8 @@ class OptimizedInferenceAgent:
         fps = int(getattr(self.opt, "fps", 25))
 
         # data["a"] is [N, L] (preprocess zero-pads the list to equal length).
-        data = self.data_processor.preprocess(ref_path, [it["padded_path"] for it in items], no_crop=no_crop)
+        with timed("preprocess"):
+            data = self.data_processor.preprocess(ref_path, [it["padded_path"] for it in items], no_crop=no_crop)
         s = data["s"]
 
         s_r, r_s_lambda, s_r_feats = G.encode_image_into_latent(s.to(device))
@@ -448,7 +457,8 @@ class OptimizedInferenceAgent:
             emo_mat = [None] * len(items)
             if pad_list:
                 batch_a = torch.stack(pad_list, dim=0).to(device)
-                logits = G.emotion_encoder.predict_emotion(batch_a)  # [m, dim_e]
+                with timed("emotion_encode", gpu=True):
+                    logits = G.emotion_encoder.predict_emotion(batch_a)  # [m, dim_e]
                 for k, m in zip(use_idx, range(len(use_idx)), strict=False):
                     emo_mat[k] = logits[m]
             for k, src in copy_from.items():
@@ -457,7 +467,8 @@ class OptimizedInferenceAgent:
                 else:
                     # Defensive: no previous chunk (only a tail can be short) —
                     # fall back to a solo read of the unpadded audio.
-                    emo_mat[k] = G.emotion_encoder.predict_emotion(auds[k].unsqueeze(0).to(device))[0]
+                    with timed("emotion_encode", gpu=True):
+                        emo_mat[k] = G.emotion_encoder.predict_emotion(auds[k].unsqueeze(0).to(device))[0]
             emo_arg = torch.stack(emo_mat, dim=0).unsqueeze(1)  # [N, 1, dim_e]
 
         def make_amp() -> contextlib.AbstractContextManager[None]:
@@ -491,7 +502,8 @@ class OptimizedInferenceAgent:
                 # duration is seconds -> frames (samples*fps/sr == seconds*fps).
                 t_i = max(1, math.ceil(it["duration"] * fps))
                 lat_i = lat_all[i, :t_i, :]
-                d_hat = G.decode_latent_into_image(s_r, s_r_feats, lat_i, batch_size=decode_bs)
+                with timed("decode", gpu=True):
+                    d_hat = G.decode_latent_into_image(s_r, s_r_feats, lat_i, batch_size=decode_bs)
                 out = self.save_video(
                     d_hat.float(),
                     it["out_path"],

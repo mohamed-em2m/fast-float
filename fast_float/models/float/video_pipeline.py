@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from fast_float.utils.stream_utils import _ABORT, _qget
+from fast_float.utils.timing import timed
 
 try:
     from fast_float.utils.pyav_writer import save_video_torchcodec
@@ -133,11 +134,14 @@ class StreamingVideoSaver:
         torch.cuda.set_device(primary)
 
         s = data["s"]
-        s_r, r_s_lambda, s_r_feats = self.encode_image_into_latent(s.to(primary))
+        with timed("encode_image", gpu=True):
+            s_r, r_s_lambda, s_r_feats = self.encode_image_into_latent(s.to(primary))
         if "s_r" in data:
-            r_s = self.encode_identity_into_motion(data["s_r"])
+            with timed("encode_identity", gpu=True):
+                r_s = self.encode_identity_into_motion(data["s_r"])
         else:
-            r_s = self.motion_autoencoder.dec.direction(r_s_lambda)
+            with timed("encode_identity", gpu=True):
+                r_s = self.motion_autoencoder.dec.direction(r_s_lambda)
         data["r_s"] = r_s
 
         if a_cfg_scale is None:
@@ -318,11 +322,11 @@ class StreamingVideoSaver:
                                 ev.synchronize()
                                 lat = lat_host.to(dev, non_blocking=True)
                                 lat.record_stream(stream)
-                            u8 = self._decode_u8(c["ae"], c["feats"], lat)
+                            with timed("decode", gpu=True, device=str(dev), batch=B):
+                                u8 = self._decode_u8(c["ae"], c["feats"], lat)
                             buf[:n_valid].copy_(u8[:n_valid], non_blocking=True)
                             done = torch.cuda.Event()
                             done.record(stream)
-
                         done_q.put((seq, buf, n_valid, done))
             except BaseException as e:
                 fail(f"decode_worker[{dev}]", e)
@@ -346,19 +350,21 @@ class StreamingVideoSaver:
                             buf, n, done = pending.pop(nxt)
                             if done is not None:
                                 done.synchronize()
-                            all_frames.append(buf[:n].numpy().copy())
+                            with timed("frame_gather"):
+                                all_frames.append(buf[:n].numpy().copy())
                             state["frames"] += n
                             pool.put(buf)
                             nxt += 1
                     if stop.is_set():
                         return
                     frames_np = np.concatenate(all_frames, axis=0)
-                    save_video_torchcodec(
-                        frames_np,
-                        video_path,
-                        audio_path=audio_path,
-                        fps=fps,
-                    )
+                    with timed("video_encode"):
+                        save_video_torchcodec(
+                            frames_np,
+                            video_path,
+                            audio_path=audio_path,
+                            fps=fps,
+                        )
                 except BaseException as e:
                     fail("writer_torchcodec", e)
                 return
@@ -396,13 +402,15 @@ class StreamingVideoSaver:
                             buf, n, done = pending.pop(nxt)
                             if done is not None:
                                 done.synchronize()
-                            writer_inst.write_frames(buf[:n].numpy())
+                            with timed("video_write"):
+                                writer_inst.write_frames(buf[:n].numpy())
                             state["frames"] += n
                             pool.put(buf)
                             nxt += 1
                     if stop.is_set():
                         return
-                    writer_inst.close()
+                    with timed("video_finalize"):
+                        writer_inst.close()
                 except BaseException as e:
                     fail("writer_pyav", e)
                 finally:
@@ -430,15 +438,17 @@ class StreamingVideoSaver:
                         buf, n, done = pending.pop(nxt)
                         if done is not None:
                             done.synchronize()
-                        proc.stdin.write(buf[:n].numpy().reshape(-1))
+                        with timed("video_write"):
+                            proc.stdin.write(buf[:n].numpy().reshape(-1))
                         state["frames"] += n
                         pool.put(buf)
                         nxt += 1
                 if stop.is_set():
                     return
-                proc.stdin.close()
-                rc = proc.wait(timeout=300)
-                drain.join(timeout=5)
+                with timed("video_finalize"):
+                    proc.stdin.close()
+                    rc = proc.wait(timeout=300)
+                    drain.join(timeout=5)
                 if rc != 0:
                     raise RuntimeError(
                         f"ffmpeg exited with {rc}: {b''.join(err_chunks).decode(errors='ignore')[:1000]}"

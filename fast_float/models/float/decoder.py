@@ -7,6 +7,7 @@ import threading
 import torch
 
 from fast_float.utils.decode_tuner import DecodeAutoTuner
+from fast_float.utils.timing import timed
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +149,8 @@ class DecoderMixin:
                 lat = torch.randn(b, dim, device=dev, dtype=dtype)
                 return self._decode_u8(ae, feats, lat, allow_split=False)
 
-            self._decode_profiles[dev.index] = tuner.tune(fn)
+            with timed("decode_tune", gpu=True, device=str(dev)):
+                self._decode_profiles[dev.index] = tuner.tune(fn)
             self._decode_tuners[dev.index] = tuner
             return self._decode_tuners[dev.index], self._decode_profiles[dev.index]
 

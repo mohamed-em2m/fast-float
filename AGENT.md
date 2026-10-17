@@ -392,7 +392,31 @@ When editing or extending the codebase, follow these design patterns:
 - Full details and rationale: **`docs/BACKEND_SELECTION.md`** — read it before
   touching the ONNX path.
 
-### 7. Shell & platform
+### 7. Logging & timing (debug mode)
+
+- **One logging entry point**: `fast_float/utils/logger.py`. Importing it installs a
+  coloured stderr handler on the `fast_float` logger (`propagate=False`, so
+  Gradio/Jupyter root rewiring can't swallow our records). Module loggers
+  (`getLogger(__name__)` under `fast_float.*`) inherit its level.
+- **Env-driven levels** — never hard-code `setLevel` in modules:
+  `FLOAT_LOG_LEVEL` (name, e.g. `DEBUG`) → else `FLOAT_DEBUG`/`FLOAT_TIMING`
+  (truthy) → else `INFO`. `set_log_level(level)` / `configure_logging(debug=True)`
+  flip **every** managed logger at once (this is what `--debug` calls — the old
+  code set the *root* logger, which did nothing because we `propagate=False`).
+- **Per-stage timing**: `fast_float/utils/timing.py`. Open a run with
+  `with timing_run("name"):` (re-entrant: the outermost scope owns the collector
+  and prints one summary table) and wrap blocks with
+  `with timed("stage", gpu=True):`. Stages aggregate by name (count/total/mean/
+  max/p95). `gpu=True` records a CUDA-event pair and defers the read to the
+  summary, so the pipeline never stalls mid-run. Everything is a no-op when no
+  run scope is active.
+- **Always-on summary** (INFO) at end of a run; **per-call lines** only in debug.
+  Instrumented stages: `preprocess`, `encode_image`, `encode_identity`,
+  `audio_encode`, `emotion_encode`, `ode_solve`, `decode`, `decode_tune`,
+  `frame_gather`, `video_write`/`video_encode`/`video_finalize`, `save`, `merge`.
+- Serve env `FLOAT_DEBUG=1` to get both the debug level and per-call timing.
+
+### 8. Shell & platform
 
 - This repo is developed on **Windows (PowerShell 5.1)**; `bash` commands are
   **WSL** (`/mnt/c/...`). Use PowerShell for tooling (`uv`, `git`, `ruff`).

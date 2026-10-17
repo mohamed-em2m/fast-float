@@ -23,6 +23,7 @@ from fast_float.utils.media import (
     process_audio_format,
     resize_image_to_256,
 )
+from fast_float.utils.timing import timed, timing_run
 
 ALLOWED_IMAGE_FORMATS = {"jpg", "jpeg", "png", "webp"}
 
@@ -205,41 +206,42 @@ async def generate_video(
         num_chunks = 1
 
         async with state.inference_lock:
-            _apply_decode_batch_size(state, request_data)
-            if chunk_seconds > 0 and duration > chunk_seconds:
-                num_chunks, output_path = await _generate_chunked(
-                    loop,
-                    state,
-                    request_data,
-                    request_id,
-                    audio_path,
-                    image_path,
-                    res_dir,
-                    stamp,
-                    chunk_seconds,
-                    overlap_seconds,
-                    encoder,
-                    fps,
-                    temp_files,
-                )
-            else:
-                state.set_progress(
-                    request_id,
-                    status="processing",
-                    stage="generating",
-                    total_chunks=1,
-                    completed_chunks=0,
-                    percent=5.0,
-                )
-                output_path = await loop.run_in_executor(
-                    state.executor,
-                    run_inference_blocking,
-                    state.agent,
-                    video_path_final,
-                    image_path,
-                    audio_path,
-                    request_data,
-                )
+            with timing_run(f"request {request_id}"):
+                _apply_decode_batch_size(state, request_data)
+                if chunk_seconds > 0 and duration > chunk_seconds:
+                    num_chunks, output_path = await _generate_chunked(
+                        loop,
+                        state,
+                        request_data,
+                        request_id,
+                        audio_path,
+                        image_path,
+                        res_dir,
+                        stamp,
+                        chunk_seconds,
+                        overlap_seconds,
+                        encoder,
+                        fps,
+                        temp_files,
+                    )
+                else:
+                    state.set_progress(
+                        request_id,
+                        status="processing",
+                        stage="generating",
+                        total_chunks=1,
+                        completed_chunks=0,
+                        percent=5.0,
+                    )
+                    output_path = await loop.run_in_executor(
+                        state.executor,
+                        run_inference_blocking,
+                        state.agent,
+                        video_path_final,
+                        image_path,
+                        audio_path,
+                        request_data,
+                    )
 
         timings["inference"] = time.time() - inference_start
         timings["total"] = time.time() - total_start_time
@@ -423,13 +425,14 @@ async def _generate_chunked(
     )
 
     merged_path = os.path.join(res_dir, f"{stamp}_{request_id}.mp4")
-    await loop.run_in_executor(
-        state.executor,
-        merge_mp4_chunks,
-        chunk_videos,
-        merged_path,
-        overlap_seconds,
-        encoder,
-        fps,
-    )
+    with timed("merge", chunks=num_chunks):
+        await loop.run_in_executor(
+            state.executor,
+            merge_mp4_chunks,
+            chunk_videos,
+            merged_path,
+            overlap_seconds,
+            encoder,
+            fps,
+        )
     return num_chunks, merged_path
