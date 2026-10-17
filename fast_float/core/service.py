@@ -134,7 +134,6 @@ def _apply_decode_batch_size(state: Any, request_data: dict[str, Any]) -> None:
         clear = getattr(model, "clear_decode_cache", None)
         if callable(clear):
             clear()
-            break
 
 
 async def generate_video(

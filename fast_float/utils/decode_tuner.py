@@ -98,16 +98,33 @@ class DecodeAutoTuner:
             if not results:
                 raise RuntimeError(f"{self.device}: decoding even 1 frame does not fit in free VRAM")
 
+            opt_bs = getattr(self.opt, "decode_batch_size", None) if self.opt else None
+            if opt_bs is not None and int(opt_bs) > 0:
+                req_bs = int(opt_bs)
+                if req_bs not in results and req_bs <= self.max_batch:
+                    # Explicit user override not visited during powers-of-two loop: measure it directly
+                    try:
+                        transient, fps, s = self._measure(decode_fn, req_bs)
+                        results[req_bs] = (transient, fps)
+                        if shape is None:
+                            shape = s
+                    except torch.cuda.OutOfMemoryError:
+                        torch.cuda.empty_cache()
+
             budget = self._budget()
             feasible = {k: v for k, v in results.items() if v[0] * self.safety <= budget}
             if not feasible:
                 k = min(results)
                 feasible = {k: results[k]}
 
-            opt_bs = getattr(self.opt, "decode_batch_size", None) if self.opt else None
             if opt_bs is not None and int(opt_bs) > 0:
                 req_bs = int(opt_bs)
-                chosen = req_bs if req_bs in results else min(req_bs, max(feasible.keys()))
+                if req_bs in feasible:
+                    chosen = req_bs
+                else:
+                    # Fallback to closest feasible batch size smaller than or equal to req_bs
+                    candidates = [k for k in feasible if k <= req_bs]
+                    chosen = max(candidates) if candidates else min(feasible)
             else:
                 best = max(f for _, f in feasible.values())
                 # Choose the smallest batch size that achieves plateau throughput

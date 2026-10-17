@@ -192,13 +192,9 @@ class StreamingVideoSaver:
             tuner, prof = self._get_decode_profile(dev, primary, ae, feats, s_r.dtype)
             ctx[dev.index] = dict(dev=dev, ae=ae, feats=feats, tuner=tuner, prof=prof)
 
-        # Select micro-batch size: user override takes precedence, otherwise use maximum tuned size
-        # to maximize GPU utilization and tensor core saturation.
-        override_bs = getattr(self.opt, "decode_batch_size", None)
-        if override_bs is not None and int(override_bs) > 0:
-            B = int(override_bs)
-        else:
-            B = max(c["prof"].batch_size for c in ctx.values())
+        # Select micro-batch size: user override takes precedence if feasible (checked by tuner),
+        # otherwise use maximum tuned size to maximize GPU utilization and tensor core saturation.
+        B = max(c["prof"].batch_size for c in ctx.values())
         static_b = self._decoder_static_batch()
         if static_b is not None:
             # Never serve micro-batches the static ONNX graph cannot take.
