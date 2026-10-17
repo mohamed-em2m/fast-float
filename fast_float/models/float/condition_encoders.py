@@ -57,9 +57,9 @@ class AudioEncoder(BaseModel):
         onnx_path = getattr(opt, "wav2vec_onnx_path", None)
         if not onnx_path:
             try:
-                from fast_float.onnx.backends import get_component
+                from fast_float.onnx.backends import get_config
 
-                comp = get_component("audio")
+                comp = get_config().component("audio")
                 if comp and comp.onnx_path:
                     onnx_path = comp.onnx_path
             except Exception:
@@ -178,9 +178,9 @@ class Audio2Emotion(nn.Module):
         onnx_path = getattr(opt, "emotion_onnx_path", None)
         if not onnx_path:
             try:
-                from fast_float.onnx.backends import get_component
+                from fast_float.onnx.backends import get_config
 
-                comp = get_component("emotion")
+                comp = get_config().component("emotion")
                 if comp and comp.onnx_path:
                     onnx_path = comp.onnx_path
             except Exception:
