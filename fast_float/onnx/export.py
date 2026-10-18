@@ -11,6 +11,7 @@ which stays because ONNX Conv ``group`` is static regardless of exporter.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from collections.abc import Sequence
 
@@ -162,19 +163,37 @@ def _trt_libs_loadable() -> bool:
     ORT then fails provider init and — crucially — silently degrades the
     *entire* session to ``CPUExecutionProvider``, discarding the CUDA EP too.
     Loading the library up front avoids that and the EP-error log spew.
+
+    The honest test is loading ORT's own provider library: that resolves the
+    exact ``libnvinfer`` version ORT was built against (plus the cuDNN/CUDA
+    sonames on ``LD_LIBRARY_PATH``). A pip ``tensorrt`` whose major disagrees
+    with that version (e.g. ``libnvinfer.so.11`` vs ORT's expected ``.10``)
+    imports fine yet is unusable, so a bare ``import tensorrt`` is not enough.
     """
     import ctypes
     import sys
 
-    # 1. Best effort: python tensorrt module sets up environment and dll directories
-    try:
+    # 1. Best effort: the python tensorrt module registers its lib dirs so the
+    #    provider library can resolve them (mandatory on Windows).
+    with contextlib.suppress(Exception):
         import tensorrt  # noqa: F401
 
-        return True
-    except Exception:
-        pass
+    # 2. Definitive: load ORT's TensorRT provider library itself.
+    try:
+        import onnxruntime
 
-    # 2. Platform-specific sonames / dll names
+        capi = os.path.join(os.path.dirname(onnxruntime.__file__), "capi")
+        provider_name = (
+            "onnxruntime_providers_tensorrt.dll" if sys.platform == "win32" else "libonnxruntime_providers_tensorrt.so"
+        )
+        provider_path = os.path.join(capi, provider_name)
+        if os.path.exists(provider_path):
+            ctypes.CDLL(provider_path)
+            return True
+    except Exception:
+        return False
+
+    # 3. Fallback: soname probe for installs without a bundled provider file.
     candidates = (
         ("nvinfer.dll", "nvinfer_10.dll", "nvinfer_9.dll", "nvinfer_8.dll")
         if sys.platform == "win32"
@@ -397,7 +416,9 @@ def make_session_from_args(onnx_path: str, args, opt_shapes=None, extra_dynamic=
     ``opt_shapes`` maps each *dynamic* input to a representative shape so the
     TensorRT EP can build shape profiles; omit it for fully-static graphs (the
     decoder). Returns ``(session, fp16_active)`` where ``fp16_active`` tells
-    callers to relax parity tolerances.
+    callers to relax parity tolerances -- it is True only when the TensorRT
+    FP16 EP is *actually* active (a requested-but-unloadable TRT must not relax
+    the CUDA/CPU parity gate).
     """
     use_gpu = torch.cuda.is_available() and not getattr(args, "cpu_ort", False)
     use_trt = use_gpu and not getattr(args, "no_trt", False)
@@ -421,7 +442,7 @@ def make_session_from_args(onnx_path: str, args, opt_shapes=None, extra_dynamic=
         trt_opt_shapes=op,
         trt_max_shapes=mx,
     )
-    return sess, fp16
+    return sess, (fp16 and "TensorrtExecutionProvider" in sess.get_providers())
 
 
 def make_runtime_session(

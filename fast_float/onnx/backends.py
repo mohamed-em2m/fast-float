@@ -219,6 +219,7 @@ def cuda_ep_usable() -> bool:
     """
     try:
         import onnxruntime as ort
+
         from onnx import TensorProto, helper
 
         node = helper.make_node("Identity", ["x"], ["y"])
@@ -229,6 +230,11 @@ def cuda_ep_usable() -> bool:
             [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])],
         )
         model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+        # onnx>=1.17 stamps IR version 13, which older ORT builds (e.g. 1.23
+        # with its max IR 11) reject before any provider runs -- making this
+        # probe always report False. Pin a widely-supported IR version so the
+        # test exercises execution providers, not the serializer default.
+        model.ir_version = min(model.ir_version, 10)
         sess = ort.InferenceSession(
             model.SerializeToString(),
             providers=["CUDAExecutionProvider", "CPUExecutionProvider"],

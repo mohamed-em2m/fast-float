@@ -74,13 +74,19 @@ ok = (not torch.cuda.is_available()
 sys.exit(0 if ok else 1)" 2>/dev/null
 }
 probe_trt() {
+  # Listing the EP only proves the onnxruntime-gpu wheel was built with TRT
+  # support; it says nothing about whether libnvinfer (of the exact version ORT
+  # expects) is loadable. Delegate to the same honest check the exporters use.
   python -c "
 import sys
 import torch
 import onnxruntime as o
-ok = (not torch.cuda.is_available()
-      or 'TensorrtExecutionProvider' in o.get_available_providers())
-sys.exit(0 if ok else 1)" 2>/dev/null
+if not torch.cuda.is_available():
+    sys.exit(0)
+if 'TensorrtExecutionProvider' not in o.get_available_providers():
+    sys.exit(1)
+from fast_float.onnx.export import _trt_libs_loadable
+sys.exit(0 if _trt_libs_loadable() else 1)" 2>/dev/null
 }
 probe_stack() { probe_onnx && probe_ort_cuda; }
 onnx_rt_pkg() {
