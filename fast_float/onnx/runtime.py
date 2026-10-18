@@ -15,6 +15,7 @@ import os
 import torch
 
 from fast_float.onnx.export import make_runtime_session, run_ort_iobinding
+from fast_float.runtimes.base_runtime import RuntimeSession
 
 LABELS = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
 
@@ -51,7 +52,7 @@ def _vec_out_len(x: torch.Tensor, prev_x) -> int:
     return n
 
 
-class EmotionOnnxBackend:
+class EmotionOnnxBackend(RuntimeSession):
     """Thin wrapper around an ORT session for emotion probabilities.
 
     Keeps torch semantics for callers: torch in (any device/dtype) ->
@@ -59,6 +60,9 @@ class EmotionOnnxBackend:
     so AMP/autocast contexts in the caller are harmless. The graph has
     symbolic batch/length, so one ``sess.run`` covers any ``[B, L]``.
     """
+
+    component = "emotion"
+    backend = "onnx"
 
     def __init__(
         self,
@@ -69,10 +73,10 @@ class EmotionOnnxBackend:
         max_batch: int | None = None,
         device_id: int | None = None,
     ):
+        super().__init__(device_id=device_id)
         if not os.path.exists(onnx_path):
             raise FileNotFoundError(f"emotion ONNX not found: {onnx_path}")
         self.path = os.path.abspath(onnx_path)
-        self.device_id = device_id
         self.session, _ = make_runtime_session(
             self.path,
             opt_shapes=opt_shapes,
@@ -123,8 +127,11 @@ class EmotionOnnxBackend:
         probs = self._run(wav_np)
         return torch.from_numpy(probs).to(device=device, dtype=torch.float32)
 
+    def forward(self, a: torch.Tensor) -> torch.Tensor:
+        return self.predict_probs(a)
 
-class Wav2vecOnnxBackend:
+
+class Wav2vecOnnxBackend(RuntimeSession):
     """Thin wrapper around an ORT session for FLOAT audio features.
 
     Covers feature-projection + the 12-layer transformer + the trained
@@ -138,6 +145,9 @@ class Wav2vecOnnxBackend:
     so training paths must keep using the torch module.
     """
 
+    component = "audio"
+    backend = "onnx"
+
     def __init__(
         self,
         onnx_path: str,
@@ -147,10 +157,10 @@ class Wav2vecOnnxBackend:
         max_batch: int | None = None,
         device_id: int | None = None,
     ):
+        super().__init__(device_id=device_id)
         if not os.path.exists(onnx_path):
             raise FileNotFoundError(f"wav2vec ONNX not found: {onnx_path}")
         self.path = os.path.abspath(onnx_path)
-        self.device_id = device_id
         self.session, _ = make_runtime_session(
             self.path,
             opt_shapes=opt_shapes,
@@ -215,8 +225,11 @@ class Wav2vecOnnxBackend:
         out = self._run(feats_np)
         return torch.from_numpy(out).to(device=device, dtype=torch.float32)
 
+    def forward(self, conv_feats: torch.Tensor) -> torch.Tensor:
+        return self.run_features(conv_feats)
 
-class FMTStepBackend:
+
+class FMTStepBackend(RuntimeSession):
     """Thin wrapper around an ORT session for one FMT vector-field step.
 
     Covers ``FlowMatchingTransformer.forward(train=False)``::
@@ -227,6 +240,9 @@ class FMTStepBackend:
     Batch is dynamic: the same graph serves plain (B) and CFG (3B) calls.
     The caller slices ``vec[:, 10:]`` for the current chunk.
     """
+
+    component = "fmt"
+    backend = "onnx"
 
     INPUTS = ("t", "x", "wa", "wr", "we", "prev_x", "prev_wa")
 
@@ -239,10 +255,10 @@ class FMTStepBackend:
         max_batch: int | None = None,
         device_id: int | None = None,
     ):
+        super().__init__(device_id=device_id, degrade_on_error="sticky")
         if not os.path.exists(onnx_path):
             raise FileNotFoundError(f"fmt ONNX not found: {onnx_path}")
         self.path = os.path.abspath(onnx_path)
-        self.device_id = device_id
         self.session, _ = make_runtime_session(
             self.path,
             opt_shapes=opt_shapes,
@@ -312,3 +328,6 @@ class FMTStepBackend:
         }
         out = self._run(feed)
         return torch.from_numpy(out).to(device=device, dtype=torch.float32)
+
+    def forward(self, *args: torch.Tensor) -> torch.Tensor:
+        return self.run_step(*args)

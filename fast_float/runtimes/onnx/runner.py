@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 
 from fast_float.onnx.export import make_runtime_session
+from fast_float.runtimes.base_runtime import RuntimeSession
 
 
 def _dynamo_disable(fn):
@@ -30,13 +31,15 @@ def _dynamo_disable(fn):
         return fn
 
 
-class _OnnxRunner(nn.Module):
+class _OnnxRunner(RuntimeSession, nn.Module):
     """Base ONNX session wrapper: torch in (any device/dtype) -> torch out.
 
     Prefers CUDA IOBinding (device-resident, zero host copies); falls back to
     the numpy host path on any failure (flag cached after the first failure so
     the hot path never pays repeated exception costs).
     """
+
+    backend = "onnx"
 
     def __init__(
         self,
@@ -47,11 +50,10 @@ class _OnnxRunner(nn.Module):
         max_batch: int | None = None,
         device_id: int | None = None,
     ):
-        super().__init__()
+        super().__init__(device_id=device_id)
         if not os.path.exists(onnx_path):
             raise FileNotFoundError(f"ONNX not found: {onnx_path}")
         self.use_gpu = torch.cuda.is_available() if use_gpu is None else bool(use_gpu)
-        self.device_id = device_id
         self.path = os.path.abspath(onnx_path)
         self._opt_shapes = opt_shapes
         self._extra_dynamic = extra_dynamic
@@ -105,6 +107,10 @@ class _OnnxRunner(nn.Module):
         """Fresh equivalent runner (used for GPU replicas / device rebind)."""
         raise NotImplementedError
 
+    def _replicate(self, device_id: int) -> _OnnxRunner:
+        """Registry-gated replicate: rebuild an equivalent session on ``device_id``."""
+        return self._recreate(device_id)
+
     def _refresh_io(self) -> None:
         """Re-cache input/output names after the session is (re)built."""
 
@@ -145,6 +151,8 @@ class _OnnxRunner(nn.Module):
 
 class DirectionOnnx(_OnnxRunner):
     """``x [B, M] -> dir [B, 512]`` (dynamic batch)."""
+
+    component = "direction"
 
     def __init__(
         self,
@@ -216,6 +224,8 @@ class RefEncOnnx(_OnnxRunner):
     handles the non-deployed 3-arg path (``input_target is not None``) which
     the exported graph does not cover.
     """
+
+    component = "refenc"
 
     def __init__(
         self,
@@ -301,6 +311,8 @@ class DecoderOnnx(_OnnxRunner):
     one ``B`` (``self.batch``). Runtime pads micro-batches up to ``B``
     (replicate) and trims the output back to ``m``.
     """
+
+    component = "decoder"
 
     def __init__(
         self,

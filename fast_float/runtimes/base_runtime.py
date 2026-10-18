@@ -7,7 +7,7 @@ sessions. The contract, so call sites can stay backend-agnostic:
 * never let a backend failure crash the pipeline -- follow the
   ``degrade_on_error`` policy (sticky / transient / raise);
 * ``replicate`` for the components that run on more than one GPU (only
-  ``decoder`` today).
+  ``decoder`` today, per the registry).
 
 See ``docs/BUILD_RUNTIME_SESSIONS.md``.
 """
@@ -36,12 +36,15 @@ class RuntimeSession(ABC):
     component: str = ""
     backend: str = "eager"
 
-    def __init__(self, device_id: int | None = None, degrade_on_error: str = "sticky"):
+    def __init__(self, device_id: int | None = None, degrade_on_error: str = "transient"):
         self.device_id = device_id
         self.degrade_on_error = degrade_on_error
         self.stats = RuntimeStats()
         self._degraded = False
         self._closed = False
+        # Cooperative: in the ``(RuntimeSession, nn.Module)`` mixins this chains
+        # to ``nn.Module.__init__`` so torch bookkeeping is initialised.
+        super().__init__()
 
     @property
     def providers(self) -> list:
@@ -59,11 +62,29 @@ class RuntimeSession(ABC):
     def replicate(self, device_id: int) -> RuntimeSession:
         """Return an equivalent session bound to ``device_id``.
 
-        Only components flagged ``replicable`` (``decoder``) need this; the
-        default raises so an accidental replicate on a primary-only component
-        fails loudly instead of silently sharing a session across GPUs.
+        Only registry-``replicable`` components (``decoder`` today) may
+        replicate; the gate fails loudly instead of silently sharing a session
+        across GPUs.
         """
-        raise NotImplementedError(f"{type(self).__name__} is not replicable")
+        if not self._replicable():
+            raise NotImplementedError(f"{self._label()} is not replicable")
+        return self._replicate(device_id)
+
+    def _replicable(self) -> bool:
+        if not self.component:
+            return False
+        try:
+            from fast_float.onnx.registry import get
+
+            return get(self.component).replicable
+        except Exception:
+            return False
+
+    def _replicate(self, device_id: int) -> RuntimeSession:
+        raise NotImplementedError(f"{type(self).__name__} has no replicate implementation")
+
+    def _label(self) -> str:
+        return self.component or type(self).__name__
 
     def degrade(self, reason: str) -> None:
         """Mark the session degraded (sticky) after a backend failure."""
