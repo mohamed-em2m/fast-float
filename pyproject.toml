@@ -77,6 +77,9 @@ dependencies = [
     "pre-commit>=4.6.2",
 ]
 
+[dependency-groups]
+dev = ["pytest>=8.0,<9"]
+
 # Flat scripts layout (no installable package) — manage the env only.
 [tool.uv]
 package = false
