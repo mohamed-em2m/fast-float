@@ -186,8 +186,11 @@ A served box must not compile at startup. On cache miss:
 - `python -m fast_float.builders build --components ... --backend onnx|dynamo --out-dir onnx`
 - `python -m fast_float.runtimes inspect` — per-component chosen runtime,
   providers, device, degradations.
-- Refactor `select_backends.py` to consume builders/runtimes instead of
-  `make_session_from_args` directly.
+- `select_backends.py` consumes builders/runtimes: it builds each ORT session
+  via `OnnxBuilder.runtime()` (provider chain / precision / TRT knobs carried on
+  the `BuildSpec`) and records the measured artifact in the cache. (The
+  converters still call `make_session_from_args` for their own post-export
+  parity check.)
 
 ## 10. Phases (behavior-preserving, risk-ordered)
 
@@ -201,9 +204,10 @@ A served box must not compile at startup. On cache miss:
    `onnx/runtime.py` is a re-export shim.
 3. **`runtimes/dynamo/`** — done: `CompiledRuntime` (+ `builders/dynamo`).
    `ExportedRuntime` (torch.export AOT) still open.
-4. **Spec/Artifact/Fingerprint/cache** — core done: `builders/onnx.OnnxBuilder`
-   wraps `export_module` and records into `ArtifactCache`. Pointing the selector
-   at builders is still open.
+4. **Spec/Artifact/Fingerprint/cache** — done: `builders/onnx.OnnxBuilder` wraps
+   `export_module` and records into `ArtifactCache`; `select_backends.py` now
+   measures through `OnnxBuilder.runtime()` (an `OrtRuntime`) and records each
+   measured artifact, instead of calling `make_session_from_args` itself.
 5. **`inspect` CLI + startup degradation warnings** — done:
    `python -m fast_float.runtimes inspect` prints the resolved per-component
    plan and where the box cannot honour it; `inspect_model`/`warn_degraded`

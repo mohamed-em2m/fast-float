@@ -104,6 +104,41 @@ class OnnxBuilder(BuilderSession):
     def record(self, artifact: BuildArtifact) -> None:
         self.cache.put(artifact.fingerprint, _entry_from_artifact(artifact))
 
+    def runtime(self, spec: BuildSpec, device_id: int | None = None):
+        """Serve ``spec``'s artifact through a :class:`RuntimeSession`.
+
+        Builds the ORT session from the spec's provider chain / precision /
+        TRT knobs (the same knobs ``make_session_from_args`` exposes), so the
+        selector measures the runtime contract instead of a raw session.
+        """
+        from fast_float.onnx.export import make_ort_session, trt_optimization_profiles
+        from fast_float.runtimes.onnx.runner import OrtRuntime
+
+        chain = tuple(spec.provider_chain or ())
+        use_gpu = "cuda" in chain or "trt" in chain
+        use_trt = "trt" in chain
+        mn = op = mx = None
+        if use_trt and spec.opt_shapes:
+            mn, op, mx = trt_optimization_profiles(
+                spec.opt_shapes,
+                min_batch=spec.trt_min_batch,
+                max_batch=spec.trt_max_batch,
+                extra=spec.extra_dynamic,
+            )
+        session = make_ort_session(
+            self.out_path(spec),
+            use_gpu=use_gpu,
+            require_gpu=use_gpu,
+            use_trt=use_trt,
+            trt_fp16=(spec.precision == "fp16"),
+            trt_cache_dir=spec.trt_cache_dir,
+            trt_min_shapes=mn,
+            trt_opt_shapes=op,
+            trt_max_shapes=mx,
+            device_id=device_id,
+        )
+        return OrtRuntime(session, spec.input_names, component=spec.component, device_id=device_id)
+
     def build(self, spec: BuildSpec, env: dict | None = None) -> BuildArtifact:
         module = spec.extra.get("module")
         sample = spec.extra.get("sample_inputs")

@@ -41,6 +41,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from fast_float.builders.onnx import OnnxBuilder
+from fast_float.builders.spec import BuildArtifact, BuildSpec
 from fast_float.onnx.backends import (
     COMPONENTS,
     HOT_COMPONENTS,
@@ -49,7 +51,7 @@ from fast_float.onnx.backends import (
     env_fingerprint,
     save_backends,
 )
-from fast_float.onnx.export import fp16_tol, make_session_from_args
+from fast_float.onnx.export import fp16_tol
 from fast_float.onnx.parity import compare_outputs
 
 ONNX_FILES = {
@@ -82,8 +84,14 @@ class Case:
         out = self.module(*self.inputs)
         return list(out) if isinstance(out, (tuple, list)) else [out]
 
-    def ort_outs(self, sess) -> list:
-        return list(sess.run(None, self.feed))
+    @property
+    def input_names(self) -> tuple[str, ...]:
+        """Graph input names, in module-input order (from the ORT feed)."""
+        return tuple(self.feed)
+
+    def runtime_outs(self, runtime) -> list:
+        out = runtime(*self.inputs)
+        return list(out) if isinstance(out, (tuple, list)) else [out]
 
 
 # --------------------------------------------------------------------------- #
@@ -258,9 +266,9 @@ def _median_ms(fn, iters: int, warmup: int) -> float:
     return ts[len(ts) // 2]
 
 
-def _provider_label(sess) -> str | None:
+def _provider_label(providers) -> str | None:
     try:
-        p = sess.get_providers()[0]
+        p = providers[0]
     except Exception:
         return None
     if "Tensorrt" in p:
@@ -270,9 +278,28 @@ def _provider_label(sess) -> str | None:
     return "cpu"
 
 
-def _parity(case: Case, sess, fp16: bool) -> dict[str, Any]:
+def _precision(args) -> str:
+    return "fp32" if getattr(args, "trt_fp32", False) else "fp16"
+
+
+def _chain(args) -> tuple[str, ...]:
+    """Provider chain implied by the selector's ORT flags."""
+    if getattr(args, "cpu_ort", False):
+        return ("cpu",)
+    if getattr(args, "no_trt", False):
+        return ("cuda", "cpu")
+    return ("trt", "cuda", "cpu")
+
+
+def _device_index(device) -> int | None:
+    if getattr(device, "type", None) == "cuda":
+        return device.index if device.index is not None else 0
+    return None
+
+
+def _parity(case: Case, runtime, fp16: bool) -> dict[str, Any]:
     atol, rtol = fp16_tol(case.atol, fp16), fp16_tol(case.rtol, fp16)
-    ref, got = case.eager_outs(), case.ort_outs(sess)
+    ref, got = case.eager_outs(), case.runtime_outs(runtime)
     if len(ref) != len(got):
         return {"ok": False, "reason": f"outputs {len(got)} != {len(ref)}"}
     ok, worst = True, {"max_abs": 0.0, "mean_abs": 0.0, "cosine": 1.0}
@@ -298,11 +325,26 @@ def _round(metrics: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
-def _select_component(name, case, args, ort_ns) -> tuple[ComponentConfig, float, float]:
+def _select_component(name, case, args, builder, device) -> tuple[ComponentConfig, float, float]:
     metrics: dict[str, Any] = {}
     eager_ms = _median_ms(lambda: case.module(*case.inputs), args.iters, args.warmup)
     metrics["eager_ms"] = eager_ms
     onnx_path = Path(args.onnx_dir) / ONNX_FILES[name]
+
+    spec = BuildSpec(
+        component=name,
+        backend="onnx",
+        input_names=case.input_names,
+        opt_shapes=case.opt_shapes,
+        extra_dynamic=case.extra_dynamic,
+        precision=_precision(args),
+        provider_chain=_chain(args),
+        trt_min_batch=args.trt_min_batch,
+        trt_max_batch=args.trt_max_batch,
+        trt_cache_dir=getattr(args, "trt_cache", None),
+        ckpt_path=args.ckpt,
+        tolerance=case.atol,
+    )
 
     best_mode, best_provider, best_ms = "eager", None, eager_ms
 
@@ -323,19 +365,29 @@ def _select_component(name, case, args, ort_ns) -> tuple[ComponentConfig, float,
 
     if not args.no_onnx and onnx_path.exists():
         try:
-            sess, fp16 = make_session_from_args(
-                str(onnx_path),
-                ort_ns,
-                opt_shapes=case.opt_shapes,
-                extra_dynamic=case.extra_dynamic,
-            )
-            par = _parity(case, sess, fp16)
+            runtime = builder.runtime(spec, device_id=_device_index(device))
+            providers = runtime.providers
+            fp16 = _precision(args) == "fp16" and any("Tensorrt" in p for p in providers)
+            par = _parity(case, runtime, fp16)
             metrics["onnx_parity"] = _round(par)
             if par["ok"]:
-                oms = _median_ms(lambda: sess.run(None, case.feed), args.iters, args.warmup)
-                provider = _provider_label(sess)
+                oms = _median_ms(lambda: runtime(*case.inputs), args.iters, args.warmup)
+                provider = _provider_label(providers)
                 metrics["onnx_ms"] = oms
                 metrics["onnx_provider"] = provider
+                metrics["onnx_providers"] = providers
+                builder.record(
+                    BuildArtifact(
+                        component=name,
+                        kind="onnx",
+                        path=str(onnx_path),
+                        provider=provider,
+                        precision=_precision(args),
+                        fingerprint=builder.fingerprint(spec),
+                        metrics={"onnx_ms": round(oms, 6), "onnx_providers": providers},
+                        parity=par,
+                    )
+                )
                 if oms * args.min_gain < best_ms:
                     best_mode, best_provider, best_ms = "onnx", provider, oms
             else:
@@ -400,17 +452,6 @@ def _select_global(args, device) -> dict[str, Any] | None:
         return {"kind": "global_generator", "error": f"{type(e).__name__}: {e}"}
 
 
-def _ort_namespace(args) -> SimpleNamespace:
-    return SimpleNamespace(
-        cpu_ort=args.cpu_ort,
-        no_trt=args.no_trt,
-        trt_fp32=args.trt_fp32,
-        trt_cache=args.trt_cache,
-        trt_min_batch=args.trt_min_batch,
-        trt_max_batch=args.trt_max_batch,
-    )
-
-
 def _assemble(components, args, fingerprint, glob) -> BackendConfig:
     chosen = {n: c.mode for n, c in components.items() if c.mode != "eager"}
     return BackendConfig(
@@ -473,6 +514,11 @@ def main(argv=None) -> int:
     ap.add_argument("--trt-cache", default=None)
     ap.add_argument("--trt-min-batch", type=int, default=1)
     ap.add_argument("--trt-max-batch", type=int, default=8)
+    ap.add_argument(
+        "--manifest",
+        default=None,
+        help="artifact cache manifest recorded per measured component (default onnx/.build_manifest.json)",
+    )
     args = ap.parse_args(argv)
 
     fingerprint = env_fingerprint()
@@ -491,7 +537,7 @@ def main(argv=None) -> int:
     # still measure ONNX so its (losing) result is on the record.
     if fingerprint.get("cuda") and not fingerprint.get("cuda_ep"):
         args.cpu_ort = True
-    ort_ns = _ort_namespace(args)
+    builder = OnnxBuilder(args.manifest)
 
     names = [n.strip() for n in args.components.split(",") if n.strip()]
     if args.hot_only:
@@ -511,7 +557,7 @@ def main(argv=None) -> int:
             components[name] = ComponentConfig(name=name, mode="eager", reason=f"build failed: {type(e).__name__}")
             continue
         try:
-            cfg, _best, _eager = _select_component(name, case, args, ort_ns)
+            cfg, _best, _eager = _select_component(name, case, args, builder, device)
             components[name] = cfg
         finally:
             del case

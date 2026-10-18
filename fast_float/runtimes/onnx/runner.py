@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import os
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -397,4 +398,52 @@ class DecoderOnnx(_OnnxRunner):
         return torch.from_numpy(out[:m]).to(device=device, dtype=torch.float32)
 
 
-__all__ = ["DecoderOnnx", "DirectionOnnx", "RefEncOnnx"]
+class OrtRuntime(RuntimeSession, nn.Module):
+    """RuntimeSession over an already-built ORT ``InferenceSession``.
+
+    For scripts (the backend selector) that construct the session themselves --
+    with their own provider/precision knobs -- but want to measure and report
+    through the runtime contract (torch in on any device -> torch out, provider
+    listing, per-call timing/stats). Uses the numpy host path only; there is no
+    device rebinding, so ``device_id`` is metadata for ``inspect``.
+    """
+
+    backend = "onnx"
+
+    def __init__(
+        self,
+        session,
+        input_names,
+        component: str = "",
+        device_id: int | None = None,
+        degrade_on_error: str = "transient",
+    ):
+        super().__init__(device_id=device_id, degrade_on_error=degrade_on_error)
+        self.session = session
+        self.input_names = tuple(input_names)
+        self.component = component
+
+    @property
+    def providers(self) -> list:
+        return self.session.get_providers()
+
+    @property
+    def output_names(self) -> list[str]:
+        return [o.name for o in self.session.get_outputs()]
+
+    @_dynamo_disable
+    def _run(self, feed):
+        return self.session.run(None, feed)
+
+    @torch.no_grad()
+    def forward(self, *inputs):
+        device = inputs[0].device if inputs else torch.device("cpu")
+        feed = {
+            name: t.detach().to("cpu", dtype=torch.float32).numpy()
+            for name, t in zip(self.input_names, inputs, strict=False)
+        }
+        outs = self._run(feed)
+        return [torch.from_numpy(np.asarray(o)).to(device=device, dtype=torch.float32) for o in outs]
+
+
+__all__ = ["DecoderOnnx", "DirectionOnnx", "OrtRuntime", "RefEncOnnx"]
