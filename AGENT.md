@@ -389,6 +389,21 @@ When editing or extending the codebase, follow these design patterns:
 - **No automatic runtime self-test or fallback** — parity/selection is validated
   by the converter/selector scripts only (`python -m fast_float.onnx.select_backends`).
   ORT providers (`trt → cuda → cpu`) fall back *inside* session creation.
+- **TensorRT must major-match ORT.** `onnxruntime-gpu` 1.23 is built against
+  **TensorRT 10.9** and dlopens `libnvinfer.so.10` / `libnvonnxparser.so.10`. A
+  TRT 11 install (`tensorrt_cu13*` → `libnvinfer.so.11`) can never satisfy that
+  link, so the provider library fails to load and ORT silently drops the whole
+  session to CUDA/CPU (the `[ort] NOTE: … libnvinfer is not loadable …` line). On
+  a CUDA-12 box install the matching wheels — remove TRT 11 first if present:
+
+  ```bash
+  pip uninstall -y tensorrt tensorrt_cu13 tensorrt_cu13_bindings tensorrt_cu13_libs
+  pip install "tensorrt-cu12==10.9.0.34"
+  ```
+
+  Bump the TRT pin in lockstep with the `onnxruntime` pin. Delete
+  `onnx/trt_cache/` after any TRT/ORT change — engine caches are tied to the exact
+  TRT version and GPU.
 - Full details and rationale: **`docs/BACKEND_SELECTION.md`** — read it before
   touching the ONNX path.
 

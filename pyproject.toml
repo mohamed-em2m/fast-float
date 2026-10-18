@@ -69,6 +69,9 @@ dependencies = [
     "nvidia-cuda-runtime>=13.4.92",
     "nvidia-cuda-nvrtc>=13.4.92",
     # ONNX runtime support (pinned onnxruntime<1.24 for cp310, and onnx<1.17 for numpy 1.x compatibility)
+    # NOTE: onnxruntime 1.23 is built against TensorRT 10.9 (dlopens libnvinfer.so.10);
+    # a TRT 11 install (tensorrt-cu13, libnvinfer.so.11) cannot be loaded -> use
+    # `tensorrt-cu12==10.9.*` on CUDA-12 boxes and keep the two pins in lockstep.
     "onnx>=1.16.0,<1.17",
     "onnxruntime>=1.19.0,<1.24",
     "pre-commit>=4.6.2",

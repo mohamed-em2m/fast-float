@@ -29,7 +29,10 @@ From a real converter run (`/content/float-fast`, Tesla T4, torch `2.11.0+cu130`
   unit silently ran on **CPU**:
   - `decoder` **0.04x**, `refenc` **0.03-0.06x**, `audio` **0.67-0.80x** — losses
   - `direction` **3.0x**, `fmt` **1.14x** — wins
-- `libnvinfer` was absent, so the **TensorRT** EP was unavailable too.
+- the **TensorRT** EP was unavailable too: the box carried `libnvinfer.so.11`
+  (TensorRT 11) but ORT `1.23` dlopens `libnvinfer.so.10` (built against TensorRT
+  10.9) — a major-version ABI mismatch no `LD_LIBRARY_PATH` can bridge. Installing
+  `tensorrt-cu12==10.9.*` makes the TRT EP loadable (see `AGENT.md` §6).
 
 So on that box the only viable fast path for the heavy components is
 `compile`; the `trt` mode is not even a candidate. A static, committed choice
