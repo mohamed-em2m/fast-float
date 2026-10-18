@@ -13,6 +13,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
+# --- pin to the project venv: bare `python`/`pip` (Colab especially) otherwise
+# land in a system site-packages and the venv stays unchanged. ---
+if [ -f "${PROJECT_ROOT}/.venv/bin/activate" ]; then
+  # shellcheck source=/dev/null
+  source "${PROJECT_ROOT}/.venv/bin/activate"
+fi
+PY="${PY:-$(command -v python)}"
+export PY
+echo "python: ${PY} ($("${PY}" -c 'import sys; print(sys.prefix)'))"
+
 OUT_DIR="${OUT_DIR:-./onnx}"
 EMO_OUT="${EMO_OUT:-${OUT_DIR}/emotion_v1.onnx}"
 FMT_OUT="${FMT_OUT:-${OUT_DIR}/fmt_step_v1.onnx}"
@@ -143,7 +153,7 @@ if [ "$(python -c 'import torch;print(torch.cuda.is_available())' 2>/dev/null)" 
     echo "TensorRT EP available (engines cached under ${OUT_DIR}/trt_cache)"
   else
     echo "TensorRT EP NOT available -> running scripts/install_tensorrt.sh"
-    bash "${SCRIPT_DIR}/install_tensorrt.sh" || true
+    PY="${PY}" bash "${SCRIPT_DIR}/install_tensorrt.sh" || true
     if probe_trt; then
       echo "TensorRT EP now available"
     else

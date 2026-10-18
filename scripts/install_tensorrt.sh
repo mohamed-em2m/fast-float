@@ -21,14 +21,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}" || exit 1
 
-# --- interpreter ---
+# --- interpreter: pin to the project venv (never a system/Colab site-packages) ---
+VENV_PY="${PROJECT_ROOT}/.venv/bin/python"
 if [ -z "${PY:-}" ]; then
-    if [ -x "${PROJECT_ROOT}/.venv/bin/python" ]; then
-        PY="${PROJECT_ROOT}/.venv/bin/python"
+    if [ -x "${VENV_PY}" ]; then
+        PY="${VENV_PY}"
     else
         PY="python"
     fi
 fi
+# Put the venv's bin/ first so bare `pip`/`python` also resolve inside it.
+if [ -f "${PROJECT_ROOT}/.venv/bin/activate" ]; then
+    # shellcheck source=/dev/null
+    source "${PROJECT_ROOT}/.venv/bin/activate"
+fi
+if [ -x "${VENV_PY}" ] && [ "${PY}" != "${VENV_PY}" ]; then
+    echo "NOTE: using PY=${PY}, but a project venv exists at ${VENV_PY}."
+    echo "      Unset PY (or set PY=${VENV_PY}) to install into the project venv."
+fi
+echo "interpreter: ${PY}"
 
 pip_install() {
     if command -v uv >/dev/null 2>&1; then
@@ -43,6 +54,27 @@ pip_uninstall() {
     else
         "${PY}" -m pip uninstall -y "$@" >/dev/null 2>&1 || true
     fi
+}
+
+# Where did each package actually land? A system/Colab interpreter silently
+# swallows the install while the project venv stays unchanged.
+report_pkgs() {
+    "${PY}" - "$@" <<'PY'
+import importlib.metadata as m
+import sys
+
+print("  sys.prefix:", sys.prefix)
+for name in sys.argv[1:]:
+    try:
+        dist = m.distribution(name)
+    except Exception:
+        print(f"  {name}: not installed"); continue
+    try:
+        loc = str(dist.locate_file(""))
+    except Exception:
+        loc = "?"
+    print(f"  {name}: {dist.version} -> {loc}")
+PY
 }
 
 # Put the pip nvidia/tensorrt lib dirs on the loader path for THIS shell (a
@@ -143,7 +175,6 @@ PY
 }
 
 echo "=== TensorRT installer ==="
-echo "python: ${PY}"
 
 if ! "${PY}" -c "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
     echo "No CUDA GPU (torch.cuda.is_available() == False) — TensorRT is CUDA-only; nothing to do."
@@ -197,6 +228,7 @@ if ! has_cuda_ep; then
         }
     fi
     add_lib_dirs
+    report_pkgs onnxruntime onnxruntime-gpu
     "${PY}" -c 'import onnxruntime as o; print("  listed providers now:", o.get_available_providers())'
 fi
 
@@ -238,6 +270,9 @@ if ! pip_install --no-cache-dir "${TRT_SPEC}"; then
         exit 1
     }
 fi
+
+echo "--- installed into ---"
+report_pkgs tensorrt-cu12 tensorrt-cu12-libs tensorrt-cu13
 
 echo "--- probing TensorRT after install ---"
 add_lib_dirs

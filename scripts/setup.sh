@@ -170,6 +170,11 @@ echo "=== Running checkpoint download script ==="
 chmod +x "${SCRIPT_DIR}/download_checkpoints.sh"
 "${SCRIPT_DIR}/download_checkpoints.sh"
 
+echo "=== Installing TensorRT (best effort; skipped when not needed) ==="
+# Run as a subprocess: the installer calls `exit`, which would end setup.sh if
+# sourced, and it needs PY to point at the project venv.
+PY="${PY:-${PROJECT_ROOT}/.venv/bin/python}" bash "${SCRIPT_DIR}/install_tensorrt.sh" || true
+
 echo "=== Creating results/checkpoints directories ==="
 mkdir -p results checkpoints
 
