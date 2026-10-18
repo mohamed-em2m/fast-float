@@ -546,12 +546,12 @@ def main(argv=None) -> int:
 
     components: dict[str, ComponentConfig] = {}
     for name in names:
-        builder = BUILDERS.get(name)
-        if builder is None:
+        make_case = BUILDERS.get(name)
+        if make_case is None:
             print(f"[select:{name}] no builder — skipping")
             continue
         try:
-            case = builder(args, device)
+            case = make_case(args, device)
         except Exception as e:
             print(f"[select:{name}] build FAILED: {e}")
             traceback.print_exc()
