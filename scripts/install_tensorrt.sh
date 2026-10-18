@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
-# Install a TensorRT build that onnxruntime-gpu<1.24 can actually load -- and,
-# when the active ORT is a CPU-only build, replace it with the GPU wheel first.
+# Install a TensorRT build that onnxruntime-gpu<1.24 can actually load -- and
+# fix the surrounding GPU stack that otherwise makes a correct TensorRT install
+# look broken.
 #
-# Two independent failures look identical from the outside ("TensorRT EP not
-# available"):
+# Four independent failures all surface as "TensorRT EP not available":
 #   1. the CPU `onnxruntime` wheel is imported (shadows onnxruntime-gpu): it
 #      lists neither CUDA nor TensorRT, so nothing can load;
-#   2. a GPU wheel is imported but ORT dlopens libnvinfer.so.10 (ORT 1.23 is
+#   2. a GPU wheel is imported but its CUDA EP cannot resolve the cu12 sonames
+#      it was built against (libcublas.so.12, libcudnn.so.9, libcufft.so.11,
+#      ...) because the box's torch is cu118/cu13 -> sessions silently drop to
+#      CPU and TensorRT cannot initialise either;
+#   3. once LD_LIBRARY_PATH is exported for (2), the loader stops honouring the
+#      interpreter's DT_RPATH, so /usr/lib64-nvidia/libcuda.so.1 becomes
+#      unresolvable -> every CUDA call fails with error 35 ("CUDA driver
+#      version is insufficient for CUDA runtime version");
+#   4. a GPU wheel is imported but ORT dlopens libnvinfer.so.10 (ORT 1.23 is
 #      built against TensorRT 10.9) while an unpinned `pip install tensorrt` on
 #      a cu13 box pulls TensorRT 11 (libnvinfer.so.11).
-# This script fixes (1) then (2), and after each step proves the EP really
-# initialises on this box rather than trusting a listed name.
+# This script fixes (1)-(3) then installs (4), and after each step proves the EP
+# really initialises on this box rather than trusting a listed name.
 #
 # Usage:  bash scripts/install_tensorrt.sh
 # Env:    TRT_SPEC  pip spec override (default tensorrt-cu12==10.9.0.34)
@@ -77,10 +85,19 @@ for name in sys.argv[1:]:
 PY
 }
 
-# Put the pip nvidia/tensorrt lib dirs on the loader path for THIS shell (a
-# freshly installed TRT/CUDA lib is otherwise invisible until the next shell).
+# System CUDA/driver lib dirs. Not optional: exporting LD_LIBRARY_PATH makes the
+# loader ignore the interpreter's DT_RPATH -- which on Colab is what exposes
+# /usr/lib64-nvidia/libcuda.so.1 -- so without these libcuda.so.1 is
+# unresolvable and every CUDA call dies with error 35. Mirrors
+# fast_float/initialize_env.py's _SYSTEM_CUDA_LIB_DIRS (the runtime path).
+_SYSTEM_CUDA_LIB_DIRS="/usr/local/cuda/lib64:/usr/lib64-nvidia"
+
+# Put the pip nvidia/tensorrt lib dirs (plus the system CUDA/driver dirs) on
+# the loader path for THIS shell; a freshly installed TRT/CUDA lib is otherwise
+# invisible until the next shell.
 add_lib_dirs() {
-    local dirs
+    local dirs sysdirs all d
+    local -a sysdirs_arr
     dirs="$("${PY}" -c 'import glob, os, site
 d = set()
 for b in site.getsitepackages() + [site.getusersitepackages()]:
@@ -89,9 +106,20 @@ for b in site.getsitepackages() + [site.getusersitepackages()]:
             if any(f.endswith((".so", ".dll")) or ".so." in f for f in fs):
                 d.add(r)
 print(":".join(sorted(d)))' 2>/dev/null || true)"
-    if [ -n "${dirs}" ]; then
-        export LD_LIBRARY_PATH="${dirs}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-        echo "ORT loader path += pip CUDA/TensorRT libs"
+    IFS=':' read -ra sysdirs_arr <<< "${_SYSTEM_CUDA_LIB_DIRS}"
+    sysdirs=""
+    for d in "${sysdirs_arr[@]}"; do
+        if [ -d "${d}" ]; then
+            sysdirs="${sysdirs}${sysdirs:+:}${d}"
+        fi
+    done
+    all="${dirs}"
+    if [ -n "${sysdirs}" ]; then
+        all="${all}${all:+:}${sysdirs}"
+    fi
+    if [ -n "${all}" ]; then
+        export LD_LIBRARY_PATH="${all}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+        echo "ORT loader path += pip CUDA/TensorRT libs + system CUDA/driver dirs"
     fi
 }
 
@@ -116,6 +144,11 @@ graph = helper.make_graph(
     [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])],
 )
 model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+# onnx >= ~1.19 defaults a new model to an IR version newer than this ORT can
+# read (ORT 1.23 tops out at IR 11); without the clamp the probe dies with
+# "Unsupported model IR version: N" and masks the real execution-provider
+# status behind a model-loading error.
+model.ir_version = min(model.ir_version, 9)
 try:
     sess = ort.InferenceSession(model.SerializeToString(), providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
 except Exception as e:
@@ -161,6 +194,11 @@ graph = helper.make_graph(
     [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])],
 )
 model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+# onnx >= ~1.19 defaults a new model to an IR version newer than this ORT can
+# read (ORT 1.23 tops out at IR 11); without the clamp the probe dies with
+# "Unsupported model IR version: N" and masks the real execution-provider
+# status behind a model-loading error.
+model.ir_version = min(model.ir_version, 9)
 try:
     sess = ort.InferenceSession(
         model.SerializeToString(),
@@ -191,6 +229,22 @@ case "${ORT_VER}" in
 esac
 TRT_SPEC="${TRT_SPEC:-tensorrt-cu12==10.9.0.34}"
 echo "target: ${TRT_SPEC} (libnvinfer.so.10)"
+
+# cu12 runtime wheels ORT 1.23's CUDA/TensorRT EPs dlopen by soname
+# (libcublas.so.12, libcudnn.so.9, libcufft.so.11, ...). A box whose torch is
+# cu118/cu13 ships none of them, so a GPU ORT wheel boots straight into the CPU
+# EP and TensorRT cannot initialise either.
+ORT_CUDA12_LIBS=(
+    nvidia-cuda-runtime-cu12
+    nvidia-cuda-nvrtc-cu12
+    nvidia-cublas-cu12
+    nvidia-cudnn-cu12
+    nvidia-cufft-cu12
+    nvidia-curand-cu12
+    nvidia-cusolver-cu12
+    nvidia-cusparse-cu12
+    nvidia-nvjitlink-cu12
+)
 
 add_lib_dirs
 
@@ -232,20 +286,31 @@ if ! has_cuda_ep; then
     "${PY}" -c 'import onnxruntime as o; print("  listed providers now:", o.get_available_providers())'
 fi
 
-# The GPU wheel lists CUDA, but ORT cu12 against torch cu130 leaves the CUDA EP
-# unable to resolve libcublas.so.12/libcudnn.so.9 -> every session drops to CPU,
-# and TensorRT cannot work either.
+# The GPU wheel lists CUDA, but ORT 1.23's CUDA EP is built against CUDA 12 and
+# dlopens the cu12 sonames (libcublas.so.12, libcudnn.so.9, libcufft.so.11, ...).
+# A box whose torch is cu118/cu13 ships none of them -> every session drops to
+# CPU, and TensorRT cannot work either. Install the matching runtime wheels
+# (pure data wheels; they coexist with torch's own bundled libs).
 if has_cuda_ep; then
     if cuda_ep_active; then
         echo "CUDA EP is active."
     else
         CUDA_VER="$("${PY}" -c 'import torch; print(torch.version.cuda)' 2>/dev/null || echo '?')"
-        echo "WARN: CUDAExecutionProvider is listed but no session activates it."
-        echo "      Likely a CUDA-major mismatch: onnxruntime-gpu 1.23 is CUDA 12,"
-        echo "      torch here is CUDA ${CUDA_VER}."
-        echo "      Fix: install the cu12 runtime libs, e.g."
-        echo "        uv pip install nvidia-cublas-cu12 nvidia-cudnn-cu12 nvidia-cuda-runtime-cu12"
-        echo "      or use an onnxruntime-gpu built for this torch's CUDA major."
+        echo "CUDAExecutionProvider is listed but no session activates it"
+        echo "(torch here is CUDA ${CUDA_VER}; onnxruntime-gpu 1.23 dlopens CUDA 12 sonames)."
+        echo "Installing the cu12 runtime libs the CUDA/TensorRT EPs need ..."
+        if pip_install --no-cache-dir "${ORT_CUDA12_LIBS[@]}"; then
+            add_lib_dirs
+            if cuda_ep_active; then
+                echo "CUDA EP is now active."
+            else
+                echo "WARN: CUDA EP still inactive after installing the cu12 runtime libs."
+                echo "      Check that ${_SYSTEM_CUDA_LIB_DIRS} exist (driver libcuda.so.1)"
+                echo "      and that the ORT wheel matches this box's CUDA major."
+            fi
+        else
+            echo "WARN: could not install the cu12 runtime libs; CUDA/TensorRT may stay CPU-only."
+        fi
     fi
 fi
 
@@ -282,7 +347,8 @@ if trt_probe; then
 fi
 echo "WARN: TensorRT still not loadable. Common causes:"
 echo "  - the active ORT is still not a GPU build (see the diagnostics above);"
-echo "  - the CUDA EP itself does not activate (CUDA-major mismatch; see above);"
+echo "  - the CUDA EP itself does not activate (missing cu12 runtime libs or an"
+echo "    unresolvable driver libcuda.so.1; see the loader path above);"
 echo "  - ORT expects a different TensorRT major (try another TRT_SPEC)."
 echo "Units will fall back to the CUDA/CPU EP."
 exit 1

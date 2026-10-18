@@ -404,6 +404,16 @@ When editing or extending the codebase, follow these design patterns:
   Bump the TRT pin in lockstep with the `onnxruntime` pin. Delete
   `onnx/trt_cache/` after any TRT/ORT change — engine caches are tied to the exact
   TRT version and GPU.
+- **A correct TensorRT install still looks broken on a bad loader path.** Two
+  traps, both handled by `scripts/install_tensorrt.sh`:
+  `onnxruntime-gpu` 1.23's CUDA EP dlopens the **CUDA 12** sonames
+  (`libcublas.so.12`, `libcudnn.so.9`, `libcufft.so.11`, …), which a torch
+  cu118/cu13 wheel does not ship — install the `nvidia-*-cu12` wheels. And once
+  `LD_LIBRARY_PATH` is exported for that, the loader stops honouring the
+  interpreter's `DT_RPATH`, so `/usr/lib64-nvidia` (the driver's `libcuda.so.1`)
+  must be on it too or every CUDA call fails with error 35 ("CUDA driver version
+  is insufficient for CUDA runtime version"). `fast_float/initialize_env.py` and
+  `scripts/setup_cuda_libs.sh` keep the same dir list for the runtime.
 - Full details and rationale: **`docs/BACKEND_SELECTION.md`** — read it before
   touching the ONNX path.
 

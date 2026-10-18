@@ -127,6 +127,10 @@ try:
         [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])],
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    # onnx >= ~1.19 defaults a new model to an IR version newer than ORT 1.23
+    # can read (it tops out at IR 11), which would abort the probe with
+    # "Unsupported model IR version" and be misreported as an ORT import error.
+    model.ir_version = min(model.ir_version, 9)
     sess = ort.InferenceSession(
         model.SerializeToString(),
         providers=["CUDAExecutionProvider", "CPUExecutionProvider"],

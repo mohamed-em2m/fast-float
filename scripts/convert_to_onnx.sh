@@ -132,7 +132,8 @@ probe_stack || { echo "ERROR: onnx stack still broken — export cannot run"; ex
 # "fell back to CPU". The loader path is augmented once, *after* the TensorRT
 # step below, so a just-installed tensorrt lib dir is picked up too.
 augment_ort_libs() {
-  local dirs
+  local dirs sysdirs d all
+  local -a sysdirs_arr
   dirs="$(python -c 'import glob, os, site
 d = set()
 for b in site.getsitepackages() + [site.getusersitepackages()]:
@@ -141,9 +142,25 @@ for b in site.getsitepackages() + [site.getusersitepackages()]:
             if any(f.endswith((".so", ".dll")) or ".so." in f for f in fs):
                 d.add(r)
 print(":".join(sorted(d)))' 2>/dev/null || true)"
-  if [ -n "${dirs}" ]; then
-    export LD_LIBRARY_PATH="${dirs}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-    echo "ORT loader path += pip CUDA/TensorRT libs"
+  # The system CUDA/driver dirs are required, not optional: exporting
+  # LD_LIBRARY_PATH makes the loader ignore the interpreter's DT_RPATH — which
+  # on Colab is what exposes /usr/lib64-nvidia/libcuda.so.1. Without them
+  # libcuda.so.1 is unresolvable and every CUDA/TRT session fails with error 35
+  # ("CUDA driver version is insufficient for CUDA runtime version").
+  IFS=':' read -ra sysdirs_arr <<< "/usr/local/cuda/lib64:/usr/lib64-nvidia"
+  sysdirs=""
+  for d in "${sysdirs_arr[@]}"; do
+    if [ -d "${d}" ]; then
+      sysdirs="${sysdirs}${sysdirs:+:}${d}"
+    fi
+  done
+  all="${dirs}"
+  if [ -n "${sysdirs}" ]; then
+    all="${all}${all:+:}${sysdirs}"
+  fi
+  if [ -n "${all}" ]; then
+    export LD_LIBRARY_PATH="${all}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    echo "ORT loader path += pip CUDA/TensorRT libs + system CUDA/driver dirs"
   fi
 }
 
