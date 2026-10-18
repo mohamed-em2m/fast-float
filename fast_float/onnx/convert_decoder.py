@@ -174,6 +174,11 @@ def build_decoder_module(
     batch: int,
     device: torch.device,
 ) -> tuple[DecoderExport, object, list]:
+    # Integral channel multipliers (the deployed default "1") feed tensor
+    # shapes and must be ints; a float (e.g. 1.0) crashes randn() deep in the
+    # decoder. Coerce here so every caller (selector included) is safe.
+    if float(channel_mult).is_integer():
+        channel_mult = int(channel_mult)
     gen = (
         Generator(
             size=image_size,

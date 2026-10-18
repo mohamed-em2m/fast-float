@@ -74,7 +74,10 @@ class FMTStepWrapper(torch.nn.Module):
 
 
 def build_fmt(args) -> FlowMatchingTransformer:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # ``opt.rank`` is a GPU *index* (deployed wiring sets ``opt.rank = 0``), not
+    # a device string: FMT builds ``torch.device(f"cuda:{opt.rank}")``. Passing
+    # "cuda"/"cpu" here produced the invalid "cuda:cuda".
+    rank = torch.cuda.current_device() if torch.cuda.is_available() else 0
     opt = SimpleNamespace(
         wav2vec_sec=2.0,
         fps=25.0,
@@ -87,7 +90,7 @@ def build_fmt(args) -> FlowMatchingTransformer:
         dim_a=512,
         dim_e=7,
         attention_window=2,
-        rank=device,
+        rank=rank,
         audio_dropout_prob=0.1,
         ref_dropout_prob=0.1,
         emotion_dropout_prob=0.1,
@@ -111,7 +114,7 @@ def build_fmt(args) -> FlowMatchingTransformer:
     return fmt.eval()
 
 
-def sample_inputs(batch: int, t_val: float, seed: int, device: str):
+def sample_inputs(batch: int, t_val: float, seed: int, device: str | torch.device):
     g = torch.Generator().manual_seed(seed)
     kw = dict(dtype=torch.float32)
     t = torch.tensor([t_val], **kw)
@@ -121,8 +124,10 @@ def sample_inputs(batch: int, t_val: float, seed: int, device: str):
     we = torch.randn(batch, 1, 7, generator=g, **kw).clamp(-1, 1)
     prev_x = torch.randn(batch, PREV_FRAMES, 512, generator=g, **kw).clamp(-1, 1)
     prev_wa = torch.randn(batch, PREV_FRAMES, 512, generator=g, **kw).clamp(-1, 1)
-    if device == "cuda":
-        t, x, wa, wr, we, prev_x, prev_wa = (v.cuda() for v in (t, x, wa, wr, we, prev_x, prev_wa))
+    # `device` may be a str or a torch.device; `torch.device("cuda") == "cuda"`
+    # is False, so normalise before testing (the selector passes a torch.device).
+    if torch.device(device).type == "cuda":
+        t, x, wa, wr, we, prev_x, prev_wa = (v.to(device) for v in (t, x, wa, wr, we, prev_x, prev_wa))
     return t, x, wa, wr, we, prev_x, prev_wa
 
 
