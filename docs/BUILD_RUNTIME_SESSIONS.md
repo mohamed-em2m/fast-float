@@ -207,8 +207,10 @@ A served box must not compile at startup. On cache miss:
 5. **`inspect` CLI + startup degradation warnings** — done:
    `python -m fast_float.runtimes inspect` prints the resolved per-component
    plan and where the box cannot honour it; `inspect_model`/`warn_degraded`
-   report live sessions at startup. Still open: native TRT builder (ORT-TRT
-   first) and per-runtime timing into `utils/timing.py`.
+   report live sessions at startup. Every `RuntimeSession` subclass's
+   ``forward`` auto-reports a ``runtime:<component>`` stage into
+   `utils/timing.py` (no-op when no timing run is open). Still open: native
+   TRT builder (ORT-TRT first).
 
 - Cross-cutting: add `tests/` for spec/fingerprint/registry (pure-CPU — the only
   locally runnable pieces; the repo has no `tests/` today).

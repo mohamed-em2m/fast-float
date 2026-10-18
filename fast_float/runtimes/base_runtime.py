@@ -14,9 +14,47 @@ See ``docs/BUILD_RUNTIME_SESSIONS.md``.
 
 from __future__ import annotations
 
+import contextlib
+import functools
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from types import FunctionType
 from typing import Any
+
+
+def _timed_forward(fn):
+    """Report one backend call to the active timing collector, if any.
+
+    Wall time only (ORT runs on its own streams, so CUDA events recorded
+    here would not bracket the real work). No-op when no ``timing_run`` is
+    open, and never lets telemetry failures reach the pipeline.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            from fast_float.utils.timing import current_collector
+
+            collector = current_collector()
+        except Exception:
+            collector = None
+        if collector is None:
+            return fn(self, *args, **kwargs)
+        t0 = time.perf_counter()
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            with contextlib.suppress(Exception):
+                collector.add(
+                    f"runtime:{self._label()}",
+                    time.perf_counter() - t0,
+                    None,
+                    {"backend": self.backend, "device": self.device_id},
+                )
+
+    wrapper._runtime_timed = True
+    return wrapper
 
 
 @dataclass
@@ -35,6 +73,15 @@ class RuntimeSession(ABC):
 
     component: str = ""
     backend: str = "eager"
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        # Wrap each subclass's own ``forward`` once so every session reports
+        # into utils/timing.py without per-implementation code. Subclasses that
+        # only inherit ``forward`` are covered by the class that defines it.
+        fwd = cls.__dict__.get("forward")
+        if isinstance(fwd, FunctionType) and not getattr(fwd, "_runtime_timed", False):
+            cls.forward = _timed_forward(fwd)
 
     def __init__(self, device_id: int | None = None, degrade_on_error: str = "transient"):
         self.device_id = device_id
