@@ -109,6 +109,7 @@ class EmotionOnnxBackend(RuntimeSession):
                     [(self.output_name, (a.shape[0], int(self.output_dim)))],
                     device=device,
                 )
+                self.stats.io_bindings += 1
                 return out.to(device=device, dtype=torch.float32)
             except Exception as e:
                 self._io_failed = True
@@ -207,6 +208,7 @@ class Wav2vecOnnxBackend(RuntimeSession):
                     ],
                     device=device,
                 )
+                self.stats.io_bindings += 1
                 return out.to(device=device, dtype=torch.float32)
             except Exception as e:
                 self._io_failed = True
@@ -308,6 +310,7 @@ class FMTStepBackend(RuntimeSession):
                     [(self.output_name, (x.shape[0], out_len, int(self._static_last)))],
                     device=device,
                 )
+                self.stats.io_bindings += 1
                 return out.to(device=device, dtype=torch.float32)
             except Exception as e:
                 self._io_failed = True

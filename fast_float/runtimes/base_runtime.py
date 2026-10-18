@@ -24,15 +24,19 @@ from typing import Any
 
 
 def _timed_forward(fn):
-    """Report one backend call to the active timing collector, if any.
+    """Count one backend call and report it to the active timing collector.
 
-    Wall time only (ORT runs on its own streams, so CUDA events recorded
-    here would not bracket the real work). No-op when no ``timing_run`` is
-    open, and never lets telemetry failures reach the pipeline.
+    ``stats.calls``/``stats.errors`` are always updated (the inspect CLI reads
+    them); the timing row is only added when a ``timing_run`` is open. Wall time
+    only -- ORT runs on its own streams, so CUDA events recorded here would not
+    bracket the real work. Telemetry failures never reach the pipeline.
     """
 
     @functools.wraps(fn)
     def wrapper(self, *args: Any, **kwargs: Any) -> Any:
+        stats = getattr(self, "stats", None)
+        if stats is not None:
+            stats.calls += 1
         try:
             from fast_float.utils.timing import current_collector
 
@@ -40,10 +44,19 @@ def _timed_forward(fn):
         except Exception:
             collector = None
         if collector is None:
-            return fn(self, *args, **kwargs)
+            try:
+                return fn(self, *args, **kwargs)
+            except Exception:
+                if stats is not None:
+                    stats.errors += 1
+                raise
         t0 = time.perf_counter()
         try:
             return fn(self, *args, **kwargs)
+        except Exception:
+            if stats is not None:
+                stats.errors += 1
+            raise
         finally:
             with contextlib.suppress(Exception):
                 collector.add(

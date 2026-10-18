@@ -97,7 +97,9 @@ class _OnnxRunner(RuntimeSession, nn.Module):
         if self._io_failed or not out_shapes:
             raise RuntimeError("iobinding unavailable")
         try:
-            return self._io_run(feed, out_shapes)
+            out = self._io_run(feed, out_shapes)
+            self.stats.io_bindings += 1
+            return out
         except Exception as e:
             self._io_failed = True
             print(f"[backends:iobinding] disabled ({e}); using host path")
