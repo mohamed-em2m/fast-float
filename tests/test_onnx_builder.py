@@ -22,6 +22,22 @@ def _tiny_onnx(path):
     onnx.save(helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)]), str(path))
 
 
+def test_runtime_gpu_chain_falls_back_to_cpu(tmp_path, monkeypatch):
+    onnx_path = tmp_path / "tiny.onnx"
+    _tiny_onnx(onnx_path)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    builder = OnnxBuilder(tmp_path / "m.json")
+    spec = BuildSpec(
+        component="direction",
+        backend="onnx",
+        input_names=("x",),
+        provider_chain=("trt", "cuda", "cpu"),
+        extra={"out_path": str(onnx_path)},
+    )
+    runtime = builder.runtime(spec)  # must not raise "GPU requested" on a CPU box
+    assert runtime.providers == ["CPUExecutionProvider"]
+
+
 def test_out_path_prefers_spec_extra(tmp_path):
     builder = OnnxBuilder(tmp_path / "m.json")
     spec = BuildSpec(component="direction", backend="onnx", extra={"out_path": "custom.onnx"})

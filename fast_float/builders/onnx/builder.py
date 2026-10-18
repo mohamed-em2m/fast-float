@@ -111,12 +111,16 @@ class OnnxBuilder(BuilderSession):
         TRT knobs (the same knobs ``make_session_from_args`` exposes), so the
         selector measures the runtime contract instead of a raw session.
         """
+        import torch
+
         from fast_float.onnx.export import make_ort_session, trt_optimization_profiles
         from fast_float.runtimes.onnx.runner import OrtRuntime
 
         chain = tuple(spec.provider_chain or ())
-        use_gpu = "cuda" in chain or "trt" in chain
-        use_trt = "trt" in chain
+        # A GPU chain on a box without CUDA must fall back to CPU, not request a
+        # GPU EP and raise (mirrors ``make_session_from_args``).
+        use_gpu = ("cuda" in chain or "trt" in chain) and torch.cuda.is_available()
+        use_trt = use_gpu and "trt" in chain
         mn = op = mx = None
         if use_trt and spec.opt_shapes:
             mn, op, mx = trt_optimization_profiles(

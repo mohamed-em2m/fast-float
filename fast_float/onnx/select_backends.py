@@ -325,7 +325,7 @@ def _round(metrics: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
-def _select_component(name, case, args, builder, device) -> tuple[ComponentConfig, float, float]:
+def _select_component(name, case, args, builder, device, env=None) -> tuple[ComponentConfig, float, float]:
     metrics: dict[str, Any] = {}
     eager_ms = _median_ms(lambda: case.module(*case.inputs), args.iters, args.warmup)
     metrics["eager_ms"] = eager_ms
@@ -344,6 +344,7 @@ def _select_component(name, case, args, builder, device) -> tuple[ComponentConfi
         trt_cache_dir=getattr(args, "trt_cache", None),
         ckpt_path=args.ckpt,
         tolerance=case.atol,
+        extra={"out_path": str(onnx_path)},
     )
 
     best_mode, best_provider, best_ms = "eager", None, eager_ms
@@ -383,7 +384,7 @@ def _select_component(name, case, args, builder, device) -> tuple[ComponentConfi
                         path=str(onnx_path),
                         provider=provider,
                         precision=_precision(args),
-                        fingerprint=builder.fingerprint(spec),
+                        fingerprint=builder.fingerprint(spec, env),
                         metrics={"onnx_ms": round(oms, 6), "onnx_providers": providers},
                         parity=par,
                     )
@@ -557,7 +558,7 @@ def main(argv=None) -> int:
             components[name] = ComponentConfig(name=name, mode="eager", reason=f"build failed: {type(e).__name__}")
             continue
         try:
-            cfg, _best, _eager = _select_component(name, case, args, builder, device)
+            cfg, _best, _eager = _select_component(name, case, args, builder, device, fingerprint)
             components[name] = cfg
         finally:
             del case
