@@ -8,9 +8,14 @@
 # mismatched tensorrt tree, installs the pinned cu12 10.9 build that matches
 # ORT, and then proves the EP really initialises on this box.
 #
+# It first ensures the venv has a GPU-enabled onnxruntime: the project pins the
+# CPU `onnxruntime` wheel, so a bare `uv sync` leaves a build with no CUDA/TRT
+# EP and TensorRT has nothing to attach to. That wheel is replaced here.
+#
 # Usage:  bash scripts/install_tensorrt.sh
-# Env:    TRT_SPEC  pip spec override (default tensorrt-cu12==10.9.0.34)
-#         PY        python interpreter (default .venv/bin/python, else python)
+# Env:    TRT_SPEC     pip spec override (default tensorrt-cu12==10.9.0.34)
+#         SKIP_ORT_GPU=1  do not replace a CPU onnxruntime wheel
+#         PY           python interpreter (default .venv/bin/python, else python)
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -127,6 +132,46 @@ print(":".join(sorted(d)))' 2>/dev/null || true)"
     fi
 }
 add_lib_dirs
+
+# A TensorRT EP only exists on a *GPU-enabled* onnxruntime build. The project
+# pins the CPU `onnxruntime` wheel (see pyproject.toml), so `uv sync` /
+# `uv pip install -e .` can leave the venv with a CPU build whose provider list
+# is just Azure+CPU — no CUDA EP, no TRT EP, nothing to install TensorRT into.
+echo "--- ORT preflight ---"
+"${PY}" -c 'import importlib.metadata as m, os, onnxruntime as o
+print("  module:", os.path.dirname(o.__file__))
+print("  providers:", o.get_available_providers())
+for p in ("onnxruntime", "onnxruntime-gpu"):
+    try:
+        print(f"  {p}: {m.version(p)}")
+    except Exception:
+        print(f"  {p}: -")'
+
+ort_has_cuda() {
+    "${PY}" -c "import onnxruntime as o, sys; sys.exit(0 if 'CUDAExecutionProvider' in o.get_available_providers() else 1)" 2>/dev/null
+}
+
+if ! ort_has_cuda; then
+    if [ "${SKIP_ORT_GPU:-0}" = "1" ]; then
+        echo "SKIP_ORT_GPU=1 -> not replacing the ORT wheel."
+    else
+        echo "ORT build has no CUDA EP (CPU wheel) -> installing onnxruntime-gpu==${ORT_VER}"
+        pip_uninstall onnxruntime
+        pip_install --no-cache-dir "onnxruntime-gpu==${ORT_VER}" || pip_install --no-cache-dir "onnxruntime-gpu<1.24" || {
+            echo "ERROR: onnxruntime-gpu install failed."
+            exit 1
+        }
+        add_lib_dirs
+        if ort_has_cuda; then
+            echo "CUDA EP now listed."
+        else
+            echo "ERROR: onnxruntime-gpu is installed but the CUDA EP still does not list."
+            echo "  - a CPU 'onnxruntime' may still shadow it (this script uninstalls it), or"
+            echo "  - the wheel's CUDA major may not match this box's driver."
+            exit 1
+        fi
+    fi
+fi
 
 echo "--- probing before install ---"
 if trt_probe; then
