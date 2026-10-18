@@ -46,7 +46,12 @@ class Wav2Vec2ForSpeechClassification(Wav2Vec2PreTrainedModel):
         self.wav2vec2 = Wav2Vec2Model(config)
         self.classifier = Wav2Vec2ClassificationHead(config)
 
-        self.init_weights()
+        # Modern transformers do weight init, tied-weight bookkeeping and
+        # generation-config setup in post_init(); the legacy init_weights()
+        # alone leaves attributes unset (e.g. all_tied_weights_keys, added in
+        # transformers 5.x) which crashes from_pretrained's loader finalizer.
+        # post_init() calls init_weights() internally, so nothing is lost.
+        self.post_init()
 
     def freeze_feature_extractor(self):
         self.wav2vec2.feature_extractor._freeze_parameters()
