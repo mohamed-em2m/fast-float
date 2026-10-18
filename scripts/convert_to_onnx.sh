@@ -114,36 +114,44 @@ for p in ('onnx','onnxscript','onnx-ir','onnxruntime','onnxruntime-gpu'):
     except Exception: print(' ', p, 'MISSING')"
 probe_stack || { echo "ERROR: onnx stack still broken — export cannot run"; exit 1; }
 
-# ORT's CUDA EP dlopens libcublas/libcudnn by soname at session init. When
-# those come from pip `nvidia-*` wheels — and especially when torch bundles a
-# *different* CUDA major than the onnxruntime-gpu wheel (e.g. torch cu130 with
-# ORT cu12) — the loader cannot find them, ORT silently drops the GPU EP, and
-# every parity check dies with "fell back to CPU". Prepend the pip nvidia lib
-# dirs so libonnxruntime_providers_cuda.so resolves its CUDA deps (a no-op when
-# the libs already live on the default path, e.g. torch bundles matching CUDA).
-if [ "$(python -c 'import torch;print(torch.cuda.is_available())' 2>/dev/null)" = "True" ]; then
-  NV_LIB_DIRS="$(python -c 'import glob,os,site; d=set();
-[d.update(glob.glob(os.path.join(b,"nvidia","*","lib"))) for b in site.getsitepackages()+[site.getusersitepackages()]];
+# ORT's CUDA/TensorRT EPs dlopen libcublas/libcudnn/libnvinfer by soname at
+# session init. When those come from pip `nvidia-*`/`tensorrt*` wheels — and
+# especially when torch bundles a *different* CUDA major than the
+# onnxruntime-gpu wheel (e.g. torch cu130 with ORT cu12) — the loader cannot
+# find them, ORT silently drops the GPU EP, and every parity check dies with
+# "fell back to CPU". The loader path is augmented once, *after* the TensorRT
+# step below, so a just-installed tensorrt lib dir is picked up too.
+augment_ort_libs() {
+  local dirs
+  dirs="$(python -c 'import glob, os, site
+d = set()
+for b in site.getsitepackages() + [site.getusersitepackages()]:
+    for p in [os.path.join(b, "nvidia"), *glob.glob(os.path.join(b, "tensorrt*"))]:
+        for r, _sub, fs in os.walk(p):
+            if any(f.endswith((".so", ".dll")) or ".so." in f for f in fs):
+                d.add(r)
 print(":".join(sorted(d)))' 2>/dev/null || true)"
-  if [ -n "${NV_LIB_DIRS}" ]; then
-    export LD_LIBRARY_PATH="${NV_LIB_DIRS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-    echo "ORT loader path += pip nvidia libs (${NV_LIB_DIRS//:/ })"
+  if [ -n "${dirs}" ]; then
+    export LD_LIBRARY_PATH="${dirs}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    echo "ORT loader path += pip CUDA/TensorRT libs"
   fi
-fi
+}
 
 echo "=== [2.5/8] tensorRT probe ==="
 if [ "$(python -c 'import torch;print(torch.cuda.is_available())' 2>/dev/null)" = "True" ]; then
   if probe_trt; then
     echo "TensorRT EP available (engines cached under ${OUT_DIR}/trt_cache)"
   else
-    echo "TensorRT EP NOT available -> attempting best-effort 'pip install tensorrt'"
-    pip install -q tensorrt 2>/dev/null || true
+    echo "TensorRT EP NOT available -> running scripts/install_tensorrt.sh"
+    bash "${SCRIPT_DIR}/install_tensorrt.sh" || true
     if probe_trt; then
       echo "TensorRT EP now available"
     else
       echo "WARN: TensorRT still unavailable — units fall back to the CUDA EP"
     fi
   fi
+  # Expose the (possibly just-installed) pip CUDA/TensorRT lib dirs.
+  augment_ort_libs
 else
   echo "no CUDA on this box — skipping TensorRT"
 fi
