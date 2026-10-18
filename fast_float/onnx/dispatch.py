@@ -27,17 +27,16 @@ Call once, after the checkpoint is loaded and the module is on its device.
 
 from __future__ import annotations
 
-import copy
 import logging
 import os
 
 import torch
-import torch.nn as nn
 
 from fast_float.onnx.backends import resolve_mode
 from fast_float.onnx.parity import compare_outputs
 from fast_float.onnx.registry import get as component_spec
 from fast_float.onnx.registry import post_load
+from fast_float.runtimes.dynamo.compiled import CompiledRuntime
 from fast_float.runtimes.onnx.runner import DecoderOnnx, DirectionOnnx, RefEncOnnx
 
 logger = logging.getLogger(__name__)
@@ -51,32 +50,6 @@ def _device_of(module) -> torch.device:
     for b in module.buffers():
         return b.device
     return torch.device("cpu")
-
-
-class _CompiledLeaf(nn.Module):
-    """``torch.compile`` around a leaf module, forwarding extra attributes.
-
-    Used where a call site also reaches into the module (e.g. ``enc.fc``).
-    """
-
-    def __init__(self, module: nn.Module, extra: dict | None = None):
-        super().__init__()
-        self._orig = module
-        self._fn = torch.compile(module)
-        self._extra_keys = list(extra or {})
-        for k, v in (extra or {}).items():
-            setattr(self, k, v)
-
-    def forward(self, *args, **kwargs):
-        return self._fn(*args, **kwargs)
-
-    def __deepcopy__(self, memo):
-        # Recompile around a fresh copy; the compiled callable itself is not
-        # copied. Weights are frozen at inference, so duplicated extras (e.g.
-        # enc.fc alongside _orig.fc) cannot diverge.
-        new_mod = copy.deepcopy(self._orig, memo)
-        extra = {k: copy.deepcopy(getattr(self, k), memo) for k in self._extra_keys}
-        return _CompiledLeaf(new_mod, extra=extra)
 
 
 # --------------------------------------------------------------------------- #
@@ -174,7 +147,7 @@ def _apply_direction(model, ae, opt) -> None:
         return
     if mode == "compile":
         try:
-            ae.dec.direction = _CompiledLeaf(target)
+            ae.dec.direction = CompiledRuntime(target, component="direction")
             logger.info("backends: direction -> torch.compile")
         except Exception as e:
             logger.warning(f"backends: direction compile failed ({e}); eager")
@@ -200,7 +173,7 @@ def _apply_refenc(model, ae, opt) -> None:
         return
     if mode == "compile":
         try:
-            ae.enc = _CompiledLeaf(enc, extra={"fc": enc.fc})
+            ae.enc = CompiledRuntime(enc, extra={"fc": enc.fc}, component="refenc")
             logger.info("backends: refenc -> torch.compile")
         except Exception as e:
             logger.warning(f"backends: refenc compile failed ({e}); eager")
