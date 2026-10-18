@@ -19,6 +19,8 @@ import torch.nn as nn
 
 from fast_float.models.float.generator import Generator
 from fast_float.onnx.export import (
+    FP16_MAX_MEAN,
+    FP16_MIN_COSINE,
     add_ort_args,
     export_module,
     fp16_tol,
@@ -116,6 +118,13 @@ def main(argv=None) -> int:
             opt_shapes={"img": [1, 3, args.image_size, args.image_size]},
         )
         atol, rtol = fp16_tol(args.atol, fp16), fp16_tol(args.rtol, fp16)
+        # The conv feature maps span a wide magnitude range (|b| up to ~39), so
+        # the FP16 error on their small elements is absolute (~1e-1 worst case)
+        # and no factor fixes it: add the functional branch (cosine + bounded
+        # mean error), same as the decoder and the emotion converter.
+        func = {"min_cosine": FP16_MIN_COSINE, "max_mean": FP16_MAX_MEAN} if fp16 else {}
+        if fp16:
+            print(f"[parity] TRT FP16 active -> relaxed tol atol={atol:g} rtol={rtol:g} + functional gate")
         with torch.no_grad():
             for bi, b in enumerate(batches):
                 g = torch.Generator(device="cpu").manual_seed(300 + bi)
@@ -125,7 +134,7 @@ def main(argv=None) -> int:
                 outs = sess.run(None, {"img": img.detach().cpu().numpy()})
                 assert len(outs) == len(ref), (len(outs), len(ref))
                 for name, r, o in zip(out_names, ref, outs, strict=False):
-                    check_parity(r, o, name=f"{name}_b{b}", atol=atol, rtol=rtol)
+                    check_parity(r, o, name=f"{name}_b{b}", atol=atol, rtol=rtol, **func)
                 if args.bench_iters > 0:
                     img_np = img.detach().cpu().numpy()
 

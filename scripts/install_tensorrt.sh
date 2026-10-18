@@ -8,7 +8,8 @@
 #      lists neither CUDA nor TensorRT, so nothing can load;
 #   2. a GPU wheel is imported but its CUDA EP cannot resolve the cu12 sonames
 #      it was built against (libcublas.so.12, libcudnn.so.9, libcufft.so.11,
-#      ...) because the box's torch is cu118/cu13 -> sessions silently drop to
+#      ...) because the box's torch is built against a different CUDA major
+#      (cu118/cu13) -> sessions silently drop to
 #      CPU and TensorRT cannot initialise either;
 #   3. once LD_LIBRARY_PATH is exported for (2), the loader stops honouring the
 #      interpreter's DT_RPATH, so /usr/lib64-nvidia/libcuda.so.1 becomes
@@ -231,9 +232,10 @@ TRT_SPEC="${TRT_SPEC:-tensorrt-cu12==10.9.0.34}"
 echo "target: ${TRT_SPEC} (libnvinfer.so.10)"
 
 # cu12 runtime wheels ORT 1.23's CUDA/TensorRT EPs dlopen by soname
-# (libcublas.so.12, libcudnn.so.9, libcufft.so.11, ...). A box whose torch is
-# cu118/cu13 ships none of them, so a GPU ORT wheel boots straight into the CPU
-# EP and TensorRT cannot initialise either.
+# (libcublas.so.12, libcudnn.so.9, libcufft.so.11, ...). A cu126 torch pulls
+# them in as deps; a box whose torch is built for another CUDA major
+# (cu118/cu13) ships none of them, so a GPU ORT wheel boots straight into the
+# CPU EP and TensorRT cannot initialise either.
 ORT_CUDA12_LIBS=(
     nvidia-cuda-runtime-cu12
     nvidia-cuda-nvrtc-cu12
@@ -288,9 +290,10 @@ fi
 
 # The GPU wheel lists CUDA, but ORT 1.23's CUDA EP is built against CUDA 12 and
 # dlopens the cu12 sonames (libcublas.so.12, libcudnn.so.9, libcufft.so.11, ...).
-# A box whose torch is cu118/cu13 ships none of them -> every session drops to
-# CPU, and TensorRT cannot work either. Install the matching runtime wheels
-# (pure data wheels; they coexist with torch's own bundled libs).
+# A box whose torch is built for another CUDA major (cu118/cu13) ships none of
+# them -> every session drops to CPU, and TensorRT cannot work either. Install
+# the matching runtime wheels (pure data wheels; they coexist with torch's own
+# bundled libs).
 if has_cuda_ep; then
     if cuda_ep_active; then
         echo "CUDA EP is active."

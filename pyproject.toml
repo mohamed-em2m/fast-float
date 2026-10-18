@@ -9,7 +9,7 @@ dependencies = [
     # torch >= 2.5.1 is required: the dynamo ONNX exporter used by
     # fast_float/onnx/export.py needs torch.export.export + a
     # torch.onnx.export() that accepts an ExportedProgram and `external_data`
-    # (added in 2.5.1). 2.7.1 is the last cu118 build.
+    # (added in 2.5.1). cu126 matches onnxruntime-gpu 1.23's CUDA 12 sonames.
     "torch==2.7.1",
     "torchvision==0.22.1",
     "torchaudio==2.7.1",
@@ -73,6 +73,10 @@ dependencies = [
     "nvidia-cuda-runtime>=13.4.92",
     "nvidia-cuda-nvrtc>=13.4.92",
     # ONNX runtime support (pinned onnxruntime<1.24 for cp310, and onnx<1.17 for numpy 1.x compatibility)
+    # NOTE: this is the *portable* stack only -- the ONNX *conversion* stack
+    # (onnxscript + onnx 1.17/1.18 + onnxruntime-gpu) is installed on demand by
+    # scripts/convert_to_onnx.sh, because ORT 1.23 caps model IR at 11 and
+    # onnxscript needs onnx>=1.17 (see AGENT.md §6).
     # NOTE: onnxruntime 1.23 is built against TensorRT 10.9 (dlopens libnvinfer.so.10);
     # a TRT 11 install (tensorrt-cu13, libnvinfer.so.11) cannot be loaded -> use
     # `tensorrt-cu12==10.9.*` on CUDA-12 boxes and keep the two pins in lockstep.

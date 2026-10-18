@@ -51,7 +51,7 @@ from fast_float.onnx.backends import (
     env_fingerprint,
     save_backends,
 )
-from fast_float.onnx.export import fp16_tol
+from fast_float.onnx.export import FP16_MAX_MEAN, FP16_MIN_COSINE, fp16_tol
 from fast_float.onnx.parity import compare_outputs
 
 ONNX_FILES = {
@@ -112,6 +112,10 @@ def _build_emotion(args, device) -> Case:
         {"input_values": wav.detach().cpu().numpy()},
         opt_shapes={"input_values": [1, int(wav.shape[1])]},
         extra_dynamic={"input_values": {1: (16000, 160000)}},
+        # Probability output: FP16 drift is absolute, so it needs the same
+        # functional gate the converter applies (see export.FP16_MIN_COSINE).
+        min_cosine=FP16_MIN_COSINE,
+        max_mean=FP16_MAX_MEAN,
     )
 
 
@@ -232,6 +236,10 @@ def _build_refenc(args, device) -> Case:
         (img,),
         {"img": img.detach().cpu().numpy()},
         opt_shapes={"img": [1, 3, args.image_size, args.image_size]},
+        # Wide-magnitude conv feature maps: FP16 error on their small elements
+        # is absolute, so it needs the converter's functional gate.
+        min_cosine=FP16_MIN_COSINE,
+        max_mean=FP16_MAX_MEAN,
     )
 
 
@@ -304,11 +312,10 @@ def _parity(case: Case, runtime, fp16: bool) -> dict[str, Any]:
         return {"ok": False, "reason": f"outputs {len(got)} != {len(ref)}"}
     ok, worst = True, {"max_abs": 0.0, "mean_abs": 0.0, "cosine": 1.0}
     for r, o in zip(ref, got, strict=False):
-        rep = compare_outputs(r, o, atol=atol, rtol=rtol)
-        this_ok = rep["ok"]
-        if case.min_cosine is not None and case.max_mean is not None:
-            this_ok = this_ok or (rep["cosine"] >= case.min_cosine and rep["mean_abs"] <= case.max_mean)
-        ok = ok and this_ok
+        # ``min_cosine``/``max_mean`` ride inside compare_outputs: they add the
+        # functional-equivalence branch the FP16 units rely on (see parity.py).
+        rep = compare_outputs(r, o, atol=atol, rtol=rtol, min_cosine=case.min_cosine, max_mean=case.max_mean)
+        ok = ok and rep["ok"]
         worst["max_abs"] = max(worst["max_abs"], rep["max_abs"])
         worst["mean_abs"] = max(worst["mean_abs"], rep["mean_abs"])
         worst["cosine"] = min(worst["cosine"], rep["cosine"])

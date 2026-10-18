@@ -38,6 +38,15 @@ So on that box the only viable fast path for the heavy components is
 `compile`; the `trt` mode is not even a candidate. A static, committed choice
 would be wrong on the next box. Hence: probe, measure, write.
 
+**Since then** the repo pins `torch 2.7.1+cu126` (torch >= 2.5.1 is required by
+the dynamo exporter) and `tensorrt-cu12==10.9.*` (see `AGENT.md` §6), so the
+CUDA 12 sonames ORT needs come from torch's own `nvidia-*-cu12` deps. On the
+same T4 that means **both** the CUDA EP and the TensorRT EP load, all six units
+export and pass parity under **TRT FP16**, and `trt` is a real candidate again.
+`emotion` and `refenc` need parity's functional-equivalence branch (cosine +
+bounded mean error) because their outputs are bounded/small-magnitude, where
+FP16 drift is absolute — see `AGENT.md` §6.
+
 ## Components
 
 | id | unit | ONNX file | call frequency | hot? |

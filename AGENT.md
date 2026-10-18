@@ -12,7 +12,7 @@ This repository (**`float-fast`**) provides:
 
 1. **High-Performance FastAPI Server**: Hardware-accelerated inference with NVENC video encoding, HTTP byte-range streaming, and WebRTC signaling.
 2. **Gradio Interfaces**: Batch generator (`gradio_interface.py`) and live audio streaming (`float_live_app.py`).
-3. **Modern Python Architecture**: Modular subpackages managed by `uv` with pinned PyTorch CUDA 11.8 wheels.
+3. **Modern Python Architecture**: Modular subpackages managed by `uv` with pinned PyTorch CUDA 12.6 wheels.
 
 ---
 
@@ -130,25 +130,42 @@ uv lock                   # re-lock (only when you intend to change the lock)
 - **Never hand-edit `uv.lock`** — it is generated; let uv own it.
 - Prefer `uv run …` over activating `.venv` manually. In CI/scripts use
   `uv run --frozen` so a stale lock can never silently re-resolve.
-- The PyTorch stack is pinned to explicit CUDA 11.8 wheels via
+- The PyTorch stack is pinned to explicit **CUDA 12.6** wheels via
   `[[tool.uv.index]]` + `[tool.uv.sources]` (see below). Do not add torch/
   torchvision/torchaudio without their CUDA source mapping.
 
 ### PyTorch Wheels
 
-PyTorch CUDA 11.8 wheels are pinned in `pyproject.toml`:
+PyTorch CUDA 12.6 wheels are pinned in `pyproject.toml`:
 
 ```toml
 [[tool.uv.index]]
-name = "pytorch-cu118"
-url = "https://download.pytorch.org/whl/cu118"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu118" }
-torchvision = { index = "pytorch-cu118" }
-torchaudio = { index = "pytorch-cu118" }
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+torchaudio = { index = "pytorch-cu126" }
 ```
+
+Two constraints decide the version and the CUDA major:
+
+- **`torch >= 2.5.1`.** `fast_float/onnx/export.py` uses the dynamo exporter
+  (`torch.export.export` + `torch.onnx.export(ExportedProgram, …)` with
+  `external_data=`), and that call signature only exists from 2.5.1 on. The
+  classic `torch.onnx.export` fallback is deliberately retired (commit
+  `397cb2e`). On 2.0.1 every converter dies with
+  `torch.export.export is required (torch>=2.1)`.
+- **CUDA 12 (cu126), not cu118.** `onnxruntime-gpu` 1.23 dlopens CUDA **12**
+  sonames (`libcublas.so.12`, `libcudnn.so.9`, `libcufft.so.11`, …). A cu126
+  torch installs `nvidia-*-cu12` wheels that provide exactly those, so torch
+  and ORT share one CUDA major. A cu118 torch instead drags in
+  `nvidia-*-cu11` wheels whose `libcudnn.so.9` / `libcurand.so.10` /
+  `libcusolver.so.11` / `libcusparse.so.12` **collide** with the cu12 files
+  (same filenames, same `nvidia/<pkg>/lib` dir), so whichever installs last
+  wins and one of the two stacks breaks.
 
 ---
 
@@ -407,13 +424,60 @@ When editing or extending the codebase, follow these design patterns:
 - **A correct TensorRT install still looks broken on a bad loader path.** Two
   traps, both handled by `scripts/install_tensorrt.sh`:
   `onnxruntime-gpu` 1.23's CUDA EP dlopens the **CUDA 12** sonames
-  (`libcublas.so.12`, `libcudnn.so.9`, `libcufft.so.11`, …), which a torch
-  cu118/cu13 wheel does not ship — install the `nvidia-*-cu12` wheels. And once
+  (`libcublas.so.12`, `libcudnn.so.9`, `libcufft.so.11`, …). A cu126 torch
+  provides them through its `nvidia-*-cu12` deps, but any box whose torch is
+  built for another CUDA major (cu118/cu13) does not — the installer adds the
+  wheels when the CUDA EP is listed but inactive. And once
   `LD_LIBRARY_PATH` is exported for that, the loader stops honouring the
   interpreter's `DT_RPATH`, so `/usr/lib64-nvidia` (the driver's `libcuda.so.1`)
   must be on it too or every CUDA call fails with error 35 ("CUDA driver version
   is insufficient for CUDA runtime version"). `fast_float/initialize_env.py` and
-  `scripts/setup_cuda_libs.sh` keep the same dir list for the runtime.
+  `scripts/setup_cuda_libs.sh` keep the same dir list for the runtime — and
+  `scripts/convert_to_onnx.sh` must call `augment_ort_libs` **before** it probes
+  TensorRT, or the probe sees an un-augmented loader path and reports a
+  false "TensorRT EP not available" even when TRT works.
+- **A plain `uv sync` silently disables the GPU execution providers.**
+  `pyproject.toml` declares the *CPU* `onnxruntime` as the portable default and
+  the CUDA box swaps in `onnxruntime-gpu`. Both distributions ship the **same**
+  `onnxruntime` package files, so whichever was installed last owns them: after
+  a `uv sync` (or any install of the CPU wheel) `get_available_providers()`
+  drops to `['AzureExecutionProvider', 'CPUExecutionProvider']` and every ONNX
+  unit falls back to CPU. `scripts/convert_to_onnx.sh` detects this and hands
+  the files back to the GPU wheel (`install_onnx_stack`) — it has to do that
+  *after* installing `onnxscript`, which itself depends on the CPU wheel and
+  would otherwise reintroduce it.
+- **A `uv` venv has no `pip`.** `uv sync`/`uv venv` ship neither a `pip` binary
+  nor the `pip` module, so `source .venv/bin/activate` leaves bare `pip`
+  resolving to the **system** pip (Colab especially) — every install lands in
+  the system site-packages and the venv stays untouched, silently. That is why
+  the repair blocks in `scripts/convert_to_onnx.sh` call
+  `uv pip install --python "${PY}"` (`pip_install`/`pip_uninstall`, the same
+  helpers `install_tensorrt.sh` already had) and never bare `pip`. The legacy
+  per-unit `scripts/convert_{fmt,wav2vec}_to_onnx.sh` still use bare
+  `python`/`pip` and only behave when run from an already-activated venv.
+- **`onnx` has to stay in the 1.17–1.18 window.** ORT 1.23 refuses any model
+  whose IR version exceeds **11**, and a model built with `onnx.helper` defaults
+  to the *installed* onnx's IR version (1.17→10, 1.18→11, 1.19→12,
+  1.20/1.21→13, 1.23→14). `onnxscript` (the dynamo exporter's translator) needs
+  onnx>=1.17, so 1.17/1.18 is the only safe pair. Conversion itself is immune —
+  Torch hardcodes IR 10 — but anything else that builds ONNX (the tests use
+  `helper.make_model`) fails to load with "Unsupported model IR version".
+  `convert_to_onnx.sh` therefore installs `ONNX_PIN="onnx>=1.17,<1.19"`, not the
+  old `onnx<1.22` (which still allows IR 12/13).
+- **TRT FP16 cannot meet an elementwise gate on bounded outputs.** TensorRT
+  FP16 rounds every accumulation in a deep stack, so on outputs that are
+  *small or bounded* the drift is absolute and no `fp16_tol` factor fixes it:
+  `emotion` (a probability vector; measured worst cosine 0.9985, `mean_abs`
+  8.9e-3, `max_abs` 3.1e-2) and `refenc` (conv feature maps, |b| up to ~39;
+  worst `max_abs` 9.8e-2 on their small elements). Both therefore also pass a
+  **functional-equivalence gate** — `cosine >= FP16_MIN_COSINE` (0.995) and
+  `mean_abs <= FP16_MAX_MEAN` (0.02), see `fast_float/onnx/export.py` and
+  `parity.compare_outputs` — exactly as the decoder has since the first TRT
+  run. The elementwise gate stays the primary check; `check_parity` prints
+  `PASS(functional)` when only the fallback saved it. The same bounds are set
+  on the `Case`s in `select_backends.py` so selection agrees with conversion.
+  Both were verified FP32-exact first (CUDA EP: `max_abs` ~1e-5, cosine 1.0),
+  so this is FP16 rounding, not a graph bug.
 - Full details and rationale: **`docs/BACKEND_SELECTION.md`** — read it before
   touching the ONNX path.
 

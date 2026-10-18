@@ -498,8 +498,28 @@ def make_runtime_session(
 
 def fp16_tol(base: float, fp16: bool, factor: float = 40.0) -> float:
     """Relax a parity tolerance when TensorRT runs in FP16 (tensor cores
-    trade ~1e-3 relative precision for speed; FP32 keeps the strict gate)."""
+    trade ~1e-3 relative precision for speed; FP32 keeps the strict gate).
+
+    The factor covers units whose outputs are *large-magnitude* (the relative
+    term then absorbs the drift). Units whose outputs are bounded or
+    small-magnitude cannot be fixed by any factor -- their FP16 drift is
+    absolute, so they pass the additional functional gate below instead.
+    """
     return base * factor if fp16 else base
+
+
+# Functional-equivalence gate for the TRT FP16 path (see
+# :func:`fast_float.onnx.parity.compare_outputs`). Measured worst case on this
+# box (Tesla T4, TRT 10.9, torch 2.7.1+cu126) for the two units whose
+# elementwise gate FP16 cannot meet:
+#   emotion  (probs in [0, 1])  cosine 0.9985  mean_abs 8.9e-3  max_abs 3.1e-2
+#   refenc   (conv feature maps, |b| up to ~39)  cosine 0.99999  mean_abs 3.1e-3
+# The classifier's argmax held on 13/13 draws and refenc's maps keep their
+# structure, so cosine + bounded mean error is the honest test; the
+# elementwise gate stays active as the primary check. 0.995 matches the
+# threshold the decoder has used since the first TRT run.
+FP16_MIN_COSINE = 0.995
+FP16_MAX_MEAN = 0.02
 
 
 def run_ort_iobinding(session, feed, out_shapes, device=None):

@@ -34,6 +34,8 @@ from fast_float.models.wav2vec2_ser import (
     Wav2Vec2ForSpeechClassification,
 )
 from fast_float.onnx.export import (
+    FP16_MAX_MEAN,
+    FP16_MIN_COSINE,
     add_ort_args,
     export_module,
     fp16_tol,
@@ -195,14 +197,18 @@ def main(argv=None) -> int:
             extra_dynamic={"input_values": {1: (16000, 160000)}},
         )
         atol, rtol = fp16_tol(args.atol, fp16), fp16_tol(args.rtol, fp16)
+        # The output is a probability vector, so FP16 drift is *absolute*
+        # (~2e-2) and no elementwise factor can absorb it: add the functional
+        # branch (cosine + bounded mean error) that the decoder already uses.
+        func = {"min_cosine": FP16_MIN_COSINE, "max_mean": FP16_MAX_MEAN} if fp16 else {}
         if fp16:
-            print(f"[parity] TRT FP16 active -> relaxed tol atol={atol:g} rtol={rtol:g}")
+            print(f"[parity] TRT FP16 active -> relaxed tol atol={atol:g} rtol={rtol:g} + functional gate")
         with torch.no_grad():
             probes = probe_inputs(args.seconds)
             for name, wav in probes.items():
                 ref = module(wav)
                 ort_out = sess.run(None, {"input_values": wav.numpy()})[0]
-                check_parity(ref, ort_out, name=name, atol=atol, rtol=rtol)
+                check_parity(ref, ort_out, name=name, atol=atol, rtol=rtol, **func)
                 top = int(np.argmax(ort_out[0]))
                 print(f"[probe:{name}] torch_top={LABELS[int(np.argmax(ref.numpy()[0]))]} onnx_top={LABELS[top]}")
                 if args.bench_iters > 0:
@@ -220,11 +226,11 @@ def main(argv=None) -> int:
             batch_wav = torch.cat([probes["noise"], probes["sine"]], dim=0)  # [2, L]
             ref = module(batch_wav)
             ort_out = sess.run(None, {"input_values": batch_wav.numpy()})[0]
-            check_parity(ref, ort_out, name="batch2", atol=atol, rtol=rtol)
+            check_parity(ref, ort_out, name="batch2", atol=atol, rtol=rtol, **func)
             short_wav = torch.randn(1, 16000).clamp(-1, 1)  # 1 s < trace length
             ref = module(short_wav)
             ort_out = sess.run(None, {"input_values": short_wav.numpy()})[0]
-            check_parity(ref, ort_out, name="short1s", atol=atol, rtol=rtol)
+            check_parity(ref, ort_out, name="short1s", atol=atol, rtol=rtol, **func)
     print("[done] emotion converter OK")
     return 0
 

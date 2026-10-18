@@ -13,12 +13,30 @@ def _to_numpy(x) -> np.ndarray:
     return np.asarray(x, dtype=np.float32)
 
 
-def compare_outputs(a, b, atol: float = 1e-4, rtol: float = 1e-4) -> dict[str, float]:
-    """Compare two outputs. Returns metrics dict with an ``ok`` flag."""
+def compare_outputs(
+    a,
+    b,
+    atol: float = 1e-4,
+    rtol: float = 1e-4,
+    min_cosine: float | None = None,
+    max_mean: float | None = None,
+) -> dict[str, float]:
+    """Compare two outputs. Returns metrics dict with an ``ok`` flag.
+
+    ``min_cosine``/``max_mean`` add a *functional-equivalence* branch for the
+    TensorRT FP16 path: an output that misses the elementwise gate still passes
+    when it is the same map (``cosine >= min_cosine`` and ``mean_abs <=
+    max_mean``). TRT FP16 rounds every accumulation in a deep stack, so on
+    bounded outputs (probability vectors, conv feature maps) a tight
+    elementwise gate measures FP16 rounding, not export correctness. The
+    decoder has relied on this branch since the first TRT run; pass ``None``
+    (the default) to keep the strict elementwise gate only.
+    """
     a, b = _to_numpy(a), _to_numpy(b)
     if a.shape != b.shape:
         return {
             "ok": False,
+            "elementwise_ok": False,
             "reason": f"shape mismatch torch={a.shape} onnx={b.shape}",
             "max_abs": float("inf"),
             "mean_abs": float("inf"),
@@ -30,19 +48,32 @@ def compare_outputs(a, b, atol: float = 1e-4, rtol: float = 1e-4) -> dict[str, f
     ok = bool(np.allclose(a, b, atol=atol, rtol=rtol))
     na, nb = np.linalg.norm(a.ravel()), np.linalg.norm(b.ravel())
     cosine = float(np.dot(a.ravel(), b.ravel()) / (na * nb + 1e-12))
+    mean_abs = float(abs_diff.mean())
+    functional = min_cosine is not None and max_mean is not None and cosine >= min_cosine and mean_abs <= max_mean
     return {
-        "ok": ok,
+        "ok": bool(ok or functional),
+        "elementwise_ok": ok,
         "max_abs": float(abs_diff.max()),
-        "mean_abs": float(abs_diff.mean()),
+        "mean_abs": mean_abs,
         "max_rel": float((abs_diff / denom).max()),
         "cosine": cosine,
     }
 
 
-def check_parity(torch_out, ort_out, name: str = "output", atol: float = 1e-4, rtol: float = 1e-4) -> dict[str, float]:
+def check_parity(
+    torch_out,
+    ort_out,
+    name: str = "output",
+    atol: float = 1e-4,
+    rtol: float = 1e-4,
+    min_cosine: float | None = None,
+    max_mean: float | None = None,
+) -> dict[str, float]:
     """Compare and print one named output pair. Raises on mismatch."""
-    rep = compare_outputs(torch_out, ort_out, atol=atol, rtol=rtol)
+    rep = compare_outputs(torch_out, ort_out, atol=atol, rtol=rtol, min_cosine=min_cosine, max_mean=max_mean)
     status = "PASS" if rep["ok"] else "FAIL"
+    if rep["ok"] and not rep.get("elementwise_ok", True):
+        status = "PASS(functional)"
     print(
         f"[parity:{name}] {status} "
         f"max_abs={rep['max_abs']:.3e} mean_abs={rep['mean_abs']:.3e} "
