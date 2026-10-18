@@ -135,6 +135,16 @@ def replicable() -> tuple[str, ...]:
     return tuple(n for n, c in REGISTRY.items() if c.replicable)
 
 
+def post_load() -> tuple[str, ...]:
+    """Components installed after the checkpoint is loaded (by ``apply_backends``)."""
+    return tuple(n for n, c in REGISTRY.items() if c.backend_stage == "post_load")
+
+
+def constructor() -> tuple[str, ...]:
+    """Components that self-wire inside their own constructors."""
+    return tuple(n for n, c in REGISTRY.items() if c.backend_stage == "constructor")
+
+
 def validate() -> list[str]:
     """Consistency problems (empty when the registry agrees with the config).
 
@@ -158,11 +168,12 @@ def validate() -> list[str]:
     return problems
 
 
-__all__ = ["REGISTRY", "ComponentSpec", "get", "hot", "names", "replicable", "validate"]
+__all__ = ["REGISTRY", "ComponentSpec", "constructor", "get", "hot", "names", "post_load", "replicable", "validate"]
 
 
 if __name__ == "__main__":  # pragma: no cover - manual check
     print(f"components: {names()}")
     print(f"hot: {hot()}")
+    print(f"post_load: {post_load()}")
     print(f"replicable: {replicable()}")
     print(f"problems: {validate() or 'none'}")

@@ -6,7 +6,8 @@ component to ``eager`` (plain torch), ``compile`` (``torch.compile``) or
 
 The three components that already had a runtime backend -- ``emotion``,
 ``audio`` and ``fmt`` -- are wired in their own modules (config-gated there).
-This module wires the remaining three, which had none:
+This module wires the remaining three, registry-driven (see
+``fast_float/onnx/registry.py``, the source of truth for the component matrix):
 
   * ``direction``  -- substitutes ``motion_autoencoder.dec.direction``
   * ``refenc``     -- substitutes ``motion_autoencoder.enc`` (exposes ``.fc``)
@@ -38,10 +39,11 @@ import torch.nn as nn
 from fast_float.onnx.backends import resolve_mode
 from fast_float.onnx.export import make_runtime_session
 from fast_float.onnx.parity import compare_outputs
+from fast_float.onnx.registry import get as component_spec
+from fast_float.onnx.registry import post_load
 
 logger = logging.getLogger(__name__)
 
-_ONNX_DIR = "./onnx"
 _MIN_COSINE = 0.999
 
 
@@ -541,7 +543,7 @@ def _apply_direction(model, ae, opt) -> None:
         except Exception as e:
             logger.warning(f"backends: direction compile failed ({e}); eager")
         return
-    path = _path(opt, "direction_onnx_path", f"{_ONNX_DIR}/direction_v1.onnx")
+    path = _path(opt, "direction_onnx_path", component_spec("direction").onnx_default)
     try:
         # No automatic parity probe: the converter/selector scripts validate;
         # the config is the contract.
@@ -567,7 +569,7 @@ def _apply_refenc(model, ae, opt) -> None:
         except Exception as e:
             logger.warning(f"backends: refenc compile failed ({e}); eager")
         return
-    path = _path(opt, "refenc_onnx_path", f"{_ONNX_DIR}/refenc_v1.onnx")
+    path = _path(opt, "refenc_onnx_path", component_spec("refenc").onnx_default)
     try:
         # The original encoder stays owned by the runner (single residency):
         # it serves .fc and the non-deployed 3-arg path.
@@ -596,7 +598,7 @@ def _apply_decoder(model, ae, opt) -> None:
         except Exception as e:
             logger.warning(f"backends: decoder compile failed ({e}); eager")
         return
-    path = _path(opt, "decoder_onnx_path", f"{_ONNX_DIR}/decoder_v1.onnx")
+    path = _path(opt, "decoder_onnx_path", component_spec("decoder").onnx_default)
     try:
         runner = DecoderOnnx(path, device_id=_primary_device_id(opt))
         model._decoder_onnx = runner
@@ -605,9 +607,18 @@ def _apply_decoder(model, ae, opt) -> None:
         logger.warning(f"backends: decoder ONNX skipped ({e}); eager")
 
 
+_INSTALLERS = {
+    "direction": _apply_direction,
+    "refenc": _apply_refenc,
+    "decoder": _apply_decoder,
+}
+
+
 def apply_backends(model, opt=None):
     """Substitute configured backends on a loaded FLOAT model.
 
+    Registry-driven: iterates the components the registry marks ``post_load``
+    (direction/refenc/decoder), in ``_INSTALLERS`` order (behaviour-preserving).
     Call once after weights are loaded and the model is on its device. The
     default all-eager config is a no-op. Never raises.
     """
@@ -616,11 +627,14 @@ def apply_backends(model, opt=None):
     ae = getattr(model, "motion_autoencoder", None)
     if ae is None:
         return model
-    for fn in (_apply_direction, _apply_refenc, _apply_decoder):
+    post = set(post_load())
+    for name, install in _INSTALLERS.items():
+        if name not in post:
+            continue
         try:
-            fn(model, ae, opt)
+            install(model, ae, opt)
         except Exception as e:
-            logger.warning(f"backends: {fn.__name__} failed ({e}); eager")
+            logger.warning(f"backends: {name} install failed ({e}); eager")
     return model
 
 
