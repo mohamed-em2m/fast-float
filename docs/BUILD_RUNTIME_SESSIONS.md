@@ -3,8 +3,12 @@
 Design plan for formalizing how FLOAT-Fast builds and runs per-component
 accelerated backends (`eager`, `compile`, `onnx`) behind one session model.
 
-Status: **proposal** (no code yet). Layout already scaffolded (empty):
-`fast_float/builders/` and `fast_float/runtimes/`.
+Status: **in progress**. Landed: specs + registry (Phase 0), registry-driven
+`apply_backends` (Phase 1a), both ONNX runner families under
+`fast_float/runtimes/onnx/` on `RuntimeSession` (Phase 2), the dynamo
+runtime + builder (Phase 3), and `builders/onnx` + its fingerprint cache
+(Phase 4 core). Remaining: ctor wiring unification (1b), pointing the selector
+at builders (4 tail), native TRT + `inspect` CLI (5).
 
 ## 1. Why
 
@@ -187,19 +191,21 @@ A served box must not compile at startup. On cache miss:
 
 ## 10. Phases (behavior-preserving, risk-ordered)
 
-0. **Reconcile** — keep `fast_float/builders/` + `fast_float/runtimes/` as the
-   layout; add `spec.py` + `registry.py` holding the §3 matrix as data. No
-   behavior change.
-1. **Unify wiring** into the registry; move emotion/audio/fmt out of ctors; fix
-   the `get_component` dead imports.
-2. **Promote runners** into `runtimes/onnx/` under `RuntimeSession`; keep
-   `dispatch.py` as a thin installer.
-3. **`runtimes/dynamo/`** + dynamo builders (`CompiledRuntime`,
-   `ExportedRuntime`).
-4. **Spec/Artifact/Fingerprint/cache** + `builders/onnx/`; point the selector at
-   builders.
+0. **Reconcile** — done: `fast_float/builders/` + `fast_float/runtimes/` are the
+   layout; `spec.py` + `registry.py` hold the §3 matrix as data.
+1. **Unify wiring** into the registry — partly done: `apply_backends` is
+   registry-driven (1a) and the `get_component` dead imports are fixed;
+   emotion/audio/fmt still self-wire in their constructors (1b, open).
+2. **Promote runners** — done: both families live in `fast_float/runtimes/onnx/`
+   under `RuntimeSession`; `dispatch.py` is the thin installer and
+   `onnx/runtime.py` is a re-export shim.
+3. **`runtimes/dynamo/`** — done: `CompiledRuntime` (+ `builders/dynamo`).
+   `ExportedRuntime` (torch.export AOT) still open.
+4. **Spec/Artifact/Fingerprint/cache** — core done: `builders/onnx.OnnxBuilder`
+   wraps `export_module` and records into `ArtifactCache`. Pointing the selector
+   at builders is still open.
 5. **Native TRT** builder (ORT-TRT first); `inspect` CLI; per-runtime timing into
-   `utils/timing.py`.
+   `utils/timing.py` — open.
 
 - Cross-cutting: add `tests/` for spec/fingerprint/registry (pure-CPU — the only
   locally runnable pieces; the repo has no `tests/` today).
