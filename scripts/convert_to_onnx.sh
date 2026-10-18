@@ -166,19 +166,25 @@ print(":".join(sorted(d)))' 2>/dev/null || true)"
 
 echo "=== [2.5/8] tensorRT probe ==="
 if [ "$(python -c 'import torch;print(torch.cuda.is_available())' 2>/dev/null)" = "True" ]; then
+  # Put the pip CUDA/TensorRT lib dirs on the loader path *before* probing:
+  # probe_trt loads ORT's TRT provider lib, which dlopens libnvinfer/libcublas,
+  # and a fresh python has none of them on its default path (this is why the
+  # probe used to report "not available" even when TensorRT worked).
+  augment_ort_libs
   if probe_trt; then
     echo "TensorRT EP available (engines cached under ${OUT_DIR}/trt_cache)"
   else
     echo "TensorRT EP NOT available -> running scripts/install_tensorrt.sh"
     PY="${PY}" bash "${SCRIPT_DIR}/install_tensorrt.sh" || true
+    # The installer runs in a subshell (its exports don't reach us) and may have
+    # installed new lib dirs, so re-augment before re-probing.
+    augment_ort_libs
     if probe_trt; then
       echo "TensorRT EP now available"
     else
       echo "WARN: TensorRT still unavailable — units fall back to the CUDA EP"
     fi
   fi
-  # Expose the (possibly just-installed) pip CUDA/TensorRT lib dirs.
-  augment_ort_libs
 else
   echo "no CUDA on this box — skipping TensorRT"
 fi

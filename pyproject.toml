@@ -5,10 +5,14 @@ description = "FLOAT audio-driven talking-face generation: fast inference API pl
 readme = "README.md"
 requires-python = ">=3.10,<3.12"
 dependencies = [
-    # Core Deep Learning - PyTorch Stack (CUDA 11.8 wheels, see [tool.uv.sources])
-    "torch==2.0.1",
-    "torchvision==0.15.2",
-    "torchaudio==2.0.2",
+    # Core Deep Learning - PyTorch Stack (CUDA 12.6 wheels, see [tool.uv.sources])
+    # torch >= 2.5.1 is required: the dynamo ONNX exporter used by
+    # fast_float/onnx/export.py needs torch.export.export + a
+    # torch.onnx.export() that accepts an ExportedProgram and `external_data`
+    # (added in 2.5.1). 2.7.1 is the last cu118 build.
+    "torch==2.7.1",
+    "torchvision==0.22.1",
+    "torchaudio==2.7.1",
     # Core Dependencies
     "numpy==1.24.4",
     # Transformers & NLP
@@ -84,10 +88,13 @@ dev = ["pytest>=8.0,<9"]
 [tool.uv]
 package = false
 
-# CUDA 11.8 PyTorch wheels instead of the default PyPI (CUDA-bundled) ones.
+# CUDA 12.6 PyTorch wheels instead of the default PyPI (CUDA-bundled) ones.
+# cu126 (not cu118) so torch and onnxruntime-gpu 1.23 — which dlopens CUDA 12
+# sonames — share one CUDA major; cu118 torch would drag in nvidia-*-cu11 wheels
+# whose cudnn/curand/cusolver/cusparse sonames clash with the cu12 ones.
 [[tool.uv.index]]
-name = "pytorch-cu118"
-url = "https://download.pytorch.org/whl/cu118"
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 
@@ -96,9 +103,9 @@ where = ["."]
 include = ["fast_float*"]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu118" }
-torchvision = { index = "pytorch-cu118" }
-torchaudio = { index = "pytorch-cu118" }
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+torchaudio = { index = "pytorch-cu126" }
 [tool.ruff]
 target-version = "py310"
 line-length = 120
