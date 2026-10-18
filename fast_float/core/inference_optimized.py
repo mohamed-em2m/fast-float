@@ -55,8 +55,10 @@ class OptimizedInferenceAgent:
         # backend before the global optimisation pass. All-eager config = no-op.
         try:
             from fast_float.onnx.dispatch import apply_backends
+            from fast_float.runtimes.inspect import warn_degraded
 
             apply_backends(self.G, self.opt)
+            warn_degraded(self.G, logger)
         except Exception as e:
             logger.warning(f"! Per-component backend dispatch skipped: {e}")
 

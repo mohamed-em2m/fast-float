@@ -204,8 +204,11 @@ A served box must not compile at startup. On cache miss:
 4. **Spec/Artifact/Fingerprint/cache** — core done: `builders/onnx.OnnxBuilder`
    wraps `export_module` and records into `ArtifactCache`. Pointing the selector
    at builders is still open.
-5. **Native TRT** builder (ORT-TRT first); `inspect` CLI; per-runtime timing into
-   `utils/timing.py` — open.
+5. **`inspect` CLI + startup degradation warnings** — done:
+   `python -m fast_float.runtimes inspect` prints the resolved per-component
+   plan and where the box cannot honour it; `inspect_model`/`warn_degraded`
+   report live sessions at startup. Still open: native TRT builder (ORT-TRT
+   first) and per-runtime timing into `utils/timing.py`.
 
 - Cross-cutting: add `tests/` for spec/fingerprint/registry (pure-CPU — the only
   locally runnable pieces; the repo has no `tests/` today).
