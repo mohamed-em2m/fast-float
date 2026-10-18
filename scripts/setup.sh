@@ -63,10 +63,17 @@ if [ "${HAS_CUDA}" = "True" ]; then
     uv pip uninstall --python .venv/bin/python onnxruntime 2>/dev/null || true
     uv pip install --python .venv/bin/python --no-cache-dir "onnxruntime-gpu<1.24" \
         || echo "⚠️ onnxruntime-gpu install failed — the CUDA EP will be unavailable."
-    # TensorRT for CUDA 12: the versioned metapackage pulls the matching
-    # tensorrt_libs; fall back to the unversioned wheel (older layout).
-    if ! uv pip install --python .venv/bin/python --no-cache-dir "tensorrt-cu12"; then
-        uv pip install --python .venv/bin/python --no-cache-dir tensorrt \
+    # TensorRT must *major-match* the ORT wheel. onnxruntime-gpu 1.23 is built
+    # against TensorRT 10.9 and dlopens libnvinfer.so.10; an unversioned
+    # `tensorrt-cu12` now resolves to TensorRT 11 (libnvinfer.so.11), which ORT
+    # cannot load — its provider lib fails and ORT silently drops the session to
+    # CUDA/CPU. Pin the cu12 build ORT 1.23 expects and evict any TRT 11 (cu13)
+    # tree first (uv skips the ones that aren't installed).
+    uv pip uninstall --python .venv/bin/python \
+        tensorrt tensorrt-cu13 tensorrt-cu13-bindings tensorrt-cu13-libs
+    if ! uv pip install --python .venv/bin/python --no-cache-dir "tensorrt-cu12==10.9.0.34"; then
+        echo "⚠️ pinned tensorrt-cu12==10.9.0.34 failed; trying unpinned (verify the EP below)."
+        uv pip install --python .venv/bin/python --no-cache-dir "tensorrt-cu12" \
             || echo "⚠️ tensorrt install skipped — the TensorRT EP will be unavailable."
     fi
     # ORT dlopens libnvinfer/libcublas by soname; put the pip lib dirs on the
@@ -90,6 +97,8 @@ echo "=== ONNX / ONNX Runtime / TensorRT stack ==="
 python - <<'PY' || true
 import ctypes
 import importlib.metadata as m
+import os
+import sys
 
 for p in ("onnx", "onnxscript", "onnx-ir", "onnxruntime", "onnxruntime-gpu", "tensorrt", "tensorrt-cu12"):
     try:
@@ -129,22 +138,30 @@ try:
         print("     Install an onnxruntime-gpu built for torch's CUDA major.")
 
     trt_listed = "TensorrtExecutionProvider" in provs
+    # Honest TRT test: load ORT's own provider library. A TensorRT tree whose
+    # major disagrees with ORT (e.g. libnvinfer.so.11 vs ORT's expected .so.10)
+    # imports fine yet is unusable, so a bare `import tensorrt` lies.
     trt_ok = False
     try:
-        import tensorrt  # noqa: F401
-        trt_ok = True
+        import tensorrt  # noqa: F401  (primes the pip lib dirs on the loader path)
     except Exception:
-        for so in ("libnvinfer.so.10", "libnvinfer.so.9", "libnvinfer.so"):
-            try:
-                ctypes.CDLL(so)
-                trt_ok = True
-                break
-            except OSError:
-                continue
-    print(f"  TensorRT EP listed: {trt_listed} | libnvinfer loadable: {trt_ok}")
+        pass
+    capi = os.path.join(os.path.dirname(onnxruntime.__file__), "capi")
+    provider = os.path.join(
+        capi,
+        "onnxruntime_providers_tensorrt.dll" if sys.platform == "win32" else "libonnxruntime_providers_tensorrt.so",
+    )
+    if os.path.exists(provider):
+        try:
+            ctypes.CDLL(provider)
+            trt_ok = True
+        except OSError:
+            trt_ok = False
+    print(f"  TensorRT EP listed: {trt_listed} | provider lib loadable: {trt_ok}")
     if trt_listed and not trt_ok:
-        print("  ⚠️ TensorRT EP listed but libnvinfer missing: pip install 'tensorrt-cu12',")
-        print("     then re-run: source scripts/setup_cuda_libs.sh")
+        print("  ⚠️ TensorRT EP listed but ORT's provider lib cannot load libnvinfer.")
+        print("     Likely a TensorRT major mismatch: ORT 1.23 needs TensorRT 10.9")
+        print("     (libnvinfer.so.10). Install: uv pip install 'tensorrt-cu12==10.9.0.34'")
 except Exception as e:
     print("  onnxruntime import failed:", e)
 PY
