@@ -457,6 +457,31 @@ When editing or extending the codebase, follow these design patterns:
   for the whole batch range. (Renaming only the `dim_param` is not enough —
   ORT's TRT engine cache key ignores dim names and reuses the stale engine; the
   static-shape change alters the graph, which does bust it.)
+- **A TRT profile is a hard ceiling; batched CFG can exceed it.** `fmt`'s
+  profile is `[1..16]` in batch (`FLOAT_TRT_MAX_BATCH`, default 16), but
+  batched chunk sampling sends `chunk_batch_size` samples through CFG, i.e.
+  `3 * chunk_batch_size` (24 for 8 chunks). TensorRT then fails every call with
+  "Set dimension [24,50,512] for tensor x does not satisfy any optimization
+  profiles", and the old handler disabled the ONNX backend for the rest of the
+  process — one dispatch turned an entire 15 s render into eager (174 s).
+  `FMTStepBackend.run_step` now splits any batch above the profile cap and
+  concatenates the results (identical math: no cross-batch ops), and a single
+  failure no longer disables the backend (3 consecutive failures do). Raise
+  `FLOAT_TRT_MAX_BATCH` (rebuilds the engine) to avoid the split entirely.
+- **cuDNN autotuning is per thread, and the decode pipeline spawns threads per
+  request.** With `torch.backends.cudnn.benchmark = True` every fresh decode
+  worker re-searched algorithms for ~40 conv shapes, costing ~1.25 s on the
+  first decode of *every* request (measured: 2849 ms first call per new thread
+  vs 50 ms with benchmark off). `StreamingVideoSaver` now sets
+  `benchmark = False` (heuristics are ~10% slower per call; set
+  `FLOAT_CUDNN_BENCHMARK=1` for long renders). Result: 13-frame requests went
+  1.8 s → 0.6 s and batched 15 s/35 s renders 151–184 s → 5.6/12.6 s.
+- **Never mutate a module inside a compiled `forward`.** `ToFlow` built its
+  coordinate grid lazily and stored it with `register_buffer` mid-forward, so
+  Dynamo's `hasattr(module, '_cached_grid')` guard failed after the first call
+  and forced a full decoder recompile (the bulk of boot time). The grid is now
+  built functionally (`_identity_grid`), which is cheap and trace-stable; boot
+  warmup dropped 58 s → 24 s with no `recompile_limit` warnings.
 - **TensorRT must major-match ORT.** `onnxruntime-gpu` 1.23 is built against
   **TensorRT 10.9** and dlopens `libnvinfer.so.10` / `libnvonnxparser.so.10`. A
   TRT 11 install (`tensorrt_cu13*` → `libnvinfer.so.11`) can never satisfy that

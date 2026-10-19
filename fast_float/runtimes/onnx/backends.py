@@ -264,6 +264,20 @@ class FMTStepBackend(RuntimeSession):
         shape = tuple(out.shape or ())
         self._static_last = shape[-1] if shape and isinstance(shape[-1], int) else None
         self._io_failed = False
+        # TensorRT refuses any batch above the optimization profile's max with
+        # "Set dimension [24,50,512] for tensor x does not satisfy any
+        # optimization profiles" -- and the runtime used to disable this backend
+        # for the rest of the process on that first failure. The graph has no
+        # cross-batch ops, so serving a larger call as several profile-sized
+        # calls is numerically identical. Batched sampling needs it: CFG sends
+        # 3 * chunk_batch_size samples, e.g. 24 for 8 chunks with a profile
+        # capped at 16.
+        self._batch_cap = None
+        if "TensorrtExecutionProvider" in self.session.get_providers():
+            cap = max_batch if max_batch is not None else int(os.environ.get("FLOAT_TRT_MAX_BATCH", "16"))
+            self._batch_cap = int(cap) if int(cap) > 0 else None
+        self._split_warned = False
+        self._failures = 0
 
     @property
     def providers(self) -> list:
@@ -290,7 +304,40 @@ class FMTStepBackend(RuntimeSession):
         the transformer (see ``FlowMatchingTransformer.forward``), so the output
         length is ``x.shape[1] + prev_x.shape[1]`` — not ``x.shape[1]``. Bind the
         output at that length or the IOBinding buffer is too small.
+
+        Batches larger than the TensorRT profile are split: the graph has no
+        cross-batch ops, so ``cat(run(chunk))`` is identical to one big call.
         """
+        cap = self._batch_cap
+        batch = int(x.shape[0])
+        if cap is not None and batch > cap:
+            if not self._split_warned:
+                self._split_warned = True
+                print(
+                    f"[backends:fmt] batch {batch} exceeds the TensorRT profile max "
+                    f"({cap}); splitting into {cap}-sized calls (numerically identical). "
+                    f"Raise FLOAT_TRT_MAX_BATCH or lower chunk_batch_size to avoid the split."
+                )
+            parts = []
+            for i in range(0, batch, cap):
+                j = min(i + cap, batch)
+                sl = slice(i, j)
+                parts.append(
+                    self.run_step(
+                        t,
+                        x[sl],
+                        wa[sl] if wa.shape[0] == batch else wa,
+                        wr[sl] if wr.shape[0] == batch else wr,
+                        we[sl] if we.shape[0] == batch else we,
+                        prev_x[sl] if prev_x.shape[0] == batch else prev_x,
+                        prev_wa[sl] if prev_wa.shape[0] == batch else prev_wa,
+                    )
+                )
+            return torch.cat(parts, dim=0)
+        return self._run_once(t, x, wa, wr, we, prev_x, prev_wa)
+
+    def _run_once(self, t, x, wa, wr, we, prev_x, prev_wa) -> torch.Tensor:
+        """One ORT call, guaranteed to fit the profile (see ``run_step``)."""
         device = x.device
         out_len = _vec_out_len(x, prev_x)
         if (

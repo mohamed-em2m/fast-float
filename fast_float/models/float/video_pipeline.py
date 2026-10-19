@@ -2,6 +2,7 @@
 
 import contextlib
 import logging
+import os
 import queue
 import shutil
 import subprocess
@@ -151,6 +152,15 @@ class StreamingVideoSaver:
         if e_cfg_scale is None:
             e_cfg_scale = self.opt.e_cfg_scale
         fps = int(getattr(self.opt, "fps", 25))
+
+        # cuDNN's algorithm search is per *thread*: with benchmark=True every
+        # fresh decode worker re-autotunes ~40 conv shapes, which costs ~1.2 s
+        # on the first decode call of *every* request (the pipeline spawns new
+        # workers per request). Heuristics are ~10% slower per call but remove
+        # that stall, which dominates short clips. Set FLOAT_CUDNN_BENCHMARK=1
+        # to restore the old behaviour for long renders.
+        if os.getenv("FLOAT_CUDNN_BENCHMARK", "0") != "1":
+            torch.backends.cudnn.benchmark = False
 
         # autocast state is thread-local: capture it here, re-enter it in every pipeline thread
         try:

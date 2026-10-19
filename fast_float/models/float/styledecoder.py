@@ -462,6 +462,21 @@ class ToRGB(nn.Module):
         return out
 
 
+def _identity_grid(h: int, w: int, device, dtype) -> torch.Tensor:
+    """Normalized ``[1, H, W, 2]`` sampling grid for ``grid_sample``.
+
+    Built functionally (no module state), so ``torch.compile`` never sees a
+    mutated attribute. The tensors are small (H*W*2) compared with the feature
+    maps they warp, so rebuilding them per call costs well under a millisecond.
+    """
+    grid_y, grid_x = torch.meshgrid(
+        torch.linspace(-1, 1, h, device=device, dtype=dtype),
+        torch.linspace(-1, 1, w, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    return torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+
+
 class ToFlow(nn.Module):
     def __init__(self, in_channel, style_dim, upsample=True, blur_kernel=None):
         if blur_kernel is None:
@@ -473,36 +488,21 @@ class ToFlow(nn.Module):
         self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))
 
     def forward(self, input, style, feat, skip=None):
-        """Batch-compatible forward with cached coordinate grid.
+        """Batch-compatible forward with a stateless coordinate grid.
 
-        The grid is computed once and stored on the module instance,
-        keyed by (h, w, device, dtype).  It is reused on every subsequent
-        call with the same configuration, eliminating the repeated
-        torch.meshgrid + torch.linspace overhead.
+        The grid depends only on (h, w, dtype). It used to be built lazily and
+        stored with ``register_buffer`` *inside* forward, which made the module
+        mutate while tracing: TorchDynamo's ``hasattr(module, '_cached_grid')``
+        guard failed right after the first call and forced a full recompile of
+        the decoder (the single biggest part of boot time). Build it before the
+        trace instead — the tensors are tiny and created once per shape.
         """
         batch_size = input.size(0)
         h, w = input.size(2), input.size(3)
+        grid = _identity_grid(h, w, input.device, input.dtype).expand(batch_size, -1, -1, -1)
 
         out = self.conv(input, style)
         out = out + self.bias
-
-        # Cached coordinate grid — only rebuilt when resolution/device/dtype changes.
-        # Uses a (h, w, device_type, device_index, dtype) key so it is safe across
-        # devices and mixed-precision contexts.
-        cache_key = (h, w, input.device.type, input.device.index, input.dtype)
-        cached = getattr(self, "_cached_grid", None)
-        if getattr(self, "_grid_cache_key", None) != cache_key or cached is None:
-            grid_y, grid_x = torch.meshgrid(
-                torch.linspace(-1, 1, h, device=input.device, dtype=input.dtype),
-                torch.linspace(-1, 1, w, device=input.device, dtype=input.dtype),
-                indexing="ij",
-            )
-            # Store as [1, H, W, 2] — registered buffer so it moves across devices and doesn't mutate during export
-            new_grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
-            self.register_buffer("_cached_grid", new_grid, persistent=False)
-            self._grid_cache_key = cache_key
-
-        grid = self._cached_grid.expand(batch_size, -1, -1, -1)
 
         if skip is not None:
             skip = self.upsample(skip)

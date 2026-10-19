@@ -301,6 +301,8 @@ class FlowMatchingTransformer(BaseModel):
         # NOTE: parity is validated by the converter/selector scripts, never
         # automatically here -- the config is the contract.
         self._onnx_backend = None
+        self._onnx_failures = 0
+        self._ONNX_MAX_FAILURES = 3
         self._compiled = None
         try:
             from fast_float.onnx.backends import resolve_mode
@@ -379,10 +381,29 @@ class FlowMatchingTransformer(BaseModel):
         backend = self._onnx_backend
         if backend is not None and all(torch.is_tensor(v) for v in (t, x, wa, wr, we, prev_x, prev_wa)):
             try:
-                return backend.run_step(t, x, wa, wr, we, prev_x, prev_wa)
+                out = backend.run_step(t, x, wa, wr, we, prev_x, prev_wa)
+                self._onnx_failures = 0
+                return out
             except Exception as e:
-                logger.warning(f"FlowMatchingTransformer: ONNX step failed ({e}); disabling backend for this run")
-                self._onnx_backend = None
+                # One transient failure (TRT profile miss, an OOM, a driver
+                # blip) used to disable ONNX for the rest of the process — the
+                # whole request then ran eager and took minutes. Fall back per
+                # call and only give up after repeated failures.
+                self._onnx_failures = getattr(self, "_onnx_failures", 0) + 1
+                if self._onnx_failures == 1:
+                    logger.warning(
+                        f"FlowMatchingTransformer: ONNX step failed ({e}); "
+                        f"falling back to torch for this step "
+                        f"(disabling after {self._ONNX_MAX_FAILURES} consecutive failures)"
+                    )
+                else:
+                    logger.debug(f"FlowMatchingTransformer: ONNX step failed again ({e})")
+                if self._onnx_failures >= self._ONNX_MAX_FAILURES:
+                    logger.warning(
+                        f"FlowMatchingTransformer: ONNX failed {self._onnx_failures}x in a row; "
+                        f"disabling backend for this run"
+                    )
+                    self._onnx_backend = None
         if self._mode == "compile":
             if self._compiled is None:
                 try:
