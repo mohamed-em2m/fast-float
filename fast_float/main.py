@@ -48,6 +48,13 @@ _BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 # Configuration
 PORT = int(os.getenv("PORT", "8000"))
+
+# Watchdog for the background boot warmup. The warmup runs in the thread pool,
+# so a wedged inference (dead CUDA context, driver reset) would otherwise keep
+# warming_up=True forever and every request would wait out its timeout. The
+# thread cannot be killed; we only guarantee that the server stops reporting
+# "warming up" and says what happened.
+WARMUP_TIMEOUT_S = float(os.getenv("WARMUP_TIMEOUT_S", "900"))
 RESULTS_DIR = os.getenv("RESULTS_DIR", "./results")
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "10"))
 OPTIMIZATION_MODE = os.getenv("OPTIMIZATION_MODE", "all")
@@ -67,8 +74,18 @@ async def _run_boot_warmups():
     isolated (sequential inference is unaffected). Clears warming_up always.
     """
     loop = asyncio.get_running_loop()
+    errors: list[str] = []
+
+    async def _run(fn, *args):
+        # Bounded: a wedged inference must not keep warming_up set forever.
+        return await asyncio.wait_for(
+            loop.run_in_executor(app_state.executor, fn, *args),
+            timeout=WARMUP_TIMEOUT_S,
+        )
+
     try:
         logger.info("🔥 Warming up model with minimal inference...")
+        app_state.set_warmup_stage("single-inference")
         warmup_start = time.time()
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as _tmp_wa:
@@ -78,8 +95,7 @@ async def _run_boot_warmups():
             silent_audio = np.zeros(8000, dtype=np.float32)  # 0.5s at 16kHz
             sf.write(warmup_audio, silent_audio, 16000)
 
-            await loop.run_in_executor(
-                app_state.executor,
+            await _run(
                 run_inference_blocking,
                 app_state.agent,
                 warmup_video,
@@ -100,10 +116,12 @@ async def _run_boot_warmups():
                     os.remove(f)
             logger.info(f"✅ Model warmup complete ({time.time() - warmup_start:.2f}s)")
         except Exception as e:
+            errors.append(f"warmup: {e}")
             logger.warning(f"⚠️ Model warmup skipped/failed: {e}")
 
         # Batched-shape warmup (B=2 silent clips) so the first real batched
         # request doesn't pay cuDNN autotuning on unseen batch shapes.
+        app_state.set_warmup_stage("batched-inference")
         try:
             batch_audios, batch_videos = [], []
             for _ in range(2):
@@ -114,8 +132,7 @@ async def _run_boot_warmups():
                 sf.write(wa, np.zeros(32000, dtype=np.float32), 16000)  # 2s silence
                 batch_audios.append(wa)
                 batch_videos.append(wv)
-            await loop.run_in_executor(
-                app_state.executor,
+            await _run(
                 run_inference_batched_blocking,
                 app_state.agent,
                 [
@@ -143,10 +160,16 @@ async def _run_boot_warmups():
                     os.remove(f)
             logger.info("✅ Batched warmup complete (B=2)")
         except Exception as e:
+            errors.append(f"batched warmup: {e}")
             logger.warning(f"⚠️ Batched warmup skipped: {e}")
+    except asyncio.CancelledError:
+        app_state.finish_warmup("cancelled")
+        raise
     finally:
-        app_state.warming_up = False
-        logger.info("🏁 Boot warmup done, /generate open")
+        # Always releases requests waiting in /generate (see
+        # AppState.wait_for_warmup) — including after a timeout or failure.
+        app_state.finish_warmup("; ".join(errors) or None)
+        logger.info(f"🏁 Boot warmup done ({app_state.warmup_elapsed():.1f}s), /generate open")
 
 
 @asynccontextmanager
@@ -201,7 +224,7 @@ async def lifespan(app: FastAPI):
     if os.getenv("SKIP_WARMUP", "0") == "1":
         logger.info("⏭️ Boot warmup skipped (SKIP_WARMUP=1)")
     else:
-        app_state.warming_up = True
+        app_state.begin_warmup()
         _task = asyncio.create_task(_run_boot_warmups())
         _BACKGROUND_TASKS.add(_task)
         _task.add_done_callback(_BACKGROUND_TASKS.discard)

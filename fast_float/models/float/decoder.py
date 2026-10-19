@@ -175,8 +175,28 @@ class DecoderMixin:
                 lat = torch.randn(b, dim, device=dev, dtype=dtype)
                 return self._decode_u8(ae, feats, lat, allow_split=False)
 
+            # The tuning sweep is GPU seconds spent before the first request, and
+            # its result only depends on the device / library versions / frame
+            # shape / tuner settings. Key on all of those so a driver, torch or
+            # resolution change re-measures instead of reusing a stale profile.
+            cache_key = "|".join(
+                [
+                    "v1",
+                    str(torch.__version__),
+                    str(torch.version.cuda),
+                    str(torch.cuda.get_device_name(dev)),
+                    ".".join(str(x) for x in torch.cuda.get_device_capability(dev)),
+                    f"{int(getattr(self.opt, 'input_size', 0))}x{dim}",
+                    str(dtype),
+                    f"mb{max_batch}",
+                    f"pl{tuner.plateau}",
+                    f"sf{tuner.safety}",
+                    f"rg{tuner.reserve_gib}",
+                    f"ob{getattr(self.opt, 'decode_batch_size', 0)}",
+                ]
+            )
             with timed("decode_tune", gpu=True, device=str(dev)):
-                self._decode_profiles[dev.index] = tuner.tune(fn)
+                self._decode_profiles[dev.index] = tuner.tune(fn, cache_key=cache_key)
             self._decode_tuners[dev.index] = tuner
             return self._decode_tuners[dev.index], self._decode_profiles[dev.index]
 

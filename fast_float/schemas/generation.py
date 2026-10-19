@@ -107,6 +107,10 @@ class HealthResponse(BaseModel):
     status: str
     model_loaded: bool
     warming_up: bool = False
+    # "starting" / "single-inference" / "batched-inference" / "done" / "failed",
+    # so a UI can show what the server is doing instead of a bare bool.
+    warmup_stage: str | None = None
+    warmup_elapsed_s: float | None = None
     encoder: str
     active_streams: int
     performance_stats: dict[str, Any]

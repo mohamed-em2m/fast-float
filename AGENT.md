@@ -285,6 +285,24 @@ The backend is launched with `uv run --frozen --no-sync` (see §6): a plain
 `uv run` re-syncs the venv back to the lock, which pins the *portable* CPU
 `onnxruntime`, and the server then boots with no CUDA/TensorRT EP.
 
+**Startup and boot warmup.** `/health` answers after ~25 s (weights + ONNX/TRT
+sessions); the background warmup then costs ~60 s on a warm engine cache
+(~2–5 min on a cold TensorRT one) and is reported as
+`warming_up` / `warmup_stage` / `warmup_elapsed_s`. Two behaviours matter:
+
+- `/generate` **waits** for warmup (up to `WARMUP_WAIT_TIMEOUT_S`, default 600)
+  instead of returning 503 immediately, so the first request after a restart is
+  served rather than rejected. `WARMUP_TIMEOUT_S` (default 900) bounds each
+  warmup phase so a wedged inference cannot leave `warming_up` set forever.
+- The decode auto-tuner's sweep (~30 s of GPU benchmarking) is cached in
+  `~/.cache/fast_float/decode_tune.json` (override with
+  `FLOAT_DECODE_TUNE_CACHE=/path`, disable with `=0`), keyed by GPU, CUDA/torch
+  version, frame shape and tuner settings. It is re-measured when the key
+  changes or when VRAM is now too tight; a run where nothing fits is never
+  cached. Without the cache a transient low-VRAM moment could pin the server to
+  batch 1 (0.5 fps instead of ~180). `SKIP_WARMUP=1` skips the warmup entirely
+  (the first real request pays the compile cost).
+
 ### 1. Launch FastAPI Server
 
 ```bash
@@ -326,10 +344,10 @@ uv run python fast_float/interfaces/float_live_app.py
 | Method | Endpoint | Description |
 | --- | --- | --- |
 | `GET` | `/` | Service health status and links |
-| `POST` | `/generate` | Generate talking portrait video from audio + image |
+| `POST` | `/generate` | Generate talking portrait video from audio + image (waits for boot warmup, up to `WARMUP_WAIT_TIMEOUT_S`) |
 | `GET` | `/download/{request_id}` | Download generated MP4 video |
 | `GET` | `/stream/{request_id}` | Stream generated MP4 with HTTP `Range` header support |
-| `GET` | `/health` | System health, model status, and FPS statistics |
+| `GET` | `/health` | System health, model status, FPS stats, and warmup progress (`warming_up`, `warmup_stage`, `warmup_elapsed_s`) |
 | `GET` | `/gpu` | Real-time GPU VRAM allocated and reserved in GB |
 | `POST` | `/gpu/clear` | Clear CUDA cache and run garbage collection |
 | `POST` | `/offer` | WebRTC SDP negotiation for real-time video playback |

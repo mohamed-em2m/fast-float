@@ -23,6 +23,8 @@ async def health():
         status="healthy",
         model_loaded=app_state.agent is not None,
         warming_up=app_state.warming_up,
+        warmup_stage=app_state.warmup_stage or None,
+        warmup_elapsed_s=round(app_state.warmup_elapsed(), 2) if app_state.warmup_started_at else None,
         encoder=(app_state.video_optimizer.encoder_type if app_state.video_optimizer else "unknown"),
         active_streams=len(app_state.active_streams),
         performance_stats={

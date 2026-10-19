@@ -24,6 +24,13 @@ router = APIRouter(tags=["generation"])
 # exhaust the server's connection pool, so we fail fast instead of queueing.
 ACQUIRE_TIMEOUT_S = 5.0
 
+# How long a request waits for the *boot warmup* to finish. Unlike the slot
+# queue above this is intentional: a client that fires right after a restart
+# used to get an immediate 503 "Model is warming up, try again shortly" for the
+# whole warmup window (tens of seconds, minutes on a cold TensorRT cache), so a
+# single request could never succeed. Waiting rides it out instead.
+WARMUP_WAIT_TIMEOUT_S = float(os.getenv("WARMUP_WAIT_TIMEOUT_S", "600"))
+
 
 def _safe_request_id(client_id: str | None) -> str:
     """Build a pollable request id, sanitizing any client-supplied value."""
@@ -42,7 +49,19 @@ async def generate(request: GenerationRequest):
         raise HTTPException(status_code=503, detail="FLOAT model is not yet loaded")
 
     if app_state.warming_up:
-        raise HTTPException(status_code=503, detail="Model is warming up, try again shortly")
+        elapsed_at_start = app_state.warmup_elapsed()
+        logger.info(f"[warmup] request held until boot warmup finishes (stage={app_state.warmup_stage})")
+        if not await app_state.wait_for_warmup(WARMUP_WAIT_TIMEOUT_S):
+            elapsed = app_state.warmup_elapsed()
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Model warmup is still running after {elapsed:.0f}s "
+                    f"(stage: {app_state.warmup_stage}, waited {elapsed - elapsed_at_start:.0f}s); "
+                    "retry shortly"
+                ),
+                headers={"Retry-After": "10"},
+            )
 
     if app_state.request_semaphore is None:
         app_state.initialize_runtime()
