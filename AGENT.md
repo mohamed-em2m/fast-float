@@ -482,6 +482,25 @@ When editing or extending the codebase, follow these design patterns:
   and forced a full decoder recompile (the bulk of boot time). The grid is now
   built functionally (`_identity_grid`), which is cheap and trace-stable; boot
   warmup dropped 58 s → 24 s with no `recompile_limit` warnings.
+- **ORT IOBinding must hand-shake with the torch stream.** `run_ort_iobinding`
+  binds raw `data_ptr()`s, and ORT runs on its own CUDA stream while PyTorch's
+  streams are non-blocking. Without an explicit sync ORT reads tensors torch has
+  only *enqueued* (the ODE's Euler update is produced immediately before every
+  step) and torch reads outputs before ORT writes them. Symptom: identical
+  requests produced visibly different videos, sometimes with NaN, and the
+  effect was invisible when calling a backend in a tight loop with a fixed
+  input. Both sides now `current_stream(device).synchronize()`. Verified: the
+  ODE became bit-identical across runs, and 3 API requests produced identical
+  frames.
+- **`seed` is authoritative for generation.** The request seed used to be
+  ignored unless `--fix_noise_seed` was set, so every run drew fresh noise.
+  `sample()` seeds the initial latent from the request seed, and chunked
+  requests pass `seed + chunk_index` per chunk (`_chunk_seed`) with one
+  generator per batch row, so a chunk's noise does not depend on how many
+  chunks share the batch. Same request → byte-identical frames; changing
+  `chunk_batch_size` still shifts results by ~1/255 because TensorRT builds
+  different engines/profiles per batch size and padded audio changes the tail
+  conditioning — that is numerical, not random.
 - **TensorRT must major-match ORT.** `onnxruntime-gpu` 1.23 is built against
   **TensorRT 10.9** and dlopens `libnvinfer.so.10` / `libnvonnxparser.so.10`. A
   TRT 11 install (`tensorrt_cu13*` → `libnvinfer.so.11`) can never satisfy that

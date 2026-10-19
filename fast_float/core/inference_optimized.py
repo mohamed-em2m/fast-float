@@ -403,6 +403,7 @@ class OptimizedInferenceAgent:
         nfe: int = 10,
         no_crop: bool = False,
         seed: int = 25,
+        seeds: list[int] | None = None,
         verbose: bool = True,
         video_encoder: str | None = None,
     ) -> list:
@@ -495,6 +496,7 @@ class OptimizedInferenceAgent:
                     emo=emo_arg,
                     nfe=nfe,
                     seed=seed,
+                    seeds=seeds,
                     s_r=s_r,
                 )
             )  # each piece is [N, T_slice, dim_w] (s_r already added)

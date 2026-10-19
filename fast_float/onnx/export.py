@@ -582,5 +582,14 @@ def run_ort_iobinding(session, feed, out_shapes, device=None):
         o = torch.empty(shape, device=dev, dtype=torch.float32)
         binding.bind_output(name, "cuda", did, np.float32, shape, o.data_ptr())
         outs.append(o)
+    # ORT runs on its own CUDA stream while the inputs were produced on torch's.
+    # PyTorch streams are non-blocking, so without an explicit handshake ORT can
+    # read tensors that torch has only *enqueued* (e.g. the Euler update inside
+    # the ODE loop) and torch can read the output before ORT has written it.
+    # That race made generation non-reproducible: identical inputs produced
+    # different latents, occasionally NaN. A stream sync is ~10 us against a
+    # multi-ms step.
+    torch.cuda.current_stream(did).synchronize()
     session.run_with_iobinding(binding)
+    torch.cuda.current_stream(did).synchronize()
     return outs

@@ -71,6 +71,11 @@ def run_inference_batched_blocking(
     request_data: dict[str, Any],
 ) -> list:
     """Synchronous batched-chunk inference runner invoked within ThreadPoolExecutor."""
+    # One seed per chunk (assigned by the caller from its position in the
+    # request) so a chunk's noise does not depend on which batch it lands in.
+    seeds = [it.get("seed") for it in items]
+    if any(s is None for s in seeds):
+        seeds = None
     return agent.run_inference_batched(
         items,
         image_path,
@@ -81,8 +86,22 @@ def run_inference_batched_blocking(
         nfe=request_data.get("nfe", 10),
         no_crop=request_data.get("no_crop", False),
         seed=request_data.get("seed", 25),
+        seeds=seeds,
         verbose=True,
     )
+
+
+def _chunk_seed(request_data: dict[str, Any], chunk_index: int) -> int:
+    """Per-chunk seed: the request seed shifted by the chunk's audio position.
+
+    Keeps a chunk's noise stable no matter how chunks are grouped into batches
+    (and across runs), which is what makes a given request reproducible.
+    """
+    try:
+        base = int(request_data.get("seed", 25))
+    except (TypeError, ValueError):
+        base = 25
+    return base + int(chunk_index)
 
 
 def _prepare_image(request_data: dict[str, Any], temp_files: list) -> str:
@@ -369,6 +388,9 @@ async def _generate_chunked(
         if len(g) == 1:
             ch = g[0]
             chunk_out = os.path.join(res_dir, f"{stamp}_{request_id}_chunk{idx:03d}.mp4")
+            # Same request seed, shifted by the chunk's position in the audio:
+            # reproducible, and independent of chunk_batch_size.
+            chunk_request = {**request_data, "seed": _chunk_seed(request_data, idx)}
             await loop.run_in_executor(
                 state.executor,
                 run_inference_blocking,
@@ -376,7 +398,7 @@ async def _generate_chunked(
                 chunk_out,
                 image_path,
                 ch["path"],
-                request_data,
+                chunk_request,
             )
             chunk_videos.append(chunk_out)
             temp_files.append(chunk_out)
@@ -399,6 +421,7 @@ async def _generate_chunked(
                         "padded_path": padded,
                         "duration": ch["duration"],
                         "out_path": chunk_out,
+                        "seed": _chunk_seed(request_data, idx),
                     }
                 )
                 idx += 1

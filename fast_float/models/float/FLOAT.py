@@ -82,6 +82,7 @@ class FLOAT(BaseModel, DecoderMixin, SamplerMixin, StreamingVideoSaver):
         emo=None,
         nfe=10,
         seed=None,
+        seeds=None,
     ) -> dict:
         try:
             s, a = data["s"], data["a"]
@@ -98,6 +99,7 @@ class FLOAT(BaseModel, DecoderMixin, SamplerMixin, StreamingVideoSaver):
                     emo=emo,
                     nfe=nfe,
                     seed=seed,
+                    seeds=seeds,
                 )
             )
 

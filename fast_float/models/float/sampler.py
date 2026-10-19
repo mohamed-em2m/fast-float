@@ -20,6 +20,31 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _noise_generator(seed: int, device) -> torch.Generator:
+    """Deterministic torch generator for the initial flow-matching noise."""
+    g = torch.Generator(device=device)
+    g.manual_seed(int(seed) & 0x7FFF_FFFF_FFFF_FFFF)
+    return g
+
+
+def _initial_noise(noise_gens, batch: int, frames: int, dim: int, device) -> torch.Tensor:
+    """Draw the ODE's initial latent for a batch.
+
+    One generator per row means row ``i`` draws the same noise whether it is
+    sampled alone or inside a batch of N — that is what makes chunked,
+    batched and sequential generation agree. Without generators this falls
+    back to the global RNG (legacy behaviour, non-reproducible).
+    """
+    if noise_gens is None:
+        return torch.randn(batch, frames, dim, device=device)
+    if len(noise_gens) == 1:
+        return torch.randn(batch, frames, dim, device=device, generator=noise_gens[0])
+    return torch.cat(
+        [torch.randn(1, frames, dim, device=device, generator=noise_gens[i]) for i in range(batch)],
+        dim=0,
+    )
+
+
 class SamplerMixin:
     """Mixin providing ODE sampling (sample) and streaming inference (inference_stream) for FLOAT."""
 
@@ -33,6 +58,7 @@ class SamplerMixin:
         emo: str | None = None,
         nfe: int = 10,
         seed: int | None = None,
+        seeds: list[int] | None = None,
         s_r=None,
     ) -> torch.Tensor:
         rank = getattr(self.opt, "rank", 0)
@@ -157,26 +183,24 @@ class SamplerMixin:
             _null_we = torch.zeros_like(we_ready)
             _emotion_cat = torch.cat([_null_we, we_ready, _null_we], dim=0)
 
+        # Initial noise. ``seed`` is authoritative: the API exposes it as a
+        # reproducibility knob, but the code used to ignore it unless the
+        # experimental ``fix_noise_seed`` flag was on, so the same request
+        # produced a different video every time. ``seeds`` supplies one seed
+        # per batch row (chunk identity), which also makes a chunk's noise
+        # independent of how many chunks share the batch.
+        noise_gens = None
+        if seeds is not None:
+            if len(seeds) != B:
+                raise ValueError(f"seeds has {len(seeds)} entries but the batch is {B}")
+            noise_gens = [_noise_generator(int(s), device) for s in seeds]
+        elif seed is not None or getattr(self.opt, "fix_noise_seed", False):
+            s = getattr(self.opt, "seed", 25) if seed is None else int(seed)
+            noise_gens = [_noise_generator(s, device)]
+
         # sampling chunk by chunk
         for t in range(0, math.ceil(T / self.num_frames_for_clip)):
-            if getattr(self.opt, "fix_noise_seed", False):
-                seed = getattr(self.opt, "seed", 25) if seed is None else seed
-                g = torch.Generator(device=device)
-                g.manual_seed(seed)
-                x0 = torch.randn(
-                    B,
-                    self.num_frames_for_clip,
-                    self.opt.dim_w,
-                    device=device,
-                    generator=g,
-                )
-            else:
-                x0 = torch.randn(
-                    B,
-                    self.num_frames_for_clip,
-                    self.opt.dim_w,
-                    device=device,
-                )
+            x0 = _initial_noise(noise_gens, B, self.num_frames_for_clip, self.opt.dim_w, device)
 
             if t == 0:  # should define the previous
                 prev_x_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_w, device=device)
@@ -281,6 +305,7 @@ class SamplerMixin:
         emo=None,
         nfe=10,
         seed=None,
+        seeds=None,
     ):
         """Generator that streams sampling latents sequentially and decodes them concurrently
 
@@ -410,6 +435,7 @@ class SamplerMixin:
                     emo=emo,
                     nfe=nfe,
                     seed=seed,
+                    seeds=seeds,
                     s_r=s_r,
                 ):
                     if stop_event.is_set():
