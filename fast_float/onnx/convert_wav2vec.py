@@ -33,7 +33,11 @@ REPO_ROOT = CURRENT_DIR.parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from fast_float.models.wav2vec2 import Wav2VecModel
+from fast_float.models.wav2vec2 import (
+    Wav2VecModel,
+    load_pretrained_with_weight_norm,
+    restore_legacy_weight_norm,
+)
 from fast_float.onnx.export import (
     FP16_MAX_MEAN,
     FP16_MIN_COSINE,
@@ -91,9 +95,13 @@ def stack_and_project(out, projection: torch.nn.Module) -> torch.Tensor:
 def load_core(w2v_dir: str) -> Wav2VecModel:
     """from_pretrained first (stock-ish subclass usually loads fine);
     manual config + state-dict load on the transformers>=4.4x finalizer
-    incompatibility (same fallback as the emotion converter)."""
+    incompatibility (same fallback as the emotion converter).
+
+    Both branches run ``restore_legacy_weight_norm``: on torch>=2.1 the loader
+    silently drops the checkpoint's ``pos_conv_embed.conv.weight_g/weight_v``
+    and leaves the parametrized weight at its random init."""
     try:
-        return Wav2VecModel.from_pretrained(w2v_dir, local_files_only=True)
+        return load_pretrained_with_weight_norm(Wav2VecModel, w2v_dir, local_files_only=True)
     except AttributeError as e:
         print(f"[weights] from_pretrained incompatible ({e}); manual load")
     from transformers import Wav2Vec2Config
@@ -113,7 +121,11 @@ def load_core(w2v_dir: str) -> Wav2VecModel:
     else:
         raise FileNotFoundError(f"no weight file in {w2v_dir}")
     missing, unexpected = core.load_state_dict(sd, strict=False)
-    print(f"[weights] manual load: {len(sd)} tensors (missing={len(missing)}, unexpected={len(unexpected)})")
+    restored = restore_legacy_weight_norm(core, sd)
+    print(
+        f"[weights] manual load: {len(sd)} tensors (missing={len(missing)}, "
+        f"unexpected={len(unexpected)}, weight_norm restored={restored})"
+    )
     return core
 
 

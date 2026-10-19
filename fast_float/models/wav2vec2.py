@@ -1,3 +1,5 @@
+import logging
+import os
 import sys
 
 import torch
@@ -11,6 +13,85 @@ except Exception:
 
 from transformers import Wav2Vec2Model
 from transformers.modeling_outputs import BaseModelOutput
+
+logger = logging.getLogger(__name__)
+
+# transformers builds ``Wav2Vec2PositionalConvEmbedding.conv`` with
+# ``nn.utils.parametrizations.weight_norm`` whenever torch exposes it
+# (torch>=2.1) and with the legacy ``nn.utils.weight_norm`` otherwise. Mirror
+# that exact check so the shim below agrees with whichever module got built.
+PARAMETRIZED_WEIGHT_NORM = hasattr(getattr(torch.nn.utils, "parametrizations", None), "weight_norm")
+
+
+def read_checkpoint_state_dict(model_dir) -> dict:
+    """Best-effort read of a local checkpoint dir's torch weights.
+
+    Returns ``{}`` when the directory has no torch weight file (e.g. a Hub id
+    that ``from_pretrained`` resolves through the HF cache), so callers can use
+    it unconditionally.
+    """
+    for name in ("model.safetensors", "pytorch_model.bin"):
+        path = os.path.join(str(model_dir), name)
+        if not os.path.exists(path):
+            continue
+        if path.endswith(".safetensors"):
+            from safetensors.torch import load_file
+
+            return load_file(path, device="cpu")
+        return torch.load(path, map_location="cpu", weights_only=True)
+    return {}
+
+
+def restore_legacy_weight_norm(model, state_dict) -> int:
+    """Re-attach legacy ``weight_g``/``weight_v`` tensors to parametrized weights.
+
+    Checkpoints saved with the legacy ``nn.utils.weight_norm`` store the
+    positional conv as ``weight_g`` (magnitude) / ``weight_v`` (direction).
+    When transformers instead builds the module with the parametrization API
+    (torch>=2.1) those two keys match nothing, so the loader reports them as
+    unused and leaves ``parametrizations.weight.original0/1`` at their random
+    init — the audio and emotion encoders then run on a random positional conv
+    (no lip sync) while every other weight still loads fine.
+
+    The magnitude is identified by element count (it only spans the output
+    channels), independent of how torch ordered ``original0``/``original1``.
+    No-op on torch<2.1 and when the checkpoint holds no such pair.
+    """
+    if not PARAMETRIZED_WEIGHT_NORM or not state_dict:
+        return 0
+    restored = 0
+    for name, module in model.named_modules():
+        parametrizations = getattr(module, "parametrizations", None)
+        if parametrizations is None or "weight" not in parametrizations:
+            continue
+        g_key = next((key for key in state_dict if key.endswith(f"{name}.weight_g")), None)
+        if g_key is None:
+            continue
+        v_key = f"{g_key[: -len('weight_g')]}weight_v"
+        if v_key not in state_dict:
+            continue
+        weight = parametrizations.weight
+        first, second = weight.original0, weight.original1
+        if first.numel() > second.numel():
+            first, second = second, first
+        magnitude, direction = state_dict[g_key], state_dict[v_key]
+        if first.numel() != magnitude.numel() or second.numel() != direction.numel():
+            logger.warning("weight_norm shim: element count mismatch at %s; left as-is", name)
+            continue
+        with torch.no_grad():
+            first.copy_(magnitude.reshape(first.shape))
+            second.copy_(direction.reshape(second.shape))
+        restored += 1
+    if restored:
+        logger.info("weight_norm shim: restored %d legacy tensor(s)", restored)
+    return restored
+
+
+def load_pretrained_with_weight_norm(model_cls, model_dir, **kwargs):
+    """``from_pretrained`` that also restores legacy ``weight_norm`` tensors."""
+    model = model_cls.from_pretrained(model_dir, **kwargs)
+    restore_legacy_weight_norm(model, read_checkpoint_state_dict(model_dir))
+    return model
 
 
 class Wav2VecModel(Wav2Vec2Model):

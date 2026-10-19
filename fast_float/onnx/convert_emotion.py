@@ -30,6 +30,10 @@ if str(REPO_ROOT) not in sys.path:
 
 import contextlib
 
+from fast_float.models.wav2vec2 import (
+    load_pretrained_with_weight_norm,
+    restore_legacy_weight_norm,
+)
 from fast_float.models.wav2vec2_ser import (
     Wav2Vec2ForSpeechClassification,
 )
@@ -91,7 +95,11 @@ def load_core_manual(emo_dir: str) -> Wav2Vec2ForSpeechClassification:
     else:
         raise FileNotFoundError(f"no weight file in {emo_dir}")
     missing, unexpected = core.load_state_dict(sd, strict=False)
-    print(f"[weights] manual load: {len(sd)} tensors (missing={len(missing)}, unexpected={len(unexpected)})")
+    restored = restore_legacy_weight_norm(core, sd)
+    print(
+        f"[weights] manual load: {len(sd)} tensors (missing={len(missing)}, "
+        f"unexpected={len(unexpected)}, weight_norm restored={restored})"
+    )
     with contextlib.suppress(Exception):
         core.tie_weights()
     return core
@@ -99,7 +107,7 @@ def load_core_manual(emo_dir: str) -> Wav2Vec2ForSpeechClassification:
 
 def build_core(emo_dir: str) -> Wav2Vec2ForSpeechClassification:
     try:
-        return Wav2Vec2ForSpeechClassification.from_pretrained(emo_dir, local_files_only=True)
+        return load_pretrained_with_weight_norm(Wav2Vec2ForSpeechClassification, emo_dir, local_files_only=True)
     except Exception as e:
         # New transformers (>=4.4x) can raise TypeError, RuntimeError, or
         # AttributeError depending on the specific finalization step that

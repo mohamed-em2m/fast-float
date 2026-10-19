@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from fast_float.models import BaseModel
-from fast_float.models.wav2vec2 import Wav2VecModel
+from fast_float.models.wav2vec2 import Wav2VecModel, load_pretrained_with_weight_norm
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +29,15 @@ class AudioEncoder(BaseModel):
 
         self.num_frames_for_clip = int(opt.wav2vec_sec * self.opt.fps)
         self.num_prev_frames = int(opt.num_prev_frames)
+        # local_files_only + the weight_norm shim: on torch>=2.1 the stock
+        # loader drops the checkpoint's pos_conv_embed weight_g/weight_v and
+        # leaves the positional conv at its random init.
         if os.path.exists(opt.wav2vec_model_path):
-            self.wav2vec2 = Wav2VecModel.from_pretrained(opt.wav2vec_model_path, local_files_only=True)
+            self.wav2vec2 = load_pretrained_with_weight_norm(
+                Wav2VecModel, opt.wav2vec_model_path, local_files_only=True
+            )
         else:
-            self.wav2vec2 = Wav2VecModel.from_pretrained(opt.wav2vec_model_path)
+            self.wav2vec2 = load_pretrained_with_weight_norm(Wav2VecModel, opt.wav2vec_model_path)
 
         self.wav2vec2.feature_extractor._freeze_parameters()
 
