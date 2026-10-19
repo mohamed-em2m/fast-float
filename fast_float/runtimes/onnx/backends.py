@@ -28,6 +28,20 @@ def _gpu_active(session) -> bool:
     return bool(provs) and provs[0] != "CPUExecutionProvider"
 
 
+def _trt_active(session) -> bool:
+    """True when the session is served by the TensorRT EP.
+
+    Only TRT bakes rigid optimization-profile bounds (min/max on the dynamic
+    dims); the CUDA and CPU EPs accept any length. Callers that clamp an input
+    to a fixed window must do so *only* under TRT, or they silently change the
+    result relative to the eager path on the other EPs.
+    """
+    try:
+        return "TensorrtExecutionProvider" in session.get_providers()
+    except Exception:
+        return False
+
+
 def _vec_out_len(x: torch.Tensor, prev_x) -> int:
     """Sequence length of one FMT step's output.
 
@@ -92,15 +106,26 @@ class EmotionOnnxBackend(RuntimeSession):
 
     @torch.no_grad()
     def predict_probs(self, a: torch.Tensor) -> torch.Tensor:
-        """Waveform ``[L]`` or ``[B, L]`` -> probs ``[B, 7]`` (float32)."""
+        """Waveform ``[L]`` or ``[B, L]`` -> probs ``[B, 7]`` (float32).
+
+        The waveform is passed through unchanged unless TensorRT is serving the
+        session: the emotion graph is exported with symbolic batch/length, so
+        the CUDA/CPU EPs accept the whole clip exactly like the eager path.
+        Clamping to a fixed window under TRT is unavoidable (its optimization
+        profile bounds length to ``[16000, 160000]``), but doing it on the other
+        EPs made emotion depend on *which backend was active* -- the same clip
+        read a different (and for long clips, a stale) emotion than eager.
+        """
         device = a.device
         if a.ndim == 1:
             a = a.unsqueeze(0)
-        # Protect against shapes exceeding or falling below TensorRT profile bounds
-        if a.shape[1] < 16000:
-            a = torch.nn.functional.pad(a, (0, 16000 - a.shape[1]), mode="replicate")
-        elif a.shape[1] > 160000:
-            a = a[:, :160000]
+        # TensorRT only: keep the length inside the built profile. Anywhere else
+        # the full waveform matches the eager SER read.
+        if _trt_active(self.session):
+            if a.shape[1] < 16000:
+                a = torch.nn.functional.pad(a, (0, 16000 - a.shape[1]), mode="replicate")
+            elif a.shape[1] > 160000:
+                a = a[:, :160000]
         if device.type == "cuda" and not self._io_failed and self.output_dim is not None and _gpu_active(self.session):
             try:
                 (out,) = run_ort_iobinding(
@@ -324,7 +349,10 @@ class FMTStepBackend(RuntimeSession):
                 sl = slice(i, j)
                 parts.append(
                     self.run_step(
-                        t,
+                        # ``t`` is exported static ([1]) and broadcast, but if a
+                        # caller ever hands us a batch-sized ``t`` it must follow
+                        # the split like every other input or the parts disagree.
+                        t[sl] if (torch.is_tensor(t) and t.ndim > 0 and t.shape[0] == batch) else t,
                         x[sl],
                         wa[sl] if wa.shape[0] == batch else wa,
                         wr[sl] if wr.shape[0] == batch else wr,

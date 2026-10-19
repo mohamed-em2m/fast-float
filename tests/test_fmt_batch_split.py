@@ -58,7 +58,7 @@ def test_split_preserves_order():
     x = torch.arange(10).view(10, 1, 1).expand(10, 50, 512).float()
     out = be.run_step(t, x, wa, wr, we, prev_x, prev_wa)
     assert be.calls == [4, 4, 2]
-    # First column of each row carries the sample index, so a mis-ordered
+    # First column of each row carries the sample index, so a misordered
     # concat would be visible immediately.
     assert torch.equal(out[:, 0, 0], torch.arange(10).float())
 
@@ -74,6 +74,23 @@ def test_shared_scalar_t_is_not_sliced():
     be._run_once = _run_once
     be.run_step(*_inputs(5))
     assert seen == [(1,), (1,), (1,)]
+
+
+def test_batch_sized_t_is_sliced_with_its_chunk():
+    """A batch-sized ``t`` must follow the split, or each part sees the wrong time."""
+    be = _backend(2)
+    seen = []
+
+    def _run_once(t, x, wa, wr, we, prev_x, prev_wa):
+        seen.append(t.detach().clone())
+        return x
+
+    be._run_once = _run_once
+    t, x, wa, wr, we, prev_x, prev_wa = _inputs(5)
+    t = torch.arange(5).float()
+    be.run_step(t, x, wa, wr, we, prev_x, prev_wa)
+    assert [tuple(s.shape) for s in seen] == [(2,), (2,), (1,)]
+    assert torch.equal(torch.cat(seen), torch.arange(5).float())
 
 
 def test_no_split_without_tensorrt():
