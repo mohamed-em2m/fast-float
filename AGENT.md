@@ -492,6 +492,16 @@ When editing or extending the codebase, follow these design patterns:
   input. Both sides now `current_stream(device).synchronize()`. Verified: the
   ODE became bit-identical across runs, and 3 API requests produced identical
   frames.
+- **Every 2 s chunk is re-synthesised from fresh noise, so the seam is a real
+  jump.** `sample()` runs one ODE per `wav2vec_sec*fps = 50` frames; chunk
+  `k>0` starts from new noise and only sees `prev_x`/`prev_wa` as conditioning,
+  so its first frames can land in a different pose. Measured on a 15 s clip:
+  latent seam delta 3-5x a normal step (4.8-6.6 vs 1.3 median) and a visible
+  jolt every 50 frames (video frame-delta `8.4` vs `1.3` typical). `sample`
+  now blends the first `FLOAT_SEAM_BLEND` frames (default 3, 0 disables) toward
+  a linear extrapolation of the previous chunk's last two frames: seams drop to
+  1.5-3.3, in line with normal motion. This is a cosmetic continuation of the
+  motion latent, not a change to the model; generation stays bit-reproducible.
 - **`seed` is authoritative for generation.** The request seed used to be
   ignored unless `--fix_noise_seed` was set, so every run drew fresh noise.
   `sample()` seeds the initial latent from the request seed, and chunked

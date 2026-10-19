@@ -3,6 +3,7 @@
 import contextlib
 import logging
 import math
+import os
 import queue
 import threading
 import traceback
@@ -18,6 +19,11 @@ except ImportError:
     odeint = None
 
 logger = logging.getLogger(__name__)
+
+
+# Frames at the start of each 2 s chunk blended into a continuation of the
+# previous chunk (see the seam handling in ``sample``). 0 disables it.
+SEAM_BLEND_FRAMES = int(os.environ.get("FLOAT_SEAM_BLEND", "3"))
 
 
 def _noise_generator(seed: int, device) -> torch.Generator:
@@ -198,6 +204,8 @@ class SamplerMixin:
             s = getattr(self.opt, "seed", 25) if seed is None else int(seed)
             noise_gens = [_noise_generator(s, device)]
 
+        prev_seam_tail = None  # [B, 2, dim] last raw frames of the previous chunk
+
         # sampling chunk by chunk
         for t in range(0, math.ceil(T / self.num_frames_for_clip)):
             x0 = _initial_noise(noise_gens, B, self.num_frames_for_clip, self.opt.dim_w, device)
@@ -282,6 +290,25 @@ class SamplerMixin:
             sample_t_trim = sample_t[:, :frames_remaining] if frames_remaining < sample_t.shape[1] else sample_t
             samples_len = sample_t_trim.shape[1]
             decoded_length += samples_len
+
+            # Hide the re-synthesis seam at the 2 s chunk boundary. Every chunk
+            # starts its ODE from fresh noise, so its first frames can jump in
+            # pose even though the model sees prev_x/prev_wa: measured seam
+            # deltas were 3-5x a normal frame step (4.8-6.6 vs 1.3 median) and
+            # showed up as a visible jolt every 50 frames. Blend the first
+            # frames toward a linear extrapolation of the previous chunk's last
+            # two frames, which brings the seam back to a normal step.
+            if prev_seam_tail is not None and SEAM_BLEND_FRAMES > 0 and samples_len > 1:
+                sample_t_trim = sample_t_trim.clone()
+                k = min(SEAM_BLEND_FRAMES, samples_len)
+                vel = prev_seam_tail[:, -1] - prev_seam_tail[:, -2]  # [B, dim]
+                for j in range(k):
+                    w = 1.0 - (j + 1) / (k + 1)
+                    if w <= 0.0:
+                        continue
+                    pred = prev_seam_tail[:, -1] + (j + 1) * vel
+                    sample_t_trim[:, j] = (1.0 - w) * sample_t_trim[:, j] + w * pred
+            prev_seam_tail = sample_t_trim[:, -2:].detach().clone()
 
             # Add reference and yield chunk
             s_r_b = s_r.unsqueeze(1) if (s_r is not None and s_r.ndim == 2) else s_r
