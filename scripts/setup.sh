@@ -83,13 +83,26 @@ fi
 
 echo "=== Syncing project environment (uv sync) ==="
 echo "--- Python comes from .python-version, deps from pyproject.toml + uv.lock ---"
-uv venv .venv --python 3.10 --clear
+# Reuse an existing venv: `--clear` used to wipe it on every run, forcing a fresh
+# ~7 GiB torch download plus a full re-extract of the layered ONNX/TensorRT
+# stack. On a box that is even moderately full the rebuild runs out of space
+# mid-way and leaves the env without TensorRT (or worse, without torch). Pass
+# --clear only when you really want a from-scratch environment.
+if [ ! -x .venv/bin/python ]; then
+    uv venv .venv --python 3.10
+fi
 # shellcheck source=/dev/null
 source .venv/bin/activate
 # uv.lock is the source of truth (torch cu126 from the pytorch index, the
 # app's onnx<1.17, ...). The ONNX *export* stack needs a different, conflicting
 # window and is layered on top below.
-uv sync
+#
+# --inexact keeps packages the lock does not know about. onnxruntime-gpu and
+# tensorrt-cu12 are layered on below; a plain `uv sync` prunes them, and the
+# installer then has to re-extract ~4.4 GiB of TensorRT libs (the Linux wheel
+# ships both the Linux and a Windows builder resource) -- the exact ENOSPC
+# failure this script has to survive on a 50 GiB disk.
+uv sync --inexact
 
 echo "=== Installing optional video codecs (torchcodec) ==="
 # torchcodec is optional; install if compatible binary wheel exists for torch/cuda
@@ -193,6 +206,24 @@ try:
         print("  ⚠️ TensorRT EP listed but ORT's provider lib cannot load libnvinfer.")
         print("     Likely a TensorRT major mismatch: ORT 1.23 needs TensorRT 10.9")
         print("     (libnvinfer.so.10). Install: uv pip install 'tensorrt-cu12==10.9.0.34'")
+    # TensorRT dlopens libnvinfer_builder_resource.so.<ver> LAZILY, only when a
+    # real network is built. The Identity-model probe above therefore passes on
+    # a truncated install (e.g. the disk filled mid-extraction) while every
+    # conversion unit later dies with "createInferBuilder: Unable to load
+    # library: libnvinfer_builder_resource.so.10.9.0". Check the file itself.
+    if trt_ok and sys.platform == "linux":
+        import glob
+        import site
+
+        builder = []
+        for base in site.getsitepackages() + [site.getusersitepackages()]:
+            builder += glob.glob(os.path.join(base, "tensorrt*", "libnvinfer_builder_resource.so*"))
+        print("  TensorRT builder resource:", "present" if builder else "MISSING")
+        if not builder:
+            print("  ⚠️ TensorRT loads, but it cannot build engines: the")
+            print("     libnvinfer_builder_resource.so.10.* file is missing from the venv")
+            print("     (usually a truncated install on a full disk). Free space, then:")
+            print("     bash scripts/install_tensorrt.sh")
 except Exception as e:
     print("  onnxruntime import failed:", e)
 PY

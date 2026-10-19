@@ -213,6 +213,25 @@ sys.exit(0 if "TensorrtExecutionProvider" in active else 1)
 PY
 }
 
+# TensorRT dlopens ``libnvinfer_builder_resource.so.<ver>`` LAZILY — only when a
+# real (non-trivial) network is built. The Identity-model probe above therefore
+# passes on an install that is missing it, and the failure only surfaces later,
+# mid-conversion, as:
+#   createInferBuilder: Error Code 6: API Usage Error (Unable to load library:
+#   libnvinfer_builder_resource.so.10.9.0: cannot open shared object file)
+# Seen when the tensorrt-cu12-libs extraction was truncated by a full disk.
+# Check the file itself so the probe tells the truth.
+has_builder_resource() {
+    [ "$(uname -s)" = "Linux" ] || return 0
+    "${PY}" - <<'PY'
+import glob, os, site, sys
+for base in site.getsitepackages() + [site.getusersitepackages()]:
+    if glob.glob(os.path.join(base, "tensorrt*", "libnvinfer_builder_resource.so*")):
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
 echo "=== TensorRT installer ==="
 
 if ! "${PY}" -c "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
@@ -318,9 +337,26 @@ if has_cuda_ep; then
 fi
 
 echo "--- probing TensorRT before install ---"
-if trt_probe; then
+if trt_probe && has_builder_resource; then
     echo "TensorRT EP already works — nothing to install."
     exit 0
+fi
+
+# The Linux tensorrt-cu12-libs wheel is ~2.7 GiB compressed and extracts to
+# ~4.4 GiB (it ships a Linux *and* a Windows builder resource). uv stages the
+# wheel and then clones it into the venv, so on a full box the extraction gets
+# truncated — the default outcome, not an edge case. Because the eviction below
+# removes the current tree first, a failed install leaves NO usable TensorRT at
+# all (and every later engine build dies with "Unable to load library:
+# libnvinfer_builder_resource.so.10.9.0"). Refuse to start without headroom.
+need_kb=7000000
+avail_kb="$(df -Pk "${PROJECT_ROOT:-.}" 2>/dev/null | awk 'NR==2{print $4}')"
+if [ -n "${avail_kb}" ] && [ "${avail_kb}" -lt "${need_kb}" ]; then
+    echo "ERROR: only $((avail_kb / 1024)) MiB free on ${PROJECT_ROOT:-.}; TensorRT needs"
+    echo "       ~7 GiB (2.7 GiB wheel + ~4.4 GiB extracted). Refusing to replace the"
+    echo "       current tree with a truncated one. Free space (try: uv cache clean)"
+    echo "       and re-run this script."
+    exit 1
 fi
 
 echo "--- evicting any mismatched tensorrt tree ---"
@@ -344,7 +380,7 @@ report_pkgs tensorrt-cu12 tensorrt-cu12-libs tensorrt-cu13
 
 echo "--- probing TensorRT after install ---"
 add_lib_dirs
-if trt_probe; then
+if trt_probe && has_builder_resource; then
     echo "OK: TensorRT EP is available (engines cache under <onnx-dir>/trt_cache)."
     exit 0
 fi
@@ -352,6 +388,10 @@ echo "WARN: TensorRT still not loadable. Common causes:"
 echo "  - the active ORT is still not a GPU build (see the diagnostics above);"
 echo "  - the CUDA EP itself does not activate (missing cu12 runtime libs or an"
 echo "    unresolvable driver libcuda.so.1; see the loader path above);"
-echo "  - ORT expects a different TensorRT major (try another TRT_SPEC)."
+echo "  - ORT expects a different TensorRT major (try another TRT_SPEC);"
+echo "  - the tensorrt-cu12-libs extraction was truncated (usually a full disk):"
+echo "    tensorrt_libs/libnvinfer_builder_resource.so.10.* is missing, which no"
+echo "    tiny-model probe catches but every real engine build does. Free space"
+echo "    and re-run this script."
 echo "Units will fall back to the CUDA/CPU EP."
 exit 1

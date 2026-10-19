@@ -469,6 +469,29 @@ When editing or extending the codebase, follow these design patterns:
   `scripts/convert_to_onnx.sh` must call `augment_ort_libs` **before** it probes
   TensorRT, or the probe sees an un-augmented loader path and reports a
   false "TensorRT EP not available" even when TRT works.
+- **A truncated TensorRT install passes every probe but cannot build engines.**
+  `libnvinfer_builder_resource.so.10.9.0` (~2 GiB, shipped by
+  `tensorrt-cu12-libs` next to `libnvinfer.so.10`) is dlopened *lazily* — only
+  when a non-trivial network is actually built. An install that lost that file,
+  typically because the disk filled during extraction, therefore still passes
+  the Identity-model probe, and every real unit later dies mid-conversion with
+  `createInferBuilder: Error Code 6: API Usage Error (Unable to load library:
+  libnvinfer_builder_resource.so.10.9.0)`. Both the installer and the `setup.sh`
+  probe now verify the file is physically present (`has_builder_resource`, a
+  glob for `tensorrt*/libnvinfer_builder_resource.so*`), and the installer now
+  *refuses to evict* the existing tree when under ~7 GiB is free (the wheel is
+  2.7 GiB compressed, ~4.4 GiB extracted) instead of half-installing it.
+  Recovery: free space (start with `uv cache clean`), then re-run
+  `scripts/install_tensorrt.sh`. TRT engine builds also need ~2 GiB in
+  `onnx/trt_cache/`, so keep headroom on the box.
+- **`setup.sh` must not prune the layered GPU stack.** `uv sync` removes packages
+  the lock does not contain, and neither `onnxruntime-gpu` nor
+  `tensorrt-cu12` is in the lock. Combined with the old
+  `uv venv .venv --clear`, every `setup.sh` run rebuilt the entire environment
+  (~7 GiB torch re-download) and then re-extracted ~4.4 GiB of TensorRT — which
+  on a 50 GiB disk ends in ENOSPC, a half-installed `tensorrt_libs/` (only the
+  `_win` builder resource survives) and units that quietly fall back to CUDA.
+  `setup.sh` now reuses an existing venv and syncs with `uv sync --inexact`.
 - **A plain `uv sync` silently disables the GPU execution providers.**
   `pyproject.toml` declares the *CPU* `onnxruntime` as the portable default and
   the CUDA box swaps in `onnxruntime-gpu`. Both distributions ship the **same**
