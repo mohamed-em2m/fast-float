@@ -40,6 +40,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from fast_float.models.float.FMT import FlowMatchingTransformer
 from fast_float.onnx.export import (
+    FP16_MAX_MEAN,
+    FP16_MIN_COSINE,
     add_ort_args,
     export_module,
     fp16_tol,
@@ -177,6 +179,12 @@ def main(argv=None) -> int:
             "prev_wa": {0: "batch"},
             "vec": {0: "batch"},
         },
+        # ``t`` is one shared scalar time value (shape [1], broadcast over the
+        # batch inside the graph), not a batch-first input. Marking its dim
+        # dynamic makes TensorRT freeze it at the profile's opt batch, so the
+        # plain forward works but every CFG call (batch 3) dies with
+        # "Dimensions with name s0 must be equal ... 1 != 3".
+        shared_inputs=("t",),
         opset=args.opset,
     )
     print(f"[export] {info['path']} via {info['exporter']}")
@@ -188,6 +196,9 @@ def main(argv=None) -> int:
             info["path"],
             args,
             opt_shapes={
+                # ``t`` is exported static ([1], see shared_inputs above), so it
+                # gets no profile entry: the TRT EP ignores/or rejects profile
+                # dims for static inputs.
                 "x": [1, CLIP_FRAMES, 512],
                 "wa": [1, CLIP_FRAMES, 512],
                 "wr": [1, 1, 512],
@@ -197,6 +208,11 @@ def main(argv=None) -> int:
             },
         )
         atol, rtol = fp16_tol(args.atol, fp16), fp16_tol(args.rtol, fp16)
+        # The vector field is bounded/small-magnitude: TRT FP16 drift is
+        # absolute (~9e-3 max, cosine 0.999997), so the elementwise gate can
+        # never pass even though the field is correct. Add the same
+        # functional-equivalence gate the emotion/refenc/audio units use.
+        func = {"min_cosine": FP16_MIN_COSINE, "max_mean": FP16_MAX_MEAN} if fp16 else {}
         names = ["t", "x", "wa", "wr", "we", "prev_x", "prev_wa"]
         with torch.no_grad():
             # B=1 (plain call) and B=3 (CFG call), t across the trajectory.
@@ -212,7 +228,7 @@ def main(argv=None) -> int:
                 ref = module(*args_in)
                 feed = {k: v.cpu().numpy() for k, v in zip(names, args_in, strict=False)}
                 ort_out = sess.run(None, feed)[0]
-                check_parity(ref, ort_out, name=name, atol=atol, rtol=rtol)
+                check_parity(ref, ort_out, name=name, atol=atol, rtol=rtol, **func)
                 print(f"[probe:{name}] shape torch={tuple(ref.shape)} onnx={tuple(ort_out.shape)}")
             if args.bench_iters > 0:
                 from fast_float.onnx.parity import benchmark

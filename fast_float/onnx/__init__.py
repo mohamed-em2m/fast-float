@@ -24,11 +24,6 @@ from fast_float.onnx.export import (
     trt_optimization_profiles,
 )
 from fast_float.onnx.parity import check_parity
-from fast_float.onnx.runtime import (
-    EmotionOnnxBackend,
-    FMTStepBackend,
-    Wav2vecOnnxBackend,
-)
 
 __all__ = [
     "BackendConfig",
@@ -50,3 +45,27 @@ __all__ = [
     "save_backends",
     "trt_optimization_profiles",
 ]
+
+# ``fast_float.onnx.runtime`` re-exports the ctor-wired ORT backends, which live
+# under ``fast_float.runtimes.onnx`` and import ``fast_float.onnx.export``.
+# Importing them eagerly here created an import cycle when a caller touched
+# ``fast_float.runtimes.onnx.*`` first (backends -> onnx.export -> onnx/__init__
+# -> onnx.runtime -> runtimes.onnx.backends, still initialising -> ImportError).
+# Re-export lazily so the runner/backends import cleanly in either order.
+_RUNTIME_BACKENDS = ("EmotionOnnxBackend", "FMTStepBackend", "Wav2vecOnnxBackend")
+
+
+def __getattr__(name):
+    if name in _RUNTIME_BACKENDS:
+        from fast_float.onnx.runtime import (
+            EmotionOnnxBackend,
+            FMTStepBackend,
+            Wav2vecOnnxBackend,
+        )
+
+        return {
+            "EmotionOnnxBackend": EmotionOnnxBackend,
+            "FMTStepBackend": FMTStepBackend,
+            "Wav2vecOnnxBackend": Wav2vecOnnxBackend,
+        }[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

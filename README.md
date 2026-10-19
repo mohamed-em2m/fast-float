@@ -37,7 +37,7 @@ FLOAT Fast wraps the FLOAT generator in production-friendly interfaces and perfo
 ```bash
 git clone https://github.com/mohamed-em2m/float-fast.git
 cd float-fast
-./scripts/setup.sh          # apt deps + uv + uv sync + checkpoints + ONNX toolchain
+./scripts/setup.sh          # apt deps + Node 22 + uv + uv sync + checkpoints + ONNX toolchain
 ```
 
 Or manually:

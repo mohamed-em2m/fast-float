@@ -225,8 +225,11 @@ A served box must not compile at startup. On cache miss:
 - Ctor self-wiring builds before device placement; FMT's `alignment_mask` is
   created on `opt.rank` (`FMT.py:289`). Registry install-after-load avoids the
   mismatch.
-- `decoder` static batch: one artifact vs a batch set (selector picks one via
-  `--dec-batch` today).
+- `decoder` static batch: **resolved** — `convert_decoder --batches` now exports a
+  set (`decoder_v1.onnx` primary + `decoder_v1_b<N>.onnx` siblings). `DecoderOnnx`
+  lazily loads the siblings and picks the smallest session covering each
+  micro-batch, and `_decoder_static_batch()` reports the largest so the decode
+  tuner may size above 8. The selector still measures the primary via `--dec-batch`.
 - `fmt` sticky degradation can hide a broken build → `inspect` warns at startup.
 - Weights fingerprint cost → use ckpt mtime+size, not a content hash.
 - Real export/parity/TRT validation only on the GPU box (local lacks

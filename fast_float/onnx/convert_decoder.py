@@ -4,9 +4,13 @@ Exports the deployed decode path ``ae.dec(latent, alpha=None, feats)`` and
 returns img only (decode uses out[0]; flow is unused there).
 
 Constraints (baked at trace time, verified in parity):
-- STATIC batch (--batch): ModulatedConv2d bakes ``groups=batch`` as an ONNX
-  attribute, so the graph is valid for exactly one B. Runtime must pad/trim
-  micro-batches to it (replicate-pad like the audio chunker, trim after).
+- STATIC batch per artifact: ModulatedConv2d bakes ``groups=batch`` as an ONNX
+  attribute, so each graph is valid for exactly one B. We export a *set*
+  (``--batches``, default 1,2,4,8,16): the primary ``--batch`` (also the
+  selector's ``--dec-batch``) goes to ``--out`` and the rest to
+  ``<stem>_b<N>.onnx`` siblings. ``DecoderOnnx`` then picks the smallest
+  session covering a micro-batch and replicate-pads/trims to it — instead of
+  always padding up to the single largest graph.
 - alpha=None path: decode never blends directions; the direction branches
   are not in the graph.
 - feats structure (count/shapes) is self-discovered by running the reference
@@ -19,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import os
 from collections import Counter
 
@@ -167,13 +172,8 @@ class DecoderExport(nn.Module):
         return img
 
 
-def build_decoder_module(
-    ckpt_path: str,
-    image_size: int,
-    channel_mult: float,
-    batch: int,
-    device: torch.device,
-) -> tuple[DecoderExport, object, list]:
+def _build_generator(ckpt_path: str, image_size: int, channel_mult: float, device: torch.device):
+    """Construct the Generator, overlay the ckpt, and self-discover the feats map."""
     # Integral channel multipliers (the deployed default "1") feed tensor
     # shapes and must be ints; a float (e.g. 1.0) crashes randn() deep in the
     # decoder. Coerce here so every caller (selector included) is safe.
@@ -210,28 +210,114 @@ def build_decoder_module(
     with torch.no_grad():
         probe_img = torch.randn(1, 3, image_size, image_size, device=device)
         _, _, feats1 = gen.enc(probe_img, None)
-    dec = gen.dec
     print(f"[model] feats: {len(feats1)} maps {[tuple(f.shape) for f in feats1]}")
+    return gen, feats1
 
-    # Equivalence proof, then freeze grouped-conv batch for export.
+
+def freeze_decoder_for_batch(dec_raw, n_feats: int, batch: int) -> DecoderExport:
+    """Fresh frozen (static-batch) export module built from the *unfrozen* dec.
+
+    ``ModulatedConv2d`` bakes ``groups=batch`` into an ONNX attribute, so each
+    static batch needs its own graph. Deep-copy first: ``_freeze_modconvs``
+    mutates in place and we must keep the raw (dynamic-batch) decoder intact
+    for the parity reference and for the other batches.
+    """
+    clone = copy.deepcopy(dec_raw)
+    _freeze_modconvs(clone, batch)
+    return DecoderExport(clone, n_feats).eval()
+
+
+def _img(out):
+    return out[0] if isinstance(out, (tuple, list)) else out
+
+
+def build_decoder_module(
+    ckpt_path: str,
+    image_size: int,
+    channel_mult: float,
+    batch: int,
+    device: torch.device,
+) -> tuple[DecoderExport, object, list]:
+    """Single-batch decoder + the raw (dynamic) dec for the parity reference.
+
+    Kept for the backend selector; ``main`` builds the whole batch set.
+    """
+    gen, feats1 = _build_generator(ckpt_path, image_size, channel_mult, device)
+    dec_raw = gen.dec
+    module = freeze_decoder_for_batch(dec_raw, len(feats1), batch)
+
+    # Equivalence proof (dynamic vs frozen), then report.
     with torch.no_grad(), _deterministic_cudnn():
         lat_b = torch.randn(batch, 512, device=device)
         feats_b = [f.expand(batch, *f.shape[1:]).contiguous() for f in feats1]
-        out_dyn = dec(lat_b, alpha=None, feats=feats_b)
-        out_dyn = out_dyn[0] if isinstance(out_dyn, (tuple, list)) else out_dyn
-        out_dyn2 = dec(lat_b, alpha=None, feats=feats_b)
-        out_dyn2 = out_dyn2[0] if isinstance(out_dyn2, (tuple, list)) else out_dyn2
+        out_dyn = _img(dec_raw(lat_b, alpha=None, feats=feats_b))
+        out_dyn2 = _img(dec_raw(lat_b, alpha=None, feats=feats_b))
     repeat = (out_dyn - out_dyn2).abs().max().item()
-    n = _freeze_modconvs(dec, batch)
     with torch.no_grad(), _deterministic_cudnn():
-        out_frozen = dec(lat_b, alpha=None, feats=feats_b)
-        out_frozen = out_frozen[0] if isinstance(out_frozen, (tuple, list)) else out_frozen
+        out_frozen = _img(module.dec(lat_b, alpha=None, feats=feats_b))
     print(
-        f"[model] froze {n} ModulatedConv2d to static batch {batch}; "
+        f"[model] froze decoder to static batch {batch}; "
         f"repeat-diff={repeat:.3e} "
         f"dyn-vs-frozen max_abs={(out_dyn - out_frozen).abs().max().item():.3e}"
     )
-    return DecoderExport(gen.dec, len(feats1)).eval(), gen.dec, feats1
+    return module, dec_raw, feats1
+
+
+def _parse_batches(spec: str) -> list[int]:
+    out = sorted({int(s) for s in spec.split(",") if s.strip()})
+    if not out:
+        raise ValueError("--batches is empty")
+    return out
+
+
+def _run_parity(dec_raw, args, device, b, feats1, feat_names, onnx_path) -> None:
+    """Eager (dynamic dec) vs the static ONNX graph for one batch, then bench."""
+    # Static batch -> fully static graph, no TRT shape profiles needed.
+    sess, fp16 = make_session_from_args(onnx_path, args)
+    atol, rtol = fp16_tol(args.atol, fp16), fp16_tol(args.rtol, fp16)
+    min_cos = 0.995 if fp16 else args.min_cosine
+    max_mean = fp16_tol(args.max_mean, fp16)
+    with torch.no_grad(), _deterministic_cudnn():
+        g = torch.Generator(device="cpu").manual_seed(777)
+        lat_t = torch.randn(b, 512, generator=g).to(device)
+        feats_b = [f.expand(b, *f.shape[1:]).contiguous() for f in feats1]
+        ref_img = _img(dec_raw(lat_t, alpha=None, feats=feats_b))
+        ort_img = sess.run(
+            None,
+            {
+                "latent": lat_t.detach().cpu().numpy(),
+                **{n: f.detach().cpu().numpy() for n, f in zip(feat_names, feats_b, strict=False)},
+            },
+        )[0]
+        rep = compare_outputs(ref_img, ort_img, atol=atol, rtol=rtol)
+        cos_ok = rep["cosine"] >= min_cos
+        mean_ok = rep["mean_abs"] <= max_mean
+        status = "PASS" if (rep["ok"] or (cos_ok and mean_ok)) else "FAIL"
+        print(
+            f"[parity:dec_b{b}] {status} "
+            f"max_abs={rep['max_abs']:.3e} mean_abs={rep['mean_abs']:.3e} "
+            f"max_rel={rep['max_rel']:.3e} cosine={rep['cosine']:.6f} "
+            f"(atol={atol:g}, rtol={rtol:g})"
+        )
+        if not (rep["ok"] or (cos_ok and mean_ok)):
+            raise RuntimeError(
+                f"decoder parity FAILED (b{b}): cosine={rep['cosine']:.6f} (min={min_cos}), "
+                f"mean_abs={rep['mean_abs']:.3e} (max={max_mean})"
+            )
+        gate = "elementwise" if rep["ok"] else "functional (cosine+mean)"
+        print(f"[parity:dec_b{b}] passed via {gate} gate (cosine={rep['cosine']:.6f}, mean_abs={rep['mean_abs']:.3e})")
+    # Bench OUTSIDE deterministic cuDNN so torch runs its deployed kernels
+    # (deterministic disables cuDNN autotuning and would inflate speedup).
+    if args.bench_iters > 0:
+        with torch.no_grad():
+            lat_np = lat_t.detach().cpu().numpy()
+            feats_np = {n: f.detach().cpu().numpy() for n, f in zip(feat_names, feats_b, strict=False)}
+            benchmark(
+                lambda: dec_raw(lat_t, alpha=None, feats=feats_b),
+                lambda: sess.run(None, {"latent": lat_np, **feats_np}),
+                name=f"dec_b{b}",
+                iters=args.bench_iters,
+            )
 
 
 def main(argv=None) -> int:
@@ -241,10 +327,18 @@ def main(argv=None) -> int:
     ap.add_argument("--image-size", type=int, default=512)
     ap.add_argument("--channel-mult", type=float, default=1.0)
     ap.add_argument(
+        "--batches",
+        default="1,2,4,8,16",
+        help="static decode batches to export (one artifact each); the runtime "
+        "picks the smallest session covering a micro-batch instead of always "
+        "padding up to the largest",
+    )
+    ap.add_argument(
         "--batch",
         type=int,
         default=8,
-        help="STATIC decode batch (runtime pads/trims to it)",
+        help="PRIMARY static batch written to --out (matches the selector's "
+        "--dec-batch); extra batches land in <stem>_b<N>.onnx siblings",
     )
     ap.add_argument(
         "--model-seed",
@@ -269,92 +363,53 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[env] device={device} static_batch={args.batch}")
+    batches = sorted(set(_parse_batches(args.batches)) | {int(args.batch)})
+    print(f"[env] device={device} static_batches={batches} primary={args.batch}")
     torch.manual_seed(args.model_seed)
     # Deployed default is int 1; float channel sizes crash randn() exactly
     # like deployed code, so coerce integral values back to int.
     cm = int(args.channel_mult) if float(args.channel_mult).is_integer() else args.channel_mult
-    module, dec, feats1 = build_decoder_module(args.ckpt, args.image_size, cm, args.batch, device)
-    b = args.batch
+    gen, feats1 = _build_generator(args.ckpt, args.image_size, cm, device)
+    dec_raw = gen.dec
     feat_names = [f"feat{i}" for i in range(len(feats1))]
 
-    def expand_feats(feats):
-        return [f.expand(b, *f.shape[1:]).contiguous() for f in feats]
+    stem = os.path.splitext(os.path.basename(args.out))[0]
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    os.makedirs(out_dir, exist_ok=True)
 
-    with torch.no_grad():
-        lat = torch.randn(b, 512, device=device)
-        feats_b = expand_feats(feats1)
-        # Warmup: validates shapes + freezes ToFlow grid caches pre-export.
-        warm = dec(lat, alpha=None, feats=feats_b)
-        warm_img = warm[0] if isinstance(warm, (tuple, list)) else warm
-        print(f"[model] warmup img {tuple(warm_img.shape)}")
+    for b in batches:
+        # The primary batch is the registry/selector artifact (--out); the rest
+        # are siblings the runtime discovers by filename.
+        out_path = args.out if b == args.batch else os.path.join(out_dir, f"{stem}_b{b}.onnx")
+        module = freeze_decoder_for_batch(dec_raw, len(feats1), b)
+        with torch.no_grad():
+            lat = torch.randn(b, 512, device=device)
+            feats_b = [f.expand(b, *f.shape[1:]).contiguous() for f in feats1]
+            # Warmup: validates shapes + freezes ToFlow grid caches pre-export.
+            warm_img = _img(module.dec(lat, alpha=None, feats=feats_b))
+            print(f"[model] b{b} warmup img {tuple(warm_img.shape)}")
 
-    # Export on CPU (tracer constant-folder trips on mixed devices).
-    module.to("cpu")
-    lat_cpu = lat.detach().cpu()
-    feats_cpu = [f.detach().cpu() for f in feats_b]
-    info = export_module(
-        module,
-        [lat_cpu, *feats_cpu],
-        args.out,
-        input_names=["latent", *feat_names],
-        output_names=["img"],
-        dynamic_axes={},  # static: grouped-conv groups baked per batch
-        opset=args.opset,
-        fixed_batch=True,  # skip batch-2 duplication + dynamic marking
-    )
-    print(f"[export] {info['path']} via {info['exporter']}")
-    for note in info.get("notes") or []:
-        print(f"[export] note: {note}")
-    module.to(device)
+        # Export on CPU (tracer constant-folder trips on mixed devices).
+        module.to("cpu")
+        info = export_module(
+            module,
+            [lat.detach().cpu(), *[f.detach().cpu() for f in feats_b]],
+            out_path,
+            input_names=["latent", *feat_names],
+            output_names=["img"],
+            dynamic_axes={},  # static: grouped-conv groups baked per batch
+            opset=args.opset,
+            fixed_batch=True,  # skip batch-2 duplication + dynamic marking
+        )
+        print(f"[export] b{b} {info['path']} via {info['exporter']}")
+        for note in info.get("notes") or []:
+            print(f"[export] note: {note}")
+        module.to(device)
 
-    if not args.skip_parity:
-        # Static batch -> fully static graph, no TRT shape profiles needed.
-        sess, fp16 = make_session_from_args(info["path"], args)
-        atol, rtol = fp16_tol(args.atol, fp16), fp16_tol(args.rtol, fp16)
-        min_cos = 0.995 if fp16 else args.min_cosine
-        max_mean = fp16_tol(args.max_mean, fp16)
-        with torch.no_grad(), _deterministic_cudnn():
-            g = torch.Generator(device="cpu").manual_seed(777)
-            lat_t = torch.randn(b, 512, generator=g).to(device)
-            ref_out = dec(lat_t, alpha=None, feats=feats_b)
-            ref_img = ref_out[0] if isinstance(ref_out, (tuple, list)) else ref_out
-            ort_img = sess.run(
-                None,
-                {
-                    "latent": lat_t.detach().cpu().numpy(),
-                    **{n: f.detach().cpu().numpy() for n, f in zip(feat_names, feats_b, strict=False)},
-                },
-            )[0]
-            rep = compare_outputs(ref_img, ort_img, atol=atol, rtol=rtol)
-            cos_ok = rep["cosine"] >= min_cos
-            mean_ok = rep["mean_abs"] <= max_mean
-            status = "PASS" if (rep["ok"] or (cos_ok and mean_ok)) else "FAIL"
-            print(
-                f"[parity:dec_b{b}] {status} "
-                f"max_abs={rep['max_abs']:.3e} mean_abs={rep['mean_abs']:.3e} "
-                f"max_rel={rep['max_rel']:.3e} cosine={rep['cosine']:.6f} "
-                f"(atol={atol:g}, rtol={rtol:g})"
-            )
-            if not (rep["ok"] or (cos_ok and mean_ok)):
-                raise RuntimeError(
-                    f"decoder parity FAILED: cosine={rep['cosine']:.6f} (min={min_cos}), "
-                    f"mean_abs={rep['mean_abs']:.3e} (max={max_mean})"
-                )
-            print(f"[parity:dec_b{b}] cosine OK ({rep['cosine']:.6f}) mean OK ({rep['mean_abs']:.3e})")
-        # Bench OUTSIDE deterministic cuDNN so torch runs its deployed kernels
-        # (deterministic disables cuDNN autotuning and would inflate speedup).
-        if args.bench_iters > 0:
-            with torch.no_grad():
-                lat_np = lat_t.detach().cpu().numpy()
-                feats_np = {n: f.detach().cpu().numpy() for n, f in zip(feat_names, feats_b, strict=False)}
-                benchmark(
-                    lambda: dec(lat_t, alpha=None, feats=feats_b),
-                    lambda: sess.run(None, {"latent": lat_np, **feats_np}),
-                    name=f"dec_b{b}",
-                    iters=args.bench_iters,
-                )
-    print("[done] decoder converter OK")
+        if not args.skip_parity:
+            _run_parity(dec_raw, args, device, b, feats1, feat_names, info["path"])
+
+    print(f"[done] decoder converter OK ({len(batches)} batches: {batches})")
     return 0
 
 

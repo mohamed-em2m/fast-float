@@ -34,7 +34,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from fast_float.models.wav2vec2 import Wav2VecModel
-from fast_float.onnx.export import export_module, make_ort_session
+from fast_float.onnx.export import (
+    FP16_MAX_MEAN,
+    FP16_MIN_COSINE,
+    add_ort_args,
+    export_module,
+    fp16_tol,
+    make_session_from_args,
+)
 from fast_float.onnx.parity import check_parity
 
 PROJ_PREFIX = "audio_encoder.audio_projection."
@@ -162,6 +169,7 @@ def main(argv=None) -> int:
     ap.add_argument("--atol", type=float, default=1e-4)
     ap.add_argument("--rtol", type=float, default=1e-4)
     ap.add_argument("--skip-parity", action="store_true")
+    add_ort_args(ap)
     args = ap.parse_args(argv)
 
     module = build_export_module(args.w2v_dir, args.ckpt)
@@ -187,8 +195,21 @@ def main(argv=None) -> int:
         print(f"[export] note: {note}")
 
     if not args.skip_parity:
-        sess = make_ort_session(info["path"], use_gpu=torch.cuda.is_available())
+        sess, fp16 = make_session_from_args(
+            info["path"],
+            args,
+            # conv_feats is dynamic in both batch (0) and frames (1); give TRT a
+            # profile spanning the deployed clip range so an engine can build.
+            opt_shapes={"conv_feats": [2, frames_for(args.seconds)]},
+            extra_dynamic={"conv_feats": {1: (10, 2000)}},
+        )
         print(f"[ort] providers={sess.get_providers()}")
+        atol, rtol = fp16_tol(args.atol, fp16), fp16_tol(args.rtol, fp16)
+        # Audio feats are bounded/small-magnitude, so under TRT FP16 the absolute
+        # drift is not covered by the fp16_tol factor alone; add the functional
+        # gate the other bounded units (emotion/refenc) use -- the same gate
+        # ``select_backends`` re-applies when it measures the artifact.
+        func = {"min_cosine": FP16_MIN_COSINE, "max_mean": FP16_MAX_MEAN} if fp16 else {}
 
         def run_case(name: str, wav: torch.Tensor, frames: int):
             # Reference: the full torch path (convs + interpolate + head).
@@ -197,7 +218,7 @@ def main(argv=None) -> int:
                 ref = stack_and_project(ref, module.projection)
                 feats = core.feature_extract(wav, frames)
             ort_out = sess.run(None, {"conv_feats": feats.numpy()})[0]
-            check_parity(ref, ort_out, name=name, atol=args.atol, rtol=args.rtol)
+            check_parity(ref, ort_out, name=name, atol=atol, rtol=rtol, **func)
             print(f"[probe:{name}] shape torch={tuple(ref.shape)} onnx={tuple(ort_out.shape)}")
 
         import math

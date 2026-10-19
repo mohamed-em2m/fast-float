@@ -1,7 +1,10 @@
 #!/bin/bash
 
-# --- Automatically inject NVIDIA & CUDA library paths ---
-export LD_LIBRARY_PATH="/usr/local/lib/python3.13/dist-packages/nvidia/cublas/lib:/usr/local/lib/python3.13/dist-packages/nvidia/cuda_runtime/lib:/usr/local/lib/python3.13/dist-packages/nvidia/cudnn/lib:/usr/lib64-nvidia:/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
+# CUDA/NVIDIA loader paths are resolved from the *project venv* after it is
+# created (augment_ort_libs below) and again at app runtime by
+# scripts/setup_cuda_libs.sh. The old block here hardcoded a python3.13
+# site-packages layout that never matched this project (it ships a python 3.10
+# venv), so it added nothing on any real box.
 
 set -e
 
@@ -36,62 +39,86 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 echo "uv version: $(uv --version)"
 
+echo "=== Ensuring Node for the Studio frontend (Vite 8 needs 20.19+/22.12+) ==="
+# Ubuntu 24.04's `nodejs` is 18.x, which Vite 8 / rolldown cannot run: they
+# import `node:util`'s `styleText` (Node >= 20.12) and die at `vite dev` with a
+# cryptic "does not provide an export named 'styleText'". Distro repos never
+# carry the needed version, so pull LTS 22 from NodeSource when the system Node
+# is missing or too old. Best effort -- a failure only disables the frontend
+# (run_all.sh re-checks and reports it), never the backend/ONNX pipeline.
+node_version_ok() {
+    local mm major minor
+    mm="$(node -p 'process.versions.node.split(".").slice(0,2).join(".")' 2>/dev/null)" || return 1
+    major="${mm%%.*}"
+    minor="${mm##*.}"
+    [ "${major}" -gt 22 ] && return 0
+    [ "${major}" -eq 22 ] && [ "${minor}" -ge 12 ] && return 0
+    [ "${major}" -eq 20 ] && [ "${minor}" -ge 19 ] && return 0
+    return 1
+}
+if command -v node >/dev/null 2>&1 && node_version_ok; then
+    echo "found node $(node -v)"
+else
+    echo "node $(node -v 2>/dev/null || echo '(missing)') is too old for Vite 8 -> installing Node 22"
+    if curl -fsSL https://deb.nodesource.com/setup_22.x | ${USE_SUDO} bash - \
+        && $USE_SUDO apt-get install -y nodejs; then
+        echo "installed node $(node -v)"
+    else
+        echo "⚠️ Node upgrade failed — the frontend needs Node 20.19+/22.12+; the backend is unaffected."
+    fi
+fi
+
+# Refresh the frontend deps after a Node/npm change. npm's optional-dependency
+# bug (npm/cli#4828) leaves platform natives out of an existing node_modules
+# when the npm that wrote it was older, so `vite dev` dies with "Cannot find
+# native binding ... @rolldown/binding-linux-x64-gnu" even though the install
+# "succeeded". `npm ci` rebuilds it from the committed lockfile.
+if [ -f "${PROJECT_ROOT}/frontend/package.json" ] && command -v npm >/dev/null 2>&1; then
+    if node_version_ok; then
+        echo "=== Installing frontend dependencies (npm ci) ==="
+        (cd "${PROJECT_ROOT}/frontend" && npm ci) \
+            || echo "⚠️ npm ci failed — run it in frontend/ before ./scripts/run_all.sh"
+    fi
+fi
+
 echo "=== Syncing project environment (uv sync) ==="
 echo "--- Python comes from .python-version, deps from pyproject.toml + uv.lock ---"
 uv venv .venv --python 3.10 --clear
 # shellcheck source=/dev/null
 source .venv/bin/activate
-uv pip install --python .venv/bin/python -e .
-uv lock
+# uv.lock is the source of truth (torch cu126 from the pytorch index, the
+# app's onnx<1.17, ...). The ONNX *export* stack needs a different, conflicting
+# window and is layered on top below.
+uv sync
 
 echo "=== Installing optional video codecs (torchcodec) ==="
 # torchcodec is optional; install if compatible binary wheel exists for torch/cuda
 uv pip install --python .venv/bin/python torchcodec || echo "⚠️ torchcodec install skipped or unavailable for current platform/PyTorch version (PyAV and FFmpeg NVENC remain available)."
 
-echo "=== Installing ONNX export toolchain (onnxscript / ONNX Runtime / TensorRT) ==="
-# onnx + onnxruntime come from pyproject (a CPU wheel; the web app uses it).
-# Add onnxscript (required by torch.export's dynamo ONNX exporter). On a CUDA
-# box the CPU onnxruntime wheel must be *replaced* by onnxruntime-gpu -- both
-# provide the ``onnxruntime`` module, and layering one over the other leaves a
-# mixed tree where the CUDA EP silently never initializes.
-uv pip install --python .venv/bin/python --no-cache-dir onnxscript \
-    || echo "⚠️ onnxscript install failed — ONNX export will need it."
-HAS_CUDA="$(python -c 'import torch;print(torch.cuda.is_available())' 2>/dev/null || echo False)"
-if [ "${HAS_CUDA}" = "True" ]; then
-    echo "CUDA detected → onnxruntime-gpu<1.24 + TensorRT (CUDA 12); best effort"
-    # Replace, never overlay: uninstall the CPU wheel first.
-    uv pip uninstall --python .venv/bin/python onnxruntime 2>/dev/null || true
-    uv pip install --python .venv/bin/python --no-cache-dir "onnxruntime-gpu<1.24" \
-        || echo "⚠️ onnxruntime-gpu install failed — the CUDA EP will be unavailable."
-    # TensorRT must *major-match* the ORT wheel. onnxruntime-gpu 1.23 is built
-    # against TensorRT 10.9 and dlopens libnvinfer.so.10; an unversioned
-    # `tensorrt-cu12` now resolves to TensorRT 11 (libnvinfer.so.11), which ORT
-    # cannot load — its provider lib fails and ORT silently drops the session to
-    # CUDA/CPU. Pin the cu12 build ORT 1.23 expects and evict any TRT 11 (cu13)
-    # tree first (uv skips the ones that aren't installed).
-    uv pip uninstall --python .venv/bin/python \
-        tensorrt tensorrt-cu13 tensorrt-cu13-bindings tensorrt-cu13-libs
-    if ! uv pip install --python .venv/bin/python --no-cache-dir "tensorrt-cu12==10.9.0.34"; then
-        echo "⚠️ pinned tensorrt-cu12==10.9.0.34 failed; trying unpinned (verify the EP below)."
-        uv pip install --python .venv/bin/python --no-cache-dir "tensorrt-cu12" \
-            || echo "⚠️ tensorrt install skipped — the TensorRT EP will be unavailable."
-    fi
-    # ORT dlopens libnvinfer/libcublas by soname; put the pip lib dirs on the
-    # loader path for this shell (the app repeats this at runtime, see
-    # fast_float/initialize_env.py).
-    NV_LIB_DIRS="$(python -c 'import glob,os,site; d=set()
-for b in site.getsitepackages()+[site.getusersitepackages()]:
-    for p in [os.path.join(b,"nvidia"), *glob.glob(os.path.join(b,"tensorrt*"))]:
-        for r,_,fs in os.walk(p):
-            if any(f.endswith((".so",".dll")) or ".so." in f for f in fs): d.add(r)
-print(":".join(sorted(d)))' 2>/dev/null || true)"
-    if [ -n "${NV_LIB_DIRS}" ]; then
-        export LD_LIBRARY_PATH="${NV_LIB_DIRS}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-        echo "ORT loader path += pip CUDA/TensorRT libs"
-    fi
-else
-    echo "No CUDA detected → CPU ONNX Runtime only."
-fi
+echo "=== Installing ONNX export toolchain (pinned: onnxscript / ONNX Runtime / TensorRT) ==="
+# The app (uv.lock / pyproject) pins onnx<1.17, but the dynamo exporter needs
+# onnxscript (onnx>=1.17) while ORT 1.23 refuses model IR > 11 -> only onnx
+# 1.17/1.18 is safe (AGENT.md §6). Install exactly that window — and the
+# matching onnxruntime — from the one shared helper, so setup.sh and
+# scripts/convert_to_onnx.sh can never disagree. Installing onnxscript by hand
+# here (as this script used to) pulls whatever onnx PyPI currently serves
+# (1.23.2 today): every session then dies with "Unsupported model IR version:
+# 14", and onnxscript's CPU onnxruntime wheel silently shadows the GPU one.
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/_onnx_env.sh"
+use_project_venv
+ensure_onnx_stack
+
+# TensorRT must *major-match* the ORT wheel (10.9 for ORT 1.23; libnvinfer.so.10).
+# The dedicated installer pins tensorrt-cu12==10.9.0.34, evicts any TRT 11
+# (cu13) tree, and re-asserts onnxruntime-gpu afterwards.
+PY="${PY}" bash "${SCRIPT_DIR}/install_tensorrt.sh" || \
+    echo "⚠️ TensorRT install failed — units fall back to the CUDA EP."
+
+# ORT dlopens libnvinfer/libcublas/libcudnn by soname; put the pip CUDA/TensorRT
+# lib dirs + the system driver dirs on the loader path for the probe below (the
+# app repeats this at runtime via scripts/setup_cuda_libs.sh).
+augment_ort_libs
 
 echo "=== ONNX / ONNX Runtime / TensorRT stack ==="
 python - <<'PY' || true
@@ -150,7 +177,7 @@ try:
         import tensorrt  # noqa: F401  (primes the pip lib dirs on the loader path)
     except Exception:
         pass
-    capi = os.path.join(os.path.dirname(onnxruntime.__file__), "capi")
+    capi = os.path.join(os.path.dirname(ort.__file__), "capi")
     provider = os.path.join(
         capi,
         "onnxruntime_providers_tensorrt.dll" if sys.platform == "win32" else "libonnxruntime_providers_tensorrt.so",
@@ -174,10 +201,7 @@ echo "=== Running checkpoint download script ==="
 chmod +x "${SCRIPT_DIR}/download_checkpoints.sh"
 "${SCRIPT_DIR}/download_checkpoints.sh"
 
-echo "=== Installing TensorRT (best effort; skipped when not needed) ==="
-# Run as a subprocess: the installer calls `exit`, which would end setup.sh if
-# sourced, and it needs PY to point at the project venv.
-PY="${PY:-${PROJECT_ROOT}/.venv/bin/python}" bash "${SCRIPT_DIR}/install_tensorrt.sh" || true
+# TensorRT was installed above, together with the pinned ORT/onnx stack.
 
 echo "=== Creating results/checkpoints directories ==="
 mkdir -p results checkpoints

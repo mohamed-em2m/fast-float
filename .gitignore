@@ -9,6 +9,7 @@ experiments/
 tmp/
 *.pth
 *.pt
+*.part
 wav2vec2-base-960h/
 wav2vec-english-speech-emotion-recognition/
 results/

@@ -1,11 +1,18 @@
-"""Convert the audio condition encoder (unit 4) to ONNX.
+"""DEPRECATED — prefer :mod:`fast_float.onnx.convert_wav2vec`.
+
+This exporter bakes a STATIC frame count T into a single ``waveform`` graph,
+but nothing in the runtime consumes it: ``AudioEncoder`` loads the *dynamic*
+conv-feats ``wav2vec_v1.onnx`` graph via ``Wav2vecOnnxBackend`` (batch and
+frames both symbolic, no pad/trim). ``scripts/convert_to_onnx.sh`` and
+``fast_float.onnx.select_backends`` were switched to ``convert_wav2vec`` so the
+artifact the selector measures is the artifact the runtime reads. This module
+is kept only so older invocations do not break; it is no longer in the pipeline.
+
+Convert the audio condition encoder (unit 4) to ONNX.
 
 Exports ``AudioEncoder``'s deployed path (wav2vec2-base core + hidden-state
 stack + projection) at a STATIC frame count T (--frames) and exact waveform
-length (T * sr / fps). The app calls inference() once per request with
-T = ceil(audio_len * fps / sr), which varies per request — so the runtime
-pads/trims to the exported T exactly like the decoder's static batch
-(see convert_decoder.py). Dynamic batch only.
+length (T * sr / fps). Dynamic batch only.
 
 Bakes the ``only_last_features`` flag at build time (deployed default False
 = stack 12 layers). Reuses the emotion converter's manual-load fallback for

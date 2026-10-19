@@ -87,18 +87,18 @@ class _OnnxRunner(RuntimeSession, nn.Module):
         """Concrete [(output_name, shape)] for IOBinding, or None to skip it."""
         raise NotImplementedError
 
-    def _io_run(self, feed, out_shapes):
+    def _io_run(self, feed, out_shapes, session=None):
         from fast_float.onnx.export import run_ort_iobinding
 
         dev = next(iter(feed.values())).device
-        return run_ort_iobinding(self.session, feed, out_shapes, device=dev)
+        return run_ort_iobinding(session or self.session, feed, out_shapes, device=dev)
 
-    def _try_io(self, feed, out_shapes):
+    def _try_io(self, feed, out_shapes, session=None):
         """IOBinding attempt; raises (and disables future attempts) on failure."""
         if self._io_failed or not out_shapes:
             raise RuntimeError("iobinding unavailable")
         try:
-            out = self._io_run(feed, out_shapes)
+            out = self._io_run(feed, out_shapes, session)
             self.stats.io_bindings += 1
             return out
         except Exception as e:
@@ -307,12 +307,39 @@ class RefEncOnnx(_OnnxRunner):
         return outs[0], outs[1], outs[2:]
 
 
+def _discover_decoder_batches(onnx_path: str) -> dict[int, str]:
+    """Map ``batch -> path`` for ``<stem>_b<N>.onnx`` siblings of ``onnx_path``.
+
+    ``convert_decoder`` writes the primary batch to ``--out`` and every other
+    batch to a ``<stem>_b<N>.onnx`` sibling (see its docstring); the runtime
+    discovers them by filename so the selector/config only need to name the
+    primary artifact. Returns ``{}`` when there are no siblings (legacy single
+    graph), in which case the caller keys everything off the primary file.
+    """
+    import glob
+    import re
+
+    abs_path = os.path.abspath(onnx_path)
+    directory = os.path.dirname(abs_path)
+    stem = os.path.splitext(os.path.basename(abs_path))[0]
+    pattern = re.compile(re.escape(stem) + r"_b(\d+)\.onnx$")
+    found: dict[int, str] = {}
+    for p in glob.glob(os.path.join(directory, f"{stem}_b*.onnx")):
+        m = pattern.search(os.path.basename(p))
+        if m:
+            found[int(m.group(1))] = p
+    return found
+
+
 class DecoderOnnx(_OnnxRunner):
     """Static-batch decode: ``latent [m,512] + feats [m,...] -> img [m,3,H,W]``.
 
-    The graph bakes ``groups=batch`` into its convs, so it is valid for exactly
-    one ``B`` (``self.batch``). Runtime pads micro-batches up to ``B``
-    (replicate) and trims the output back to ``m``.
+    The graph bakes ``groups=batch`` into its convs, so each artifact is valid
+    for exactly one ``B``. ``convert_decoder`` exports a *set* of them; this
+    runner loads them lazily and, per call, picks the smallest session covering
+    the incoming micro-batch ``m`` (replicate-pads up to it and trims the
+    output back to ``m``). ``self.batch`` is the largest available batch, which
+    lifts the decode chunk-size cap from the single artifact's ``B``.
     """
 
     component = "decoder"
@@ -326,27 +353,83 @@ class DecoderOnnx(_OnnxRunner):
         max_batch: int | None = None,
         device_id: int | None = None,
     ):
-        super().__init__(
-            onnx_path,
-            use_gpu=use_gpu,
-            opt_shapes=opt_shapes,
-            extra_dynamic=extra_dynamic,
-            max_batch=max_batch,
-            device_id=device_id,
-        )
+        if not os.path.exists(onnx_path):
+            raise FileNotFoundError(f"ONNX not found: {onnx_path}")
+        RuntimeSession.__init__(self, device_id=device_id)
+        self.use_gpu = torch.cuda.is_available() if use_gpu is None else bool(use_gpu)
+        self.path = os.path.abspath(onnx_path)
+        self._opt_shapes = opt_shapes
+        self._extra_dynamic = extra_dynamic
+        self._max_batch = max_batch
+        self._io_failed = False
+        self._sessions: dict = {}
+        self._io: dict = {}
+        self._paths = _discover_decoder_batches(onnx_path)
+        # Load the primary artifact eagerly: gives ``providers`` a session and
+        # anchors the no-siblings (legacy single-graph) case.
+        session, meta = self._load(self.path)
+        key = meta["batch"]
+        self._primary_key = key
+        self._paths[key] = self.path
+        self._sessions[key] = session
+        self._io[key] = meta
+        self.session = session
         self._refresh_io()
+        int_keys = sorted(k for k in self._paths if isinstance(k, int))
+        self.batches = int_keys
+        self.batch = int_keys[-1] if int_keys else None
 
-    def _refresh_io(self) -> None:
-        ins = self.session.get_inputs()
-        self.latent_name = ins[0].name
-        self.feat_names = [i.name for i in ins[1:]]
+    @staticmethod
+    def _read_io(session, path: str) -> dict:
+        ins = session.get_inputs()
         shape0 = ins[0].shape
         b = shape0[0] if shape0 else None
-        self.batch = int(b) if isinstance(b, int) else None
-        out = self.session.get_outputs()[0]
-        self.output_name = out.name
+        out = session.get_outputs()[0]
         out_shape = tuple(out.shape or ())
-        self.output_shape = out_shape if len(out_shape) == 4 and all(isinstance(d, int) for d in out_shape) else None
+        return {
+            "path": path,
+            "latent_name": ins[0].name,
+            "feat_names": [i.name for i in ins[1:]],
+            "batch": int(b) if isinstance(b, int) else None,
+            "output_name": out.name,
+            "output_shape": out_shape if len(out_shape) == 4 and all(isinstance(d, int) for d in out_shape) else None,
+        }
+
+    def _load(self, path: str):
+        session, _ = make_runtime_session(
+            path,
+            opt_shapes=self._opt_shapes,
+            extra_dynamic=self._extra_dynamic,
+            max_batch=self._max_batch,
+            use_gpu=self.use_gpu,
+            device_id=self.device_id,
+        )
+        return session, self._read_io(session, path)
+
+    def _ensure(self, key):
+        if key not in self._sessions:
+            path = self._paths.get(key)
+            if path is None:
+                raise KeyError(f"no ONNX decoder artifact for batch {key}")
+            session, meta = self._load(path)
+            self._sessions[key] = session
+            self._io[key] = meta
+        return self._sessions[key], self._io[key]
+
+    def _select_batch(self, m: int):
+        for b in self.batches:
+            if b >= m:
+                return b
+        return self.batches[-1] if self.batches else self._primary_key
+
+    def _refresh_io(self) -> None:
+        # Primary-session metadata (self.session); keeps ``providers`` and the
+        # legacy single-artifact attributes working.
+        meta = self._read_io(self.session, self.path)
+        self.latent_name = meta["latent_name"]
+        self.feat_names = meta["feat_names"]
+        self.output_name = meta["output_name"]
+        self.output_shape = meta["output_shape"]
 
     def _recreate(self, device_id: int | None = None):
         return DecoderOnnx(
@@ -358,10 +441,24 @@ class DecoderOnnx(_OnnxRunner):
             device_id=device_id if device_id is not None else self.device_id,
         )
 
-    def _io_shapes(self):
-        if self.output_shape is None:
-            return None
-        return [(self.output_name, self.output_shape)]
+    def _rebind(self, device_id: int) -> None:
+        self.device_id = int(device_id)
+        self._sessions = {}
+        self._io = {}
+        session, meta = self._load(self.path)
+        key = meta["batch"]
+        self._primary_key = key
+        self._sessions[key] = session
+        self._io[key] = meta
+        self.session = session
+        self._io_failed = False
+        self._refresh_io()
+
+    def _io_shapes(self, meta: dict | None = None):
+        meta = meta or self._io.get(self._primary_key) or {}
+        out_shape = meta.get("output_shape")
+        out_name = meta.get("output_name") or getattr(self, "output_name", "img")
+        return [(out_name, out_shape)] if out_shape else None
 
     @_dynamo_disable
     def _run(self, feed):
@@ -371,30 +468,34 @@ class DecoderOnnx(_OnnxRunner):
     def forward(self, latent: torch.Tensor, feats) -> torch.Tensor:
         device = latent.device
         m = latent.shape[0]
-        big_b = self.batch or m
-        if m > big_b:
+        key = self._select_batch(m)
+        session, meta = self._ensure(key)
+        big_b = meta["batch"]
+        if big_b is not None and m > big_b:
             raise ValueError(f"decode batch {m} exceeds static ONNX batch {big_b}")
+        big_b = big_b or m
         fs = list(feats)
         fs = [f.expand(big_b, *f.shape[1:]) if f.shape[0] == 1 else f for f in fs]
         if m < big_b:
             pad = big_b - m
             latent = torch.cat([latent, latent[-1:].expand(pad, *latent.shape[1:])], dim=0)
             fs = [torch.cat([f, f[-1:].expand(pad, *f.shape[1:])], dim=0) if f.shape[0] == m else f for f in fs]
-        if device.type == "cuda" and self._gpu_active() and len(fs) == len(self.feat_names) and self.batch is not None:
-            shapes = self._io_shapes()
+        feat_names = meta["feat_names"]
+        if device.type == "cuda" and self._gpu_active() and len(fs) == len(feat_names) and meta["batch"] is not None:
+            shapes = self._io_shapes(meta)
             if shapes is not None:
                 try:
-                    feed = {self.latent_name: latent.to(dtype=torch.float32)}
-                    for name, f in zip(self.feat_names, fs, strict=False):
+                    feed = {meta["latent_name"]: latent.to(dtype=torch.float32)}
+                    for name, f in zip(feat_names, fs, strict=False):
                         feed[name] = f.to(dtype=torch.float32)
-                    (out,) = self._try_io(feed, shapes)
+                    (out,) = self._try_io(feed, shapes, session)
                     return out[:m].to(device=device, dtype=torch.float32)
                 except Exception:
                     pass
-        feed = {self.latent_name: self._np(latent)}
-        for name, f in zip(self.feat_names, fs, strict=False):
+        feed = {meta["latent_name"]: self._np(latent)}
+        for name, f in zip(feat_names, fs, strict=False):
             feed[name] = self._np(f)
-        out = self._run(feed)
+        out = session.run(None, feed)[0]
         return torch.from_numpy(out[:m]).to(device=device, dtype=torch.float32)
 
 

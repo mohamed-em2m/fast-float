@@ -43,9 +43,9 @@ the dynamo exporter) and `tensorrt-cu12==10.9.*` (see `AGENT.md` §6), so the
 CUDA 12 sonames ORT needs come from torch's own `nvidia-*-cu12` deps. On the
 same T4 that means **both** the CUDA EP and the TensorRT EP load, all six units
 export and pass parity under **TRT FP16**, and `trt` is a real candidate again.
-`emotion` and `refenc` need parity's functional-equivalence branch (cosine +
-bounded mean error) because their outputs are bounded/small-magnitude, where
-FP16 drift is absolute — see `AGENT.md` §6.
+`emotion`, `refenc`, `audio` and `fmt` need parity's functional-equivalence branch
+(cosine + bounded mean error) because their outputs are bounded/small-magnitude,
+where FP16 drift is absolute — see `AGENT.md` §6.
 
 ## Components
 
@@ -55,7 +55,7 @@ FP16 drift is absolute — see `AGENT.md` §6.
 | `audio` | wav2vec2 + projection | `wav2vec_v1.onnx` | once / chunk | **yes** |
 | `direction` | motion direction (QR) | `direction_v1.onnx` | once / request | no |
 | `fmt` | FMT vector field | `fmt_step_v1.onnx` | **NFE x chunks** | **yes** |
-| `decoder` | StyleDecoder synthesis | `decoder_v1.onnx` | per micro-batch | **yes** |
+| `decoder` | StyleDecoder synthesis | `decoder_v1.onnx` (+ `decoder_v1_b<N>.onnx` set) | per micro-batch | **yes** |
 | `refenc` | reference encoder | `refenc_v1.onnx` | once / request | no |
 
 Only the **hot** components are worth optimizing. A 3x win on `direction`

@@ -319,6 +319,10 @@ class FlowMatchingTransformer(BaseModel):
                 self._onnx_backend = FMTStepBackend(
                     onnx_path,
                     opt_shapes={
+                        # ``t`` is exported static ([1]) — see
+                        # export_module(shared_inputs=...) in convert_fmt.py — so
+                        # it needs no TRT profile. Every *dynamic* input must
+                        # have one or ORT drops the session to CUDA.
                         "x": [1, n_clip, dim_w],
                         "wa": [1, n_clip, dim_w],
                         "wr": [1, 1, dim_w],

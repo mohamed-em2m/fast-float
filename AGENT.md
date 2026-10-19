@@ -276,11 +276,21 @@ pre-commit run -all-files
 # Backend → http://localhost:8000 | Frontend → http://localhost:3000
 ```
 
+The frontend needs **Node 20.19+ / 22.12+** (Vite 8's rolldown imports
+`node:util.styleText`); `scripts/setup.sh` installs Node 22 from NodeSource when
+the system Node is older, and `run_all.sh` refuses to start on a too-old Node
+instead of dying inside Vite.
+
+The backend is launched with `uv run --frozen --no-sync` (see §6): a plain
+`uv run` re-syncs the venv back to the lock, which pins the *portable* CPU
+`onnxruntime`, and the server then boots with no CUDA/TensorRT EP.
+
 ### 1. Launch FastAPI Server
 
 ```bash
-# Direct run with uv and hypercorn
-uv run hypercorn fast_float.main:app --bind 0.0.0.0:8000 --log-level info
+# Direct run with uv and hypercorn. `--no-sync` keeps the ONNX export stack /
+# onnxruntime-gpu that setup.sh + convert_to_onnx.sh layered over the lock.
+uv run --frozen --no-sync hypercorn fast_float.main:app --bind 0.0.0.0:8000 --log-level info
 
 # Or using the shell script
 ./scripts/run_api.sh
@@ -406,6 +416,29 @@ When editing or extending the codebase, follow these design patterns:
 - **No automatic runtime self-test or fallback** — parity/selection is validated
   by the converter/selector scripts only (`python -m fast_float.onnx.select_backends`).
   ORT providers (`trt → cuda → cpu`) fall back *inside* session creation.
+- **The `decoder` graph is static-batch, so it ships as a set.**
+  `ModulatedConv2d` bakes `groups=batch` into the graph, making each artifact
+  valid for exactly one `B`. `convert_decoder.py --batches 1,2,4,8,16` writes the
+  primary `--batch` (default 8, matching the selector's `--dec-batch`) to `--out`
+  and the rest to `<stem>_b<N>.onnx` siblings. `DecoderOnnx`
+  (`runtimes/onnx/runner.py`) discovers the siblings, loads them **lazily**, and
+  per call picks the smallest session covering the micro-batch (replicate-pad,
+  trim). `_decoder_static_batch()` returns the *largest* available batch, so the
+  decode tuner can size above the primary instead of being capped at it.
+- **A batch-shared scalar input must stay static.** `fmt` takes one scalar time
+  value `t` (`torch.tensor([t_val])`, shape `[1]`, broadcast over the batch
+  *inside* the graph) — it is not a batch-first tensor. `export_module` used to
+  duplicate every dim-0==1 sample to batch 2 and then mark dim 0 dynamic, so `t`
+  became `[s0]` and shared the batch dim with the rank-3 inputs. TensorRT's ONNX
+  parser cannot tie a rank-1 tensor's `s0` to the rank-3 inputs' `s0`: it froze
+  `t` at the profile's *opt* batch, so the plain call worked and every CFG call
+  (batch 3B) died with "Dimensions with name s0 must be equal. Condition '=='
+  violated: 1 != 3". Converters now pass `shared_inputs=(...)` to
+  `export_module`, which skips those inputs in both `_ensure_batch2` and
+  `_dynamo_mark`; the exported `t` stays static `[1]` and TRT builds one engine
+  for the whole batch range. (Renaming only the `dim_param` is not enough —
+  ORT's TRT engine cache key ignores dim names and reuses the stale engine; the
+  static-shape change alters the graph, which does bust it.)
 - **TensorRT must major-match ORT.** `onnxruntime-gpu` 1.23 is built against
   **TensorRT 10.9** and dlopens `libnvinfer.so.10` / `libnvonnxparser.so.10`. A
   TRT 11 install (`tensorrt_cu13*` → `libnvinfer.so.11`) can never satisfy that
@@ -446,15 +479,25 @@ When editing or extending the codebase, follow these design patterns:
   the files back to the GPU wheel (`install_onnx_stack`) — it has to do that
   *after* installing `onnxscript`, which itself depends on the CPU wheel and
   would otherwise reintroduce it.
+- **`uv run` re-syncs the venv and kills the GPU EPs.** Same trap, runtime side:
+  the lock (`uv.lock`) pins the portable CPU `onnxruntime`, while the export
+  stack (`onnx` 1.17/1.18 + `onnxruntime-gpu` + TensorRT) is layered on top by
+  `setup.sh` / `convert_to_onnx.sh`. Every launcher therefore runs
+  `uv run --frozen **--no-sync**`; a plain `uv run --frozen` re-syncs the env to
+  the lock and the backend boots with
+  `Available Execution Providers: ['AzureExecutionProvider', 'CPUExecutionProvider']`
+  (observed in `scripts/run_all.sh` logs). Affected: `run_all.sh`, `run_api.sh`,
+  `run_gradio.sh`, `run_live.sh`.
 - **A `uv` venv has no `pip`.** `uv sync`/`uv venv` ship neither a `pip` binary
   nor the `pip` module, so `source .venv/bin/activate` leaves bare `pip`
   resolving to the **system** pip (Colab especially) — every install lands in
-  the system site-packages and the venv stays untouched, silently. That is why
-  the repair blocks in `scripts/convert_to_onnx.sh` call
-  `uv pip install --python "${PY}"` (`pip_install`/`pip_uninstall`, the same
-  helpers `install_tensorrt.sh` already had) and never bare `pip`. The legacy
-  per-unit `scripts/convert_{fmt,wav2vec}_to_onnx.sh` still use bare
-  `python`/`pip` and only behave when run from an already-activated venv.
+  the system site-packages and the venv stays untouched, silently. The venv +
+  install logic now lives in one sourced file, **`scripts/_onnx_env.sh`**
+  (`use_project_venv` defines `pip_install`/`pip_uninstall` on
+  `uv pip install --python "${PY}"`, plus `probe_*`/`ensure_onnx_stack`/
+  `augment_ort_libs`/`probe_trt`), which `scripts/convert_to_onnx.sh` **and** the
+  per-unit `scripts/convert_{fmt,wav2vec}_to_onnx.sh` all source; none of them
+  use bare `pip` anymore.
 - **`onnx` has to stay in the 1.17–1.18 window.** ORT 1.23 refuses any model
   whose IR version exceeds **11**, and a model built with `onnx.helper` defaults
   to the *installed* onnx's IR version (1.17→10, 1.18→11, 1.19→12,
@@ -462,22 +505,32 @@ When editing or extending the codebase, follow these design patterns:
   onnx>=1.17, so 1.17/1.18 is the only safe pair. Conversion itself is immune —
   Torch hardcodes IR 10 — but anything else that builds ONNX (the tests use
   `helper.make_model`) fails to load with "Unsupported model IR version".
-  `convert_to_onnx.sh` therefore installs `ONNX_PIN="onnx>=1.17,<1.19"`, not the
-  old `onnx<1.22` (which still allows IR 12/13).
+  `scripts/_onnx_env.sh` therefore pins `ONNX_PIN="onnx>=1.17,<1.19"`, not the
+  old `onnx<1.22` (which still allows IR 12/13), and its `probe_onnx` checks the
+  onnx **version** (not just importability) so `ensure_onnx_stack` actually
+  repairs an out-of-window onnx (e.g. a stray 1.19+ pulled in by another tool).
 - **TRT FP16 cannot meet an elementwise gate on bounded outputs.** TensorRT
   FP16 rounds every accumulation in a deep stack, so on outputs that are
   *small or bounded* the drift is absolute and no `fp16_tol` factor fixes it:
   `emotion` (a probability vector; measured worst cosine 0.9985, `mean_abs`
-  8.9e-3, `max_abs` 3.1e-2) and `refenc` (conv feature maps, |b| up to ~39;
-  worst `max_abs` 9.8e-2 on their small elements). Both therefore also pass a
-  **functional-equivalence gate** — `cosine >= FP16_MIN_COSINE` (0.995) and
-  `mean_abs <= FP16_MAX_MEAN` (0.02), see `fast_float/onnx/export.py` and
-  `parity.compare_outputs` — exactly as the decoder has since the first TRT
-  run. The elementwise gate stays the primary check; `check_parity` prints
-  `PASS(functional)` when only the fallback saved it. The same bounds are set
-  on the `Case`s in `select_backends.py` so selection agrees with conversion.
-  Both were verified FP32-exact first (CUDA EP: `max_abs` ~1e-5, cosine 1.0),
-  so this is FP16 rounding, not a graph bug.
+  8.9e-3, `max_abs` 3.1e-2), `refenc` (conv feature maps, |b| up to ~39;
+  worst `max_abs` 9.8e-2 on their small elements), `audio` (projected
+  wav2vec feats; worst cosine 0.999996, `mean_abs` 4.2e-4, `max_abs` 1.6e-2),
+  and `fmt` (the flow-matching vector field; worst cosine 0.999996, `mean_abs`
+  5.9e-3, `max_abs` 4.1e-2).
+  All four therefore also pass a **functional-equivalence gate** —
+  `cosine >= FP16_MIN_COSINE` (0.995) and `mean_abs <= FP16_MAX_MEAN` (0.02),
+  see `fast_float/onnx/export.py` and `parity.compare_outputs` — exactly as the
+  decoder has since the first TRT run. The elementwise gate stays the primary
+  check; `check_parity` prints `PASS(functional)` when only the fallback saved
+  it. The same bounds are set on the `Case`s in `select_backends.py` so
+  selection agrees with conversion. Each was verified FP32-exact first (CUDA
+  EP: `max_abs` ~1e-5, cosine 1.0), so this is FP16 rounding, not a graph bug.
+  (`audio` only started hitting TRT FP16 once its converter passed explicit
+  TRT profiles for the dynamic `conv_feats`; before that TRT could not build an
+  engine and the EP fell back to CUDA, where the strict gate passed by luck.
+  `fmt` is the same story: before the scalar-`t` export fix above, TRT built no
+  engine and CUDA carried it.)
 - Full details and rationale: **`docs/BACKEND_SELECTION.md`** — read it before
   touching the ONNX path.
 

@@ -1,9 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Prefer the project venv. This file is *sourced* by the launchers
+# (run_all.sh / run_api.sh / environments.sh) from a plain shell where `.venv`
+# is not activated; falling back to the system `python` finds no
+# onnxruntime/nvidia wheels, and `set -e` then aborts the launch.
+_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_PROJECT_ROOT="$(cd "${_SCRIPT_DIR}/.." && pwd)"
+if [[ -x "${_PROJECT_ROOT}/.venv/bin/python" ]]; then
+    PY="${_PROJECT_ROOT}/.venv/bin/python"
+else
+    PY="${PY:-python}"
+fi
+
 # Find Python site-packages directories
 mapfile -t PACKAGE_PATHS < <(
-    python -c '
+    "${PY}" -c '
 import site
 for p in site.getsitepackages():
     print(p)
@@ -74,7 +86,7 @@ printf ' - %s\n' "${UNIQUE_PATHS[@]}"
 echo
 echo "Testing ONNX Runtime..."
 
-python - <<'PY'
+"${PY}" - <<'PY'
 try:
     import onnxruntime as ort
     print("Available Execution Providers:", ort.get_available_providers())

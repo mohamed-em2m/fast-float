@@ -24,33 +24,43 @@ def _as_tuple(inputs):
     return tuple(inputs)
 
 
-def _dynamo_mark(args, dynamic_dims=(0, 1)):
+def _dynamo_mark(args, dynamic_dims=(0, 1), skip=()):
     """Mark dims dynamic for torch.export.
 
     Uses ``maybe_mark_dynamic`` (Dim-dicts misbehave under
     ``assume_static_by_default`` in some builds). Size-1 dims get
     specialized by dynamo, so the trace sample must already have ``>1``
     on every dim we want dynamic — callers pass batch>=2 samples.
+    ``skip`` holds positional indices of inputs that are NOT batch-first
+    (e.g. the FMT scalar time ``t``), which must stay static.
     """
     try:
         from torch._dynamo import maybe_mark_dynamic
     except Exception:
         return False
     marked = False
-    for a in args:
-        if isinstance(a, torch.Tensor):
-            for d in dynamic_dims:
-                if d < a.ndim and a.shape[d] > 1:
-                    maybe_mark_dynamic(a, d)
-                    marked = True
+    for i, a in enumerate(args):
+        if i in skip or not isinstance(a, torch.Tensor):
+            continue
+        for d in dynamic_dims:
+            if d < a.ndim and a.shape[d] > 1:
+                maybe_mark_dynamic(a, d)
+                marked = True
     return marked
 
 
-def _ensure_batch2(args):
-    """Duplicate a batch-1 sample so dynamo sees batch=2 (shapes only)."""
+def _ensure_batch2(args, skip=()):
+    """Duplicate a batch-1 sample so dynamo sees batch=2 (shapes only).
+
+    ``skip`` holds positional indices that must not be touched: duplicating a
+    *shared* input (the FMT scalar time ``t``, which is deliberately shape
+    ``[1]`` and broadcast inside the graph) would both falsify its shape and
+    get dim 0 marked dynamic, which TensorRT then mis-resolves across the
+    rank-1/rank-3 inputs.
+    """
     out = []
-    for a in args:
-        if isinstance(a, torch.Tensor) and a.ndim >= 1 and a.shape[0] == 1:
+    for i, a in enumerate(args):
+        if i not in skip and isinstance(a, torch.Tensor) and a.ndim >= 1 and a.shape[0] == 1:
             a = torch.cat([a, a], dim=0)
         out.append(a)
     return tuple(out)
@@ -66,6 +76,7 @@ def export_module(
     opset: int = 17,
     fixed_batch: bool = False,
     mark_dims: tuple[int, ...] = (0, 1),
+    shared_inputs: Sequence[str] = (),
 ) -> dict[str, str]:
     """Export ``module`` to ``out_path`` via dynamo. Returns info dict.
 
@@ -73,24 +84,30 @@ def export_module(
     comes from ``mark_dims`` and dynamo's own opset selection.
     ``fixed_batch=True`` skips sample duplication + dynamic marking (for
     graphs with baked batch, e.g. static-batch grouped conv).
+    ``shared_inputs`` names inputs that are broadcast across the batch rather
+    than batch-first (the FMT scalar time ``t``): they keep their traced shape
+    and no dim of theirs is marked dynamic, so TensorRT never has to reconcile
+    a rank-1 shared dim against the rank-3 batch dims.
     Raises RuntimeError when dynamo export is unavailable/fails.
     """
     module = module.eval()
     inputs = _as_tuple(sample_inputs)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     notes = []
+    marked = False
     if not (hasattr(torch, "export") and hasattr(torch.export, "export")):
         raise RuntimeError(
             "torch.export.export is required (torch>=2.1) and the classic "
             f"torch.onnx.export fallback is retired. This box has torch "
             f"{torch.__version__}. Run conversion on the GPU box (torch>=2.1)."
         )
+    skip = {input_names.index(n) for n in shared_inputs if n in input_names}
     if fixed_batch:
         trace_args = inputs
         notes.append("fixed batch: no dynamic marking")
     else:
-        trace_args = _ensure_batch2(inputs)
-        marked = _dynamo_mark(trace_args, dynamic_dims=mark_dims)
+        trace_args = _ensure_batch2(inputs, skip=skip)
+        marked = _dynamo_mark(trace_args, dynamic_dims=mark_dims, skip=skip)
         notes.append(f"dynamo dynamic dims={mark_dims} marked={marked}")
     try:
         ep = torch.export.export(module, trace_args, strict=False)
@@ -112,7 +129,17 @@ def export_module(
             f"torch>=2.9 rejects its dynamic_axes): {e}. Fix the graph (see "
             "the converter substitution notes) instead of falling back."
         ) from e
-    notes.append("dynamo export with symbolic batch/length")
+    # Report the dynamics honestly: a fixed-batch graph (the decoder, whose
+    # grouped convs bake ``groups=batch``) has no symbolic axes at all, while
+    # other units may mark only some dims (e.g. ``audio`` bakes length and
+    # marks batch only). Claiming "symbolic batch/length" unconditionally was
+    # wrong for both.
+    if fixed_batch:
+        notes.append("dynamo export: static batch/length (baked at trace)")
+    elif marked:
+        notes.append(f"dynamo export with symbolic dims={mark_dims}")
+    else:
+        notes.append("dynamo export: static shapes (no dims marked dynamic)")
     return {
         "path": os.path.abspath(out_path),
         "exporter": "dynamo",

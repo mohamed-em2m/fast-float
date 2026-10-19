@@ -56,7 +56,7 @@ from fast_float.onnx.parity import compare_outputs
 
 ONNX_FILES = {
     "emotion": "emotion_v1.onnx",
-    "audio": "audio_enc_v1.onnx",
+    "audio": "wav2vec_v1.onnx",
     "direction": "direction_v1.onnx",
     "fmt": "fmt_step_v1.onnx",
     "decoder": "decoder_v1.onnx",
@@ -120,25 +120,31 @@ def _build_emotion(args, device) -> Case:
 
 
 def _build_audio(args, device) -> Case:
-    from fast_float.onnx.convert_audio import build_audio_module
+    from fast_float.onnx.convert_wav2vec import build_export_module, frames_for
 
-    module, _, _ = build_audio_module(
-        args.ckpt,
-        args.w2v_dir,
-        args.audio_frames,
-        512,
-        False,
-        device,
-    )
-    wav_len = int(args.audio_frames * 16000 / 25.0)
+    module = build_export_module(args.w2v_dir, args.ckpt).to(device).eval()
+    core = module.core
+    frames = frames_for(args.seconds)
+    wav_len = int(16000 * args.seconds)
     g = torch.Generator().manual_seed(11)
-    a = torch.randn(1, wav_len, generator=g).clamp(-1, 1).to(device)
+    wav = torch.randn(1, wav_len, generator=g).clamp(-1, 1).to(device)
+    with torch.no_grad():
+        # The runtime feeds ``feature_extract``'s conv feats (the conv front-end
+        # + interpolation stay in torch); the graph covers the transformer +
+        # projection head. Measure the same graph the runtime loads.
+        feats = core.feature_extract(wav, frames)
     return Case(
         "audio",
         module,
-        (a,),
-        {"waveform": a.detach().cpu().numpy()},
-        opt_shapes={"waveform": [1, wav_len]},
+        (feats,),
+        {"conv_feats": feats.detach().cpu().numpy()},
+        opt_shapes={"conv_feats": [1, frames, 512]},
+        extra_dynamic={"conv_feats": {1: (10, 2000)}},
+        # Bounded/small-magnitude feats: TRT FP16 drift is absolute, so it needs
+        # the same functional gate the emotion/refenc cases (and the converter)
+        # apply -- see export.FP16_MIN_COSINE.
+        min_cosine=FP16_MIN_COSINE,
+        max_mean=FP16_MAX_MEAN,
     )
 
 
@@ -182,6 +188,8 @@ def _build_fmt(args, device) -> Case:
     ins = sample_inputs(3, 0.5, 99, device)  # CFG 3B: the hot call
     feed = {k: v.detach().cpu().numpy() for k, v in zip(names, ins, strict=False)}
     opt = {
+        # ``t`` is the shared scalar time and is exported *static* ([1], see
+        # export_module(shared_inputs=...)), so it gets no profile entry.
         "x": [1, CLIP_FRAMES, 512],
         "wa": [1, CLIP_FRAMES, 512],
         "wr": [1, 1, 512],
@@ -189,7 +197,18 @@ def _build_fmt(args, device) -> Case:
         "prev_x": [1, PREV_FRAMES, 512],
         "prev_wa": [1, PREV_FRAMES, 512],
     }
-    return Case("fmt", module, tuple(ins), feed, opt_shapes=opt)
+    return Case(
+        "fmt",
+        module,
+        tuple(ins),
+        feed,
+        opt_shapes=opt,
+        # Vector-field output is bounded/small-magnitude: TRT FP16 drift is
+        # absolute (~9e-3, cosine 0.999997), so it needs the same functional
+        # gate the converter applies (see export.FP16_MIN_COSINE).
+        min_cosine=FP16_MIN_COSINE,
+        max_mean=FP16_MAX_MEAN,
+    )
 
 
 def _build_decoder(args, device) -> Case:
@@ -509,7 +528,9 @@ def main(argv=None) -> int:
     ap.add_argument("--image-size", type=int, default=512)
     ap.add_argument("--motion-dim", type=int, default=20)
     ap.add_argument("--dec-batch", type=int, default=8)
-    ap.add_argument("--audio-frames", type=int, default=300)
+    # Deprecated: the audio graph is now the dynamic conv_feats wav2vec graph,
+    # so its sample length comes from --seconds (frames are not baked anymore).
+    ap.add_argument("--audio-frames", type=int, default=300, help=argparse.SUPPRESS)
     ap.add_argument("--prev-frames", type=int, default=10)
     ap.add_argument("--fmt-depth", type=int, default=8)
     ap.add_argument("--fmt-dim-h", type=int, default=1024)

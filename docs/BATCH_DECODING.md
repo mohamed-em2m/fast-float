@@ -28,6 +28,14 @@ The method [`FLOAT.get_optimal_decode_batch_size(device)`](file:///c:/Users/emam
 > [!NOTE]
 > If `opt.decode_batch_size` is explicitly configured in `self.opt`, it takes absolute precedence over automatic detection.
 
+> [!NOTE]
+> When the **ONNX decoder** backend is active the tuner is also capped by the
+> largest static batch that shipped. `convert_decoder.py` exports a *set*
+> (`decoder_v1.onnx` + `decoder_v1_b<N>.onnx`), so the cap is the largest
+> sibling (16 by default) rather than whichever graph the selector measured.
+> Each micro-batch is padded to the **smallest** session that covers it and
+> trimmed back, so a 4-frame chunk never pays for a 16-frame graph.
+
 ---
 
 ## 3. Core Architecture

@@ -211,7 +211,7 @@ def _apply_decoder(model, ae, opt) -> None:
     try:
         runner = DecoderOnnx(path, device_id=_primary_device_id(opt))
         model._decoder_onnx = runner
-        logger.info(f"backends: decoder -> ONNX {path} (static batch {runner.batch}, {runner.providers})")
+        logger.info(f"backends: decoder -> ONNX {path} (batches {getattr(runner, 'batches', [])}, {runner.providers})")
     except Exception as e:
         logger.warning(f"backends: decoder ONNX skipped ({e}); eager")
 
