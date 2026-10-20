@@ -71,3 +71,30 @@ def test_runtime_session_honours_the_no_trt_marker(tmp_path, monkeypatch):
     (tmp_path / f"decoder_v1.onnx{export.TRT_DISABLED_MARKER}").write_text("veto", encoding="utf-8")
     export.make_runtime_session(str(model))
     assert seen["use_trt"] is False
+
+
+def test_veto_writes_the_marker_when_trt_was_not_used(tmp_path):
+    # The runtime tries TRT first, so an artifact validated on the CUDA EP has
+    # to carry the marker or production runs the unchecked provider.
+    model = tmp_path / "decoder_v1.onnx"
+    marker = tmp_path / f"decoder_v1.onnx{export.TRT_DISABLED_MARKER}"
+    assert convert_decoder._veto_or_clear_trt(str(model), 4, trt_on=False) is False
+    assert marker.exists()
+
+
+def test_veto_clears_a_stale_marker_when_trt_passes(tmp_path):
+    model = tmp_path / "decoder_v1.onnx"
+    marker = tmp_path / f"decoder_v1.onnx{export.TRT_DISABLED_MARKER}"
+    marker.write_text("stale", encoding="utf-8")
+    assert convert_decoder._veto_or_clear_trt(str(model), 4, trt_on=True) is True
+    assert not marker.exists()
+    # nothing to clear: no spurious "cleared" log for a fresh artifact
+    assert convert_decoder._veto_or_clear_trt(str(model), 4, trt_on=True) is False
+
+
+@pytest.mark.parametrize(
+    ("argv", "no_trt"),
+    [([], True), (["--trt"], False), (["--trt", "--no-trt"], True), (["--no-trt"], True)],
+)
+def test_converter_defaults_to_the_cuda_ep(argv, no_trt):
+    assert convert_decoder._parse_args(argv).no_trt is no_trt

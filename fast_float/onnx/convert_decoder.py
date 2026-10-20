@@ -310,8 +310,31 @@ def _gate(rep: dict, args) -> bool:
 def _mark_no_trt(onnx_path: str) -> str:
     marker = f"{onnx_path}{TRT_DISABLED_MARKER}"
     with open(marker, "w", encoding="utf-8") as f:
-        f.write("TensorRT EP failed the uint8 parity gate for this decoder artifact.\n")
+        f.write(
+            "TensorRT EP is vetoed for this decoder artifact: it either failed the uint8 "
+            "parity gate or the artifact was validated without it (see convert_decoder).\n"
+        )
     return marker
+
+
+def _veto_or_clear_trt(onnx_path: str, b: int, trt_on: bool) -> bool:
+    """Keep the shipped artifact and the runtime on the same execution provider.
+
+    The runtime (``make_runtime_session``) always tries TensorRT first, so a
+    graph validated on the CUDA EP must leave the ``.no_trt`` sidecar behind or
+    production would silently run the provider that was *not* checked - exactly
+    how a 10x-slower, visibly wrong decoder shipped before.
+    """
+    marker = f"{onnx_path}{TRT_DISABLED_MARKER}"
+    if trt_on:
+        if os.path.exists(marker):
+            os.remove(marker)
+            return True
+        return False
+    if not os.path.exists(marker):
+        _mark_no_trt(onnx_path)
+        print(f"[parity:dec_b{b}] wrote {os.path.basename(marker)}: runtime will skip TensorRT")
+    return False
 
 
 def _run_parity(dec_raw, args, device, b, feats1, feat_names, onnx_path) -> None:
@@ -327,14 +350,14 @@ def _run_parity(dec_raw, args, device, b, feats1, feat_names, onnx_path) -> None
 
     # Static batch -> fully static graph, no TRT shape profiles needed.
     sess, _fp16 = make_session_from_args(onnx_path, args)
+    trt_on = "TensorrtExecutionProvider" in sess.get_providers()
     rep = _measure(dec_raw, sess, lat_t, feats_b, feed)
     print(
         f"[parity:dec_b{b}] max_lsb={rep['max_lsb']} mean_lsb={rep['mean_lsb']:.3f} "
-        f"cosine={rep['cosine']:.6f} ({gate_desc})"
+        f"cosine={rep['cosine']:.6f} ({gate_desc}{'' if trt_on else ', no TRT'})"
     )
     if not _gate(rep, args):
-        trt_on = "TensorrtExecutionProvider" in sess.get_providers()
-        if not trt_on or getattr(args, "no_trt", False):
+        if not trt_on:
             raise RuntimeError(
                 f"decoder parity FAILED (b{b}): max_lsb={rep['max_lsb']} (max={args.max_lsb}), "
                 f"mean_lsb={rep['mean_lsb']:.3f} (max={args.max_mean_lsb:g}), "
@@ -347,6 +370,7 @@ def _run_parity(dec_raw, args, device, b, feats1, feat_names, onnx_path) -> None
         fallback = copy.copy(args)
         fallback.no_trt = True
         sess, _fp16 = make_session_from_args(onnx_path, fallback)
+        trt_on = "TensorrtExecutionProvider" in sess.get_providers()
         rep = _measure(dec_raw, sess, lat_t, feats_b, feed)
         print(
             f"[parity:dec_b{b}] max_lsb={rep['max_lsb']} mean_lsb={rep['mean_lsb']:.3f} "
@@ -358,16 +382,10 @@ def _run_parity(dec_raw, args, device, b, feats1, feat_names, onnx_path) -> None
                 f"max_lsb={rep['max_lsb']} (max={args.max_lsb}), "
                 f"mean_lsb={rep['mean_lsb']:.3f} (max={args.max_mean_lsb:g})"
             )
-        print(
-            f"[parity:dec_b{b}] PASS on CUDA EP; wrote {os.path.basename(_mark_no_trt(onnx_path))} "
-            "so the runtime skips TensorRT for this artifact"
-        )
-    else:
-        stale = f"{onnx_path}{TRT_DISABLED_MARKER}"
-        if os.path.exists(stale):
-            os.remove(stale)
-            print(f"[parity:dec_b{b}] cleared stale {os.path.basename(stale)} (TRT passes now)")
-        print(f"[parity:dec_b{b}] PASS")
+    cleared = _veto_or_clear_trt(onnx_path, b, trt_on)
+    if cleared:
+        print(f"[parity:dec_b{b}] cleared stale {TRT_DISABLED_MARKER} (TRT passes now)")
+    print(f"[parity:dec_b{b}] PASS")
 
     # Bench OUTSIDE deterministic cuDNN so torch runs its deployed kernels
     # (deterministic disables cuDNN autotuning and would inflate speedup).
@@ -381,7 +399,7 @@ def _run_parity(dec_raw, args, device, b, feats1, feat_names, onnx_path) -> None
             )
 
 
-def main(argv=None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Convert frame decoder to ONNX")
     ap.add_argument("--ckpt", default="./checkpoints/float.pth")
     ap.add_argument("--out", default="./onnx/decoder_v1.onnx")
@@ -417,8 +435,31 @@ def main(argv=None) -> int:
     ap.add_argument("--max-mean-lsb", type=float, default=0.5, help="mean uint8 frame error vs eager torch")
     ap.add_argument("--skip-parity", action="store_true")
     ap.add_argument("--bench-iters", type=int, default=10)
+    ap.add_argument(
+        "--trt",
+        action="store_true",
+        help="opt in to the TensorRT EP for the parity session; off by default "
+        "because TRT partitions this graph (10x slower) and misses the uint8 gate",
+    )
     add_ort_args(ap)
-    args = ap.parse_args(argv)
+    return ap
+
+
+def _parse_args(argv=None):
+    """Parse flags and make TensorRT opt-in for this converter.
+
+    A TRT session for this decoder was measured at 0.09x eager with a 4.375
+    max_abs error, so the default parity session (and therefore the shipped
+    artifact's ``.no_trt`` sidecar) must be the CUDA EP. ``--trt`` restores the
+    old behaviour for a box where TRT has been re-validated.
+    """
+    args = _build_parser().parse_args(argv)
+    args.no_trt = bool(args.no_trt) or not args.trt
+    return args
+
+
+def main(argv=None) -> int:
+    args = _parse_args(argv)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batches = sorted(set(_parse_batches(args.batches)) | {int(args.batch)})

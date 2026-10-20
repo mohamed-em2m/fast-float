@@ -288,6 +288,8 @@ ORT_ARGS="--trt-max-batch 16" ./scripts/convert_to_onnx.sh
 See [`docs/BACKEND_SELECTION.md`](docs/BACKEND_SELECTION.md) for the measurement methodology and [`docs/BUILD_RUNTIME_SESSIONS.md`](docs/BUILD_RUNTIME_SESSIONS.md) for session construction. Partial acceleration is always safe: any component that is missing, fails parity, or fails to load falls back to PyTorch.
 
 > The decoder is frequently *not* worth exporting: in our measurements the ONNX decoder ran at 0.82–0.88× eager because the eager postprocess is already fused, while `fmt` gained 4.07×. Always trust the generated config over intuition.
+>
+> TensorRT is also opt-in for this converter (`--trt`) and off by default. On a T4 the TRT engine for the decoder ran at **0.09× eager** with `max_abs=4.375` / `cosine=0.983` versus eager: ORT partitions the graph across TRT-FP16 and CUDA-FP32, which is both slow and visibly wrong. The converter now gates parity in uint8 frames (≤2 LSB max, ≤0.5 LSB mean) and writes `<model>.onnx.no_trt` so the runtime uses the same provider it validated.
 
 ---
 
