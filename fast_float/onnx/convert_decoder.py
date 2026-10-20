@@ -337,7 +337,7 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--batch",
         type=int,
-        default=8,
+        default=4,
         help="PRIMARY static batch written to --out (matches the selector's "
         "--dec-batch); extra batches land in <stem>_b<N>.onnx siblings",
     )
