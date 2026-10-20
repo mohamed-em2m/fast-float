@@ -17,6 +17,10 @@ from collections.abc import Sequence
 
 import torch
 
+# Sidecar suffix a converter drops next to an artifact it could only validate
+# without TensorRT; ``make_runtime_session`` honours it.
+TRT_DISABLED_MARKER = ".no_trt"
+
 
 def _as_tuple(inputs):
     if isinstance(inputs, torch.Tensor):
@@ -55,7 +59,7 @@ def _ensure_batch2(args, skip=()):
     ``skip`` holds positional indices that must not be touched: duplicating a
     *shared* input (the FMT scalar time ``t``, which is deliberately shape
     ``[1]`` and broadcast inside the graph) would both falsify its shape and
-    get dim 0 marked dynamic, which TensorRT then mis-resolves across the
+    get dim 0 marked dynamic, which TensorRT then resolves wrongly across the
     rank-1/rank-3 inputs.
     """
     out = []
@@ -502,8 +506,16 @@ def make_runtime_session(
         use_gpu = torch.cuda.is_available()
     if max_batch is None:
         max_batch = int(os.environ.get("FLOAT_TRT_MAX_BATCH", "16"))
+    # A converter can veto TensorRT for one artifact by dropping a
+    # ``<model>.onnx.no_trt`` sidecar next to it (see
+    # ``convert_decoder._mark_no_trt``): TRT ran 10x slower *and* failed the
+    # uint8 parity gate on the frame decoder, and the runtime must not pick it
+    # back up just because the EP is available.
+    no_trt = TRT_DISABLED_MARKER and os.path.exists(f"{onnx_path}{TRT_DISABLED_MARKER}")
+    if no_trt:
+        print(f"[ort] {os.path.basename(onnx_path)}: TRT vetoed by {TRT_DISABLED_MARKER}; using CUDA EP")
     mn = op = mx = None
-    if use_gpu and opt_shapes:
+    if use_gpu and opt_shapes and not no_trt:
         mn, op, mx = trt_optimization_profiles(
             opt_shapes,
             min_batch=min_batch,
@@ -513,7 +525,7 @@ def make_runtime_session(
     sess = make_ort_session(
         onnx_path,
         use_gpu=use_gpu,
-        use_trt=use_gpu,
+        use_trt=use_gpu and not no_trt,
         trt_fp16=fp16,
         trt_min_shapes=mn,
         trt_opt_shapes=op,

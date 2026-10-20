@@ -511,8 +511,10 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--min-gain",
         type=float,
-        default=1.03,
-        help="candidate must beat eager by this factor to be chosen",
+        default=1.10,
+        help="candidate must beat eager by this factor to be chosen; 3%% was "
+        "inside run-to-run noise and picked torch.compile for refenc at 1.05x, "
+        "paying a recompile storm for nothing",
     )
     ap.add_argument("--compile-mode", default="default")
     ap.add_argument("--no-compile", action="store_true")

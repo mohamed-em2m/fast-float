@@ -27,6 +27,7 @@ import copy
 import os
 from collections import Counter
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,9 +35,9 @@ import torch.nn.functional as F
 from fast_float.models.float.generator import Generator
 from fast_float.models.float.styledecoder import ModulatedConv2d
 from fast_float.onnx.export import (
+    TRT_DISABLED_MARKER,
     add_ort_args,
     export_module,
-    fp16_tol,
     make_session_from_args,
 )
 from fast_float.onnx.parity import benchmark, compare_outputs
@@ -271,51 +272,110 @@ def _parse_batches(spec: str) -> list[int]:
     return out
 
 
+def _u8_lsb(ref, out) -> tuple[int, float]:
+    """Quantized-frame error: what the decode path actually writes.
+
+    ``_quantize_u8_hwc`` clamps to [-1, 1], scales by 127.5 and truncates, so a
+    sub-LSB float drift is invisible while a 4.4 drift is a broken face. Gating
+    here is meaningful at every precision; the old blanket ``fp16_tol`` (atol x
+    40) accepted any bounded output, which is how a decoder graph that was off
+    by 4.375 passed as "max_abs=4.375 cosine=0.98".
+    """
+
+    def q(x):
+        arr = np.asarray(x.detach().cpu() if torch.is_tensor(x) else x, dtype=np.float32)
+        return np.clip((arr + 1.0) * 127.5, 0.0, 255.0).astype(np.uint8)
+
+    d = np.abs(q(ref).astype(np.int16) - q(out).astype(np.int16))
+    return int(d.max()), float(d.mean())
+
+
+def _measure(dec_raw, sess, lat_t, feats_b, feed) -> dict:
+    """torch (dynamic dec) vs this session, in the deployed uint8 domain."""
+    with torch.no_grad(), _deterministic_cudnn():
+        ref_img = _img(dec_raw(lat_t, alpha=None, feats=feats_b))
+        ort_img = sess.run(None, feed)[0]
+    max_lsb, mean_lsb = _u8_lsb(ref_img, ort_img)
+    return {
+        "max_lsb": max_lsb,
+        "mean_lsb": mean_lsb,
+        "cosine": compare_outputs(ref_img, ort_img)["cosine"],
+    }
+
+
+def _gate(rep: dict, args) -> bool:
+    return rep["max_lsb"] <= args.max_lsb and rep["mean_lsb"] <= args.max_mean_lsb
+
+
+def _mark_no_trt(onnx_path: str) -> str:
+    marker = f"{onnx_path}{TRT_DISABLED_MARKER}"
+    with open(marker, "w", encoding="utf-8") as f:
+        f.write("TensorRT EP failed the uint8 parity gate for this decoder artifact.\n")
+    return marker
+
+
 def _run_parity(dec_raw, args, device, b, feats1, feat_names, onnx_path) -> None:
     """Eager (dynamic dec) vs the static ONNX graph for one batch, then bench."""
+    g = torch.Generator(device="cpu").manual_seed(777)
+    lat_t = torch.randn(b, 512, generator=g).to(device)
+    feats_b = [f.expand(b, *f.shape[1:]).contiguous() for f in feats1]
+    feed = {
+        "latent": lat_t.detach().cpu().numpy(),
+        **{n: f.detach().cpu().numpy() for n, f in zip(feat_names, feats_b, strict=False)},
+    }
+    gate_desc = f"gate: max_lsb<={args.max_lsb}, mean_lsb<={args.max_mean_lsb:g}"
+
     # Static batch -> fully static graph, no TRT shape profiles needed.
-    sess, fp16 = make_session_from_args(onnx_path, args)
-    atol, rtol = fp16_tol(args.atol, fp16), fp16_tol(args.rtol, fp16)
-    min_cos = 0.995 if fp16 else args.min_cosine
-    max_mean = fp16_tol(args.max_mean, fp16)
-    with torch.no_grad(), _deterministic_cudnn():
-        g = torch.Generator(device="cpu").manual_seed(777)
-        lat_t = torch.randn(b, 512, generator=g).to(device)
-        feats_b = [f.expand(b, *f.shape[1:]).contiguous() for f in feats1]
-        ref_img = _img(dec_raw(lat_t, alpha=None, feats=feats_b))
-        ort_img = sess.run(
-            None,
-            {
-                "latent": lat_t.detach().cpu().numpy(),
-                **{n: f.detach().cpu().numpy() for n, f in zip(feat_names, feats_b, strict=False)},
-            },
-        )[0]
-        rep = compare_outputs(ref_img, ort_img, atol=atol, rtol=rtol)
-        cos_ok = rep["cosine"] >= min_cos
-        mean_ok = rep["mean_abs"] <= max_mean
-        status = "PASS" if (rep["ok"] or (cos_ok and mean_ok)) else "FAIL"
-        print(
-            f"[parity:dec_b{b}] {status} "
-            f"max_abs={rep['max_abs']:.3e} mean_abs={rep['mean_abs']:.3e} "
-            f"max_rel={rep['max_rel']:.3e} cosine={rep['cosine']:.6f} "
-            f"(atol={atol:g}, rtol={rtol:g})"
-        )
-        if not (rep["ok"] or (cos_ok and mean_ok)):
+    sess, _fp16 = make_session_from_args(onnx_path, args)
+    rep = _measure(dec_raw, sess, lat_t, feats_b, feed)
+    print(
+        f"[parity:dec_b{b}] max_lsb={rep['max_lsb']} mean_lsb={rep['mean_lsb']:.3f} "
+        f"cosine={rep['cosine']:.6f} ({gate_desc})"
+    )
+    if not _gate(rep, args):
+        trt_on = "TensorrtExecutionProvider" in sess.get_providers()
+        if not trt_on or getattr(args, "no_trt", False):
             raise RuntimeError(
-                f"decoder parity FAILED (b{b}): cosine={rep['cosine']:.6f} (min={min_cos}), "
-                f"mean_abs={rep['mean_abs']:.3e} (max={max_mean})"
+                f"decoder parity FAILED (b{b}): max_lsb={rep['max_lsb']} (max={args.max_lsb}), "
+                f"mean_lsb={rep['mean_lsb']:.3f} (max={args.max_mean_lsb:g}), "
+                f"cosine={rep['cosine']:.6f}, providers={sess.get_providers()}"
             )
-        gate = "elementwise" if rep["ok"] else "functional (cosine+mean)"
-        print(f"[parity:dec_b{b}] passed via {gate} gate (cosine={rep['cosine']:.6f}, mean_abs={rep['mean_abs']:.3e})")
+        # TRT cannot run this graph faithfully (and is far slower): rebuild the
+        # session on the CUDA EP, re-gate, and leave a marker so the runtime
+        # never re-enables TRT for the artifact we just shipped.
+        print(f"[parity:dec_b{b}] FAIL on TensorRT (max_lsb={rep['max_lsb']}) - retrying on the CUDA EP")
+        fallback = copy.copy(args)
+        fallback.no_trt = True
+        sess, _fp16 = make_session_from_args(onnx_path, fallback)
+        rep = _measure(dec_raw, sess, lat_t, feats_b, feed)
+        print(
+            f"[parity:dec_b{b}] max_lsb={rep['max_lsb']} mean_lsb={rep['mean_lsb']:.3f} "
+            f"cosine={rep['cosine']:.6f} ({gate_desc}, no TRT)"
+        )
+        if not _gate(rep, args):
+            raise RuntimeError(
+                f"decoder parity FAILED (b{b}) with and without TensorRT: "
+                f"max_lsb={rep['max_lsb']} (max={args.max_lsb}), "
+                f"mean_lsb={rep['mean_lsb']:.3f} (max={args.max_mean_lsb:g})"
+            )
+        print(
+            f"[parity:dec_b{b}] PASS on CUDA EP; wrote {os.path.basename(_mark_no_trt(onnx_path))} "
+            "so the runtime skips TensorRT for this artifact"
+        )
+    else:
+        stale = f"{onnx_path}{TRT_DISABLED_MARKER}"
+        if os.path.exists(stale):
+            os.remove(stale)
+            print(f"[parity:dec_b{b}] cleared stale {os.path.basename(stale)} (TRT passes now)")
+        print(f"[parity:dec_b{b}] PASS")
+
     # Bench OUTSIDE deterministic cuDNN so torch runs its deployed kernels
     # (deterministic disables cuDNN autotuning and would inflate speedup).
     if args.bench_iters > 0:
         with torch.no_grad():
-            lat_np = lat_t.detach().cpu().numpy()
-            feats_np = {n: f.detach().cpu().numpy() for n, f in zip(feat_names, feats_b, strict=False)}
             benchmark(
                 lambda: dec_raw(lat_t, alpha=None, feats=feats_b),
-                lambda: sess.run(None, {"latent": lat_np, **feats_np}),
+                lambda: sess.run(None, feed),
                 name=f"dec_b{b}",
                 iters=args.bench_iters,
             )
@@ -348,18 +408,15 @@ def main(argv=None) -> int:
         help="seed for random init (irrelevant when ckpt overlays all)",
     )
     ap.add_argument("--opset", type=int, default=17)
-    # Nondeterminism note: cuDNN conv_transpose2d uses atomic-add kernels, so
-    # parity runs under _deterministic_cudnn (repeat-diff must print 0.0).
-    # On random weights the warp stack is chaotic: kernel summation order
-    # alone leaves ~0.7 max_abs (mean ~1e-3, cosine 0.9999+). Trained weights
-    # run far tighter — the GPU-box run is the true numeric gate. The tripwire
-    # for structural breaks is mean_abs + cosine, not max_abs.
-    ap.add_argument("--atol", type=float, default=1.0)
-    ap.add_argument("--rtol", type=float, default=1e-2)
-    ap.add_argument("--min-cosine", type=float, default=0.998)
-    ap.add_argument("--max-mean", type=float, default=0.05)
+    # Parity is gated in the *deployed* uint8 domain: the decode path clamps to
+    # [-1, 1], scales by 127.5 and truncates, so float-space max_abs is not what
+    # the video shows. 2 LSB max / 0.5 LSB mean is invisible on a 512x512 frame
+    # and fails a structurally wrong graph (the broken TensorRT engine measured
+    # max_abs=4.375, cosine=0.983 while "passing" atol=40).
+    ap.add_argument("--max-lsb", type=int, default=2, help="max uint8 frame error vs eager torch")
+    ap.add_argument("--max-mean-lsb", type=float, default=0.5, help="mean uint8 frame error vs eager torch")
     ap.add_argument("--skip-parity", action="store_true")
-    ap.add_argument("--bench-iters", type=int, default=2)
+    ap.add_argument("--bench-iters", type=int, default=10)
     add_ort_args(ap)
     args = ap.parse_args(argv)
 
