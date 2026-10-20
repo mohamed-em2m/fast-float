@@ -29,19 +29,17 @@ Requires Gradio >= 4.40 (for gr.Timer and streaming gr.Audio input).
     Install the project env with: uv sync --frozen
 """
 
-import os
-import sys
-import time
-import queue
-import shutil
-import logging
-import tempfile
 import datetime
+import logging
+import os
+import shutil
+import sys
+import tempfile
 import threading
+import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 # ---- logging setup -------------------------------------------------------- #
 # NOTE: This block is intentionally placed BEFORE gradio so that we can
@@ -49,10 +47,10 @@ from typing import Optional
 # logging during its import, we re-attach via setup_logger() which uses
 # propagate=False — making our named logger immune to root-logger rewiring.
 try:
-    from fast_float.utils.logger import setup_logger
+    from fast_float.utils.logger import set_log_level, setup_logger
 except ImportError:
     try:
-        from utils.logger import setup_logger
+        from utils.logger import set_log_level, setup_logger
     except ImportError:
         # Fallback: self-contained logger that doesn't rely on the root logger.
         def setup_logger(name="float_fast", **_):
@@ -70,10 +68,15 @@ except ImportError:
             _log.propagate = False
             return _log
 
+        def set_log_level(level):
+            logging.getLogger().setLevel(level)
 
+
+import contextlib
+
+import gradio as gr
 import numpy as np
 import soundfile as sf
-import gradio as gr
 
 # Re-create the logger AFTER gradio is imported so our handler is attached
 # last and propagate=False keeps it safe from any further root-logger changes.
@@ -81,20 +84,26 @@ logger = setup_logger("float_live_app")
 
 try:
     from fast_float.core.inference_optimized import (
-        OptimizedInferenceAgent as InferenceAgent,
         InferenceOptions,
+    )
+    from fast_float.core.inference_optimized import (
+        OptimizedInferenceAgent as InferenceAgent,
     )
 except ImportError:
     try:
         from core.inference_optimized import (
-            OptimizedInferenceAgent as InferenceAgent,
             InferenceOptions,
+        )
+        from core.inference_optimized import (
+            OptimizedInferenceAgent as InferenceAgent,
         )
     except ImportError:
         try:
             from inference_optimized import (
-                OptimizedInferenceAgent as InferenceAgent,
                 InferenceOptions,
+            )
+            from inference_optimized import (
+                OptimizedInferenceAgent as InferenceAgent,
             )
         except ImportError:
             from fast_float.core.generate import (
@@ -106,7 +115,7 @@ except ImportError:
 def _coerce_int(value, default):
     """Gradio sliders always return float — inference needs plain ints."""
     try:
-        return int(round(float(value)))
+        return round(float(value))
     except (TypeError, ValueError):
         return default
 
@@ -121,10 +130,12 @@ def _coerce_float(value, default):
 def is_torchcodec_ready() -> bool:
     try:
         from fast_float.utils.pyav_writer import is_torchcodec_available
+
         return is_torchcodec_available()
     except Exception:
         try:
             from utils.pyav_writer import is_torchcodec_available
+
             return is_torchcodec_available()
         except Exception:
             return False
@@ -145,6 +156,7 @@ def detect_default_encoder() -> str:
     """Auto-detect whether to default to FFmpeg NVENC, CPU PyAV, or Torchcodec."""
     try:
         import subprocess
+
         res = subprocess.run(
             ["ffmpeg", "-hide_banner", "-encoders"],
             capture_output=True,
@@ -180,7 +192,7 @@ class FloatModel:
             overrides.extend(["--wav2vec_model_path", wav2vec_model_path])
         original_argv = sys.argv.copy()
         try:
-            sys.argv = [sys.argv[0]] + overrides
+            sys.argv = [sys.argv[0], *overrides]
             self.opt = InferenceOptions().parse()
         finally:
             sys.argv = original_argv
@@ -325,14 +337,14 @@ class FloatModel:
 # --------------------------------------------------------------------------- #
 @dataclass
 class LiveSession:
-    ref_image_path: Optional[str] = None
-    sample_rate: Optional[int] = None
+    ref_image_path: str | None = None
+    sample_rate: int | None = None
     buffer: list = field(default_factory=list)  # list of 1-D numpy float chunks
     buffered_seconds: float = 0.0
     chunk_idx: int = 0
     running: bool = False
     last_latency: float = 0.0
-    session_dir: Optional[str] = None
+    session_dir: str | None = None
 
     def reset_audio(self):
         self.buffer = []
@@ -364,7 +376,7 @@ def build_interface(
     res_dir="./results",
     wav2vec_model_path=None,
     ngpus=1,
-    default_video_encoder: Optional[str] = None,
+    default_video_encoder: str | None = None,
 ):
     if default_video_encoder is None:
         default_video_encoder = detect_default_encoder()
@@ -405,9 +417,7 @@ def build_interface(
                             sources=["upload"],
                             height=300,
                         )
-                        b_audio_file = gr.Audio(
-                            label="Audio File", type="filepath", sources=["upload"]
-                        )
+                        b_audio_file = gr.Audio(label="Audio File", type="filepath", sources=["upload"])
 
                         with gr.Accordion("⚙️ Advanced Options", open=False):
                             b_emotion = gr.Dropdown(
@@ -424,18 +434,13 @@ def build_interface(
                                 value="S2E",
                                 label="Emotion Control",
                             )
-                            b_no_crop = gr.Checkbox(
-                                label="Skip Face Cropping", value=False
-                            )
-                            b_seed = gr.Slider(
-                                0, 10000, value=25, step=1, label="Random Seed"
-                            )
+                            b_no_crop = gr.Checkbox(label="Skip Face Cropping", value=False)
+                            b_seed = gr.Slider(0, 10000, value=25, step=1, label="Random Seed")
                             b_decode_batch = gr.Radio(
-                                choices=["Auto", "1", "2", "4", "8", "16","32","64"],
+                                choices=["Auto", "1", "2", "4", "8", "16", "32", "64"],
                                 value="Auto",
                                 label="🗂️ Decode Batch Size",
-                                info="Frames decoded per GPU micro-batch. "
-                                     "'Auto' picks the best size for your VRAM.",
+                                info="Frames decoded per GPU micro-batch. 'Auto' picks the best size for your VRAM.",
                             )
                             b_video_encoder = gr.Radio(
                                 choices=get_encoder_choices(),
@@ -448,9 +453,7 @@ def build_interface(
                         gr.Markdown("### 🎛️ Generation Parameters")
                         with gr.Group():
                             b_nfe = gr.Slider(1, 50, value=10, step=1, label="NFE")
-                            b_a_cfg = gr.Slider(
-                                0.0, 5.0, value=2.0, step=0.1, label="Audio CFG Scale"
-                            )
+                            b_a_cfg = gr.Slider(0.0, 5.0, value=2.0, step=0.1, label="Audio CFG Scale")
                             b_r_cfg = gr.Slider(
                                 0.0,
                                 3.0,
@@ -458,13 +461,9 @@ def build_interface(
                                 step=0.1,
                                 label="Reference CFG Scale",
                             )
-                            b_e_cfg = gr.Slider(
-                                0.0, 3.0, value=1.0, step=0.1, label="Emotion CFG Scale"
-                            )
+                            b_e_cfg = gr.Slider(0.0, 3.0, value=1.0, step=0.1, label="Emotion CFG Scale")
 
-                        b_generate_btn = gr.Button(
-                            "🚀 Generate Video", variant="primary", size="lg"
-                        )
+                        b_generate_btn = gr.Button("🚀 Generate Video", variant="primary", size="lg")
                         b_status = gr.Textbox(label="Status", lines=10)
                         b_video_out = gr.Video(label="Generated Video", height=400)
 
@@ -531,12 +530,8 @@ def build_interface(
                                 value="S2E",
                                 label="Emotion Control",
                             )
-                            l_no_crop = gr.Checkbox(
-                                label="Skip Face Cropping", value=False
-                            )
-                            l_seed = gr.Slider(
-                                0, 10000, value=25, step=1, label="Random Seed"
-                            )
+                            l_no_crop = gr.Checkbox(label="Skip Face Cropping", value=False)
+                            l_seed = gr.Slider(0, 10000, value=25, step=1, label="Random Seed")
                             l_nfe = gr.Slider(
                                 1,
                                 20,
@@ -544,9 +539,7 @@ def build_interface(
                                 step=1,
                                 label="NFE (lower = faster/less latency)",
                             )
-                            l_a_cfg = gr.Slider(
-                                0.0, 5.0, value=2.0, step=0.1, label="Audio CFG Scale"
-                            )
+                            l_a_cfg = gr.Slider(0.0, 5.0, value=2.0, step=0.1, label="Audio CFG Scale")
                             l_r_cfg = gr.Slider(
                                 0.0,
                                 3.0,
@@ -554,15 +547,12 @@ def build_interface(
                                 step=0.1,
                                 label="Reference CFG Scale",
                             )
-                            l_e_cfg = gr.Slider(
-                                0.0, 3.0, value=1.0, step=0.1, label="Emotion CFG Scale"
-                            )
+                            l_e_cfg = gr.Slider(0.0, 3.0, value=1.0, step=0.1, label="Emotion CFG Scale")
                             l_decode_batch = gr.Radio(
                                 choices=["Auto", "1", "2", "4", "8", "16"],
                                 value="Auto",
                                 label="🗂️ Decode Batch Size",
-                                info="Frames decoded per GPU micro-batch. "
-                                     "'Auto' picks the best size for your VRAM.",
+                                info="Frames decoded per GPU micro-batch. 'Auto' picks the best size for your VRAM.",
                             )
                             l_video_encoder = gr.Radio(
                                 choices=get_encoder_choices(),
@@ -583,19 +573,15 @@ def build_interface(
                             l_stop_btn = gr.Button("⏹️ Stop")
 
                     with gr.Column(scale=1):
-                        l_video_out = gr.Video(
-                            label="Live Output", height=400, autoplay=True, loop=False
-                        )
-                        l_status = gr.Textbox(
-                            label="Live Status", lines=3, elem_classes=["live-status"]
-                        )
+                        l_video_out = gr.Video(label="Live Output", height=400, autoplay=True, loop=False)
+                        l_status = gr.Textbox(label="Live Status", lines=3, elem_classes=["live-status"])
 
                 # Ticks periodically; each tick checks whether enough audio has
                 # been buffered, and if so, runs one inference call.
                 l_timer = gr.Timer(0.5, active=False)
 
                 # ---- session lifecycle -------------------------------------------------
-                def start_live(ref_image, session: Optional[LiveSession]):
+                def start_live(ref_image, session: LiveSession | None):
                     if ref_image is None:
                         return (
                             session,
@@ -605,16 +591,14 @@ def build_interface(
                     session = LiveSession()
                     session.ref_image_path = ref_image
                     session.running = True
-                    session.session_dir = tempfile.mkdtemp(
-                        prefix="float_live_", dir=model.live_dir
-                    )
+                    session.session_dir = tempfile.mkdtemp(prefix="float_live_", dir=model.live_dir)
                     return (
                         session,
                         gr.update(active=True),
                         "🟢 Listening... start talking.",
                     )
 
-                def stop_live(session: Optional[LiveSession]):
+                def stop_live(session: LiveSession | None):
                     if session is None:
                         return None, gr.update(active=False), "⏹️ Stopped."
                     session.running = False
@@ -634,7 +618,7 @@ def build_interface(
                 )
 
                 # ---- audio ingestion ----------------------------------------------------
-                def on_audio_stream(chunk, session: Optional[LiveSession]):
+                def on_audio_stream(chunk, session: LiveSession | None):
                     if session is None or chunk is None or not session.running:
                         return session
                     sr, data = _to_mono_float(chunk)
@@ -653,7 +637,7 @@ def build_interface(
 
                 # ---- periodic inference tick --------------------------------------------
                 def on_tick(
-                    session: Optional[LiveSession],
+                    session: LiveSession | None,
                     emotion,
                     a_cfg,
                     r_cfg,
@@ -677,21 +661,13 @@ def build_interface(
                             ),
                         )
 
-                    if not session.session_dir or not os.path.isdir(
-                        session.session_dir
-                    ):
-                        os.makedirs(
-                            session.session_dir or model.live_dir, exist_ok=True
-                        )
-                        if not session.session_dir or not os.path.isdir(
-                            session.session_dir
-                        ):
+                    if not session.session_dir or not os.path.isdir(session.session_dir):
+                        os.makedirs(session.session_dir or model.live_dir, exist_ok=True)
+                        if not session.session_dir or not os.path.isdir(session.session_dir):
                             return (
                                 gr.update(),
                                 session,
-                                gr.update(
-                                    value="❌ Session temp dir missing — please Stop and Start again."
-                                ),
+                                gr.update(value="❌ Session temp dir missing — please Stop and Start again."),
                             )
 
                     # Pull everything currently buffered and reset for the next chunk.
@@ -701,12 +677,8 @@ def build_interface(
                     session.chunk_idx += 1
                     idx = session.chunk_idx
 
-                    chunk_wav = os.path.join(
-                        session.session_dir, f"chunk_{idx:05d}.wav"
-                    )
-                    chunk_mp4 = os.path.join(
-                        session.session_dir, f"chunk_{idx:05d}.mp4"
-                    )
+                    chunk_wav = os.path.join(session.session_dir, f"chunk_{idx:05d}.wav")
+                    chunk_mp4 = os.path.join(session.session_dir, f"chunk_{idx:05d}.mp4")
                     sf.write(chunk_wav, audio, sr)
 
                     t0 = time.time()
@@ -731,9 +703,7 @@ def build_interface(
                         return (
                             gr.update(),
                             session,
-                            gr.update(
-                                value=f"❌ Chunk {idx} failed: {e}\n\n--- Traceback ---\n{tb}"
-                            ),
+                            gr.update(value=f"❌ Chunk {idx} failed: {e}\n\n--- Traceback ---\n{tb}"),
                         )
 
                     session.last_latency = time.time() - t0
@@ -742,9 +712,7 @@ def build_interface(
                     if idx > MAX_LIVE_CLIPS_KEPT:
                         old_idx = idx - MAX_LIVE_CLIPS_KEPT
                         for ext in (".wav", ".mp4"):
-                            old_path = os.path.join(
-                                session.session_dir, f"chunk_{old_idx:05d}{ext}"
-                            )
+                            old_path = os.path.join(session.session_dir, f"chunk_{old_idx:05d}{ext}")
                             if os.path.exists(old_path):
                                 os.remove(old_path)
 
@@ -773,14 +741,12 @@ def build_interface(
                 )
 
                 # Best-effort temp cleanup if the user closes the tab without Stop.
-                try:
+                with contextlib.suppress(Exception):
                     demo.unload(
                         fn=stop_live,
                         inputs=[session_state],
                         outputs=[session_state, l_timer, l_status],
                     )
-                except Exception:
-                    pass
 
         with gr.Accordion("ℹ️ Help & Information", open=False):
             gr.Markdown(
@@ -823,14 +789,10 @@ def parse_launch_args():
     parser.add_argument("--server_name", type=str, default="0.0.0.0")
     parser.add_argument("--share", action="store_true")
     parser.add_argument("--auth", type=str, default=None)
-    parser.add_argument(
-        "--auth_message", type=str, default="Please login to access FLOAT"
-    )
+    parser.add_argument("--auth_message", type=str, default="Please login to access FLOAT")
     parser.add_argument("--ckpt_path", type=str, default="./checkpoints/float.pth")
     parser.add_argument("--res_dir", type=str, default="./results")
-    parser.add_argument(
-        "--wav2vec_model_path", type=str, default="facebook/wav2vec2-base-960h"
-    )
+    parser.add_argument("--wav2vec_model_path", type=str, default="facebook/wav2vec2-base-960h")
     parser.add_argument("--debug", action="store_true")
 
     parser.add_argument("--queue", action=_argparse.BooleanOptionalAction, default=True)
@@ -886,8 +848,7 @@ if __name__ == "__main__":
     ckpt_dir = os.path.dirname(args.ckpt_path)
     if ckpt_dir:
         blocked_paths.append(os.path.abspath(ckpt_dir))
-    for d in ("models", ".venv", ".git", "config"):
-        blocked_paths.append(os.path.abspath(d))
+    blocked_paths.extend(os.path.abspath(d) for d in ("models", ".venv", ".git", "config"))
 
     launch_kwargs = {
         "server_name": args.server_name,
@@ -911,7 +872,9 @@ if __name__ == "__main__":
         launch_kwargs["favicon_path"] = args.favicon_path
     if args.debug:
         launch_kwargs["debug"] = True
-        logging.getLogger().setLevel(logging.DEBUG)  # verbose mode
+        # Flip OUR loggers (fast_float.* + float_live_app); they use
+        # propagate=False, so the root logger alone never shows DEBUG lines.
+        set_log_level(logging.DEBUG)
 
     try:
         if args.queue:

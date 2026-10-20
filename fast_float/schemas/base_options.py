@@ -1,4 +1,5 @@
-import os, argparse, json
+import argparse
+import json
 
 
 class BaseOptions:
@@ -14,12 +15,8 @@ class BaseOptions:
         parser.add_argument("--fix_noise_seed", action="store_true")
 
         # video
-        parser.add_argument(
-            "--input_size", type=int, default=512, help="input image size"
-        )
-        parser.add_argument(
-            "--input_nc", type=int, default=3, help="input image channel"
-        )
+        parser.add_argument("--input_size", type=int, default=512, help="input image size")
+        parser.add_argument("--input_nc", type=int, default=3, help="input image channel")
         parser.add_argument("--fps", type=float, default=25.0)
 
         # audio
@@ -36,12 +33,25 @@ class BaseOptions:
             type=float,
             help="window length L (seconds), 50 frames",
         )
-        parser.add_argument(
-            "--wav2vec_model_path", default="./checkpoints/wav2vec2-base-960h"
-        )
+        parser.add_argument("--wav2vec_model_path", default="./checkpoints/wav2vec2-base-960h")
         parser.add_argument(
             "--audio2emotion_path",
             default="./checkpoints/wav2vec-english-speech-emotion-recognition",
+        )
+        parser.add_argument(
+            "--emotion_onnx_path",
+            default="./onnx/emotion_v1.onnx",
+            help="ONNX S2E classifier (preferred over torch weights when present)",
+        )
+        parser.add_argument(
+            "--wav2vec_onnx_path",
+            default="./onnx/wav2vec_v1.onnx",
+            help="ONNX wav2vec2 encoder, inference() only (torch stays the training path)",
+        )
+        parser.add_argument(
+            "--fmt_onnx_path",
+            default="./onnx/fmt_step_v1.onnx",
+            help="ONNX FMT single-step (ODE loop/CFG stay in Python; torch fallback on mismatch)",
         )
         parser.add_argument(
             "--attention_window",
@@ -51,9 +61,7 @@ class BaseOptions:
         )
 
         parser.add_argument("--only_last_features", action="store_true")
-        parser.add_argument(
-            "--average_emotion", action="store_true", help="averaging emotion or not."
-        )
+        parser.add_argument("--average_emotion", action="store_true", help="averaging emotion or not.")
 
         # dropout
         parser.add_argument("--audio_dropout_prob", default=0.1, type=float)
@@ -61,15 +69,11 @@ class BaseOptions:
         parser.add_argument("--emotion_dropout_prob", default=0.1, type=float)
 
         # model Hyper Parameters
-        parser.add_argument(
-            "--style_dim", type=int, default=512, help="w latent dimension"
-        )
+        parser.add_argument("--style_dim", type=int, default=512, help="w latent dimension")
         parser.add_argument("--dim_a", type=int, default=512, help="audio dimension")
         parser.add_argument("--dim_w", type=int, default=512, help="face dimension")
         parser.add_argument("--dim_h", type=int, default=1024, help="hidden dimension")
-        parser.add_argument(
-            "--dim_m", type=int, default=20, help="dimension of orthogonal basis"
-        )
+        parser.add_argument("--dim_m", type=int, default=20, help="dimension of orthogonal basis")
         parser.add_argument("--dim_e", type=int, default=7, help="emotion dimension")
 
         # option for FMT
@@ -93,9 +97,7 @@ class BaseOptions:
             type=int,
             help="Number of Function Evaluateions (NFEs) for ODE solver",
         )
-        parser.add_argument(
-            "--torchdiffeq_ode_method", default="euler", help="ODE solver"
-        )
+        parser.add_argument("--torchdiffeq_ode_method", default="euler", help="ODE solver")
         parser.add_argument(
             "--a_cfg_scale",
             default=2.0,
@@ -116,18 +118,14 @@ class BaseOptions:
         )
         parser.add_argument("--ngpus", type=int, default=1, help="number of gpus")
         # option for Diffusion (ablation)
-        parser.add_argument(
-            "--n_diff_steps", type=int, default=100, help="number of diffusion steps"
-        )
+        parser.add_argument("--n_diff_steps", type=int, default=100, help="number of diffusion steps")
         parser.add_argument(
             "--diff_schedule",
             type=str,
             default="cosine",
             choices=["linear", "cosine", "quadratic", "sigmoid"],
         )
-        parser.add_argument(
-            "--diffusion_mode", type=str, default="sample", choices=["sample", "noise"]
-        )
+        parser.add_argument("--diffusion_mode", type=str, default="sample", choices=["sample", "noise"])
 
         return parser
 
@@ -143,19 +141,19 @@ class BaseOptions:
             comment = ""
             default = self.parser.get_default(k)
             if v != default:
-                comment = "\t[default: %s]" % str(default)
-            message += "{:>25}: {:<30}{}\n".format(str(k), str(v), comment)
+                comment = f"\t[default: {default!s}]"
+            message += f"{k!s:>25}: {v!s:<30}{comment}\n"
         message += "----------------- End -------------------"
         print(message)
 
 
 def save_options(opt, save_path):
-    with open(save_path, "wt") as f:
+    with open(save_path, "w") as f:
         json.dump(vars(opt), f, indent=4)
 
 
 def load_options(opt, load_path):
-    with open(load_path, "rt") as f:
+    with open(load_path) as f:
         _update = json.loads(f)
     opt.update(_update)
     return opt

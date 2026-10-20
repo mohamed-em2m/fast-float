@@ -1,12 +1,13 @@
-from fastapi import APIRouter
-from fast_float.schemas.generation import HealthResponse
-from fast_float.core.state import app_state
-from fast_float.utils.gpu import (
-    get_gpu_info,
-    get_current_gpu_memory,
-    clear_gpu_memory,
-)
 import torch
+from fastapi import APIRouter
+
+from fast_float.core.state import app_state
+from fast_float.schemas.generation import HealthResponse
+from fast_float.utils.gpu import (
+    clear_gpu_memory,
+    get_current_gpu_memory,
+    get_gpu_info,
+)
 
 router = APIRouter(tags=["system"])
 
@@ -22,11 +23,9 @@ async def health():
         status="healthy",
         model_loaded=app_state.agent is not None,
         warming_up=app_state.warming_up,
-        encoder=(
-            app_state.video_optimizer.encoder_type
-            if app_state.video_optimizer
-            else "unknown"
-        ),
+        warmup_stage=app_state.warmup_stage or None,
+        warmup_elapsed_s=round(app_state.warmup_elapsed(), 2) if app_state.warmup_started_at else None,
+        encoder=(app_state.video_optimizer.encoder_type if app_state.video_optimizer else "unknown"),
         active_streams=len(app_state.active_streams),
         performance_stats={
             "total_requests": total_req,

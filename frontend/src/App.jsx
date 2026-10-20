@@ -156,7 +156,7 @@ export default function App() {
       <main className="studio-main-grid">
         {/* Left Column: Creator Workbench */}
         <section className="workbench-col">
-          <PortraitCanvas 
+          <PortraitCanvas
             imagePreview={imagePreview}
             setImagePreview={setImagePreview}
             setImageBase64={setImageBase64}
@@ -172,7 +172,7 @@ export default function App() {
             setAudioFormat={setAudioFormat}
           />
 
-          <ParameterControls 
+          <ParameterControls
             params={params}
             setParams={setParams}
           />
@@ -180,7 +180,7 @@ export default function App() {
 
         {/* Right Column: Stage & Telemetry */}
         <section className="stage-col">
-          <StudioStage 
+          <StudioStage
             onGenerate={handleGenerate}
             isGenerating={isGenerating}
             progress={progress}
@@ -189,7 +189,7 @@ export default function App() {
             onToast={showToast}
           />
 
-          <TelemetryDashboard 
+          <TelemetryDashboard
             latestResult={generationResult}
             history={history}
           />

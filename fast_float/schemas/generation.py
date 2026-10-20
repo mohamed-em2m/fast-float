@@ -1,4 +1,5 @@
-from typing import Literal, Optional, Dict, Any
+from typing import Any, Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -8,8 +9,11 @@ class GenerationRequest(BaseModel):
     sample_rate: int = Field(16000, ge=8000, le=48000, description="Audio sample rate in Hz")
     channels: int = Field(1, ge=1, le=2, description="Audio channel count")
     sample_width: int = Field(2, description="Audio sample width in bytes (1=8bit, 2=16bit, 4=32bit)")
-    image_base64: Optional[str] = Field(None, description="Base64 encoded portrait image. If omitted, default image is used.")
-    image_format: Optional[str] = Field("jpg", description="Format of image_base64 (jpg, png, etc.)")
+    image_base64: str | None = Field(
+        None,
+        description="Base64 encoded portrait image. If omitted, default image is used.",
+    )
+    image_format: str | None = Field("jpg", description="Format of image_base64 (jpg, png, etc.)")
     emotion: Literal["S2E", "neutral", "happy", "sad", "angry", "surprise", "disgust"] = Field(
         "S2E", description="Emotion conditioning mode"
     )
@@ -20,7 +24,9 @@ class GenerationRequest(BaseModel):
     e_cfg_scale: float = Field(1.0, ge=0.5, le=3.0, description="Emotion classifier-free guidance scale")
     no_crop: bool = Field(False, description="Disable automatic face crop")
     compress: bool = Field(True, description="Compress output video using optimized encoder")
-    quality: Literal["fast", "balanced", "high"] = Field("balanced", description="Encoding quality (fast, balanced, high)")
+    quality: Literal["fast", "balanced", "high"] = Field(
+        "balanced", description="Encoding quality (fast, balanced, high)"
+    )
     chunk_seconds: float = Field(
         0.0,
         ge=0.0,
@@ -57,7 +63,7 @@ class GenerationRequest(BaseModel):
         description="Max silence padding when equalizing chunk lengths for a "
         "sample batch. Chunks needing more padding run solo.",
     )
-    client_request_id: Optional[str] = Field(
+    client_request_id: str | None = Field(
         None,
         max_length=64,
         description="Client-supplied id so the browser can poll /progress/{id} "
@@ -76,7 +82,7 @@ class GenerationResponse(BaseModel):
     status: str = "success"
     request_id: str
     download_url: str
-    download_backup: Optional[str] = None
+    download_backup: str | None = None
     stream_url: str
     video_path: str
     file_size_mb: float
@@ -101,16 +107,20 @@ class HealthResponse(BaseModel):
     status: str
     model_loaded: bool
     warming_up: bool = False
+    # "starting" / "single-inference" / "batched-inference" / "done" / "failed",
+    # so a UI can show what the server is doing instead of a bare bool.
+    warmup_stage: str | None = None
+    warmup_elapsed_s: float | None = None
     encoder: str
     active_streams: int
-    performance_stats: Dict[str, Any]
-    gpu_info: Optional[Dict[str, Any]] = None
+    performance_stats: dict[str, Any]
+    gpu_info: dict[str, Any] | None = None
 
 
 class WebRTCOfferRequest(BaseModel):
     sdp: str = Field(..., min_length=1)
     type: str = Field(..., min_length=1)
-    stream_id: Optional[str] = None
+    stream_id: str | None = None
 
 
 class WebRTCOfferResponse(BaseModel):

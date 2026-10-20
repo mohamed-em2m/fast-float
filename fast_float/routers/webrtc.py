@@ -1,8 +1,10 @@
 import os
-from typing import Dict, Any
+from typing import Any
+
 from fastapi import APIRouter, HTTPException
-from fast_float.schemas.generation import WebRTCOfferRequest, WebRTCOfferResponse
+
 from fast_float.core.state import app_state
+from fast_float.schemas.generation import WebRTCOfferRequest, WebRTCOfferResponse
 from fast_float.utils.logger import logger
 
 try:
@@ -17,7 +19,7 @@ router = APIRouter(tags=["webrtc"])
 
 # MediaPlayer instances keyed by id(pc). A player spawns an ffmpeg subprocess,
 # so it must be stopped when its peer connection goes away.
-_players: Dict[int, Any] = {}
+_players: dict[int, Any] = {}
 
 
 def _cleanup_peer(pc) -> None:
@@ -77,9 +79,7 @@ async def webrtc_offer(request: WebRTCOfferRequest):
                     pc.addTrack(player.audio)
                 _players[id(pc)] = player
                 if player.video is None and player.audio is None:
-                    logger.warning(
-                        f"Media has no playable tracks for {request.stream_id}"
-                    )
+                    logger.warning(f"Media has no playable tracks for {request.stream_id}")
                     try:
                         await pc.close()
                     finally:
@@ -90,9 +90,7 @@ async def webrtc_offer(request: WebRTCOfferRequest):
                     )
                 logger.info(f"Attached MediaPlayer tracks for {request.stream_id}")
             except Exception as e:
-                logger.warning(
-                    f"Failed to attach media player for {request.stream_id}: {e}"
-                )
+                logger.warning(f"Failed to attach media player for {request.stream_id}: {e}")
                 try:
                     await pc.close()
                 finally:
@@ -100,7 +98,7 @@ async def webrtc_offer(request: WebRTCOfferRequest):
                 raise HTTPException(
                     status_code=500,
                     detail="Failed to prepare media for WebRTC stream",
-                )
+                ) from e
         else:
             await pc.close()
             app_state.pcs.discard(pc)

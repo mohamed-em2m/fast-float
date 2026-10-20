@@ -7,12 +7,13 @@ Provides fast, zero-subprocess CPU alternatives to FFmpeg CLI / NVENC:
 """
 
 import os
-import time
-from typing import Optional, Union
+from typing import Union
+
 import numpy as np
 
 try:
     import av
+
     _PYAV_AVAILABLE = True
 except ImportError:
     av = None
@@ -22,6 +23,8 @@ try:
     import torch
 except ImportError:
     torch = None
+
+import contextlib
 
 from fast_float.utils.logger import logger
 
@@ -40,6 +43,7 @@ def is_torchcodec_available() -> bool:
     """Check if torchcodec is installed with VideoEncoder support."""
     try:
         from torchcodec.encoders import VideoEncoder  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -58,7 +62,7 @@ class PyAVVideoWriter:
         height: int,
         fps: int = 25,
         channels: int = 3,
-        audio_path: Optional[str] = None,
+        audio_path: str | None = None,
         preset: str = "ultrafast",
         crf: int = 23,
     ):
@@ -121,10 +125,8 @@ class PyAVVideoWriter:
             except Exception as e:
                 logger.warning(f"⚠️ PyAV audio track init failed for {self.audio_path}: {e}")
                 if self.audio_in is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         self.audio_in.close()
-                    except Exception:
-                        pass
                 self.audio_in = None
                 self.out_astream = None
                 self.resampler = None
@@ -169,15 +171,9 @@ class PyAVVideoWriter:
                 and self.resampler is not None
             ):
                 try:
-                    max_duration = (
-                        self.frames_written / float(self.fps) if self.fps > 0 else None
-                    )
+                    max_duration = self.frames_written / float(self.fps) if self.fps > 0 else None
                     for aframe in self.audio_in.decode(self.in_astream):
-                        if (
-                            max_duration is not None
-                            and aframe.time is not None
-                            and aframe.time >= max_duration
-                        ):
+                        if max_duration is not None and aframe.time is not None and aframe.time >= max_duration:
                             break
                         resampled = self.resampler.resample(aframe)
                         for rf in resampled:
@@ -197,10 +193,8 @@ class PyAVVideoWriter:
                 except Exception as e:
                     logger.warning(f"⚠️ PyAV audio muxing warning: {e}")
                 finally:
-                    try:
+                    with contextlib.suppress(Exception):
                         self.audio_in.close()
-                    except Exception:
-                        pass
                     self.audio_in = None
 
         finally:
@@ -221,7 +215,7 @@ class PyAVVideoWriter:
 def save_video_pyav(
     vid: Union["torch.Tensor", np.ndarray],
     video_path: str,
-    audio_path: Optional[str] = None,
+    audio_path: str | None = None,
     fps: int = 25,
     preset: str = "ultrafast",
     crf: int = 23,
@@ -258,7 +252,7 @@ def save_video_pyav(
         elif vid_np.dtype != np.uint8:
             vid_np = vid_np.astype(np.uint8)
 
-    T, H, W, C = vid_np.shape
+    _T, H, W, C = vid_np.shape
     with PyAVVideoWriter(
         output_path=video_path,
         width=W,
@@ -278,6 +272,7 @@ def save_video_pyav(
 # Torchcodec encoder helpers
 # ---------------------------------------------------------------------------
 
+
 def _mux_audio_onto_video(
     video_only_path: str,
     audio_path: str,
@@ -293,12 +288,18 @@ def _mux_audio_onto_video(
     if not _PYAV_AVAILABLE or av is None:
         # Fast fallback: copy-mux with ffmpeg (no video re-encode)
         import subprocess
+
         cmd = [
-            "ffmpeg", "-y",
-            "-i", video_only_path,
-            "-i", audio_path,
-            "-c:v", "copy",
-            "-c:a", "aac",
+            "ffmpeg",
+            "-y",
+            "-i",
+            video_only_path,
+            "-i",
+            audio_path,
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
             "-shortest",
             output_path,
         ]
@@ -346,11 +347,7 @@ def _mux_audio_onto_video(
         if in_astream and out_astream and resampler:
             try:
                 for aframe in in_audio.decode(in_astream):
-                    if (
-                        max_duration is not None
-                        and aframe.time is not None
-                        and aframe.time >= max_duration
-                    ):
+                    if max_duration is not None and aframe.time is not None and aframe.time >= max_duration:
                         break
                     for rf in resampler.resample(aframe):
                         rf.pts = None
@@ -373,7 +370,7 @@ def _mux_audio_onto_video(
 def save_video_torchcodec(
     vid: Union["torch.Tensor", np.ndarray],
     video_path: str,
-    audio_path: Optional[str] = None,
+    audio_path: str | None = None,
     fps: int = 25,
     codec: str = "libx264",
     crf: int = 23,
@@ -395,10 +392,7 @@ def save_video_torchcodec(
     try:
         from torchcodec.encoders import VideoEncoder as _TCEncoder
     except ImportError:
-        raise RuntimeError(
-            "torchcodec is not installed. "
-            "Install with: pip install torchcodec"
-        )
+        raise RuntimeError("torchcodec is not installed. Install with: pip install torchcodec") from None
 
     # ------ normalise input to (T, C, H, W) uint8 CPU tensor ------
     if torch is not None and isinstance(vid, torch.Tensor):
@@ -407,10 +401,7 @@ def save_video_torchcodec(
         t = vid
         if t.dim() == 4 and t.shape[-1] in (3, 4):  # (T, H, W, C) -> (T, C, H, W)
             t = t.permute(0, 3, 1, 2).contiguous()
-        if torch.is_floating_point(t):
-            t = (t.clamp(-1.0, 1.0) * 127.5 + 127.5).to(torch.uint8)
-        else:
-            t = t.to(torch.uint8)
+        t = (t.clamp(-1.0, 1.0) * 127.5 + 127.5).to(torch.uint8) if torch.is_floating_point(t) else t.to(torch.uint8)
         frames_tensor = t.cpu()
     else:
         vid_np = np.asarray(vid)
@@ -434,8 +425,7 @@ def save_video_torchcodec(
 
     try:
         logger.info(
-            f"[torchcodec] encoding {len(frames_tensor)} frames @ {fps}fps "
-            f"codec={codec} crf={crf} -> {tmp_video}"
+            f"[torchcodec] encoding {len(frames_tensor)} frames @ {fps}fps codec={codec} crf={crf} -> {tmp_video}"
         )
         encoder = _TCEncoder(frames=frames_tensor, frame_rate=float(fps))
         encoder.to_file(
@@ -456,9 +446,7 @@ def save_video_torchcodec(
             )
     finally:
         if need_audio:
-            try:
+            with contextlib.suppress(Exception):
                 os.remove(tmp_video)
-            except Exception:
-                pass
 
     return video_path

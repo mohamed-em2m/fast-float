@@ -63,12 +63,12 @@ export default function ParameterControls({ params, setParams }) {
             {params.nfe <= 8 ? '⚡ Ultra-fast' : params.nfe <= 15 ? 'Balanced (Recommended)' : 'High Fidelity'}
           </span>
         </div>
-        <input 
-          type="range" 
-          min="5" 
-          max="25" 
+        <input
+          type="range"
+          min="5"
+          max="25"
           step="1"
-          value={params.nfe} 
+          value={params.nfe}
           onChange={(e) => updateParam('nfe', parseInt(e.target.value, 10))}
         />
         <div className="slider-ticks">
@@ -84,14 +84,14 @@ export default function ParameterControls({ params, setParams }) {
           <span>Generation Seed</span>
         </label>
         <div className="seed-input-row">
-          <input 
-            type="number" 
-            value={params.seed} 
-            onChange={(e) => updateParam('seed', parseInt(e.target.value, 10) || 0)} 
+          <input
+            type="number"
+            value={params.seed}
+            onChange={(e) => updateParam('seed', parseInt(e.target.value, 10) || 0)}
             className="seed-input"
           />
-          <button 
-            type="button" 
+          <button
+            type="button"
             className="btn-secondary btn-sm"
             onClick={handleRandomizeSeed}
             title="Randomize seed"
@@ -173,9 +173,9 @@ export default function ParameterControls({ params, setParams }) {
 
       {/* Advanced Toggle */}
       <div className="advanced-toggle-row">
-        <button 
-          type="button" 
-          className="btn-text-toggle" 
+        <button
+          type="button"
+          className="btn-text-toggle"
           onClick={() => setShowAdvanced(!showAdvanced)}
         >
           <span>Advanced Guidance & Compression</span>
@@ -194,12 +194,12 @@ export default function ParameterControls({ params, setParams }) {
                 <span className="control-val-badge">{params.a_cfg_scale.toFixed(1)}</span>
               </label>
             </div>
-            <input 
-              type="range" 
-              min="1.0" 
-              max="4.0" 
+            <input
+              type="range"
+              min="1.0"
+              max="4.0"
               step="0.1"
-              value={params.a_cfg_scale} 
+              value={params.a_cfg_scale}
               onChange={(e) => updateParam('a_cfg_scale', parseFloat(e.target.value))}
             />
           </div>
@@ -212,12 +212,12 @@ export default function ParameterControls({ params, setParams }) {
                 <span className="control-val-badge">{params.r_cfg_scale.toFixed(1)}</span>
               </label>
             </div>
-            <input 
-              type="range" 
-              min="0.5" 
-              max="3.0" 
+            <input
+              type="range"
+              min="0.5"
+              max="3.0"
               step="0.1"
-              value={params.r_cfg_scale} 
+              value={params.r_cfg_scale}
               onChange={(e) => updateParam('r_cfg_scale', parseFloat(e.target.value))}
             />
           </div>
@@ -230,12 +230,12 @@ export default function ParameterControls({ params, setParams }) {
                 <span className="control-val-badge">{params.e_cfg_scale.toFixed(1)}</span>
               </label>
             </div>
-            <input 
-              type="range" 
-              min="0.5" 
-              max="3.0" 
+            <input
+              type="range"
+              min="0.5"
+              max="3.0"
               step="0.1"
-              value={params.e_cfg_scale} 
+              value={params.e_cfg_scale}
               onChange={(e) => updateParam('e_cfg_scale', parseFloat(e.target.value))}
             />
           </div>

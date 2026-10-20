@@ -1,4 +1,5 @@
 from fastapi import APIRouter
+
 from fast_float.routers.generation import router as generation_router
 from fast_float.routers.health import router as health_router
 from fast_float.routers.webrtc import router as webrtc_router

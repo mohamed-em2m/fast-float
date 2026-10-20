@@ -1,324 +1,246 @@
-"""Convert the FMT single ODE step (unit 2) to ONNX.
+"""Unit 3: convert the FLOAT flow-matching transformer step to ONNX.
 
-Exports ``FlowMatchingTransformer.forward`` at CFG-triplet batch (3B) with
-canonical shapes. Python keeps cat/chunk/CFG-combine + prev-chaining + the
-ODE loop — the same recipe the runtime will use, verified here in numpy.
+Wraps :class:`FlowMatchingTransformer.forward(train=False)` — a single
+ODE vector-field evaluation::
 
-Canonical per-step shapes (B = base batch, Lc = clip frames, Lp = prev):
-  t (3B,) | x,wa (3B,Lc,512) | wr (3B,1,512) | we (3B,1,7)
-  | prev_x,prev_wa (3B,Lp,512) -> out (3B,Lp+Lc,512)
+    (t[1], x[B,50,512], wa[B,50,512], wr[B,1,512], we[B,1,7],
+     prev_x[B,10,512], prev_wa[B,10,512]) -> vec [B,60,512]
 
-L is static per config (pos_embed + alignment_mask are fixed buffers), so
-only the batch axis is dynamic. Prev tensors are always passed (zeros for
-chunk 0) — matching deployed behavior and avoiding Optional ONNX inputs.
+The ODE loop, CFG cat/chunk/combine and chunk autoregression stay in
+Python (see ``forward_with_cfv`` / ``sample``); only this inner step —
+the dominant cost (~9 evals x 3B batch per 50-frame chunk) — runs in ORT.
+Batch is dynamic, so one file serves both the plain (B) and CFG (3B)
+calls. Internal length is fixed at 60 (50 clip + 10 prev) by construction.
+
+Structural CLI flags (--fmt-depth, --dim-h, ...) must match the deploy
+opt; the app runs a live torch-vs-ONNX probe at init and falls back to
+torch on any mismatch.
+
+Usage (from repo root):
+    python -m fast_float.onnx.convert_fmt --out ./onnx/fmt_step_v1.onnx
 """
+
 from __future__ import annotations
 
 import argparse
 import os
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
-import torch.nn as nn
+
+# Repo-root bootstrap (same rule as the other converters: only REPO_ROOT
+# may be added — never fast_float/ itself, whose onnx/ subpackage would
+# shadow the pip `onnx` dependency).
+CURRENT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = CURRENT_DIR.parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from fast_float.models.float.FMT import FlowMatchingTransformer
-from fast_float.onnx.export import export_module, make_ort_session
-from fast_float.onnx.parity import benchmark, check_parity
+from fast_float.onnx.export import (
+    FP16_MAX_MEAN,
+    FP16_MIN_COSINE,
+    add_ort_args,
+    export_module,
+    fp16_tol,
+    make_session_from_args,
+)
+from fast_float.onnx.parity import check_parity
 
 FMT_PREFIX = "fmt."
-DIM_W = 512
-DIM_E = 7
+CLIP_FRAMES = 50
+PREV_FRAMES = 10
 
 
-def default_fmt_opt(clip_frames: int = 50, prev_frames: int = 10) -> SimpleNamespace:
-    """opt subset FMT needs, matching base_options.py deployed defaults."""
-    return SimpleNamespace(
-        wav2vec_sec=2.0,
-        fps=25.0,
-        num_prev_frames=prev_frames,
-        dim_w=DIM_W,
-        dim_a=DIM_W,
-        dim_e=DIM_E,
-        dim_h=1024,
-        mlp_ratio=4.0,
-        fmt_depth=8,
-        num_heads=8,
-        attention_window=2,
-        audio_dropout_prob=0.1,
-        ref_dropout_prob=0.1,
-        emotion_dropout_prob=0.1,
-        rank=0 if torch.cuda.is_available() else "cpu",
-    )
-
-
-class FMTStepExport(nn.Module):
-    """Single ODE step at triplet batch. All CFG cats pre-built by caller."""
+class FMTStepWrapper(torch.nn.Module):
+    """Single vector-field step. ``train=False`` disables all dropout
+    paths, keeping the graph tracer-friendly."""
 
     def __init__(self, fmt: FlowMatchingTransformer):
         super().__init__()
         self.fmt = fmt
 
-    def forward(self, t, x, wa, wr, we, prev_x, prev_wa):
+    def forward(
+        self,
+        t: torch.Tensor,
+        x: torch.Tensor,
+        wa: torch.Tensor,
+        wr: torch.Tensor,
+        we: torch.Tensor,
+        prev_x: torch.Tensor,
+        prev_wa: torch.Tensor,
+    ) -> torch.Tensor:
         return self.fmt.forward(t, x, wa, wr, we, prev_x, prev_wa, train=False)
 
 
-class _PlainNorm(nn.Module):
-    """LayerNorm(affine=False) in pure elementwise ops (export-safe).
-
-    The exporter maps affine-free nn.LayerNorm to a LayerNormalization node
-    with empty scale/bias inputs, which the ONNX checker rejects. This
-    formulation uses only ReduceMean/Sub/Mul/Div/Sqrt — supported everywhere.
-    """
-
-    def __init__(self, eps: float = 1e-6):
-        super().__init__()
-        self.eps = eps
-
-    def forward(self, x):
-        m = x.mean(dim=-1, keepdim=True)
-        v = ((x - m) ** 2).mean(dim=-1, keepdim=True)
-        return (x - m) / torch.sqrt(v + self.eps)
-
-
-def cfv_combine_torch(out_3b, lp: int, a_scale: float, e_scale: float):
-    """Runtime recipe: chunk triplet, CFV-combine, drop prev frames."""
-    uncond, all_cond, audio_only = torch.chunk(out_3b, chunks=3, dim=0)
-    cfv = uncond + a_scale * (audio_only - uncond) + e_scale * (all_cond - audio_only)
-    return cfv[:, lp:]
-
-
-def build_fmt_module(
-    ckpt_path: str, clip_frames: int, prev_frames: int, device: torch.device
-) -> tuple[FMTStepExport, FlowMatchingTransformer, SimpleNamespace]:
-    opt = default_fmt_opt(clip_frames, prev_frames)
-    # Honour explicit frame overrides by resizing the derived constants.
-    opt.num_prev_frames = prev_frames
-    opt.wav2vec_sec = clip_frames / float(opt.fps)
-    fmt = FlowMatchingTransformer(opt).to(device).eval()
-
-    # The classic exporter cannot translate aten::scaled_dot_product_attention
-    # (dynamo on modern torch can, but the fallback path must work too), so
-    # the export — and its parity reference — use the math-equivalent manual
-    # attention path. Same weights; only kernel summation order differs.
-    with torch.no_grad():
-        p0 = probe_batch(1, clip_frames, prev_frames, device, 7)
-        t0 = to_triplet(p0)
-        out_fused = fmt.forward(
-            t0["t"], t0["x"], t0["wa"], t0["wr"], t0["we"],
-            t0["prev_x"], t0["prev_wa"], train=False,
-        )
-    had_fused = False
-    for blk in fmt.blocks:
-        had_fused = had_fused or blk.attn.fused_attn
-        blk.attn.fused_attn = False
-    with torch.no_grad():
-        out_manual = fmt.forward(
-            t0["t"], t0["x"], t0["wa"], t0["wr"], t0["we"],
-            t0["prev_x"], t0["prev_wa"], train=False,
-        )
-    diff = (out_fused - out_manual).abs().max().item()
-    print(f"[model] fused_attn was={had_fused} -> manual (export-safe); "
-          f"sdpa-vs-manual max_abs={diff:.3e}")
-
-    # Affine-free LayerNorm -> _PlainNorm (same equivalence proof pattern).
-    n_sub = 0
-    for blk in fmt.blocks:
-        blk.norm1 = _PlainNorm(blk.norm1.eps)
-        blk.norm2 = _PlainNorm(blk.norm2.eps)
-        n_sub += 2
-    fmt.decoder.norm_final = _PlainNorm(fmt.decoder.norm_final.eps)
-    n_sub += 1
-    with torch.no_grad():
-        out_plain = fmt.forward(
-            t0["t"], t0["x"], t0["wa"], t0["wr"], t0["we"],
-            t0["prev_x"], t0["prev_wa"], train=False,
-        )
-    ndiff = (out_manual - out_plain).abs().max().item()
-    print(f"[model] LayerNorm(affine=False) x{n_sub} -> _PlainNorm; "
-          f"ln-vs-plain max_abs={ndiff:.3e}")
-
-    n_total = sum(p.numel() for p in fmt.parameters())
-    print(
-        f"[model] FMT depth={opt.fmt_depth} heads={opt.num_heads} "
-        f"Lc={clip_frames} Lp={prev_frames} params={n_total / 1e6:.1f}M"
+def build_fmt(args) -> FlowMatchingTransformer:
+    # ``opt.rank`` is a GPU *index* (deployed wiring sets ``opt.rank = 0``), not
+    # a device string: FMT builds ``torch.device(f"cuda:{opt.rank}")``. Passing
+    # "cuda"/"cpu" here produced the invalid "cuda:cuda".
+    rank = torch.cuda.current_device() if torch.cuda.is_available() else 0
+    opt = SimpleNamespace(
+        wav2vec_sec=2.0,
+        fps=25.0,
+        num_prev_frames=args.prev_frames,
+        dim_h=args.dim_h,
+        mlp_ratio=args.mlp_ratio,
+        fmt_depth=args.fmt_depth,
+        num_heads=args.num_heads,
+        dim_w=512,
+        dim_a=512,
+        dim_e=7,
+        attention_window=2,
+        rank=rank,
+        audio_dropout_prob=0.1,
+        ref_dropout_prob=0.1,
+        emotion_dropout_prob=0.1,
     )
-    if os.path.exists(ckpt_path):
-        sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        from collections import Counter
-
-        tops = Counter(k.split(".")[0] for k in sd.keys())
-        print(f"[weights] ckpt top-level prefixes: {dict(tops.most_common(10))}")
-        sub = {
-            k[len(FMT_PREFIX):]: v
-            for k, v in sd.items()
-            if k.startswith(FMT_PREFIX)
-        }
+    fmt = FlowMatchingTransformer(opt)
+    if os.path.exists(args.ckpt):
+        sd = torch.load(args.ckpt, map_location="cpu", weights_only=True)
+        sub = {k[len(FMT_PREFIX) :]: v for k, v in sd.items() if k.startswith(FMT_PREFIX)}
         if not sub:
+            print(f"[weights] WARN: no {FMT_PREFIX}* keys in {args.ckpt}")
+        else:
+            missing, unexpected = fmt.load_state_dict(sub, strict=False)
             print(
-                "[weights] WARN: no fmt.* keys in ckpt — exporting randomly "
-                "initialized FMT (parity still valid, weights differ from deploy)"
+                f"[weights] fmt: {len(sub)} tensors from {args.ckpt} "
+                f"(missing={len(missing)}, unexpected={len(unexpected)})"
             )
-        missing, unexpected = fmt.load_state_dict(sub, strict=False)
-        print(
-            f"[weights] overlaid {len(sub)} tensors from {ckpt_path} "
-            f"(missing={len(missing)}, unexpected={len(unexpected)})"
-        )
-        fmt.to(device)
+            if missing or unexpected:
+                print(f"[weights] WARN: fmt weight mismatch: missing={len(missing)} unexpected={len(unexpected)}")
     else:
-        print(
-            f"[weights] WARN: {ckpt_path} not found — exporting randomly "
-            "initialized FMT (parity still valid, weights differ from deploy)"
-        )
-    return FMTStepExport(fmt).eval(), fmt, opt
+        print(f"[weights] WARN: {args.ckpt} not found — random init (parity still valid)")
+    return fmt.eval()
 
 
-def probe_batch(
-    b: int, clip: int, prev: int, device: torch.device, seed: int
-) -> dict:
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    kw = {"generator": g}
-    x = torch.randn(b, clip, DIM_W, **kw)
-    wa = torch.randn(b, clip, DIM_W, **kw)
-    wr = torch.randn(b, 1, DIM_W, **kw)
-    we = torch.randn(b, 1, DIM_E, **kw).softmax(-1)
-    prev_x = torch.randn(b, prev, DIM_W, **kw)
-    prev_wa = torch.randn(b, prev, DIM_W, **kw)
-    t = torch.full((1,), 0.35 + 0.05 * (seed % 5))
-    return {
-        "t": t.to(device),
-        "x": x.to(device),
-        "wa": wa.to(device),
-        "wr": wr.to(device),
-        "we": we.to(device),
-        "prev_x": prev_x.to(device),
-        "prev_wa": prev_wa.to(device),
-    }
-
-
-def to_triplet(p: dict) -> dict:
-    b3 = p["x"].shape[0] * 3
-    t3 = p["t"].expand(b3).contiguous()
-    null_wa = torch.zeros_like(p["wa"])
-    null_we = torch.zeros_like(p["we"])
-    return {
-        "t": t3,
-        "x": p["x"].repeat(3, 1, 1),
-        "wa": torch.cat([null_wa, p["wa"], p["wa"]], 0),
-        "wr": p["wr"].repeat(3, 1, 1),
-        "we": torch.cat([null_we, p["we"], null_we], 0),
-        "prev_x": p["prev_x"].repeat(3, 1, 1),
-        "prev_wa": p["prev_wa"].repeat(3, 1, 1),
-    }
+def sample_inputs(batch: int, t_val: float, seed: int, device: str | torch.device):
+    g = torch.Generator().manual_seed(seed)
+    kw = dict(dtype=torch.float32)
+    t = torch.tensor([t_val], **kw)
+    x = torch.randn(batch, CLIP_FRAMES, 512, generator=g, **kw).clamp(-1, 1)
+    wa = torch.randn(batch, CLIP_FRAMES, 512, generator=g, **kw).clamp(-1, 1)
+    wr = torch.randn(batch, 1, 512, generator=g, **kw).clamp(-1, 1)
+    we = torch.randn(batch, 1, 7, generator=g, **kw).clamp(-1, 1)
+    prev_x = torch.randn(batch, PREV_FRAMES, 512, generator=g, **kw).clamp(-1, 1)
+    prev_wa = torch.randn(batch, PREV_FRAMES, 512, generator=g, **kw).clamp(-1, 1)
+    # `device` may be a str or a torch.device; `torch.device("cuda") == "cuda"`
+    # is False, so normalise before testing (the selector passes a torch.device).
+    if torch.device(device).type == "cuda":
+        t, x, wa, wr, we, prev_x, prev_wa = (v.to(device) for v in (t, x, wa, wr, we, prev_x, prev_wa))
+    return t, x, wa, wr, we, prev_x, prev_wa
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Convert FMT single ODE step to ONNX")
+    ap = argparse.ArgumentParser(description="Convert FLOAT FMT step to ONNX")
     ap.add_argument("--ckpt", default="./checkpoints/float.pth")
     ap.add_argument("--out", default="./onnx/fmt_step_v1.onnx")
-    ap.add_argument("--clip-frames", type=int, default=50)
-    ap.add_argument("--prev-frames", type=int, default=10)
-    ap.add_argument("--batches", default="1,2")
-    ap.add_argument("--a-cfg", type=float, default=2.0)
-    ap.add_argument("--e-cfg", type=float, default=1.0)
     ap.add_argument("--opset", type=int, default=17)
-    ap.add_argument("--atol", type=float, default=2e-4)
-    ap.add_argument("--rtol", type=float, default=2e-4)
+    ap.add_argument("--fmt-depth", type=int, default=8)
+    ap.add_argument("--dim-h", type=int, default=1024)
+    ap.add_argument("--num-heads", type=int, default=8)
+    ap.add_argument("--mlp-ratio", type=float, default=4.0)
+    ap.add_argument("--prev-frames", type=int, default=10)
+    ap.add_argument("--atol", type=float, default=1e-4)
+    ap.add_argument("--rtol", type=float, default=1e-4)
     ap.add_argument("--skip-parity", action="store_true")
-    ap.add_argument("--bench-iters", type=int, default=30)
-    ap.add_argument("--cpu-ort", action="store_true",
-                    help="allow CPU ORT session on a CUDA box (dev only)")
+    ap.add_argument(
+        "--bench-iters",
+        type=int,
+        default=30,
+        help="warmed benchmark iters on the CFG case (0 = skip)",
+    )
+    add_ort_args(ap)
     args = ap.parse_args(argv)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[env] device={device}")
-    module, fmt, _ = build_fmt_module(
-        args.ckpt, args.clip_frames, args.prev_frames, device
-    )
-    batches = [int(s) for s in args.batches.split(",") if s.strip()]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    fmt = build_fmt(args).to(device)
+    for blk in fmt.blocks:
+        if hasattr(blk, "attn"):
+            blk.attn.fused_attn = False
+    module = FMTStepWrapper(fmt).eval().to(device)
 
-    # Export with B=1 triplet; dynamic batch axis proves B=2 in parity.
-    # Export on CPU: the tracer/constant-folder trips on mixed devices when
-    # the module sits on CUDA. The graph is device-agnostic; parity + bench
-    # still run torch on the real device below.
-    fmt.to("cpu")
-    cpu = torch.device("cpu")
-    sample = to_triplet(probe_batch(1, args.clip_frames, args.prev_frames, cpu, 0))
-    order = ["t", "x", "wa", "wr", "we", "prev_x", "prev_wa"]
+    trace = sample_inputs(2, 0.5, 0, device)  # batch 2: dynamic batch mark
     info = export_module(
         module,
-        [sample[k] for k in order],
+        trace,
         args.out,
-        input_names=order,
-        output_names=["step_out"],
-        dynamic_axes={k: {0: "batch3"} for k in order} | {"step_out": {0: "batch3"}},
+        input_names=["t", "x", "wa", "wr", "we", "prev_x", "prev_wa"],
+        output_names=["vec"],
+        dynamic_axes={
+            "t": {},
+            "x": {0: "batch"},
+            "wa": {0: "batch"},
+            "wr": {0: "batch"},
+            "we": {0: "batch"},
+            "prev_x": {0: "batch"},
+            "prev_wa": {0: "batch"},
+            "vec": {0: "batch"},
+        },
+        # ``t`` is one shared scalar time value (shape [1], broadcast over the
+        # batch inside the graph), not a batch-first input. Marking its dim
+        # dynamic makes TensorRT freeze it at the profile's opt batch, so the
+        # plain forward works but every CFG call (batch 3) dies with
+        # "Dimensions with name s0 must be equal ... 1 != 3".
+        shared_inputs=("t",),
         opset=args.opset,
     )
     print(f"[export] {info['path']} via {info['exporter']}")
     for note in info.get("notes") or []:
         print(f"[export] note: {note}")
-    fmt.to(device)
 
     if not args.skip_parity:
-        sess = make_ort_session(
+        sess, fp16 = make_session_from_args(
             info["path"],
-            use_gpu=torch.cuda.is_available() and not args.cpu_ort,
-            require_gpu=torch.cuda.is_available() and not args.cpu_ort,
+            args,
+            opt_shapes={
+                # ``t`` is exported static ([1], see shared_inputs above), so it
+                # gets no profile entry: the TRT EP ignores/or rejects profile
+                # dims for static inputs.
+                "x": [1, CLIP_FRAMES, 512],
+                "wa": [1, CLIP_FRAMES, 512],
+                "wr": [1, 1, 512],
+                "we": [1, 1, 7],
+                "prev_x": [1, PREV_FRAMES, 512],
+                "prev_wa": [1, PREV_FRAMES, 512],
+            },
         )
-        print(f"[ort] providers={sess.get_providers()}")
+        atol, rtol = fp16_tol(args.atol, fp16), fp16_tol(args.rtol, fp16)
+        # The vector field is bounded/small-magnitude: TRT FP16 drift is
+        # absolute (~9e-3 max, cosine 0.999997), so the elementwise gate can
+        # never pass even though the field is correct. Add the same
+        # functional-equivalence gate the emotion/refenc/audio units use.
+        func = {"min_cosine": FP16_MIN_COSINE, "max_mean": FP16_MAX_MEAN} if fp16 else {}
+        names = ["t", "x", "wa", "wr", "we", "prev_x", "prev_wa"]
         with torch.no_grad():
-            for bi, b in enumerate(batches):
-                p = probe_batch(b, args.clip_frames, args.prev_frames, device, 100 + bi)
-                tri = to_triplet(p)
-                # Deployed path: forward_with_cfv with pre-built cats (steady state).
-                ref = fmt.forward_with_cfv(
-                    t=p["t"],
-                    x=p["x"],
-                    wa=p["wa"],
-                    wr=p["wr"],
-                    we=p["we"],
-                    prev_x=p["prev_x"],
-                    prev_wa=p["prev_wa"],
-                    a_cfg_scale=args.a_cfg,
-                    r_cfg_scale=1.0,
-                    e_cfg_scale=args.e_cfg,
-                    _audio_cat=tri["wa"],
-                    _ref_cat=tri["wr"],
-                    _emotion_cat=tri["we"],
-                    _prev_x_cat=tri["prev_x"],
-                    _prev_wa_cat=tri["prev_wa"],
+            # B=1 (plain call) and B=3 (CFG call), t across the trajectory.
+            cases = [
+                ("plain_t0", 1, 0.0, 1),
+                ("plain_t05", 1, 0.5, 2),
+                ("plain_t1", 1, 1.0, 3),
+                ("cfg_t05", 3, 0.5, 4),
+                ("cfg_t01", 3, 0.1, 5),
+            ]
+            for name, batch, t_val, seed in cases:
+                args_in = sample_inputs(batch, t_val, seed, device)
+                ref = module(*args_in)
+                feed = {k: v.cpu().numpy() for k, v in zip(names, args_in, strict=False)}
+                ort_out = sess.run(None, feed)[0]
+                check_parity(ref, ort_out, name=name, atol=atol, rtol=rtol, **func)
+                print(f"[probe:{name}] shape torch={tuple(ref.shape)} onnx={tuple(ort_out.shape)}")
+            if args.bench_iters > 0:
+                from fast_float.onnx.parity import benchmark
+
+                bench_in = sample_inputs(3, 0.5, 99, device)
+                bench_feed = {k: v.cpu().numpy() for k, v in zip(names, bench_in, strict=False)}
+                benchmark(
+                    lambda: module(*bench_in),
+                    lambda: sess.run(None, bench_feed),
+                    name="fmt_cfg_b3",
+                    iters=args.bench_iters,
                 )
-                ort_out = sess.run(
-                    None, {k: tri[k].detach().cpu().numpy() for k in order}
-                )[0]
-                # THE parity: torch full-step output vs the runtime recipe
-                # (ORT triplet -> chunk + CFV combine -> drop prev frames).
-                combined = cfv_combine_torch(
-                    torch.from_numpy(ort_out), args.prev_frames,
-                    args.a_cfg, args.e_cfg,
-                )
-                check_parity(
-                    ref[:, args.prev_frames:],
-                    combined,
-                    name=f"fmt_b{b}",
-                    atol=args.atol,
-                    rtol=args.rtol,
-                )
-                if args.bench_iters > 0:
-                    np_inputs = {k: tri[k].detach().cpu().numpy() for k in order}
-                    benchmark(
-                        lambda: fmt.forward_with_cfv(
-                            t=p["t"], x=p["x"], wa=p["wa"], wr=p["wr"],
-                            we=p["we"], prev_x=p["prev_x"], prev_wa=p["prev_wa"],
-                            a_cfg_scale=args.a_cfg, r_cfg_scale=1.0,
-                            e_cfg_scale=args.e_cfg,
-                            _audio_cat=tri["wa"], _ref_cat=tri["wr"],
-                            _emotion_cat=tri["we"], _prev_x_cat=tri["prev_x"],
-                            _prev_wa_cat=tri["prev_wa"],
-                        ),
-                        lambda: sess.run(None, np_inputs),
-                        name=f"fmt_b{b}",
-                        iters=args.bench_iters,
-                    )
     print("[done] fmt converter OK")
     return 0
 

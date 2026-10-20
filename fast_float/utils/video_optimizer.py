@@ -1,10 +1,10 @@
+import contextlib
 import os
+import shutil
+import subprocess
+import tempfile
 import time
 import uuid
-import shutil
-import tempfile
-import subprocess
-from typing import Tuple
 
 from fast_float.utils.logger import logger
 
@@ -146,9 +146,7 @@ class VideoSaveOptimizer:
             else:
                 error_output = result.stderr.decode("utf-8", errors="ignore") if result.stderr else "Unknown error"
                 error_lines = [
-                    line
-                    for line in error_output.split("\n")
-                    if "error" in line.lower() or "failed" in line.lower()
+                    line for line in error_output.split("\n") if "error" in line.lower() or "failed" in line.lower()
                 ]
                 error_msg = error_lines[0] if error_lines else error_output[:200]
                 logger.warning(f"      ❌ {encoder} failed: {error_msg}")
@@ -166,8 +164,8 @@ class VideoSaveOptimizer:
         output_path: str,
         fps: int = 25,
         quality: str = "fast",
-        resolution: Tuple[int, int] = (256, 256),
-    ) -> Tuple[bool, float, str]:
+        resolution: tuple[int, int] = (256, 256),
+    ) -> tuple[bool, float, str]:
         """Convert or compress video using detected hardware or CPU encoder."""
         start_time = time.time()
         width, height = resolution
@@ -285,7 +283,5 @@ class VideoSaveOptimizer:
             return False, time.time() - start_time, "error"
         finally:
             if os.path.exists(tmp_out):
-                try:
+                with contextlib.suppress(Exception):
                     os.remove(tmp_out)
-                except Exception:
-                    pass

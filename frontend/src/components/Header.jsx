@@ -134,8 +134,8 @@ export default function Header({ onToast }) {
         <div className={`status-pill ${isOnline ? 'status-online' : 'status-offline'}`}>
           <span className={isOnline ? 'live-dot' : 'offline-dot'} />
           <span className="status-label">
-            {isOnline 
-              ? (health?.model_loaded ? 'Model Ready' : 'Server Online') 
+            {isOnline
+              ? (health?.model_loaded ? 'Model Ready' : 'Server Online')
               : 'Disconnected'}
           </span>
         </div>
@@ -149,16 +149,16 @@ export default function Header({ onToast }) {
                 {gpu.memory.allocated_gb} / {gpu.memory.total_gb} GB
               </span>
               <div className="gpu-bar-bg">
-                <div 
-                  className="gpu-bar-fill" 
-                  style={{ width: `${Math.min(gpu.memory.usage_percent, 100)}%` }} 
+                <div
+                  className="gpu-bar-fill"
+                  style={{ width: `${Math.min(gpu.memory.usage_percent, 100)}%` }}
                 />
               </div>
             </div>
-            <button 
-              className="btn-icon" 
-              onClick={handleClearGpu} 
-              disabled={isClearing} 
+            <button
+              className="btn-icon"
+              onClick={handleClearGpu}
+              disabled={isClearing}
               title="Clear GPU VRAM cache"
             >
               <Trash2 size={14} className={isClearing ? 'animate-spin' : ''} />
@@ -172,8 +172,8 @@ export default function Header({ onToast }) {
         </button>
 
         {/* Settings Toggle */}
-        <button 
-          className="btn-secondary btn-sm" 
+        <button
+          className="btn-secondary btn-sm"
           onClick={openSettings}
           title="Configure API Endpoint"
         >

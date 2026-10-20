@@ -2,12 +2,14 @@ __pycache__/
 .DS_Store
 venv/
 .venv/
-
+/onnx/
+/temp/
 results/
 experiments/
 tmp/
 *.pth
 *.pt
+*.part
 wav2vec2-base-960h/
 wav2vec-english-speech-emotion-recognition/
 results/

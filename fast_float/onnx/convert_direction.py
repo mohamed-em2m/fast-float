@@ -4,6 +4,7 @@ Exports the QR-free path: Q is baked as a buffer (same cache the torch
 model uses since the QR fix), forward is diag_embed + matmul + sum.
 Canonical shapes: x (B, M) -> out (B, 512). Dynamic batch.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -14,7 +15,12 @@ import torch
 import torch.nn as nn
 
 from fast_float.models.float.styledecoder import Direction
-from fast_float.onnx.export import export_module, make_ort_session
+from fast_float.onnx.export import (
+    add_ort_args,
+    export_module,
+    fp16_tol,
+    make_session_from_args,
+)
 from fast_float.onnx.parity import benchmark, check_parity
 
 
@@ -35,30 +41,24 @@ class DirectionExport(nn.Module):
             probe = torch.randn(4, self.motion_dim, device=q.device)
             a = (torch.diag_embed(probe) @ q.T).sum(1)
             b = probe @ q.T
-            print(f"[model] diag_embed-form vs matmul max_abs="
-                  f"{(a - b).abs().max().item():.3e}")
+            print(f"[model] diag_embed-form vs matmul max_abs={(a - b).abs().max().item():.3e}")
 
     def forward(self, x):
         return x @ self.Q.T
 
 
-def build_direction_module(
-    ckpt_path: str, motion_dim: int, device: torch.device
-) -> tuple[DirectionExport, Direction]:
+def build_direction_module(ckpt_path: str, motion_dim: int, device: torch.device) -> tuple[DirectionExport, Direction]:
     direction = Direction(motion_dim).to(device).eval()
     if os.path.exists(ckpt_path):
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        tops = Counter(k.split(".")[0] for k in sd.keys())
+        tops = Counter(k.split(".")[0] for k in sd)
         print(f"[weights] ckpt top-level prefixes: {dict(tops.most_common(10))}")
         # Direction lives at motion_autoencoder.dec.direction; fall back to a
         # suffix scan (there is exactly one Direction module in the graph).
-        sub = {
-            "weight": v
-            for k, v in sd.items()
-            if k == "motion_autoencoder.dec.direction.weight"
-        }
+        _dir_key = "motion_autoencoder.dec.direction.weight"
+        sub = {"weight": sd[_dir_key]} if _dir_key in sd else {}
         if not sub:
-            cands = [k for k in sd.keys() if k.endswith("dec.direction.weight")]
+            cands = [k for k in sd if k.endswith("dec.direction.weight")]
             if len(cands) == 1:
                 sub = {"weight": sd[cands[0]]}
                 print(f"[weights] fallback prefix: {cands[0]}")
@@ -82,10 +82,7 @@ def build_direction_module(
             )
         direction.to(device)
     else:
-        print(
-            f"[weights] WARN: {ckpt_path} not found — exporting randomly "
-            "initialized Direction (parity still valid)"
-        )
+        print(f"[weights] WARN: {ckpt_path} not found — exporting randomly initialized Direction (parity still valid)")
     return DirectionExport(direction).eval(), direction
 
 
@@ -100,7 +97,7 @@ def main(argv=None) -> int:
     ap.add_argument("--rtol", type=float, default=2e-4)
     ap.add_argument("--skip-parity", action="store_true")
     ap.add_argument("--bench-iters", type=int, default=100)
-    ap.add_argument("--cpu-ort", action="store_true")
+    add_ort_args(ap)
     args = ap.parse_args(argv)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -118,31 +115,31 @@ def main(argv=None) -> int:
         output_names=["dir"],
         dynamic_axes={"x": {0: "batch"}, "dir": {0: "batch"}},
         opset=args.opset,
+        mark_dims=(0,),  # M is baked into Q; only batch is dynamic
     )
     print(f"[export] {info['path']} via {info['exporter']}")
     for note in info.get("notes") or []:
         print(f"[export] note: {note}")
 
     if not args.skip_parity:
-        sess = make_ort_session(
+        sess, fp16 = make_session_from_args(
             info["path"],
-            use_gpu=torch.cuda.is_available() and not args.cpu_ort,
-            require_gpu=torch.cuda.is_available() and not args.cpu_ort,
+            args,
+            opt_shapes={"x": [1, m]},
         )
-        print(f"[ort] providers={sess.get_providers()}")
+        atol, rtol = fp16_tol(args.atol, fp16), fp16_tol(args.rtol, fp16)
         with torch.no_grad():
             for bi, b in enumerate(batches):
                 g = torch.Generator(device="cpu").manual_seed(1000 + bi)
                 x = torch.randn(b, m, generator=g).to(device)
                 ref = direction(x)
                 ort_out = sess.run(None, {"x": x.detach().cpu().numpy()})[0]
-                check_parity(ref, ort_out, name=f"dir_b{b}",
-                             atol=args.atol, rtol=args.rtol)
+                check_parity(ref, ort_out, name=f"dir_b{b}", atol=atol, rtol=rtol)
                 if args.bench_iters > 0:
                     x_np = x.detach().cpu().numpy()
                     benchmark(
-                        lambda: direction(x),
-                        lambda: sess.run(None, {"x": x_np}),
+                        lambda x=x: direction(x),
+                        lambda x_np=x_np: sess.run(None, {"x": x_np}),
                         name=f"dir_b{b}",
                         iters=args.bench_iters,
                     )

@@ -1,7 +1,8 @@
 import asyncio
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Dict, Set, Any
+from typing import Any
 
 
 class AppState:
@@ -15,24 +16,31 @@ class AppState:
         # NOTE: inference is serialized by inference_lock (one GPU), so a
         # large thread pool only wastes RAM. 2 workers cover inference +
         # lifespan warmup overlap.
-        self.agent: Optional[Any] = None
-        self.opt: Optional[Any] = None
-        self.video_optimizer: Optional[Any] = None
-        self.public_url: Optional[str] = None
-        self.public_backup_url: Optional[str] = None
-        self.pcs: Set[Any] = set()
-        self.active_streams: Dict[str, str] = {}
+        self.agent: Any | None = None
+        self.opt: Any | None = None
+        self.video_optimizer: Any | None = None
+        self.public_url: str | None = None
+        self.public_backup_url: str | None = None
+        self.pcs: set[Any] = set()
+        self.active_streams: dict[str, str] = {}
         self.queue_counter: int = 0
-        self.progress: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self.progress: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.max_concurrent_requests: int = max_concurrent_requests
         self.max_workers: int = max_workers
-        self.executor: Optional[ThreadPoolExecutor] = None
-        self.request_semaphore: Optional[asyncio.Semaphore] = None
-        self.inference_lock: Optional[asyncio.Lock] = None
-        # True while background boot warmup runs. /generate answers 503 until
-        # it clears so a real request never contends with warmup on one GPU.
+        self.executor: ThreadPoolExecutor | None = None
+        self.request_semaphore: asyncio.Semaphore | None = None
+        self.inference_lock: asyncio.Lock | None = None
+        # True while background boot warmup runs. Requests that arrive while it
+        # is set wait for ``warmup_event`` (see wait_for_warmup) instead of
+        # being rejected, so a client that fires one request right after a
+        # restart is served rather than 503'd for the whole warmup window.
         self.warming_up: bool = False
-        self.performance_stats: Dict[str, Any] = {
+        self.warmup_event: asyncio.Event | None = None
+        self.warmup_stage: str = ""
+        self.warmup_started_at: float = 0.0
+        self.warmup_finished_at: float = 0.0
+        self.warmup_error: str | None = None
+        self.performance_stats: dict[str, Any] = {
             "total_requests": 0,
             "total_inference_time": 0.0,
             "total_preprocess_time": 0.0,
@@ -49,6 +57,61 @@ class AppState:
         if self.executor is None:
             self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
 
+    # ------------------------------------------------------------- boot warmup
+    def begin_warmup(self) -> None:
+        """Mark the boot warmup as running (call from inside the event loop)."""
+        self.warmup_event = asyncio.Event()
+        self.warmup_started_at = time.time()
+        self.warmup_finished_at = 0.0
+        self.warmup_stage = "starting"
+        self.warmup_error = None
+        self.warming_up = True
+
+    def set_warmup_stage(self, stage: str) -> None:
+        self.warmup_stage = stage
+
+    def finish_warmup(self, error: str | None = None) -> None:
+        """Clear ``warming_up`` and release every waiting request.
+
+        Always called from the warmup task's ``finally``: a failed warmup is
+        not fatal (sequential inference still works), but leaving the flag set
+        would 503 the server forever.
+        """
+        self.warming_up = False
+        self.warmup_stage = "failed" if error else "done"
+        self.warmup_error = error
+        self.warmup_finished_at = time.time()
+        if self.warmup_event is not None:
+            self.warmup_event.set()
+
+    def warmup_elapsed(self) -> float:
+        """Seconds since warmup began, frozen once it finished (health metric)."""
+        if not self.warmup_started_at:
+            return 0.0
+        end = self.warmup_finished_at or time.time()
+        return max(0.0, end - self.warmup_started_at)
+
+    async def wait_for_warmup(self, timeout: float) -> bool:
+        """Wait up to ``timeout`` seconds for warmup to finish.
+
+        Returns ``True`` when the server is open (or was never closed), and
+        ``False`` on timeout. Requests used to hard-fail with a 503 during
+        warmup, which surfaced to users as "Model is warming up, try again
+        shortly" on *every* call: a retrying client was the only way in.
+        """
+        if not self.warming_up:
+            return True
+        event = self.warmup_event
+        if event is None:
+            # begin_warmup() hasn't run yet (or we're on another loop): don't
+            # block a request on a signal that can never arrive.
+            return not self.warming_up
+        try:
+            await asyncio.wait_for(event.wait(), timeout=max(0.0, timeout))
+            return True
+        except asyncio.TimeoutError:
+            return not self.warming_up
+
     def set_progress(self, request_id: str, **fields: Any) -> None:
         """Create or update the progress record for a request (LRU-capped)."""
         record = self.progress.get(request_id)
@@ -60,7 +123,7 @@ class AppState:
         while len(self.progress) > self.MAX_PROGRESS_ENTRIES:
             self.progress.popitem(last=False)
 
-    def get_progress(self, request_id: str) -> Optional[Dict[str, Any]]:
+    def get_progress(self, request_id: str) -> dict[str, Any] | None:
         record = self.progress.get(request_id)
         return dict(record) if record is not None else None
 

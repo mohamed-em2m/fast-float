@@ -1,12 +1,13 @@
-import os
 import gc
-from typing import Optional, Dict, Any
+import os
+from typing import Any
+
 import torch
 
 from fast_float.utils.logger import logger
 
 
-def get_gpu_info() -> Dict[str, Any]:
+def get_gpu_info() -> dict[str, Any]:
     """Get GPU information safely without crashing if CUDA is unavailable."""
     if not torch.cuda.is_available():
         return {"status": "no_gpu"}
@@ -37,7 +38,7 @@ def clear_gpu_memory() -> None:
         gc.collect()
 
 
-def get_current_gpu_memory() -> Optional[Dict[str, float]]:
+def get_current_gpu_memory() -> dict[str, float] | None:
     """Get current GPU memory allocation and usage statistics in GB."""
     if not torch.cuda.is_available():
         return None
@@ -71,6 +72,4 @@ def print_gpu_status() -> None:
     logger.info(f"   Total: {info.get('total_memory_gb', 0)}GB | Limit: {info.get('memory_limit_gb', 0)}GB")
 
     if mem:
-        logger.info(
-            f"   Current: {mem['allocated_gb']}GB ({mem['usage_percent']}%) | Reserved: {mem['reserved_gb']}GB"
-        )
+        logger.info(f"   Current: {mem['allocated_gb']}GB ({mem['usage_percent']}%) | Reserved: {mem['reserved_gb']}GB")
