@@ -18,9 +18,11 @@ This module wires the remaining three, registry-driven (see
 The ONNX runners themselves live in ``fast_float.runtimes.onnx.runner`` and are
 re-exported here for scripts.
 
-Parity is validated by the converter/selector scripts, never automatically
-here -- the config is the contract (helpers below stay importable for
-scripts). With the default all-eager config nothing is substituted.
+Parity is validated by the converter/selector scripts (the config is the
+contract), plus a one-shot self-test when a component is installed here: the
+graph is only as good as the execution provider that loads it, and providers
+are chosen at runtime. ``FLOAT_SKIP_BACKEND_SELFTEST=1`` skips the probes.
+With the default all-eager config nothing is substituted.
 
 Call once, after the checkpoint is loaded and the module is on its device.
 """
@@ -53,8 +55,23 @@ def _device_of(module) -> torch.device:
 
 
 # --------------------------------------------------------------------------- #
-# Parity helpers for scripts/manual use only (never called automatically).
+# Parity self-tests, run once per component at install time.
+#
+# These used to be dead code ("the config is the contract"), which is how a
+# decoder artifact that was off by 4.375 / cosine 0.983 got installed and
+# shipped a broken face: the graph is only as good as the execution provider
+# that loads it, and the provider is chosen at runtime, not at export time.
 # --------------------------------------------------------------------------- #
+
+
+def _selftests_enabled() -> bool:
+    """Skip the install-time probes for benchmarking (``FLOAT_SKIP_BACKEND_SELFTEST=1``)."""
+    return os.environ.get("FLOAT_SKIP_BACKEND_SELFTEST", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _cosine_ok(ref: torch.Tensor, got: torch.Tensor, name: str) -> bool:
@@ -96,13 +113,20 @@ def _selftest_refenc(ref, runner, image_size: int) -> bool:
 def _selftest_decoder(ae, runner, image_size: int) -> bool:
     dec = ae.dec
     device = _device_of(dec)
-    big_b = runner.batch or 4
+    # One artifact is enough to judge the exporter run, and load time matters:
+    # probe the smallest static batch (the artifact the converter names).
+    big_b = int(getattr(runner, "batch", None) or 4)
+    b = max(1, min(big_b, 4))
     g = torch.Generator(device="cpu").manual_seed(2)
-    with torch.no_grad():
-        probe = torch.randn(1, 3, image_size, image_size, generator=g).to(device)
-        _, _, feats1 = ae.enc(probe, None)
-    lat = torch.randn(big_b, 512, generator=g).to(device)
-    feats = [f.expand(big_b, *f.shape[1:]).contiguous() for f in feats1]
+    try:
+        with torch.no_grad():
+            probe = torch.randn(1, 3, image_size, image_size, generator=g).to(device)
+            _, _, feats1 = ae.enc(probe, None)
+    except Exception as e:  # an encoder that cannot be probed must not veto the decoder
+        print(f"[backends:decoder] self-test skipped ({e})")
+        return True
+    lat = torch.randn(b, 512, generator=g).to(device)
+    feats = [f.expand(b, *f.shape[1:]).contiguous() for f in feats1]
     with torch.no_grad():
         ref = dec(lat, alpha=None, feats=feats)
         ref = ref[0] if isinstance(ref, (tuple, list)) else ref
@@ -158,6 +182,9 @@ def _apply_direction(model, ae, opt) -> None:
         # the config is the contract.
         motion_dim = int(target.weight.shape[1])
         runner = DirectionOnnx(path, opt_shapes={"x": [1, motion_dim]}, device_id=_primary_device_id(opt))
+        if _selftests_enabled() and not _selftest_direction(target, runner):
+            logger.warning("backends: direction ONNX failed the parity self-test; eager")
+            return
         ae.dec.direction = runner
         logger.info(f"backends: direction -> ONNX {path} ({runner.providers})")
     except Exception as e:
@@ -190,6 +217,9 @@ def _apply_refenc(model, ae, opt) -> None:
             opt_shapes={"img": [1, 3, size, size]},
             device_id=_primary_device_id(opt),
         )
+        if _selftests_enabled() and not _selftest_refenc(enc, runner, size):
+            logger.warning("backends: refenc ONNX failed the parity self-test; eager")
+            return
         ae.enc = runner
         logger.info(f"backends: refenc -> ONNX {path} ({runner.providers})")
     except Exception as e:
@@ -210,6 +240,9 @@ def _apply_decoder(model, ae, opt) -> None:
     path = _path(opt, "decoder_onnx_path", component_spec("decoder").onnx_default)
     try:
         runner = DecoderOnnx(path, device_id=_primary_device_id(opt))
+        if _selftests_enabled() and not _selftest_decoder(ae, runner, _image_size(opt)):
+            logger.warning("backends: decoder ONNX failed the parity self-test; eager")
+            return
         model._decoder_onnx = runner
         logger.info(f"backends: decoder -> ONNX {path} (batches {getattr(runner, 'batches', [])}, {runner.providers})")
     except Exception as e:

@@ -334,6 +334,7 @@ See [`docs/BACKEND_SELECTION.md`](docs/BACKEND_SELECTION.md) for the measurement
 | `FLOAT_DECODE_AUTOCAST` | unset | `fp16` or `bf16` autocast for the eager/compiled decoder; off by default |
 | `FLOAT_SEAM_BLEND` | `3` | Frames cross-faded at chunk seams (0 disables) |
 | `FLOAT_CUDNN_BENCHMARK` | `0` | Enable cuDNN autotuning (adds startup/heap churn; off by default) |
+| `FLOAT_SKIP_BACKEND_SELFTEST` | unset | Skip the one-shot ONNX install-time self-tests (`1`; benchmarking only) |
 
 > Decode knobs are opt-in on purpose: channels_last and autocast can change numerics or be a pessimization depending on the GPU and kernel mix. Measure with the tuner enabled (`FLOAT_DECODE_TUNE_CACHE`) before baking them into a deployment.
 
