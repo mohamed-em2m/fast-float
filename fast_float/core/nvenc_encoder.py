@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -44,14 +45,8 @@ _ENCODE_OPTS = [
 _WRITE_BLOCK = 32
 
 
-def frames_to_uint8_hwc(vid: torch.Tensor) -> np.ndarray:
-    """Convert a frame tensor to a contiguous ``(T, H, W, 3|4)`` uint8 array.
-
-    Accepts ``(T, C, H, W)`` or ``(T, H, W, C)``, float in ``[-1, 1]`` or
-    integer. The device copy (``.cpu()``) synchronizes only the stream that
-    produced the tensor, so this is safe to call from a decode loop that is
-    itself running on a non-default CUDA stream.
-    """
+def _to_uint8_hwc(vid: torch.Tensor) -> torch.Tensor:
+    """Device-side half of the export: ``(T, C|H, H|W, W|C)`` -> uint8 NHWC."""
     if vid.dim() != 4:
         raise ValueError(f"Expected a 4D frame tensor, got shape {tuple(vid.shape)}")
     if vid.shape[1] in (3, 4) and vid.shape[-1] not in (3, 4):
@@ -62,13 +57,73 @@ def frames_to_uint8_hwc(vid: torch.Tensor) -> np.ndarray:
         vid = (vid.clamp(-1.0, 1.0) * 127.5 + 127.5).to(torch.uint8)
     else:
         vid = vid.to(torch.uint8)
+    return vid
 
-    arr = vid.cpu().numpy()
+
+def frames_to_uint8_hwc(vid: torch.Tensor) -> np.ndarray:
+    """Convert a frame tensor to a contiguous ``(T, H, W, 3|4)`` uint8 array.
+
+    Accepts ``(T, C, H, W)`` or ``(T, H, W, C)``, float in ``[-1, 1]`` or
+    integer. The device copy (``.cpu()``) synchronizes only the stream that
+    produced the tensor, so this is safe to call from a decode loop that is
+    itself running on a non-default CUDA stream.
+    """
+    arr = _to_uint8_hwc(vid).cpu().numpy()
     if arr.ndim != 4 or arr.shape[-1] not in (3, 4):
         raise ValueError(f"Expected (T, H, W, 3|4) frames, got {arr.shape}")
     if not arr.flags["C_CONTIGUOUS"]:
         arr = np.ascontiguousarray(arr)
     return arr
+
+
+@dataclass
+class StagedFrames:
+    """Host-visible frames whose device->host copy may still be in flight.
+
+    ``frames`` aliases pinned host memory, so the encoder thread must call
+    :meth:`wait` before reading it and keep this object alive until the encode
+    finishes (that reference is what keeps the pinned buffer from being freed).
+    """
+
+    frames: np.ndarray
+    host: torch.Tensor | None = None
+    event: torch.cuda.Event | None = None
+
+    def wait(self) -> np.ndarray:
+        if self.event is not None:
+            self.event.synchronize()
+            self.event = None
+        return self.frames
+
+
+def stage_frames_for_nvenc(
+    vid: torch.Tensor,
+    stream: torch.cuda.Stream | None = None,
+) -> StagedFrames:
+    """Cast and copy frames out of device memory on the caller's stream.
+
+    Decoding runs on the default stream, so doing the cast + D2H there stalls
+    the next chunk for ~60 ms. Passing a private stream issues both there and
+    returns immediately instead; the encode thread blocks on the returned
+    event, which overlaps the copy with the next decode.
+
+    With ``stream=None`` (or a CPU tensor) this is a synchronous conversion and
+    the returned object is already safe to read.
+    """
+    if stream is not None and vid.is_cuda:
+        stream.wait_stream(torch.cuda.current_stream(vid.device))
+        with torch.cuda.stream(stream):
+            u8 = _to_uint8_hwc(vid)
+            host = torch.empty(u8.shape, dtype=torch.uint8, pin_memory=True)
+            host.copy_(u8, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(stream)
+        # ``vid`` was allocated on the decode stream; tell the caching allocator
+        # that the side stream still reads it so its block is not reused early.
+        vid.record_stream(stream)
+        return StagedFrames(host.numpy(), host, event)
+
+    return StagedFrames(frames_to_uint8_hwc(vid))
 
 
 def encode_numpy_nvenc(

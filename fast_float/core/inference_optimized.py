@@ -26,7 +26,11 @@ except ImportError:
     from utils.pyav_writer import save_video_pyav, save_video_torchcodec
 
 from fast_float.core.data_processor import DataProcessor
-from fast_float.core.nvenc_encoder import encode_numpy_nvenc, encode_video_nvenc, frames_to_uint8_hwc
+from fast_float.core.nvenc_encoder import (
+    encode_numpy_nvenc,
+    encode_video_nvenc,
+    stage_frames_for_nvenc,
+)
 from fast_float.core.options import InferenceOptions
 from fast_float.core.simple_encoder import SimpleVideoEncoder
 from fast_float.utils.timing import timed, timing_scope
@@ -212,10 +216,10 @@ class OptimizedInferenceAgent:
         return choice not in ("cpu pyav", "pyav", "pyav_cpu", "torchcodec", "torch codec", "tc")
 
     @staticmethod
-    def _encode_nvenc_chunk(frames, video_path: str, fps: int) -> str:
-        """Worker-thread body: encode already-converted frames (no torch calls)."""
+    def _encode_nvenc_chunk(staged, video_path: str, fps: int) -> str:
+        """Worker-thread body: wait for the async copy, then run ffmpeg."""
         with timed("save"):
-            return encode_numpy_nvenc(frames, video_path, fps=fps)
+            return encode_numpy_nvenc(staged.wait(), video_path, fps=fps)
 
     @torch.no_grad()
     @timing_scope("run_inference")
@@ -510,6 +514,12 @@ class OptimizedInferenceAgent:
 
         out_paths: list = [None] * len(items)
         pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="vidsave") if parallel_save else None
+        # Cast + D2H run on their own stream so the next chunk can decode while
+        # the frames are still being copied out; the encode thread waits on the
+        # per-chunk event instead of stalling this loop.
+        save_stream = (
+            torch.cuda.Stream(device=torch.device(device)) if pool is not None and torch.cuda.is_available() else None
+        )
         # Sampling AND decoding stay under one autocast context, exactly like the
         # sequential path (run_inference wraps the whole generate() call). The
         # latents leave the ODE solve in half precision when AMP is on, so the
@@ -543,11 +553,12 @@ class OptimizedInferenceAgent:
                     with timed("decode", gpu=True):
                         d_hat = G.decode_latent_into_image(s_r, s_r_feats, lat_i, batch_size=decode_bs)
                     if pool is not None:
-                        # Convert on this thread (stream-ordered) and let the
-                        # worker run ffmpeg/NVENC while the next chunk decodes.
+                        # Hand the cast + copy to the save stream (returns
+                        # immediately) and let the worker run ffmpeg/NVENC
+                        # while the next chunk decodes.
                         out_paths[i] = pool.submit(
                             self._encode_nvenc_chunk,
-                            frames_to_uint8_hwc(d_hat),
+                            stage_frames_for_nvenc(d_hat, save_stream),
                             it["out_path"],
                             fps,
                         )

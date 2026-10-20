@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from fast_float.core.nvenc_encoder import frames_to_uint8_hwc
+from fast_float.core.nvenc_encoder import frames_to_uint8_hwc, stage_frames_for_nvenc
 
 
 def test_nchw_float_maps_to_uint8_hwc():
@@ -30,3 +30,13 @@ def test_hwc_uint8_is_not_repermuted():
 def test_rejects_non_4d():
     with pytest.raises(ValueError, match="4D"):
         frames_to_uint8_hwc(torch.zeros(3, 4, 5))
+
+
+def test_stage_without_stream_is_synchronous():
+    vid = torch.randn(2, 3, 4, 5)
+    staged = stage_frames_for_nvenc(vid)
+
+    assert staged.event is None
+    assert staged.host is None
+    assert staged.wait() is staged.frames
+    assert np.array_equal(staged.wait(), frames_to_uint8_hwc(vid))
