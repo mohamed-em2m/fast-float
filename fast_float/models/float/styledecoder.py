@@ -552,13 +552,14 @@ class Direction(nn.Module):
         self._Q_fp = None
 
     def _fingerprint(self, w):
-        return (
-            w._version,
-            w.data_ptr(),
-            w.device,
-            w.dtype,
-            w.detach().to(torch.float32).sum().item(),
-        )
+        # Deliberately no `.item()`: reading a scalar back forces a device sync
+        # on every forward, and it is what Dynamo reports as a graph break here
+        # (`Tensor.item()`), splitting the compiled decoder in two. This is
+        # still complete for every loader in the repo: in-place overlays
+        # (`param.copy_`, `load_state_dict`) bump `_version`, and replacing the
+        # parameter changes `data_ptr`. Only a raw `.data.copy_` would slip
+        # through, and nothing on the inference path does that.
+        return (w._version, w.data_ptr(), w.device, w.dtype)
 
     def _orthonormal_basis(self):
         """Cached Q factor of weight. Recomputed only if weight changed."""
