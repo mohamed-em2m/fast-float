@@ -84,7 +84,7 @@ def main(argv=None) -> int:
     ap.add_argument("--atol", type=float, default=2e-4)
     ap.add_argument("--rtol", type=float, default=2e-4)
     ap.add_argument("--skip-parity", action="store_true")
-    ap.add_argument("--bench-iters", type=int, default=10)
+    ap.add_argument("--bench-iters", type=int, default=2)
     add_ort_args(ap)
     args = ap.parse_args(argv)
 
