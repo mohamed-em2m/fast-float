@@ -1,7 +1,9 @@
 """decoder.py - Decoder, batch decoder, profile manager, and multi-GPU decode replica handling for FLOAT."""
 
+import contextlib
 import copy
 import logging
+import os
 import threading
 
 import torch
@@ -10,6 +12,25 @@ from fast_float.utils.decode_tuner import DecodeAutoTuner
 from fast_float.utils.timing import timed
 
 logger = logging.getLogger(__name__)
+
+# Optimization knobs: Allow TensorFloat-32 on Ampere+ architectures
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+try:
+    import torch._dynamo
+
+    torch._dynamo.config.cache_size_limit = 64
+    torch._dynamo.config.suppress_errors = True
+except Exception:
+    pass
+
+_CHANNELS_LAST_ENV = "FLOAT_DECODE_CHANNELS_LAST"
+_ON_VALUES = frozenset({"1", "true", "yes", "on"})
+# Pre-expanding broadcast style vectors is only cheaper than per-chunk cuDNN
+# copies while they stay small; guard against spatial feature maps.
+_FEAT_EXPAND_BUDGET_BYTES = 64 * 1024 * 1024
 
 
 class DecoderMixin:
@@ -96,6 +117,53 @@ class DecoderMixin:
                 reps[idx] = proto._recreate(device_id=idx)
             return reps[idx]
 
+    def _channels_last_decode(self) -> bool:
+        """Whether the eager/compiled decoder should run in channels_last.
+
+        Off by default (``FLOAT_DECODE_CHANNELS_LAST=1`` or
+        ``opt.decode_channels_last``): worth A/B-testing per device, since it
+        only pays off if the GPU kernels prefer NHWC.
+        """
+        flag = getattr(self.opt, "decode_channels_last", None)
+        if flag is not None:
+            return bool(flag)
+        return os.environ.get(_CHANNELS_LAST_ENV, "").strip().lower() in _ON_VALUES
+
+    def _prepare_decoder(self, ae) -> None:
+        """One-time per-decoder setup: channels_last weights + per-replica compile.
+
+        ``dispatch`` compiles only the primary model's ``dec``, so a multi-GPU
+        replica reusing it would run the primary device's weights.
+        """
+        dec = ae.dec
+        if self._channels_last_decode() and not getattr(dec, "_ff_channels_last", False):
+            with self._decode_lock:
+                if not getattr(dec, "_ff_channels_last", False):
+                    dec.to(memory_format=torch.channels_last)
+                    dec._ff_channels_last = True
+        if getattr(self, "_decoder_compiled", None) is None:
+            return
+        primary = getattr(self, "motion_autoencoder", None)
+        if primary is not None and ae is primary:
+            return
+        if getattr(ae, "_ff_decoder_compiled", None) is None:
+            with self._decode_lock:
+                if getattr(ae, "_ff_decoder_compiled", None) is None:
+                    ae._ff_decoder_compiled = torch.compile(dec)
+
+    def _bind_decoder(self, ae, device):
+        """Retrieve the decoder runner once per request/worker, avoiding per-chunk locks."""
+        backend = self._decoder_for(device)
+        if backend is not None:
+            return backend
+        compiled = getattr(self, "_decoder_compiled", None)
+        if compiled is not None or self._channels_last_decode():
+            self._prepare_decoder(ae)
+        if compiled is None:
+            return ae.dec
+        primary = getattr(self, "motion_autoencoder", None)
+        return compiled if (primary is None or ae is primary) else (getattr(ae, "_ff_decoder_compiled", None) or ae.dec)
+
     def _decode_call(self, ae, latent: torch.Tensor, feats: list) -> torch.Tensor:
         """Route the decode call through the configured backend.
 
@@ -104,15 +172,72 @@ class DecoderMixin:
         config selects them; otherwise this is the plain
         ``ae.dec(latent, alpha=None, feats=...)`` path on the per-device replica.
         """
-        backend = self._decoder_for(latent.device)
-        if backend is not None:
-            return backend(latent, feats)
-        dec = getattr(self, "_decoder_compiled", None) or ae.dec
-        out = dec(latent, alpha=None, feats=feats)
+        dec = getattr(self, "_active_bound_dec", None)
+        if dec is None:
+            dec = self._bind_decoder(ae, latent.device)
+
+        dev_type = latent.device.type if hasattr(latent, "device") else "cuda"
+        if dev_type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                out = dec(latent, feats) if hasattr(dec, "providers") else dec(latent, alpha=None, feats=feats)
+        else:
+            out = dec(latent, feats) if hasattr(dec, "providers") else dec(latent, alpha=None, feats=feats)
+
         if isinstance(out, (tuple, list)):
             out = out[0]
         return out
 
+    @staticmethod
+    def _quantize_u8_hwc(out: torch.Tensor) -> torch.Tensor:
+        """[-1, 1] float NCHW -> uint8 HWC.
+
+        When the decoder is channels_last the final ``permute(...).contiguous()``
+        returns the input unchanged instead of copying a full batch.
+        """
+        out = out.add_(1.0).mul_(127.5).clamp_(0.0, 255.0).to(torch.uint8)
+        return out.permute(0, 2, 3, 1).contiguous()
+
+    @staticmethod
+    def _slice_feats(feats: list, i: int, m: int) -> list:
+        out = []
+        for f in feats:
+            if f.shape[0] == 1:
+                out.append(f.expand(m, *f.shape[1:]).contiguous() if m > 1 else f)
+            else:
+                out.append(f[i : i + m])
+        return out
+
+    def _note_decode_oom(self) -> None:
+        """Evict the allocator cache only after repeated OOMs.
+
+        ``empty_cache`` frees every cached block and synchronizes the device, so
+        paying it on each split stalls every decode worker.
+        """
+        streak = getattr(self, "_decode_oom_streak", 0) + 1
+        limit = max(1, int(getattr(self.opt, "decode_oom_evict_after", 2)))
+        if streak < limit:
+            self._decode_oom_streak = streak
+            return
+        self._decode_oom_streak = 0
+        with contextlib.suppress(Exception):
+            torch.cuda.empty_cache()
+
+    def _decode_tiled_u8(self, ae, feats: list, lat, b: int, static_b: int) -> torch.Tensor:
+        """Tile a batch the static ONNX graph cannot take, writing uint8 HWC once."""
+        first = self._quantize_u8_hwc(self._decode_call(ae, lat[:static_b], self._slice_feats(feats, 0, static_b)))
+        out = first.new_empty((b, *first.shape[1:]))
+        out[: first.shape[0]].copy_(first)
+        done = first.shape[0]
+        while done < b:
+            m = min(static_b, b - done)
+            chunk = self._quantize_u8_hwc(
+                self._decode_call(ae, lat[done : done + m], self._slice_feats(feats, done, m))
+            )
+            out[done : done + chunk.shape[0]].copy_(chunk)
+            done += chunk.shape[0]
+        return out
+
+    @torch.inference_mode()
     def _decode_u8(self, ae, feats_in, lat, allow_split=True) -> torch.Tensor:
         """lat [b, dim] -> uint8 [b, H, W, C] on lat's device/current stream. Halves batch on OOM."""
         b = lat.shape[0]
@@ -124,27 +249,21 @@ class DecoderMixin:
         try:
             if static_b is not None and b > static_b:
                 # Static-batch ONNX graph: tile to it (pad/trim inside).
-                parts = []
-                for i in range(0, b, static_b):
-                    m = min(static_b, b - i)
-                    chunk_feats = [f[i : i + m] if f.shape[0] == b else f for f in feats]
-                    parts.append(self._decode_call(ae, lat[i : i + m], chunk_feats))
-                out = torch.cat(parts, dim=0)
+                out = self._decode_tiled_u8(ae, feats, lat, b, static_b)
             else:
-                out = self._decode_call(ae, lat, feats)
-            out = out.float()
-            out = out.add_(1.0).mul_(127.5).clamp_(0.0, 255.0).to(torch.uint8)
-            return out.permute(0, 2, 3, 1).contiguous()
+                out = self._quantize_u8_hwc(self._decode_call(ae, lat, feats))
+            self._decode_oom_streak = 0
+            return out
         except torch.cuda.OutOfMemoryError:
             if not allow_split or b <= 1:
                 raise
         # (outside the except block so the failed tensors are released first)
-        torch.cuda.empty_cache()
+        self._note_decode_oom()
         h = b // 2
         return torch.cat(
             [
-                self._decode_u8(ae, feats_in, lat[:h]),
-                self._decode_u8(ae, feats_in, lat[h:]),
+                self._decode_u8(ae, feats_in, lat[:h], allow_split=allow_split),
+                self._decode_u8(ae, feats_in, lat[h:], allow_split=allow_split),
             ],
             0,
         )
@@ -193,6 +312,7 @@ class DecoderMixin:
                     f"sf{tuner.safety}",
                     f"rg{tuner.reserve_gib}",
                     f"ob{getattr(self.opt, 'decode_batch_size', 0)}",
+                    f"cl{int(self._channels_last_decode())}",
                 ]
             )
             with timed("decode_tune", gpu=True, device=str(dev)):
@@ -267,7 +387,133 @@ class DecoderMixin:
         except Exception:
             return 4
 
-    @torch.no_grad()
+    def _default_decode_batch(self, device) -> int:
+        """Tuned micro-batch from the decode profile, else the VRAM heuristic.
+
+        ``video_pipeline`` already plans with ``prof.batch_size``; without this
+        the sampler path picked a different (heuristic) batch for the same GPU.
+        """
+        if (
+            not getattr(self.opt, "decode_batch_size", None)
+            and device is not None
+            and getattr(device, "type", None) == "cuda"
+        ):
+            idx = device.index if device.index is not None else torch.cuda.current_device()
+            prof = (getattr(self, "_decode_profiles", None) or {}).get(idx)
+            if prof is not None and int(prof.batch_size) > 0:
+                return int(prof.batch_size)
+        return self.get_optimal_decode_batch_size(device)
+
+    def _expand_feats(self, feats: list, n: int) -> list:
+        """Expand per-frame style vectors once per request so chunks only slice."""
+        out = []
+        for f in feats:
+            if f.shape[0] == 1 and n > 1 and f.numel() * f.element_size() * n <= _FEAT_EXPAND_BUDGET_BYTES:
+                out.append(f.expand(n, *f.shape[1:]).contiguous())
+            else:
+                out.append(f)
+        return out
+
+    def _align_feats_3d(self, feats: list, b_dim: int, t_dim: int, n_total: int) -> list:
+        aligned = []
+        for f in feats:
+            if f.shape[0] == 1:
+                aligned.append(f)
+            elif f.shape[0] == b_dim:
+                aligned.append(f.unsqueeze(1).expand(-1, t_dim, *f.shape[1:]).reshape(n_total, *f.shape[1:]))
+            elif f.shape[0] == n_total:
+                aligned.append(f)
+            else:
+                aligned.append(f[:1])
+        return self._expand_feats(aligned, n_total)
+
+    def _align_feats_2d(self, feats: list, n_total: int) -> list:
+        aligned = []
+        for f in feats:
+            if f.shape[0] in (1, n_total):
+                aligned.append(f)
+            elif n_total % f.shape[0] == 0:
+                t = n_total // f.shape[0]
+                aligned.append(f.unsqueeze(1).expand(-1, t, *f.shape[1:]).reshape(n_total, *f.shape[1:]))
+            else:
+                aligned.append(f[:1])
+        return self._expand_feats(aligned, n_total)
+
+    def _decode_chunks(self, ae, lat: torch.Tensor, feats: list, bs: int) -> torch.Tensor:
+        """Decode ``lat`` in mini-batches into one preallocated output tensor."""
+        n = lat.shape[0]
+        pad_bs = getattr(self, "_compiled_batch_size", None)
+        first_m = min(bs, n)
+        if pad_bs is not None and first_m < pad_bs:
+            pad_size = pad_bs - first_m
+            padded_lat = torch.cat([lat[:first_m], lat[first_m - 1 : first_m].expand(pad_size, -1)], dim=0)
+            padded_feats = [
+                (
+                    f
+                    if f.shape[0] == 1
+                    else torch.cat([f[:first_m], f[first_m - 1 : first_m].expand(pad_size, *f.shape[1:])], dim=0)
+                )
+                for f in feats
+            ]
+            first = self._decode_call(ae, padded_lat, padded_feats)[:first_m]
+        else:
+            first = self._decode_call(ae, lat[:first_m], self._slice_feats(feats, 0, first_m))
+
+        out = first.new_empty((n, *first.shape[1:]))
+        step = first.shape[0]
+        out[:step].copy_(first)
+
+        while step < n:
+            m = min(bs, n - step)
+            if pad_bs is not None and m < pad_bs:
+                pad_size = pad_bs - m
+                padded_lat = torch.cat([lat[step : step + m], lat[step + m - 1 : step + m].expand(pad_size, -1)], dim=0)
+                padded_feats = [
+                    (
+                        f
+                        if f.shape[0] == 1
+                        else torch.cat(
+                            [f[step : step + m], f[step + m - 1 : step + m].expand(pad_size, *f.shape[1:])], dim=0
+                        )
+                    )
+                    for f in feats
+                ]
+                chunk = self._decode_call(ae, padded_lat, padded_feats)[:m]
+            else:
+                chunk = self._decode_call(ae, lat[step : step + m], self._slice_feats(feats, step, m))
+
+            got = chunk.shape[0]
+            if got <= 0:
+                raise RuntimeError("decoder returned an empty batch")
+            out[step : step + got].copy_(chunk)
+            step += got
+        return out
+
+    def compile_decoder(self, batch_size: int = 8, mode: str = "reduce-overhead"):
+        """Compiles the motion autoencoder decoder with static CUDA Graphs and channels_last layout."""
+        ae = getattr(self, "motion_autoencoder", None)
+        if ae is None or not hasattr(ae, "dec"):
+            return None
+        try:
+            ae.dec.to(memory_format=torch.channels_last)
+            ae.dec._ff_channels_last = True
+            compiled = torch.compile(
+                ae.dec,
+                mode=mode,
+                dynamic=False,
+                fullgraph=False,
+            )
+            self._decoder_compiled = compiled
+            self._compiled_batch_size = batch_size
+            logger.info(f"FloatDecoder: motion_autoencoder.dec compiled with mode={mode}, static_bs={batch_size}")
+            return compiled
+        except Exception as e:
+            logger.warning(f"FloatDecoder: torch.compile failed ({e}), falling back to eager")
+            self._decoder_compiled = ae.dec
+            self._compiled_batch_size = None
+            return ae.dec
+
+    @torch.inference_mode()
     def _decode_latent_batched(
         self,
         ae,
@@ -283,90 +529,31 @@ class DecoderMixin:
         if device is None:
             device = r_d.device if (hasattr(r_d, "device") and r_d.device.type == "cuda") else None
 
-        bs = batch_size if batch_size is not None else self.get_optimal_decode_batch_size(device)
+        bs = batch_size if batch_size is not None else self._default_decode_batch(device)
         bs = max(1, int(bs))
         static_b = self._decoder_static_batch()
         if static_b is not None:
             bs = min(bs, static_b)
 
-        if r_d.ndim == 3:
-            b_dim, t_dim, d_dim = r_d.shape
-            n_total = b_dim * t_dim
-            r_d_flat = r_d.reshape(n_total, d_dim)
+        self._active_bound_dec = self._bind_decoder(ae, device or getattr(r_d, "device", None) or self._cuda_device())
+        try:
+            if r_d.ndim == 3:
+                b_dim, t_dim, d_dim = r_d.shape
+                n_total = b_dim * t_dim
+                flat = r_d.reshape(n_total, d_dim)
+                out = self._decode_chunks(ae, flat, self._align_feats_3d(s_r_feats, b_dim, t_dim, n_total), bs)
+                return out.reshape(b_dim, t_dim, *out.shape[1:])
 
-            aligned_feats = []
-            for f in s_r_feats:
-                if f.shape[0] == 1:
-                    aligned_feats.append(("broadcast", f))
-                elif f.shape[0] == b_dim:
-                    full_f = f.unsqueeze(1).expand(-1, t_dim, *f.shape[1:]).reshape(n_total, *f.shape[1:])
-                    aligned_feats.append(("slice", full_f))
-                elif f.shape[0] == n_total:
-                    aligned_feats.append(("slice", f))
-                else:
-                    aligned_feats.append(("broadcast", f[:1]))
-
-            if n_total <= bs:
-                chunk_feats = [
-                    f.expand(n_total, *f.shape[1:]).contiguous() if mode == "broadcast" else f
-                    for mode, f in aligned_feats
-                ]
-                out = self._decode_call(ae, r_d_flat, chunk_feats)
-                return out.view(b_dim, t_dim, *out.shape[1:])
-            else:
-                out_chunks = []
-                for i in range(0, n_total, bs):
-                    chunk_r_d = r_d_flat[i : i + bs]
-                    m = chunk_r_d.shape[0]
-                    chunk_feats = [
-                        (f.expand(m, *f.shape[1:]).contiguous() if mode == "broadcast" else f[i : i + m])
-                        for mode, f in aligned_feats
-                    ]
-                    chunk_out = self._decode_call(ae, chunk_r_d, chunk_feats)
-                    out_chunks.append(chunk_out)
-                out = torch.cat(out_chunks, dim=0)
-                return out.view(b_dim, t_dim, *out.shape[1:])
-        else:
             is_1d = r_d.ndim == 1
             if is_1d:
                 r_d = r_d.unsqueeze(0)
             n_total = r_d.shape[0]
+            out = self._decode_chunks(ae, r_d, self._align_feats_2d(s_r_feats, n_total), bs)
+            return out.squeeze(0) if is_1d else out
+        finally:
+            self._active_bound_dec = None
 
-            aligned_feats = []
-            for f in s_r_feats:
-                if f.shape[0] == 1:
-                    aligned_feats.append(("broadcast", f))
-                elif f.shape[0] == n_total:
-                    aligned_feats.append(("slice", f))
-                elif n_total % f.shape[0] == 0:
-                    t = n_total // f.shape[0]
-                    full_f = f.unsqueeze(1).expand(-1, t, *f.shape[1:]).reshape(n_total, *f.shape[1:])
-                    aligned_feats.append(("slice", full_f))
-                else:
-                    aligned_feats.append(("broadcast", f[:1]))
-
-            if n_total <= bs:
-                chunk_feats = [
-                    f.expand(n_total, *f.shape[1:]).contiguous() if mode == "broadcast" else f
-                    for mode, f in aligned_feats
-                ]
-                out = self._decode_call(ae, r_d, chunk_feats)
-                return out.squeeze(0) if is_1d else out
-            else:
-                out_chunks = []
-                for i in range(0, n_total, bs):
-                    chunk_r_d = r_d[i : i + bs]
-                    m = chunk_r_d.shape[0]
-                    chunk_feats = [
-                        (f.expand(m, *f.shape[1:]).contiguous() if mode == "broadcast" else f[i : i + m])
-                        for mode, f in aligned_feats
-                    ]
-                    chunk_out = self._decode_call(ae, chunk_r_d, chunk_feats)
-                    out_chunks.append(chunk_out)
-                out = torch.cat(out_chunks, dim=0)
-                return out.squeeze(0) if is_1d else out
-
-    @torch.no_grad()
+    @torch.inference_mode()
     def decode_latent_into_image(
         self,
         s_r: torch.Tensor,
@@ -387,7 +574,7 @@ class DecoderMixin:
         )
 
     ######## Motion Encoder - Helpers ########
-    @torch.no_grad()
+    @torch.inference_mode()
     def encode_image_into_latent(self, x: torch.Tensor) -> list:
         if x.ndim == 3:
             x = x.unsqueeze(0)
@@ -395,7 +582,7 @@ class DecoderMixin:
         x_r_lambda = self.motion_autoencoder.enc.fc(x_r)
         return x_r, x_r_lambda, x_r_feats
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def encode_identity_into_motion(self, x_r: torch.Tensor) -> torch.Tensor:
         if x_r.ndim == 1:
             x_r = x_r.unsqueeze(0)
@@ -415,6 +602,7 @@ class FloatDecoder(DecoderMixin):
         self._decode_profiles = {}
         self._decode_tuners = {}
         self._ae_replicas = {}
+        self._decode_oom_streak = 0
 
 
 __all__ = ["DecoderMixin", "FloatDecoder"]

@@ -13,6 +13,8 @@ import traceback
 import numpy as np
 import torch
 
+from fast_float.streaming.dispatcher import FrameDispatcher
+from fast_float.streaming.types import StreamMeta
 from fast_float.utils.stream_utils import _ABORT, _qget
 from fast_float.utils.timing import timed
 
@@ -122,6 +124,7 @@ class StreamingVideoSaver:
         nfe=10,
         seed=None,
         video_encoder=None,
+        dispatcher: FrameDispatcher | None = None,
     ) -> str:
         t_start = time.perf_counter()
         encoder_choice = str(video_encoder or getattr(self.opt, "video_encoder", "FFmpeg NVENC")).strip().lower()
@@ -229,6 +232,19 @@ class StreamingVideoSaver:
         stop = threading.Event()
         errors = []
         state = {"total": None, "frames": 0}
+
+        if dispatcher is not None:
+            dispatcher.bind(
+                StreamMeta(
+                    fps=float(fps),
+                    width=int(W),
+                    height=int(H),
+                    channels=int(C),
+                    request_id=str(getattr(self, "request_id", "") or ""),
+                    audio_path=audio_path,
+                ),
+                stop_event=stop,
+            )
         work_q: queue.Queue = queue.Queue()  # latents only: tiny, unbounded is fine
         done_q: queue.Queue = queue.Queue()
         pool: queue.Queue = queue.Queue()  # pinned host buffers = backpressure
@@ -362,6 +378,8 @@ class StreamingVideoSaver:
                                 done.synchronize()
                             with timed("frame_gather"):
                                 all_frames.append(buf[:n].numpy().copy())
+                            if dispatcher is not None:
+                                dispatcher.submit(buf[:n].numpy())
                             state["frames"] += n
                             pool.put(buf)
                             nxt += 1
@@ -414,6 +432,8 @@ class StreamingVideoSaver:
                                 done.synchronize()
                             with timed("video_write"):
                                 writer_inst.write_frames(buf[:n].numpy())
+                            if dispatcher is not None:
+                                dispatcher.submit(buf[:n].numpy())
                             state["frames"] += n
                             pool.put(buf)
                             nxt += 1
@@ -450,6 +470,8 @@ class StreamingVideoSaver:
                             done.synchronize()
                         with timed("video_write"):
                             proc.stdin.write(buf[:n].numpy().reshape(-1))
+                        if dispatcher is not None:
+                            dispatcher.submit(buf[:n].numpy())
                         state["frames"] += n
                         pool.put(buf)
                         nxt += 1
@@ -495,6 +517,8 @@ class StreamingVideoSaver:
 
         if errors:
             where, exc, tb = errors[0]
+            if dispatcher is not None:
+                dispatcher.error(exc)
             raise RuntimeError(f"[{where}] {exc}\n{tb}") from exc
 
         dt = time.perf_counter() - t_start

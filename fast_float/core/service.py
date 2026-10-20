@@ -47,6 +47,7 @@ def run_inference_blocking(
     image_path: str,
     audio_path: str,
     request_data: dict[str, Any],
+    dispatcher: Any | None = None,
 ) -> str:
     """Synchronous inference runner invoked within ThreadPoolExecutor."""
     return agent.run_inference(
@@ -61,6 +62,7 @@ def run_inference_blocking(
         no_crop=request_data.get("no_crop", False),
         seed=request_data.get("seed", 25),
         verbose=True,
+        dispatcher=dispatcher,
     )
 
 
@@ -69,6 +71,7 @@ def run_inference_batched_blocking(
     items: list,
     image_path: str,
     request_data: dict[str, Any],
+    dispatcher: Any | None = None,
 ) -> list:
     """Synchronous batched-chunk inference runner invoked within ThreadPoolExecutor."""
     # One seed per chunk (assigned by the caller from its position in the
@@ -88,6 +91,7 @@ def run_inference_batched_blocking(
         seed=request_data.get("seed", 25),
         seeds=seeds,
         verbose=True,
+        dispatcher=dispatcher,
     )
 
 
@@ -160,6 +164,7 @@ async def generate_video(
     request_data: dict[str, Any],
     request_id: str,
     state=app_state,
+    dispatcher: Any | None = None,
 ) -> tuple[str, dict[str, float]]:
     """Complete pipeline to process inputs, run model inference, and return final video.
 
@@ -216,6 +221,11 @@ async def generate_video(
         if state.inference_lock is None:
             state.inference_lock = asyncio.Lock()
 
+        if dispatcher is not None:
+            # The pipeline binds with the chunk path; live transports need the
+            # full request audio for playback.
+            dispatcher.set_audio_path(audio_path)
+
         # 4. Decide single-pass vs chunked based on audio length
         chunk_seconds = float(request_data.get("chunk_seconds", 0.0) or 0.0)
         overlap_seconds = float(request_data.get("chunk_overlap_seconds", 0.5) or 0.0)
@@ -242,6 +252,7 @@ async def generate_video(
                         encoder,
                         fps,
                         temp_files,
+                        dispatcher,
                     )
                 else:
                     state.set_progress(
@@ -260,6 +271,7 @@ async def generate_video(
                         image_path,
                         audio_path,
                         request_data,
+                        dispatcher,
                     )
 
         timings["inference"] = time.time() - inference_start
@@ -327,6 +339,9 @@ async def generate_video(
             except Exception:
                 pass
         raise
+    finally:
+        if dispatcher is not None:
+            await asyncio.to_thread(dispatcher.shutdown)
 
 
 async def _generate_chunked(
@@ -343,6 +358,7 @@ async def _generate_chunked(
     encoder: str,
     fps: int,
     temp_files: list,
+    dispatcher: Any | None = None,
 ) -> tuple[int, str]:
     """Render each audio chunk, then merge. Returns (chunk_count, merged_path)."""
     chunks = split_wav_into_chunks(audio_path, chunk_seconds, overlap_seconds, out_dir=res_dir)
@@ -399,6 +415,7 @@ async def _generate_chunked(
                 image_path,
                 ch["path"],
                 chunk_request,
+                dispatcher,
             )
             chunk_videos.append(chunk_out)
             temp_files.append(chunk_out)
@@ -432,6 +449,7 @@ async def _generate_chunked(
                 items,
                 image_path,
                 request_data,
+                dispatcher,
             )
             for o in outs:
                 chunk_videos.append(o)

@@ -221,6 +221,7 @@ class OptimizedInferenceAgent:
         verbose: bool = True,
         benchmark: bool = False,
         video_encoder: str | None = None,
+        dispatcher=None,
     ) -> str:
         timings: dict[str, float] = {}
         total_start = time.perf_counter()
@@ -247,7 +248,7 @@ class OptimizedInferenceAgent:
                 return torch.autocast("cuda", dtype=torch.float16)
             return contextlib.nullcontext()
 
-        def generate(out_path: str) -> str:
+        def generate(out_path: str, tap=None) -> str:
             """Sampling + decoding + video encoding + audio mux, fully overlapped."""
             with make_amp():
                 return self.G_opt.inference_and_save(
@@ -255,6 +256,7 @@ class OptimizedInferenceAgent:
                     video_path=out_path,
                     audio_path=audio_path,
                     video_encoder=video_encoder,
+                    dispatcher=tap,
                     **gen_kwargs,
                 )
 
@@ -286,7 +288,7 @@ class OptimizedInferenceAgent:
         first_run = getattr(self.G_opt, "_decode_profiles", None) is None
         t0 = time.perf_counter()
         with timed("generate_and_save"):
-            res_video_path = generate(res_video_path)
+            res_video_path = generate(res_video_path, tap=dispatcher)
         timings["generate_and_save"] = time.perf_counter() - t0
         timings["total"] = time.perf_counter() - total_start
 
@@ -406,6 +408,7 @@ class OptimizedInferenceAgent:
         seeds: list[int] | None = None,
         verbose: bool = True,
         video_encoder: str | None = None,
+        dispatcher=None,
     ) -> list:
         """Sample several padded audio chunks in ONE model batch, then decode each.
 
@@ -420,6 +423,8 @@ class OptimizedInferenceAgent:
         longer than 30% of the window are silence-padded into the batched read,
         shorter tails reuse the previous chunk's emotion.
         """
+        if dispatcher is not None:
+            logger.warning("[dispatch] batched chunk generation does not support a frame dispatcher yet; ignoring it")
         G = self.G_opt
         rank = getattr(self.opt, "rank", 0)
         device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"

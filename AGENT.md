@@ -11,8 +11,9 @@ This document provides system architecture, coding patterns, directory layouts, 
 This repository (**`float-fast`**) provides:
 
 1. **High-Performance FastAPI Server**: Hardware-accelerated inference with NVENC video encoding, HTTP byte-range streaming, and WebRTC signaling.
-2. **Gradio Interfaces**: Batch generator (`gradio_interface.py`) and live audio streaming (`float_live_app.py`).
-3. **Modern Python Architecture**: Modular subpackages managed by `uv` with pinned PyTorch CUDA 12.6 wheels.
+2. **Live Preview Transports**: frames tapped straight off the decoder and pushed to browsers while the request is still generating — raw frames over WebSocket, or an aiortc video track over WebRTC (`live: true`).
+3. **Gradio Interfaces**: Batch generator (`gradio_interface.py`) and live audio streaming (`float_live_app.py`).
+4. **Modern Python Architecture**: Modular subpackages managed by `uv` with pinned PyTorch CUDA 12.6 wheels.
 
 ---
 
@@ -48,7 +49,7 @@ float-fast/
 │   ├── float.pth
 │   ├── wav2vec2-base-960h/
 │   └── wav2vec-english-speech-emotion-recognition/
-└── fast_float/                     # Main Python application package
+├── fast_float/                     # Main Python application package
     ├── __init__.py
     ├── main.py                     # FastAPI application entrypoint with lifespan
     ├── initialize_env.py           # Multi-path environment initialization
@@ -62,7 +63,12 @@ float-fast/
     │   ├── __init__.py             # Aggregate APIRouter
     │   ├── generation.py           # POST /generate, GET /download/{id}, GET /stream/{id}
     │   ├── health.py               # GET /health, GET /gpu, POST /gpu/clear
+    │   ├── streaming.py            # WS /ws/stream/{request_id} (live raw frames)
     │   └── webrtc.py               # POST /offer (WebRTC SDP signaling & media player)
+    ├── streaming/                  # Per-request frame tap feeding live transports
+    │   ├── types.py                # StreamMeta (fps/size/channels/first_idx/pts_ms)
+    │   ├── dispatcher.py           # FrameDispatcher + FrameQueue (live | lossless)
+    │   └── live.py                 # LiveStream fan-out + LiveStreamDispatcher
     ├── schemas/                    # Pydantic V2 data models & options
     │   ├── __init__.py
     │   ├── base_options.py         # BaseOptions argparse configuration parser
@@ -98,6 +104,11 @@ float-fast/
     └── options/                    # Backward-compatibility shims for legacy imports
         ├── __init__.py
         └── base_options.py
+├── tests/                          # pytest suite (dispatcher, live stream, backends)
+└── frontend/                       # React 19 + Vite studio UI
+    └── src/                        # App.jsx, StudioStage.jsx, services/api.js, ...
+        ├── services/live.js        # WS protocol client
+        └── components/LivePreview.jsx  # WS canvas / WebRTC <video> live preview
 ```
 
 ---
@@ -350,7 +361,8 @@ uv run python fast_float/interfaces/float_live_app.py
 | `GET` | `/health` | System health, model status, FPS stats, and warmup progress (`warming_up`, `warmup_stage`, `warmup_elapsed_s`) |
 | `GET` | `/gpu` | Real-time GPU VRAM allocated and reserved in GB |
 | `POST` | `/gpu/clear` | Clear CUDA cache and run garbage collection |
-| `POST` | `/offer` | WebRTC SDP negotiation for real-time video playback |
+| `POST` | `/offer` | WebRTC SDP negotiation for real-time video playback (add `"live": true` + `"stream_id"` to attach an in-flight generation's live track) |
+| `WS` | `/ws/stream/{request_id}` | Live raw RGB(A) frames while `/generate` is running (see §8.9) |
 
 ### Example `/generate` Request Body
 
@@ -660,3 +672,105 @@ When editing or extending the codebase, follow these design patterns:
 - In PowerShell, chain with `cmd1; if ($?) { cmd2 }` (there is no `&&`).
 - Validate `.sh` changes against an LF, BOM-free copy if `bash -n` complains —
   committed scripts that fail locally usually only have CRLF line endings.
+
+### 9. Live streaming (frame dispatcher → WebSocket / WebRTC)
+
+**Why a tap, not a second pipeline.** Generation is GPU-bound and writes MP4 as
+fast as it can; live transports need the *same* frames as they leave the decoder.
+`fast_float/streaming/` is a per-request hook fed by the writer thread — it never
+re-runs inference.
+
+**The dispatcher theorem (locked — do not "fix" one leg by breaking another).**
+Pick any two of {contiguous `idx`, bounded memory, never block the producer}:
+
+| mode | queue | drops | producer |
+| --- | --- | --- | --- |
+| `live` (default) | bounded by `max_queue_frames` | oldest frames, reported as gaps | never blocked |
+| `lossless` | bounded by `max_queue_frames` | none — blocks up to `submit_timeout_ms`, then disables | throttled by design |
+
+- `FrameDispatcher` owns `idx`: `submit(frames)` numbers frames from `_cursor` in
+  submission order, so chunked generation is continuous with no `frame_base`
+  plumbing. `pts_ms = (idx - first_idx) * 1000 / fps`.
+- `submit()` **copies** before returning; the pipeline recycles pinned pool
+  buffers immediately (`pool.put(buf)` right after `submit`). Never hand
+  `submit()` a buffer you keep mutating.
+- Hooks (`open` → `dispatch`/`gap` → `close`) run on the **delivery thread**, in
+  order. Keep them fast; `max_dispatch_ms`/`stall_limits` disable a stalling tap.
+- `max_lag_ms` is a bound in **media time**, not wall clock — a wall-clock bound
+  starves any stream whose generation is slower than real time.
+- Defaults: `max_queue_frames=50`, `max_lag_ms=1000`, `gap_timeout_ms=0`,
+  `submit_timeout_ms=2000`, `close_timeout=2.0`, `max_dispatch_ms=250`,
+  `stall_limits=3`, `dispatch_granularity="batch"`, `abort_on_error=False`,
+  `fail_fast_on_open=False`. `LiveStreamDispatcher` overrides granularity to
+  `"frame"` with `max_queue_frames=64`, `max_lag_ms=1500`.
+
+**Pipeline wiring** (already applied — follow the same shape for new writers):
+`inference_and_save(..., dispatcher=)` calls `dispatcher.bind(StreamMeta(...))`
+once per run, `dispatcher.submit(buf[:n].numpy())` in **all three** writer
+branches *before* `pool.put(buf)`, and `dispatcher.error(exc)` on writer failure.
+`generate_video` owns the terminal `await asyncio.to_thread(dispatcher.shutdown)`
+in its outermost `finally` (so preprocessing failures shut down too).
+`run_inference` / `generate` forward the tap; the batched path warns and ignores
+it.
+
+**`LiveStream` fan-out.** `LiveStreamDispatcher.dispatch`/`gap` publish tuples
+`("frame", idx, pts_ms, ndarray)` / `("gap", start, end, reason)`; `finish()` adds
+the `CLOSE` sentinel. Subscribers are `asyncio.Queue`s that drop the oldest item
+when full. **Every loop interaction from a non-loop thread must go through
+`call_soon_threadsafe`** — `start()` (called by `bind` on the writer thread) and
+`finish()`/`publish_threadsafe()` do. A direct `Event.set()` from the pipeline
+thread hangs `wait_meta()` for its full timeout. `finish()` defers the sentinel
+through the loop so already-scheduled publishes land first, and `publish()` has
+no `done` guard for the same reason. `subscribe()` happens **before**
+`wait_meta()` so the first decoded frames are not published to nobody (frames
+published before a subscriber exists are lost by design — live, not replay).
+
+**WS protocol** (`fast_float/routers/streaming.py`, `HEADER = struct.Struct(">III")`):
+
+| direction | payload |
+| --- | --- |
+| server → | `{"type":"meta","fps","width","height","channels","first_idx","total_frames","has_audio"}` |
+| server → | binary `[u32 idx][u32 count][u32 pts_ms][rgb(a) bytes]`, one frame per message |
+| server → | `{"type":"gap","start","end","reason"}` · `{"type":"done","result"}` · `{"type":"error","message"}` |
+
+Close codes: `4404` (unknown/finished request), `4408` (no metadata — the
+stream's `error` is forwarded in the message). `WAIT_TIMEOUT_S=15` (POST/WS race)
+and `META_TIMEOUT_S=30` are module constants so tests can monkeypatch them. A
+slow reader loses frames; it never backpressures the GPU.
+
+**WebRTC** (`routers/webrtc.py`): `"live": true` routes to `_live_offer`, which
+subscribes **before** `wait_meta`, registers the subscription in `_live_subs`
+**before** `addTrack`, and wraps subscribe→hand-off in
+`except BaseException: stream.unsubscribe(queue)` — a cancelled offer must not
+leave a queue in the stream for the stream's lifetime. `LiveVideoTrack` paces at
+`meta.fps`, sets `pts = pts_ms * 90` with `time_base=1/90000`, and uses
+`format="rgba"` for 4-channel frames. Request audio is attached as a
+`MediaPlayer` (approximate A/V sync: video trails generation, audio starts at
+the offer). `_cleanup_peer` stops the track, unsubscribes, pushes `CLOSE`, and
+stops the audio player's tracks. The browser must declare `recvonly` video+audio
+transceivers *before* `createOffer` and must merge remote tracks
+(`attachRemoteTrack`) instead of assigning `event.streams[0]` blindly.
+
+**`/generate` integration:** register the stream in `app_state.live_streams`
+*before* the semaphore (so a fast WS attach finds it), force
+`chunk_batch_size=1`, pass `dispatcher=`, `finish(result=...)` on success, and
+`_close_live(...)` on 429 / `BaseException` / `finally`. `_close_live` only pops
+the registry entry when that id still maps to *this* stream. Every failure path
+must call `finish(...)` so watchers never hang.
+
+**Known limits (by design — do not "fix" casually):**
+
+- `app_state.live_streams` is **per process** → single worker only; multi-worker
+  deployments need a broker/broadcast layer.
+- WS ships raw RGB (~19.6 MB/s at 512²×25 fps) and the browser converts with a
+  per-pixel JS loop. Prefer WebRTC for bandwidth-limited clients.
+- No WS auto-reconnect; a vanished client is reaped by ASGI pings and by send
+  failures.
+- `dispatcher.error()` is still invoked from the writer thread (not the delivery
+  thread) — keep it side-effect free / logging-only.
+
+**Tests:** `tests/test_frame_dispatcher.py` (live/lossless, gaps, lag,
+shutdown, stats) and `tests/test_live_stream.py` (fan-out, drop-oldest, WS
+round-trip, and an end-to-end `TestClient` run through the real delivery thread —
+the regression guard for cross-thread wake-ups). Patch `WAIT_TIMEOUT_S` down when
+adding WS tests so failures are fast.

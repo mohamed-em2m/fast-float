@@ -69,6 +69,10 @@ class GenerationRequest(BaseModel):
         description="Client-supplied id so the browser can poll /progress/{id} "
         "before the long-running /generate call returns.",
     )
+    live: bool = Field(
+        False,
+        description="Also publish frames live to /ws/stream/{id} and live /offer peers while the video is generated.",
+    )
 
 
 class PerformanceTimings(BaseModel):
@@ -121,6 +125,7 @@ class WebRTCOfferRequest(BaseModel):
     sdp: str = Field(..., min_length=1)
     type: str = Field(..., min_length=1)
     stream_id: str | None = None
+    live: bool = Field(False, description="Attach the in-flight live stream instead of a finished file")
 
 
 class WebRTCOfferResponse(BaseModel):

@@ -41,6 +41,9 @@ export default function App() {
   const [generationResult, setGenerationResult] = useState(null);
   const [history, setHistory] = useState([]);
   const [toast, setToast] = useState(null);
+  // 'mp4' streams the finished file; 'ws'/'webrtc' stream frames live.
+  const [transport, setTransport] = useState('mp4');
+  const [liveRequestId, setLiveRequestId] = useState(null);
   const progressTimerRef = useRef(null);
 
   const stopProgressPolling = () => {
@@ -90,6 +93,9 @@ export default function App() {
         ? crypto.randomUUID()
         : `c${Date.now()}${Math.random().toString(16).slice(2)}`;
     setProgress({ status: 'queued', stage: 'queued', percent: 0, completed_chunks: 0, total_chunks: 0 });
+    // Publish the id before the POST so the live transports can attach while
+    // the request is still generating.
+    setLiveRequestId(transport === 'mp4' ? null : clientRequestId);
     stopProgressPolling();
     progressTimerRef.current = setInterval(async () => {
       const p = await fetchProgress(clientRequestId);
@@ -119,6 +125,7 @@ export default function App() {
         decode_batch_size: params.decode_batch_size,
         chunk_batch_size: params.chunk_batch_size,
         client_request_id: clientRequestId,
+        live: transport !== 'mp4',
       };
 
       const result = await generateVideo(payload);
@@ -137,6 +144,7 @@ export default function App() {
       stopProgressPolling();
       setProgress(null);
       setIsGenerating(false);
+      setLiveRequestId(null);
     }
   };
 
@@ -187,6 +195,9 @@ export default function App() {
             generationResult={generationResult}
             hasAudio={Boolean(audioBase64)}
             onToast={showToast}
+            transport={transport}
+            setTransport={setTransport}
+            liveRequestId={liveRequestId}
           />
 
           <TelemetryDashboard

@@ -14,6 +14,7 @@ from fast_float.schemas.generation import (
     GenerationResponse,
     PerformanceTimings,
 )
+from fast_float.streaming.live import LiveStreamDispatcher
 from fast_float.utils.logger import logger
 from fast_float.utils.media import TARGET_IMAGE_SIZE
 
@@ -40,6 +41,15 @@ def _safe_request_id(client_id: str | None) -> str:
             return cleaned
     app_state.queue_counter += 1
     return f"req_{app_state.queue_counter}_{uuid.uuid4().hex[:8]}"
+
+
+def _close_live(dispatcher, request_id: str, message: str) -> None:
+    """Retire a live stream so watchers stop waiting for frames."""
+    if dispatcher is None:
+        return
+    if app_state.live_streams.get(request_id) is dispatcher.stream:
+        app_state.live_streams.pop(request_id, None)
+    dispatcher.stream.finish(error=message)
 
 
 @router.post("/generate", response_model=GenerationResponse)
@@ -75,6 +85,16 @@ async def generate(request: GenerationRequest):
         message="Waiting for a free GPU slot",
     )
 
+    live_dispatcher = None
+    if request.live:
+        loop = asyncio.get_running_loop()
+        live_dispatcher = LiveStreamDispatcher(request_id, loop)
+        app_state.live_streams[request_id] = live_dispatcher.stream
+        # Batched sampling decodes several chunks at once and cannot feed a
+        # per-frame transport.
+        if int(getattr(request, "chunk_batch_size", 1) or 1) > 1:
+            logger.info(f"[{request_id}] live stream: forcing chunk_batch_size=1")
+
     try:
         await asyncio.wait_for(app_state.request_semaphore.acquire(), timeout=ACQUIRE_TIMEOUT_S)
     except asyncio.TimeoutError:
@@ -84,12 +104,23 @@ async def generate(request: GenerationRequest):
             stage="error",
             message="Server busy, try again shortly",
         )
+        _close_live(live_dispatcher, request_id, "Server busy, try again shortly")
         raise HTTPException(status_code=429, detail="Server busy, try again shortly") from None
+    except BaseException:
+        _close_live(live_dispatcher, request_id, "Request cancelled")
+        raise
 
     try:
         try:
             req_dict = request.model_dump() if hasattr(request, "model_dump") else request.dict()
-            video_path, timings = await generate_video(req_dict, request_id, app_state)
+            if live_dispatcher is not None:
+                req_dict["chunk_batch_size"] = 1
+            video_path, timings = await generate_video(
+                req_dict,
+                request_id,
+                app_state,
+                dispatcher=live_dispatcher,
+            )
             app_state.active_streams[request_id] = video_path
 
             pub_url = app_state.public_url or "http://localhost:8000"
@@ -99,7 +130,7 @@ async def generate(request: GenerationRequest):
 
             file_size_mb = round(os.path.getsize(video_path) / (1024 * 1024), 2) if os.path.exists(video_path) else 0.0
 
-            return GenerationResponse(
+            response = GenerationResponse(
                 status="success",
                 request_id=request_id,
                 download_url=f"{pub_url}/download/{request_id}",
@@ -117,12 +148,19 @@ async def generate(request: GenerationRequest):
                 ),
                 chunks=int(timings.get("chunks", 1)),
             )
+            if live_dispatcher is not None:
+                live_dispatcher.stream.finish(result=response.model_dump())
+            return response
 
-        except HTTPException:
+        except HTTPException as e:
+            if live_dispatcher is not None:
+                live_dispatcher.stream.finish(error=str(e.detail))
             raise
         except ValueError as e:
             logger.warning(f"[{request_id}] Bad request: {e}")
             app_state.set_progress(request_id, status="error", stage="error", message=str(e))
+            if live_dispatcher is not None:
+                live_dispatcher.stream.finish(error=str(e))
             raise HTTPException(status_code=400, detail=str(e)) from e
         except FileNotFoundError as e:
             logger.error(f"[{request_id}] Generation output missing: {e}")
@@ -132,6 +170,8 @@ async def generate(request: GenerationRequest):
                 stage="error",
                 message="Video generation failed",
             )
+            if live_dispatcher is not None:
+                live_dispatcher.stream.finish(error="Generation output missing")
             raise HTTPException(status_code=502, detail="Video generation failed") from e
         except Exception as e:
             logger.error(f"[{request_id}] Generation failed: {e!s}")
@@ -141,9 +181,12 @@ async def generate(request: GenerationRequest):
                 stage="error",
                 message="Video generation failed",
             )
+            if live_dispatcher is not None:
+                live_dispatcher.stream.finish(error=str(e))
             raise HTTPException(status_code=500, detail="Video generation failed") from e
     finally:
         app_state.request_semaphore.release()
+        _close_live(live_dispatcher, request_id, "generation ended")
 
 
 @router.get("/progress/{request_id}", response_model=GenerationProgress)

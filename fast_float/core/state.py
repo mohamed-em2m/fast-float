@@ -23,6 +23,9 @@ class AppState:
         self.public_backup_url: str | None = None
         self.pcs: set[Any] = set()
         self.active_streams: dict[str, str] = {}
+        # Live (in-flight) streams keyed by request id; consumed by the
+        # WebSocket and WebRTC transports.
+        self.live_streams: dict[str, Any] = {}
         self.queue_counter: int = 0
         self.progress: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.max_concurrent_requests: int = max_concurrent_requests
@@ -126,6 +129,17 @@ class AppState:
     def get_progress(self, request_id: str) -> dict[str, Any] | None:
         record = self.progress.get(request_id)
         return dict(record) if record is not None else None
+
+    async def wait_for_live_stream(self, request_id: str, timeout: float = 15.0) -> Any | None:
+        """Wait for a live stream to register (the POST and the WS race)."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            stream = self.live_streams.get(request_id)
+            if stream is not None:
+                return stream
+            await asyncio.sleep(0.05)
+        return None
 
     def clear_progress(self, request_id: str) -> None:
         self.progress.pop(request_id, None)
