@@ -359,7 +359,7 @@ def main(argv=None) -> int:
     ap.add_argument("--min-cosine", type=float, default=0.998)
     ap.add_argument("--max-mean", type=float, default=0.05)
     ap.add_argument("--skip-parity", action="store_true")
-    ap.add_argument("--bench-iters", type=int, default=10)
+    ap.add_argument("--bench-iters", type=int, default=2)
     add_ort_args(ap)
     args = ap.parse_args(argv)
 

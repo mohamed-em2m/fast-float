@@ -47,7 +47,7 @@ W2V_DIR="${W2V_DIR:-./checkpoints/wav2vec2-base-960h}"
 # Decoder bakes a STATIC batch per artifact. With static batch padding,
 # a single target batch (DEC_BATCH) covers all chunk sizes. Default DEC_BATCHES
 # to DEC_BATCH to avoid looping through 5 redundant batch exports (1,2,4,8,16).
-DEC_BATCH="${DEC_BATCH:-8}"
+DEC_BATCH="${DEC_BATCH:-4 8 16}"
 DEC_BATCHES="${DEC_BATCHES:-${DEC_BATCH}}"
 W2V_SECONDS="${W2V_SECONDS:-3.0}"
 # Extra flags forwarded to every converter, e.g. ORT_ARGS="--no-trt" to force
