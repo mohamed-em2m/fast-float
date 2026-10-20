@@ -189,6 +189,7 @@ def _build_generator(ckpt_path: str, image_size: int, channel_mult: float, devic
         .to(device)
         .eval()
     )
+
     if os.path.exists(ckpt_path):
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         tops = Counter(k.split(".")[0] for k in sd)

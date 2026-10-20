@@ -10,6 +10,7 @@ import os
 import tempfile
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import torch
@@ -25,7 +26,7 @@ except ImportError:
     from utils.pyav_writer import save_video_pyav, save_video_torchcodec
 
 from fast_float.core.data_processor import DataProcessor
-from fast_float.core.nvenc_encoder import encode_video_nvenc
+from fast_float.core.nvenc_encoder import encode_numpy_nvenc, encode_video_nvenc, frames_to_uint8_hwc
 from fast_float.core.options import InferenceOptions
 from fast_float.core.simple_encoder import SimpleVideoEncoder
 from fast_float.utils.timing import timed, timing_scope
@@ -203,6 +204,18 @@ class OptimizedInferenceAgent:
         except Exception as e:
             logger.error(f"Error: {e}\n{traceback.format_exc()}")
             raise
+
+    @staticmethod
+    def _uses_nvenc(video_encoder: str | None) -> bool:
+        """True when the encoder is the direct FFmpeg/NVENC pipe (CPU-side work)."""
+        choice = str(video_encoder or "").strip().lower()
+        return choice not in ("cpu pyav", "pyav", "pyav_cpu", "torchcodec", "torch codec", "tc")
+
+    @staticmethod
+    def _encode_nvenc_chunk(frames, video_path: str, fps: int) -> str:
+        """Worker-thread body: encode already-converted frames (no torch calls)."""
+        with timed("save"):
+            return encode_numpy_nvenc(frames, video_path, fps=fps)
 
     @torch.no_grad()
     @timing_scope("run_inference")
@@ -485,42 +498,73 @@ class OptimizedInferenceAgent:
             return contextlib.nullcontext()
 
         decode_bs = getattr(self.opt, "decode_batch_size", None)
-        out_paths = []
+        encoder_choice = video_encoder or getattr(self.opt, "video_encoder", "FFmpeg NVENC")
+        parallel_save = self._uses_nvenc(encoder_choice)
+
+        # This path never calls `video_pipeline.inference_and_save`, which is
+        # where the per-request cuDNN policy is applied. Mirror it here: with
+        # benchmark=True every fresh executor thread re-autotunes ~40 conv
+        # shapes (~1.2 s) on its first decode.
+        if os.getenv("FLOAT_CUDNN_BENCHMARK", "0") != "1":
+            torch.backends.cudnn.benchmark = False
+
+        out_paths: list = [None] * len(items)
+        pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="vidsave") if parallel_save else None
         # Sampling AND decoding stay under one autocast context, exactly like the
         # sequential path (run_inference wraps the whole generate() call). The
         # latents leave the ODE solve in half precision when AMP is on, so the
         # decoder must run under autocast too — otherwise half latents hit fp32
         # weights and torch raises a dtype mismatch.
-        with make_amp():
-            parts = list(
-                G.sample(
-                    data,
-                    a_cfg_scale=a_cfg_scale,
-                    r_cfg_scale=r_cfg_scale,
-                    e_cfg_scale=e_cfg_scale,
-                    emo=emo_arg,
-                    nfe=nfe,
-                    seed=seed,
-                    seeds=seeds,
-                    s_r=s_r,
-                )
-            )  # each piece is [N, T_slice, dim_w] (s_r already added)
-            lat_all = torch.cat(parts, dim=1)  # [N, T_full, dim_w]
+        try:
+            with make_amp():
+                parts = list(
+                    G.sample(
+                        data,
+                        a_cfg_scale=a_cfg_scale,
+                        r_cfg_scale=r_cfg_scale,
+                        e_cfg_scale=e_cfg_scale,
+                        emo=emo_arg,
+                        nfe=nfe,
+                        seed=seed,
+                        seeds=seeds,
+                        s_r=s_r,
+                    )
+                )  # each piece is [N, T_slice, dim_w] (s_r already added)
+                lat_all = torch.cat(parts, dim=1)  # [N, T_full, dim_w]
 
-            for i, it in enumerate(items):
-                # duration is seconds -> frames (samples*fps/sr == seconds*fps).
-                t_i = max(1, math.ceil(it["duration"] * fps))
-                lat_i = lat_all[i, :t_i, :]
-                with timed("decode", gpu=True):
-                    d_hat = G.decode_latent_into_image(s_r, s_r_feats, lat_i, batch_size=decode_bs)
-                out = self.save_video(
-                    d_hat.float(),
-                    it["out_path"],
-                    it["audio_path"],
-                    video_encoder=video_encoder,
-                )
-                out_paths.append(out)
-                del d_hat, lat_i
+                for i, it in enumerate(items):
+                    # duration is seconds -> frames (samples*fps/sr == seconds*fps).
+                    t_i = max(1, math.ceil(it["duration"] * fps))
+                    # The merge used to trim the overlapping head by re-encoding;
+                    # skip those frames before decoding instead. One frame is kept
+                    # even for a pathologically short chunk.
+                    trim = min(max(0, int(it.get("trim_frames", 0) or 0)), t_i - 1)
+                    lat_i = lat_all[i, trim:t_i, :]
+                    with timed("decode", gpu=True):
+                        d_hat = G.decode_latent_into_image(s_r, s_r_feats, lat_i, batch_size=decode_bs)
+                    if pool is not None:
+                        # Convert on this thread (stream-ordered) and let the
+                        # worker run ffmpeg/NVENC while the next chunk decodes.
+                        out_paths[i] = pool.submit(
+                            self._encode_nvenc_chunk,
+                            frames_to_uint8_hwc(d_hat),
+                            it["out_path"],
+                            fps,
+                        )
+                    else:
+                        out_paths[i] = self.save_video(
+                            d_hat.float(),
+                            it["out_path"],
+                            it["audio_path"],
+                            video_encoder=video_encoder,
+                        )
+                    del d_hat, lat_i
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True)
+
+        if pool is not None:
+            out_paths = [future.result() for future in out_paths]
 
         if verbose:
             logger.info(f"> [Done] Batched inference: {len(items)} chunk(s) in one sample batch")

@@ -43,8 +43,9 @@ def _expected_u8(latent):
 
 
 @pytest.fixture(autouse=True)
-def _no_layout_env(monkeypatch):
+def _no_tuning_env(monkeypatch):
     monkeypatch.delenv("FLOAT_DECODE_CHANNELS_LAST", raising=False)
+    monkeypatch.delenv("FLOAT_DECODE_AUTOCAST", raising=False)
 
 
 def test_decode_u8_returns_uint8_hwc():
@@ -97,10 +98,10 @@ def test_oom_split_defers_empty_cache(monkeypatch):
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda *a, **k: evictions.append(1))
     real = model._decode_call
 
-    def flaky(ae_arg, latent, feats):
+    def flaky(ae_arg, latent, feats, **kwargs):
         if latent.shape[0] > 2:
             raise torch.cuda.OutOfMemoryError("boom")
-        return real(ae_arg, latent, feats)
+        return real(ae_arg, latent, feats, **kwargs)
 
     monkeypatch.setattr(model, "_decode_call", flaky)
     lat = torch.randn(4, 8)
@@ -115,10 +116,10 @@ def test_oom_evicts_cache_after_configured_streak(monkeypatch):
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda *a, **k: evictions.append(1))
     real = model._decode_call
 
-    def flaky(ae_arg, latent, feats):
+    def flaky(ae_arg, latent, feats, **kwargs):
         if latent.shape[0] > 2:
             raise torch.cuda.OutOfMemoryError("boom")
-        return real(ae_arg, latent, feats)
+        return real(ae_arg, latent, feats, **kwargs)
 
     monkeypatch.setattr(model, "_decode_call", flaky)
     model._decode_u8(ae, [torch.randn(1, 8)], torch.randn(4, 8))
@@ -149,6 +150,33 @@ def test_prepare_decoder_applies_channels_last_once(monkeypatch):
     model._prepare_decoder(ae)
     assert ae.dec._ff_channels_last is True
     assert ae.dec.weight.is_contiguous(memory_format=torch.channels_last)
+
+
+def test_autocast_is_off_by_default_and_opt_in(monkeypatch):
+    model, _ = _model()
+    assert model._decode_autocast_dtype() is None
+    monkeypatch.setenv("FLOAT_DECODE_AUTOCAST", "fp16")
+    assert model._decode_autocast_dtype() is torch.float16
+    monkeypatch.setenv("FLOAT_DECODE_AUTOCAST", "bf16")
+    assert model._decode_autocast_dtype() is torch.bfloat16
+    monkeypatch.setenv("FLOAT_DECODE_AUTOCAST", "0")
+    assert model._decode_autocast_dtype() is None
+
+
+def test_decode_u8_binds_decoder_once_per_call(monkeypatch):
+    model, ae = _model()
+    monkeypatch.setattr(model, "_decoder_static_batch", lambda: 2)
+    binds = []
+    real = model._bind_decoder
+
+    def counting(ae_arg, device):
+        binds.append(device)
+        return real(ae_arg, device)
+
+    monkeypatch.setattr(model, "_bind_decoder", counting)
+    model._decode_u8(ae, [torch.randn(1, 8)], torch.randn(5, 8))
+    assert len(binds) == 1
+    assert not hasattr(model, "_active_bound_dec")
 
 
 def test_replica_gets_its_own_compiled_decoder(monkeypatch):

@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import datetime
+import math
 import os
 import tempfile
 import time
@@ -401,7 +402,7 @@ async def _generate_chunked(
             percent=round(done / num_chunks * 90, 1),
             message=f"{done}/{num_chunks} chunks{batch_note}",
         )
-        if len(g) == 1:
+        if len(g) == 1 and batch_size <= 1:
             ch = g[0]
             chunk_out = os.path.join(res_dir, f"{stamp}_{request_id}_chunk{idx:03d}.mp4")
             # Same request seed, shifted by the chunk's position in the audio:
@@ -439,6 +440,12 @@ async def _generate_chunked(
                         "duration": ch["duration"],
                         "out_path": chunk_out,
                         "seed": _chunk_seed(request_data, idx),
+                        # The batched path decodes fewer frames instead of
+                        # trimming the overlap in the merge, which turns the
+                        # merge into a stream copy (no second encode pass).
+                        # ceil matches ffmpeg's `trim=start=<overlap>`: frames
+                        # whose PTS is below the cut are dropped.
+                        "trim_frames": math.ceil(overlap_seconds * fps) if idx > 0 else 0,
                     }
                 )
                 idx += 1
@@ -466,14 +473,19 @@ async def _generate_chunked(
     )
 
     merged_path = os.path.join(res_dir, f"{stamp}_{request_id}.mp4")
+    # With chunk_batch_size > 1 every group goes through the batched path, which
+    # already dropped the overlapping head frames; merging is then a lossless
+    # stream copy. The sequential path still needs the filter trim.
+    merge_overlap = 0.0 if batch_size > 1 else overlap_seconds
     with timed("merge", chunks=num_chunks):
         await loop.run_in_executor(
             state.executor,
             merge_mp4_chunks,
             chunk_videos,
             merged_path,
-            overlap_seconds,
+            merge_overlap,
             encoder,
             fps,
+            audio_path,
         )
     return num_chunks, merged_path

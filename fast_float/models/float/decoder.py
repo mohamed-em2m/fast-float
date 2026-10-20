@@ -13,20 +13,9 @@ from fast_float.utils.timing import timed
 
 logger = logging.getLogger(__name__)
 
-# Optimization knobs: Allow TensorFloat-32 on Ampere+ architectures
-if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
-try:
-    import torch._dynamo
-
-    torch._dynamo.config.cache_size_limit = 64
-    torch._dynamo.config.suppress_errors = True
-except Exception:
-    pass
-
 _CHANNELS_LAST_ENV = "FLOAT_DECODE_CHANNELS_LAST"
+_AUTOCAST_ENV = "FLOAT_DECODE_AUTOCAST"
+_AUTOCAST_DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 _ON_VALUES = frozenset({"1", "true", "yes", "on"})
 # Pre-expanding broadcast style vectors is only cheaper than per-chunk cuDNN
 # copies while they stay small; guard against spatial feature maps.
@@ -129,6 +118,22 @@ class DecoderMixin:
             return bool(flag)
         return os.environ.get(_CHANNELS_LAST_ENV, "").strip().lower() in _ON_VALUES
 
+    def _decode_autocast_dtype(self):
+        """Autocast dtype for the eager/compiled decoder, or ``None`` (default).
+
+        Off by default: the decoder's AdaIN/SPADE normalizations and the fp32
+        ONNX reference path make reduced precision a per-device A/B decision,
+        not a safe global default. Enable with ``FLOAT_DECODE_AUTOCAST=fp16``
+        (or ``bf16``, or ``opt.decode_autocast``).
+        """
+        value = getattr(self.opt, "decode_autocast", None)
+        if value is None:
+            value = os.environ.get(_AUTOCAST_ENV, "")
+        key = str(value).strip().lower()
+        if key in {"", "0", "off", "false", "no"}:
+            return None
+        return _AUTOCAST_DTYPES.get(key)
+
     def _prepare_decoder(self, ae) -> None:
         """One-time per-decoder setup: channels_last weights + per-replica compile.
 
@@ -164,25 +169,26 @@ class DecoderMixin:
         primary = getattr(self, "motion_autoencoder", None)
         return compiled if (primary is None or ae is primary) else (getattr(ae, "_ff_decoder_compiled", None) or ae.dec)
 
-    def _decode_call(self, ae, latent: torch.Tensor, feats: list) -> torch.Tensor:
+    def _decode_call(self, ae, latent: torch.Tensor, feats: list, bound_dec=None) -> torch.Tensor:
         """Route the decode call through the configured backend.
 
         ``_decoder_onnx`` (static-batch ONNX, one session per GPU) and
         ``_decoder_compiled`` are set by ``fast_float.onnx.dispatch`` when the
         config selects them; otherwise this is the plain
         ``ae.dec(latent, alpha=None, feats=...)`` path on the per-device replica.
+
+        ``bound_dec`` is resolved once per request by the caller so decode
+        workers do not re-enter the ONNX replica lock on every chunk.
         """
-        dec = getattr(self, "_active_bound_dec", None)
-        if dec is None:
-            dec = self._bind_decoder(ae, latent.device)
-
-        dev_type = latent.device.type if hasattr(latent, "device") else "cuda"
-        if dev_type == "cuda":
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                out = dec(latent, feats) if hasattr(dec, "providers") else dec(latent, alpha=None, feats=feats)
-        else:
-            out = dec(latent, feats) if hasattr(dec, "providers") else dec(latent, alpha=None, feats=feats)
-
+        dec = bound_dec if bound_dec is not None else self._bind_decoder(ae, latent.device)
+        is_onnx = hasattr(dec, "providers")
+        amp_dtype = None if is_onnx else self._decode_autocast_dtype()
+        device_type = getattr(getattr(latent, "device", None), "type", None)
+        ctx = contextlib.nullcontext()
+        if amp_dtype is not None and device_type == "cuda":
+            ctx = torch.autocast(device_type="cuda", dtype=amp_dtype)
+        with ctx:
+            out = dec(latent, feats) if is_onnx else dec(latent, alpha=None, feats=feats)
         if isinstance(out, (tuple, list)):
             out = out[0]
         return out
@@ -222,23 +228,25 @@ class DecoderMixin:
         with contextlib.suppress(Exception):
             torch.cuda.empty_cache()
 
-    def _decode_tiled_u8(self, ae, feats: list, lat, b: int, static_b: int) -> torch.Tensor:
+    def _decode_tiled_u8(self, ae, feats: list, lat, b: int, static_b: int, bound_dec=None) -> torch.Tensor:
         """Tile a batch the static ONNX graph cannot take, writing uint8 HWC once."""
-        first = self._quantize_u8_hwc(self._decode_call(ae, lat[:static_b], self._slice_feats(feats, 0, static_b)))
+        first = self._quantize_u8_hwc(
+            self._decode_call(ae, lat[:static_b], self._slice_feats(feats, 0, static_b), bound_dec=bound_dec)
+        )
         out = first.new_empty((b, *first.shape[1:]))
         out[: first.shape[0]].copy_(first)
         done = first.shape[0]
         while done < b:
             m = min(static_b, b - done)
             chunk = self._quantize_u8_hwc(
-                self._decode_call(ae, lat[done : done + m], self._slice_feats(feats, done, m))
+                self._decode_call(ae, lat[done : done + m], self._slice_feats(feats, done, m), bound_dec=bound_dec)
             )
             out[done : done + chunk.shape[0]].copy_(chunk)
             done += chunk.shape[0]
         return out
 
     @torch.inference_mode()
-    def _decode_u8(self, ae, feats_in, lat, allow_split=True) -> torch.Tensor:
+    def _decode_u8(self, ae, feats_in, lat, allow_split=True, bound_dec=None) -> torch.Tensor:
         """lat [b, dim] -> uint8 [b, H, W, C] on lat's device/current stream. Halves batch on OOM."""
         b = lat.shape[0]
         # One explicit contiguous copy of broadcast feats: the decoder touches
@@ -246,12 +254,14 @@ class DecoderMixin:
         # stride-0 expanded view.
         feats = [f.expand(b, *f.shape[1:]).contiguous() if (f.shape[0] == 1 and b > 1) else f for f in feats_in]
         static_b = self._decoder_static_batch()
+        if bound_dec is None:
+            bound_dec = self._bind_decoder(ae, lat.device)
         try:
             if static_b is not None and b > static_b:
                 # Static-batch ONNX graph: tile to it (pad/trim inside).
-                out = self._decode_tiled_u8(ae, feats, lat, b, static_b)
+                out = self._decode_tiled_u8(ae, feats, lat, b, static_b, bound_dec=bound_dec)
             else:
-                out = self._quantize_u8_hwc(self._decode_call(ae, lat, feats))
+                out = self._quantize_u8_hwc(self._decode_call(ae, lat, feats, bound_dec=bound_dec))
             self._decode_oom_streak = 0
             return out
         except torch.cuda.OutOfMemoryError:
@@ -262,8 +272,8 @@ class DecoderMixin:
         h = b // 2
         return torch.cat(
             [
-                self._decode_u8(ae, feats_in, lat[:h], allow_split=allow_split),
-                self._decode_u8(ae, feats_in, lat[h:], allow_split=allow_split),
+                self._decode_u8(ae, feats_in, lat[:h], allow_split=allow_split, bound_dec=bound_dec),
+                self._decode_u8(ae, feats_in, lat[h:], allow_split=allow_split, bound_dec=bound_dec),
             ],
             0,
         )
@@ -313,6 +323,7 @@ class DecoderMixin:
                     f"rg{tuner.reserve_gib}",
                     f"ob{getattr(self.opt, 'decode_batch_size', 0)}",
                     f"cl{int(self._channels_last_decode())}",
+                    f"ac{self._decode_autocast_dtype()}",
                 ]
             )
             with timed("decode_tune", gpu=True, device=str(dev)):
@@ -439,25 +450,11 @@ class DecoderMixin:
                 aligned.append(f[:1])
         return self._expand_feats(aligned, n_total)
 
-    def _decode_chunks(self, ae, lat: torch.Tensor, feats: list, bs: int) -> torch.Tensor:
+    def _decode_chunks(self, ae, lat: torch.Tensor, feats: list, bs: int, bound_dec=None) -> torch.Tensor:
         """Decode ``lat`` in mini-batches into one preallocated output tensor."""
         n = lat.shape[0]
-        pad_bs = getattr(self, "_compiled_batch_size", None)
         first_m = min(bs, n)
-        if pad_bs is not None and first_m < pad_bs:
-            pad_size = pad_bs - first_m
-            padded_lat = torch.cat([lat[:first_m], lat[first_m - 1 : first_m].expand(pad_size, -1)], dim=0)
-            padded_feats = [
-                (
-                    f
-                    if f.shape[0] == 1
-                    else torch.cat([f[:first_m], f[first_m - 1 : first_m].expand(pad_size, *f.shape[1:])], dim=0)
-                )
-                for f in feats
-            ]
-            first = self._decode_call(ae, padded_lat, padded_feats)[:first_m]
-        else:
-            first = self._decode_call(ae, lat[:first_m], self._slice_feats(feats, 0, first_m))
+        first = self._decode_call(ae, lat[:first_m], self._slice_feats(feats, 0, first_m), bound_dec=bound_dec)
 
         out = first.new_empty((n, *first.shape[1:]))
         step = first.shape[0]
@@ -465,53 +462,13 @@ class DecoderMixin:
 
         while step < n:
             m = min(bs, n - step)
-            if pad_bs is not None and m < pad_bs:
-                pad_size = pad_bs - m
-                padded_lat = torch.cat([lat[step : step + m], lat[step + m - 1 : step + m].expand(pad_size, -1)], dim=0)
-                padded_feats = [
-                    (
-                        f
-                        if f.shape[0] == 1
-                        else torch.cat(
-                            [f[step : step + m], f[step + m - 1 : step + m].expand(pad_size, *f.shape[1:])], dim=0
-                        )
-                    )
-                    for f in feats
-                ]
-                chunk = self._decode_call(ae, padded_lat, padded_feats)[:m]
-            else:
-                chunk = self._decode_call(ae, lat[step : step + m], self._slice_feats(feats, step, m))
-
+            chunk = self._decode_call(ae, lat[step : step + m], self._slice_feats(feats, step, m), bound_dec=bound_dec)
             got = chunk.shape[0]
             if got <= 0:
                 raise RuntimeError("decoder returned an empty batch")
             out[step : step + got].copy_(chunk)
             step += got
         return out
-
-    def compile_decoder(self, batch_size: int = 8, mode: str = "reduce-overhead"):
-        """Compiles the motion autoencoder decoder with static CUDA Graphs and channels_last layout."""
-        ae = getattr(self, "motion_autoencoder", None)
-        if ae is None or not hasattr(ae, "dec"):
-            return None
-        try:
-            ae.dec.to(memory_format=torch.channels_last)
-            ae.dec._ff_channels_last = True
-            compiled = torch.compile(
-                ae.dec,
-                mode=mode,
-                dynamic=False,
-                fullgraph=False,
-            )
-            self._decoder_compiled = compiled
-            self._compiled_batch_size = batch_size
-            logger.info(f"FloatDecoder: motion_autoencoder.dec compiled with mode={mode}, static_bs={batch_size}")
-            return compiled
-        except Exception as e:
-            logger.warning(f"FloatDecoder: torch.compile failed ({e}), falling back to eager")
-            self._decoder_compiled = ae.dec
-            self._compiled_batch_size = None
-            return ae.dec
 
     @torch.inference_mode()
     def _decode_latent_batched(
@@ -535,23 +492,23 @@ class DecoderMixin:
         if static_b is not None:
             bs = min(bs, static_b)
 
-        self._active_bound_dec = self._bind_decoder(ae, device or getattr(r_d, "device", None) or self._cuda_device())
-        try:
-            if r_d.ndim == 3:
-                b_dim, t_dim, d_dim = r_d.shape
-                n_total = b_dim * t_dim
-                flat = r_d.reshape(n_total, d_dim)
-                out = self._decode_chunks(ae, flat, self._align_feats_3d(s_r_feats, b_dim, t_dim, n_total), bs)
-                return out.reshape(b_dim, t_dim, *out.shape[1:])
+        bound_dec = self._bind_decoder(ae, device or getattr(r_d, "device", None) or self._cuda_device())
 
-            is_1d = r_d.ndim == 1
-            if is_1d:
-                r_d = r_d.unsqueeze(0)
-            n_total = r_d.shape[0]
-            out = self._decode_chunks(ae, r_d, self._align_feats_2d(s_r_feats, n_total), bs)
-            return out.squeeze(0) if is_1d else out
-        finally:
-            self._active_bound_dec = None
+        if r_d.ndim == 3:
+            b_dim, t_dim, d_dim = r_d.shape
+            n_total = b_dim * t_dim
+            flat = r_d.reshape(n_total, d_dim)
+            out = self._decode_chunks(
+                ae, flat, self._align_feats_3d(s_r_feats, b_dim, t_dim, n_total), bs, bound_dec=bound_dec
+            )
+            return out.reshape(b_dim, t_dim, *out.shape[1:])
+
+        is_1d = r_d.ndim == 1
+        if is_1d:
+            r_d = r_d.unsqueeze(0)
+        n_total = r_d.shape[0]
+        out = self._decode_chunks(ae, r_d, self._align_feats_2d(s_r_feats, n_total), bs, bound_dec=bound_dec)
+        return out.squeeze(0) if is_1d else out
 
     @torch.inference_mode()
     def decode_latent_into_image(
@@ -574,7 +531,7 @@ class DecoderMixin:
         )
 
     ######## Motion Encoder - Helpers ########
-    @torch.inference_mode()
+    @torch.no_grad()
     def encode_image_into_latent(self, x: torch.Tensor) -> list:
         if x.ndim == 3:
             x = x.unsqueeze(0)
@@ -582,7 +539,7 @@ class DecoderMixin:
         x_r_lambda = self.motion_autoencoder.enc.fc(x_r)
         return x_r, x_r_lambda, x_r_feats
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def encode_identity_into_motion(self, x_r: torch.Tensor) -> torch.Tensor:
         if x_r.ndim == 1:
             x_r = x_r.unsqueeze(0)

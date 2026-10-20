@@ -7,7 +7,8 @@
 # venv), so it added nothing on any real box.
 
 set -e
-
+apt-get update
+apt-get install -y python3.10-dev build-essential
 # Always resolve paths relative to the repo root (this script lives in scripts/)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"

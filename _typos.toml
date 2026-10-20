@@ -5,7 +5,10 @@
 ser = "ser"
 # rust_model.ot -> legacy PyTorch/HF weight filename extension
 ot = "ot"
+# CC BY-NC-ND license acronym (No-Derivatives)
+ND = "ND"
 
 [default.extend-identifiers]
 ser = "ser"
 "rust_model.ot" = "rust_model.ot"
+ND = "ND"

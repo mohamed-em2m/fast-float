@@ -1,10 +1,33 @@
 # FLOAT Fast
 
-**A high-performance serving and inference stack for FLOAT — audio-driven talking-portrait generation (ICCV 2025).**
+**A serving and inference stack for FLOAT — audio-driven talking-portrait generation (ICCV 2025).**
+
+[![License: CC BY-NC-ND 4.0](https://img.shields.io/badge/License-CC%20BY--NC--ND%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-nd/4.0/) #
+[![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/release/python-3100/)
+[![PyTorch 2.7.1](https://img.shields.io/badge/pytorch-2.7.1-ee4c2c.svg)](https://pytorch.org/)
+[![FastAPI](https://img.shields.io/badge/API-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
+[![ICCV 2025](https://img.shields.io/badge/ICCV-2025-4b44ce.svg)](https://iccv.thecvf.com)
 
 > **Attribution — please read.** FLOAT Fast is a community engineering project built on top of the official **FLOAT** research implementation by [Taekyung Ki](https://taekyungki.github.io), [Dongchan Min](https://kevinmin95.github.io), and [Gyeongsu Chae](https://www.aistudios.com/ko) (DeepBrain AI), presented at **ICCV 2025**. The model architecture, trained checkpoints, method, and original inference code are entirely their work, released under a [Creative Commons Attribution-NonCommercial-NoDerivatives 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/) license. This repository adds a serving/inference layer around it and **inherits the same non-commercial license**. If you use it, please cite the original paper — see [Citation](#citation).
 >
 > Upstream project: [deepbrainai-research/float](https://github.com/deepbrainai-research/float) · Project page: <https://deepbrainai-research.github.io/float/>
+
+---
+
+## Contents
+
+- [What this repository adds](#what-this-repository-adds)
+- [Requirements](#requirements)
+- [Quick start](#quick-start)
+- [API](#api)
+- [Live streaming](#live-streaming)
+- [Per-component backends (ONNX / TensorRT)](#per-component-backends-onnx--tensorrt)
+- [Configuration](#configuration)
+- [Development](#development)
+- [Repository layout](#repository-layout)
+- [Known limitations](#known-limitations)
+- [License](#license)
+- [About FLOAT (upstream)](#about-float-upstream)
 
 ---
 
@@ -13,24 +36,26 @@
 FLOAT Fast wraps the FLOAT generator in production-friendly interfaces and performance work:
 
 - **FastAPI server** — hardware-accelerated inference with **NVENC** video encoding, HTTP **byte-range streaming**, and **WebRTC** signaling for real-time playback.
-- **React + Vite "Studio" frontend** — a browser UI for driving generation against the API.
-- **Gradio apps** — a batch UI (`gradio_interface.py`) and a live microphone streaming UI (`float_live_app.py`).
-- **Batched latent decoding + VRAM auto-sizing** — decodes frames in micro-batches sized to the free GPU memory. See [`docs/BATCH_DECODING.md`](docs/BATCH_DECODING.md).
+- **Live frame streaming** — frames are published to a **WebSocket** (`/ws/stream/{id}`) and to live WebRTC peers *while* the video is being generated, so the browser can start playing before the MP4 is finished.
+- **React + Vite "Studio" frontend** — a browser UI for driving generation against the API, including a live-preview surface.
+- **Gradio apps** — a batch UI (`fast_float/legacy/gradio_interface.py`) and a live microphone streaming UI (`fast_float/interfaces/float_live_app.py`).
+- **Batched latent decoding + VRAM auto-sizing** — decodes frames in micro-batches sized to free GPU memory, with a tuner cache to skip re-probing on repeat runs. See [`docs/BATCH_DECODING.md`](docs/BATCH_DECODING.md).
 - **Asynchronous streaming pipeline** — a multi-threaded producer/consumer over multiple CUDA streams and GPUs, overlapping encode, transfer, and disk I/O. See [`docs/STREAMING_PIPELINE.md`](docs/STREAMING_PIPELINE.md).
-- **ONNX / TensorRT acceleration** — per-module ONNX export with parity verification and benchmarking, plus a TensorRT (FP16) execution provider chain. See [ONNX & TensorRT](#onnx--tensorrt).
+- **Per-component ONNX / TensorRT acceleration** — each module can run `eager`, `compile`, or `onnx` (TensorRT → CUDA → CPU), selected from a config generated **on the target box** after parity + benchmark checks. See [Backends](#per-component-backends-onnx--tensorrt).
 
 ---
 
-## Getting started
+## Requirements
 
-### Requirements
-
-- Linux with an **NVIDIA GPU** (upstream tested on A100 and V100).
+- Linux with an **NVIDIA GPU** (upstream tested on A100 and V100; the stack also runs on T4 / RTX-class cards).
 - **Python 3.10** (from `.python-version`), managed by [uv](https://docs.astral.sh/uv/getting-started/installation/).
 - `ffmpeg`, `git`, `wget`, `curl`.
 - **Node 20.19+ / 22.12+** for the React frontend.
+- Optional: **TensorRT 10.9 (CUDA 12)** for the TRT execution provider. ONNX Runtime 1.23 links against `libnvinfer.so.10`; a TensorRT 11 install cannot be loaded.
 
-> The upstream `generate.py` CLI still works, but this fork drives inference through the FastAPI server / Gradio apps.
+> The upstream `generate.py` CLI still works from [`fast_float/legacy/`](fast_float/legacy), but this fork drives inference through the FastAPI server and Gradio apps.
+
+## Quick start
 
 ### Setup
 
@@ -47,7 +72,7 @@ uv sync --frozen            # Python from .python-version, CUDA torch pins from 
 ./scripts/download_checkpoints.sh
 ```
 
-### Preparing checkpoints
+### Checkpoints
 
 Download automatically:
 
@@ -88,29 +113,33 @@ The Wav2Vec2-based models are [wav2vec2-base-960h](https://huggingface.co/facebo
 | Goal | Command | Default URL |
 |---|---|---|
 | Backend + frontend together | `./scripts/run_all.sh` | API `:8000`, Studio `:3000` |
-| FastAPI / WebRTC server only | `./scripts/run_api.sh` | `:8000` |
+| FastAPI / WebRTC / WebSocket server only | `./scripts/run_api.sh` | `:8000` |
 | React Studio only | `./scripts/run_frontend.sh` | `:3000` |
 | Gradio batch app | `./scripts/run_gradio.sh` | `:7860` |
 | Gradio live (mic) app | `./scripts/run_live.sh` | `:7860` |
 
-Environment overrides: `PORT`, `FRONTEND_PORT`, `VITE_API_URL`, `CORS_ORIGINS`, `NGPUS` (number of GPUs used for decoding).
+The server starts warming up the model on boot; `GET /health` reports `warmup_stage` until it is ready.
 
 ---
 
-## API reference
+## API
+
+Interactive docs: `http://localhost:8000/docs`.
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/` | Service health status and links |
+| `GET` | `/` | Service metadata (`service`, `version`, `status`, `docs_url`, `public_url`) |
+| `GET` | `/health` | Health, warmup stage, encoder, active streams, FPS statistics |
+| `GET` | `/gpu` | GPU VRAM allocated / reserved (GB) |
+| `POST` | `/gpu/clear` | Clear the CUDA cache and run garbage collection |
 | `POST` | `/generate` | Generate a talking-portrait video from audio + image |
+| `GET` | `/progress/{request_id}` | Progress for a queued/running generation |
 | `GET` | `/download/{request_id}` | Download the generated MP4 |
 | `GET` | `/stream/{request_id}` | Stream the MP4 with HTTP `Range` support |
-| `GET` | `/health` | System health, model status, FPS statistics |
-| `GET` | `/gpu` | GPU VRAM allocated / reserved (GB) |
-| `POST` | `/gpu/clear` | Clear CUDA cache and run garbage collection |
-| `POST` | `/offer` | WebRTC SDP negotiation for real-time playback |
+| `WS` | `/ws/stream/{request_id}` | Live frames while the video is generated (see [Live streaming](#live-streaming)) |
+| `POST` | `/offer` | WebRTC SDP negotiation (finished file, or `"live": true`) |
 
-### Example `/generate` request
+### `POST /generate`
 
 ```json
 {
@@ -128,28 +157,127 @@ Environment overrides: `PORT`, `FRONTEND_PORT`, `VITE_API_URL`, `CORS_ORIGINS`, 
   "e_cfg_scale": 1.0,
   "no_crop": false,
   "compress": true,
-  "quality": "balanced"
+  "quality": "balanced",
+  "decode_batch_size": 0,
+  "client_request_id": "optional-browser-id",
+  "live": false
 }
 ```
 
+| Field | Default | Notes |
+|---|---|---|
+| `audio_format` | `pcm` | `pcm`, `wav`, `mp3`, … |
+| `sample_rate` | `16000` | 8 000–48 000 Hz |
+| `image_base64` | `null` | Omit to use the built-in default portrait |
+| `emotion` | `S2E` | `S2E` infers emotion from audio; or `neutral`/`happy`/`sad`/`angry`/`surprise`/`disgust` |
+| `nfe` | `10` | ODE solver steps, 5–25 |
+| `chunk_seconds` / `chunk_overlap_seconds` | `0` / `0.5` | Split long audio into independently generated windows and merge |
+| `chunk_batch_size` / `chunk_pad_seconds` | `1` / `2.0` | Sample several chunks in one model batch (pads short chunks with silence) |
+| `decode_batch_size` | `0` | Frames per decode micro-batch; `0` lets the VRAM tuner choose |
+| `client_request_id` | `null` | Lets the browser poll `/progress/{id}` before the long-running call returns |
+| `live` | `false` | Also publish frames to `/ws/stream/{id}` and to live `/offer` peers |
+
+The response contains `request_id`, `download_url`, `stream_url`, `performance` timings, `encoder`, `resolution`, and the number of generated `chunks`.
+
+> A generation is long-running. To show progress immediately, send `client_request_id` and poll `GET /progress/{client_request_id}`; to watch frames, open the WebSocket described below.
+
 ---
 
-## ONNX & TensorRT
+## Live streaming
 
-Inference can be accelerated by exporting the six FLOAT submodules to ONNX and running them through a **TensorRT (FP16) → CUDA → CPU** execution-provider chain, falling back to PyTorch wherever a module is not exported or fails.
+Three transports share the same generated frames:
+
+| Transport | Endpoint | Latency | Use when |
+|---|---|---|---|
+| MP4 file | `GET /stream/{id}` (Range) + `GET /download/{id}` | after completion | You need a complete, seekable file |
+| WebSocket frames | `WS /ws/stream/{id}` | per decoded frame | You need low-latency pixels and can draw them yourself |
+| WebRTC | `POST /offer` with `"live": true` | per decoded frame | You want the browser's native video pipeline |
+
+### Flow
+
+1. `POST /generate` with `"live": true` (and a `client_request_id` so the id is known up-front).
+2. Immediately open `WS /ws/stream/{client_request_id}` — the socket waits up to 15 s for the request to be registered.
+3. The server sends a `meta` message, then one binary message per decoded frame, then `done` (or `error`).
+
+### WebSocket wire format
+
+```text
+server → {"type":"meta","fps":25,"width":512,"height":512,"channels":3,
+          "first_idx":0,"total_frames":120,"has_audio":true}
+server → binary: [u32 frame_idx][u32 frame_count][u32 pts_ms][raw RGB(A) bytes]
+server → {"type":"gap","start":40,"end":47,"reason":"..."}
+server → {"type":"done","result":{...}}     # same object /generate returns
+server → {"type":"error","message":"..."}
+```
+
+- The 12-byte header is big-endian (`>III`); `count` is currently always `1`.
+- Pixel payload is `width * height * channels` bytes of **uint8, RGB(A), row-major** — no per-message image encoding.
+- Frames are **lossy by design**: each client has a bounded queue (64). A slow client skips frames and observes an index jump (`gap` / `frame_idx` discontinuity) rather than slowing the GPU.
+- Close codes: **4404** unknown or already-finished request, **4408** the stream never produced metadata.
+
+```js
+// Minimal browser client (after POST /generate returns the request id)
+const ws = new WebSocket(`ws://localhost:8000/ws/stream/${requestId}`);
+ws.binaryType = "arraybuffer";
+let meta;
+
+ws.onmessage = (event) => {
+  if (typeof event.data === "string") {
+    const msg = JSON.parse(event.data);
+    if (msg.type === "meta") meta = msg;
+    if (msg.type === "done") console.log("finished", msg.result);
+    if (msg.type === "error") console.error(msg.message);
+    return;
+  }
+  const view = new DataView(event.data);
+  const idx = view.getUint32(0);
+  const ptsMs = view.getUint32(8);
+  const pixels = new Uint8ClampedArray(event.data, 12);
+  drawFrame(pixels, meta.width, meta.height, idx, ptsMs); // putImageData / WebGL upload
+};
+```
+
+The React Studio uses the same protocol through `frontend/src/services/live.js` (routed via the Vite `/api` proxy in development).
+
+---
+
+## Per-component backends (ONNX / TensorRT)
+
+The pipeline is split into named components, each of which can run in a different mode:
+
+| Component | Unit | Call frequency |
+|---|---|---|
+| `emotion` | S2E emotion classifier | once / request |
+| `audio` | wav2vec2 + projection | once / chunk |
+| `direction` | motion direction (QR) | once / request |
+| `fmt` | FMT vector field | NFE × chunks |
+| `decoder` | StyleDecoder synthesis | per micro-batch |
+| `refenc` | reference encoder | once / request |
+
+| Mode | What it is |
+|---|---|
+| `eager` | Plain PyTorch — the reference and the universal fallback |
+| `compile` | `torch.compile` (inductor) around the torch module |
+| `onnx` | The exported ONNX graph on an execution provider (`trt` → `cuda` → `cpu`) |
+
+The config is **hardware-specific** and generated on the target box — never hand-tuned from another machine:
 
 ```bash
 ./scripts/convert_to_onnx.sh
 ```
 
-For each unit — emotion (S2E), FMT step, direction, Wav2Vec2 audio encoder, frame decoder, and reference encoder — the script:
+For each unit the script exports (`torch.export` → ONNX), runs a **parity check** against the PyTorch reference, **benchmarks** warmed latency, and records only the units that actually win. The generated file is `onnx/backends.generated.yaml`.
 
-1. exports the module with `torch.export` → ONNX,
-2. runs a **parity check** against the PyTorch reference,
-3. **benchmarks** warmed latency (PyTorch vs ONNX Runtime), and
-4. reports the speedup — a unit is only worth keeping as ONNX when `speedup >= 1`.
+Resolution order at runtime:
 
-TensorRT is used by default when available (FP16 with an on-disk engine cache), otherwise the CUDA execution provider is used, otherwise CPU. Override via `ORT_ARGS`:
+1. `$FLOAT_BACKENDS_CONFIG` (explicit path)
+2. `onnx/backends.generated.yaml` (produced on this box)
+3. `config/backends.yaml` (committed default: everything `eager`)
+4. `eager` fallback for anything missing or failing to load
+
+Per-component debugging override: `FLOAT_MODE_fmt=eager`, and `FLOAT_DISABLE_BACKENDS=1` forces eager everywhere.
+
+TensorRT is preferred when available (FP16 with an on-disk engine cache), then the CUDA EP, then CPU. Override via `ORT_ARGS`:
 
 ```bash
 ORT_ARGS="--no-trt" ./scripts/convert_to_onnx.sh        # force the CUDA EP
@@ -157,7 +285,90 @@ ORT_ARGS="--trt-fp32" ./scripts/convert_to_onnx.sh      # strict parity (no FP16
 ORT_ARGS="--trt-max-batch 16" ./scripts/convert_to_onnx.sh
 ```
 
-ONNX Runtime backends are wired into the inference runtime with automatic fallback to PyTorch, so partial acceleration is always safe.
+See [`docs/BACKEND_SELECTION.md`](docs/BACKEND_SELECTION.md) for the measurement methodology and [`docs/BUILD_RUNTIME_SESSIONS.md`](docs/BUILD_RUNTIME_SESSIONS.md) for session construction. Partial acceleration is always safe: any component that is missing, fails parity, or fails to load falls back to PyTorch.
+
+> The decoder is frequently *not* worth exporting: in our measurements the ONNX decoder ran at 0.82–0.88× eager because the eager postprocess is already fused, while `fmt` gained 4.07×. Always trust the generated config over intuition.
+
+---
+
+## Configuration
+
+### Server
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` | `8000` | API port |
+| `FRONTEND_PORT` | `3000` | Studio dev port (`run_all.sh`) |
+| `VITE_API_URL` | `http://localhost:${PORT}` | Backend URL used by the frontend |
+| `CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | Comma-separated allowed origins |
+| `NGPUS` | `1` | GPUs used for parallel decoding |
+| `MAX_CONCURRENT_REQUESTS` | `10` | Request semaphore |
+| `RESULTS_DIR` | `./results` | Output directory |
+| `WARMUP_TIMEOUT_S` | `900` | Boot warmup budget before serving anyway |
+| `WARMUP_WAIT_TIMEOUT_S` | `600` | How long `/generate` waits for warmup |
+| `SKIP_WARMUP` | `0` | `1` skips boot warmup (debug) |
+| `AVATER_PUBLIC_URL` | `http://localhost:${PORT}` | Public base URL returned in responses |
+| `BACKUP_AVATER_PUBLIC_URL` | unset | Secondary public URL |
+| `OPTIMIZATION_MODE` | `all` | Legacy inference optimization preset |
+| `USE_FP16` | `true` | FP16 model weights |
+| `HYPERCORN_STARTUP_TIMEOUT` | `1200` | Hypercorn startup timeout (seconds) |
+
+### Backends
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FLOAT_BACKENDS_CONFIG` | unset | Explicit per-component config path |
+| `FLOAT_MODE_<COMPONENT>` | unset | Override one component (e.g. `FLOAT_MODE_fmt=eager`) |
+| `FLOAT_DISABLE_BACKENDS` | unset | Force `eager` everywhere |
+| `FLOAT_TRT_MAX_BATCH` | `16` | TensorRT engine max batch |
+
+### Decoding & performance
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FLOAT_DECODE_TUNE_CACHE` | `~/.cache/fast_float/decode_tune.json` | Decode autotuner cache (`0` disables) |
+| `FLOAT_CACHE_DIR` | `~/.cache/fast_float` | Base cache directory |
+| `FLOAT_DECODE_CHANNELS_LAST` | `0` | Run the eager/compiled decoder in channels_last (A/B per device) |
+| `FLOAT_DECODE_AUTOCAST` | unset | `fp16` or `bf16` autocast for the eager/compiled decoder; off by default |
+| `FLOAT_SEAM_BLEND` | `3` | Frames cross-faded at chunk seams (0 disables) |
+| `FLOAT_CUDNN_BENCHMARK` | `0` | Enable cuDNN autotuning (adds startup/heap churn; off by default) |
+
+> Decode knobs are opt-in on purpose: channels_last and autocast can change numerics or be a pessimization depending on the GPU and kernel mix. Measure with the tuner enabled (`FLOAT_DECODE_TUNE_CACHE`) before baking them into a deployment.
+
+### Logging
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FLOAT_LOG_LEVEL` | unset | Explicit log level |
+| `FLOAT_DEBUG` / `FLOAT_TIMING` | unset | Per-call timing and debug lines |
+
+---
+
+## Development
+
+```bash
+# Python
+uv run --frozen --no-sync python -m pytest -q     # tests live in tests/
+uv run --frozen --no-sync ruff check .
+uv run --frozen --no-sync ruff format .
+
+# Frontend
+cd frontend
+npm ci
+npm run lint        # oxlint
+npm run build
+npm run dev         # :3000, proxies /api -> :8000 (including WebSockets)
+```
+
+The ONNX export tests need the conversion stack (`onnxscript`, `onnx>=1.17`), which is **not** part of the portable runtime lockfile — install it with `./scripts/convert_to_onnx.sh` or skip those tests on a runtime-only box.
+
+Git hooks (ruff, gitleaks, commitizen, typos, markdownlint, shellcheck) are configured in `.pre-commit-config.yaml`:
+
+```bash
+pre-commit install --install-hooks
+```
+
+See [`AGENT.md`](AGENT.md) for the architecture guide and [`docs/UI_UX_BRIEF.md`](docs/UI_UX_BRIEF.md) for the frontend design notes.
 
 ---
 
@@ -165,26 +376,41 @@ ONNX Runtime backends are wired into the inference runtime with automatic fallba
 
 ```text
 float-fast/
-├── pyproject.toml                  # metadata, deps, uv indexes
-├── uv.lock                         # pinned lockfile
-├── Dockerfile                      # container build (CUDA base)
-├── config/api.json                 # endpoint / public URL config
-├── scripts/                        # setup, run, and ONNX-conversion scripts
-├── checkpoints/                    # model weights
-├── docs/                           # BATCH_DECODING.md, STREAMING_PIPELINE.md
-├── frontend/                       # React + Vite Studio
-└── fast_float/                     # main Python package
-    ├── main.py                     # FastAPI entrypoint
-    ├── core/                       # inference pipeline & shared state
-    ├── routers/                    # generation / health / webrtc endpoints
-    ├── schemas/                    # Pydantic v2 models
-    ├── utils/                      # GPU, media, logging, video optimizer
-    ├── models/float/               # FLOAT generator, FMT, style decoder, encoders
-    ├── interfaces/                 # Gradio batch + live apps
-    └── onnx/                       # ONNX export, parity, and runtime backends
+├── pyproject.toml              # metadata, deps, uv indexes, ruff/pytest config
+├── uv.lock                     # pinned lockfile
+├── Dockerfile                  # container build (CUDA 12.1 base)
+├── config/
+│   ├── api.json                # optional public URL overrides
+│   └── backends.yaml           # committed backend default (all eager)
+├── scripts/                    # setup, run, ONNX conversion, TensorRT install
+├── checkpoints/                # model weights (downloaded)
+├── docs/                       # backend selection, batch decoding, streaming, UI notes
+├── frontend/                   # React + Vite Studio (components, services/live.js)
+├── tests/                      # pytest suite (no GPU required for most tests)
+└── fast_float/
+    ├── main.py                 # FastAPI entrypoint (routers, CORS, lifespan)
+    ├── core/                   # request pipeline, service, shared app state
+    ├── routers/                # generation, health, streaming (WS), webrtc
+    ├── schemas/                # Pydantic v2 request/response models
+    ├── streaming/              # frame dispatcher, live fan-out, stream types
+    ├── runtimes/               # runtime backends (ONNX session selection)
+    ├── onnx/                   # export, parity, dispatch, backend config
+    ├── utils/                  # GPU, media, logging, timing, video optimizer, tuner
+    ├── models/float/           # FLOAT generator, FMT, style decoder, encoders
+    ├── interfaces/             # Gradio live app
+    └── legacy/                 # upstream CLI (generate.py) + batch Gradio app
 ```
 
-See [`AGENT.md`](AGENT.md) for a deeper architecture guide.
+---
+
+## Known limitations
+
+- **Linux + NVIDIA only.** NVENC, CUDA streams, and the TensorRT path assume it; the portable ONNX runtime can run CPU-only, but the server targets GPU boxes.
+- **Single API process for live streams.** The live-stream registry lives in process memory, so run one API worker. Horizontal scaling would need an external broker.
+- **Live transport is lossy by design.** WebSocket and live WebRTC drop frames for slow consumers; use the finished MP4 (`/download`, `/stream`) when every frame matters.
+- **Backend config is per machine.** `onnx/backends.generated.yaml` is an artifact of the box that produced it; regenerate after changing GPUs, drivers, or the ONNX/TensorRT stack.
+- **TensorRT/ORT ABI pins matter.** ONNX Runtime 1.23 expects TensorRT 10.9 (`libnvinfer.so.10`); mismatched majors fail to load.
+- **Non-commercial license** inherited from upstream (see below).
 
 ---
 
@@ -246,10 +472,12 @@ The method runs faster than current diffusion-based methods with fewer sampling 
 - The inference code includes an automatic face-cropping function, which may involve black **padding** regions. You can manually disable cropping, though it may lead to suboptimal performance.
 - If your audio contains heavy background music, use [ClearVoice](https://github.com/modelscope/ClearerVoice-Studio) to extract the vocals first.
 
+> In this fork the CLI lives at `fast_float/legacy/generate.py` and expects the checkpoints described above.
+
 **1. Emotion from audio** — generate with an emotion inferred from the audio (omit `--emo`). Adjust intensity with `--e_cfg_scale` (default 1; try 5–10 for more intensity).
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python generate.py \
+CUDA_VISIBLE_DEVICES=0 python fast_float/legacy/generate.py \
     --ref_path path/to/reference/image \
     --aud_path path/to/audio \
     --seed 15 \
@@ -262,7 +490,7 @@ CUDA_VISIBLE_DEVICES=0 python generate.py \
 **2. Redirecting emotion** — specify `--emo` with one of seven emotions: `['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise']`.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python generate.py \
+CUDA_VISIBLE_DEVICES=0 python fast_float/legacy/generate.py \
     --ref_path path/to/reference/image \
     --aud_path path/to/audio \
     --emo 'happy' \
@@ -278,7 +506,7 @@ CUDA_VISIBLE_DEVICES=0 python generate.py \
 **3. Running example and results**
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python generate.py \
+CUDA_VISIBLE_DEVICES=0 python fast_float/legacy/generate.py \
     --ref_path assets/sam_altman.webp \
     --aud_path assets/aud-sample-vs-1.wav \
     --seed 15 \
