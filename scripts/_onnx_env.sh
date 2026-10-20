@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2329
 # Shared ONNX conversion environment for the scripts in this directory.
 #
 # Sourced (never executed directly) so convert_to_onnx.sh and the per-unit
@@ -32,8 +32,19 @@ use_project_venv() {
   if [ -f "${PROJECT_ROOT}/.venv/bin/activate" ]; then
     # shellcheck source=/dev/null
     source "${PROJECT_ROOT}/.venv/bin/activate"
+  elif [ -f "${PROJECT_ROOT}/.venv/Scripts/activate" ]; then
+    # shellcheck source=/dev/null
+    source "${PROJECT_ROOT}/.venv/Scripts/activate"
   fi
-  PY="${PY:-$(command -v python)}"
+  if [ -z "${PY:-}" ]; then
+    if [ -x "${PROJECT_ROOT}/.venv/bin/python" ]; then
+      PY="${PROJECT_ROOT}/.venv/bin/python"
+    elif [ -x "${PROJECT_ROOT}/.venv/Scripts/python.exe" ]; then
+      PY="${PROJECT_ROOT}/.venv/Scripts/python.exe"
+    else
+      PY="$(command -v python)"
+    fi
+  fi
   export PY
   echo "python: ${PY} ($("${PY}" -c 'import sys; print(sys.prefix)'))"
   if command -v uv >/dev/null 2>&1; then
@@ -53,7 +64,7 @@ use_project_venv() {
 # rejects ("Unsupported model IR version"). Enforce the pin here so the repair
 # below actually fires.
 probe_onnx() {
-  python -c "
+  "${PY}" -c "
 import sys, importlib.metadata as m
 import onnx.external_data_helper, onnxscript, onnxruntime  # noqa: F401
 mm = lambda v: tuple(int(p) for p in v.split('.')[:2])
@@ -64,7 +75,7 @@ sys.exit(0 if (onnx_ok and m.version('onnxscript') == '0.7.2') else 1)" 2>/dev/n
 # On CUDA boxes the ORT build must ALSO ship a working CUDA EP. CPU-only torch
 # boxes always pass this probe.
 probe_ort_cuda() {
-  python -c "
+  "${PY}" -c "
 import sys
 import torch
 import onnxruntime as o
@@ -77,7 +88,7 @@ probe_stack() { probe_onnx && probe_ort_cuda; }
 
 # onnxruntime>=1.24 dropped cp310 wheels; the box runs CPython 3.10.
 onnx_rt_pkg() {
-  if python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+  if "${PY}" -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
     echo "onnxruntime-gpu<${ORT_MAX}"
   else
     echo "onnxruntime<${ORT_MAX}"
@@ -101,7 +112,7 @@ install_onnx_stack() {
 }
 
 print_onnx_versions() {
-  python -c "import importlib.metadata as m
+  "${PY}" -c "import importlib.metadata as m
 for p in ('onnx','onnxscript','onnx-ir','onnxruntime','onnxruntime-gpu'):
     try: print(' ', p, m.version(p))
     except Exception: print(' ', p, 'MISSING')"
@@ -110,6 +121,9 @@ for p in ('onnx','onnxscript','onnx-ir','onnxruntime','onnxruntime-gpu'):
 # Verify the stack, repairing once (and once more with a reinstall), then abort
 # the caller on failure (export cannot run without it).
 ensure_onnx_stack() {
+  if [ "${FLOAT_ONNX_STACK_READY:-0}" = "1" ]; then
+    return 0
+  fi
   if ! probe_stack; then
     echo "installing onnx stack (pin ${ONNX_PIN}, ${ONNXSCRIPT_PIN}, onnxruntime<${ORT_MAX})"
     install_onnx_stack
@@ -121,13 +135,14 @@ ensure_onnx_stack() {
   echo "onnx stack versions:"
   print_onnx_versions
   probe_stack || { echo "ERROR: onnx stack still broken — export cannot run"; exit 1; }
+  export FLOAT_ONNX_STACK_READY=1
 }
 
 # Listing the EP only proves the wheel was built with TRT support; it says
 # nothing about whether libnvinfer (of the exact version ORT expects) is
 # loadable. Delegate to the same honest check the exporters use.
 probe_trt() {
-  python -c "
+  "${PY}" -c "
 import sys
 import torch
 import onnxruntime as o
@@ -150,7 +165,7 @@ sys.exit(0 if _trt_libs_loadable() else 1)" 2>/dev/null
 augment_ort_libs() {
   local dirs sysdirs d all
   local -a sysdirs_arr
-  dirs="$(python -c 'import glob, os, site
+  dirs="$("${PY}" -c 'import glob, os, site
 d = set()
 for b in site.getsitepackages() + [site.getusersitepackages()]:
     for p in [os.path.join(b, "nvidia"), *glob.glob(os.path.join(b, "tensorrt*"))]:

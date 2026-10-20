@@ -28,12 +28,12 @@ else
 fi
 
 echo "=== [2/3] python deps ==="
-python -c "import torch; print('torch', torch.__version__, 'cuda=', torch.cuda.is_available())"
+"${PY}" -c "import torch; print('torch', torch.__version__, 'cuda=', torch.cuda.is_available())"
 # Verify (and repair) the pinned onnx stack; aborts on failure (prerequisite).
 ensure_onnx_stack
 
 echo "=== [3/3] convert: FMT step (unit 2) ==="
-python -m fast_float.onnx.convert_fmt \
+"${PY}" -m fast_float.onnx.convert_fmt \
   --ckpt "${CKPT}" --out "${FMT_OUT}" "$@"
 
 echo "=== artifacts ==="

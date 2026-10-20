@@ -40,12 +40,12 @@ else
 fi
 
 echo "=== [2/3] python deps ==="
-python -c "import torch; print('torch', torch.__version__, 'cuda=', torch.cuda.is_available())"
+"${PY}" -c "import torch; print('torch', torch.__version__, 'cuda=', torch.cuda.is_available())"
 # Verify (and repair) the pinned onnx stack; aborts on failure (prerequisite).
 ensure_onnx_stack
 
 echo "=== [3/3] convert: wav2vec2 (unit 4) ==="
-python -m fast_float.onnx.convert_wav2vec \
+"${PY}" -m fast_float.onnx.convert_wav2vec \
   --ckpt "${CKPT}" --w2v-dir "${W2V_DIR}" --out "${W2V_OUT}" "$@"
 
 echo "=== artifacts ==="
