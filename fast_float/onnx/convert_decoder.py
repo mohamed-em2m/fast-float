@@ -329,7 +329,7 @@ def main(argv=None) -> int:
     ap.add_argument("--channel-mult", type=float, default=1.0)
     ap.add_argument(
         "--batches",
-        default="1,2,4,8,16",
+        default="4,8,16",
         help="static decode batches to export (one artifact each); the runtime "
         "picks the smallest session covering a micro-batch instead of always "
         "padding up to the largest",
