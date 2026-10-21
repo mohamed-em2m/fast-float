@@ -398,6 +398,15 @@ class DecoderOnnx(_OnnxRunner):
         b = shape0[0] if shape0 else None
         out = session.get_outputs()[0]
         out_shape = tuple(out.shape or ())
+        # The decode path quantizes with ``_quantize_u8_hwc``, i.e. it reads the
+        # graph output as NCHW float frames in [-1, 1]. A converter/format change
+        # that emits NHWC (or a non-frame tensor) would otherwise deploy and
+        # render scrambled pictures: fail here instead so dispatch falls back to
+        # eager. Static shapes are guaranteed by the converter (dynamic_axes={}).
+        if len(out_shape) != 4:
+            raise ValueError(f"decoder artifact must output NCHW frames [b, C, H, W], got shape {out_shape}")
+        if all(isinstance(d, int) for d in out_shape) and out_shape[1] not in (3, 4):
+            raise ValueError(f"decoder artifact must output NCHW frames [b, C, H, W] with C in 3..4, got {out_shape}")
         return {
             "path": path,
             "latent_name": ins[0].name,

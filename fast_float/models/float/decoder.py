@@ -195,13 +195,16 @@ class DecoderMixin:
 
     @staticmethod
     def _quantize_u8_hwc(out: torch.Tensor) -> torch.Tensor:
-        """[-1, 1] float NCHW -> uint8 HWC.
+        """[-1, 1] float NCHW -> uint8 HWC (never mutates ``out``).
 
-        When the decoder is channels_last the final ``permute(...).contiguous()``
-        returns the input unchanged instead of copying a full batch.
+        Out-of-place on purpose: the in-place add/mul/clamp silently destroyed
+        the caller's float frames (any later use of the decoder output -- a
+        debug dump, a re-quantize, a second consumer -- read clamped 0..255
+        data). The channels_last fast path is preserved: ``permute(...)
+        .contiguous()`` is a no-op copy when the tensor already lives NHWC.
         """
-        out = out.add_(1.0).mul_(127.5).clamp_(0.0, 255.0).to(torch.uint8)
-        return out.permute(0, 2, 3, 1).contiguous()
+        u8 = ((out + 1.0) * 127.5).clamp_(0.0, 255.0).to(torch.uint8)
+        return u8.permute(0, 2, 3, 1).contiguous()
 
     @staticmethod
     def _slice_feats(feats: list, i: int, m: int) -> list:
@@ -435,6 +438,7 @@ class DecoderMixin:
             elif f.shape[0] == n_total:
                 aligned.append(f)
             else:
+                self._warn_feat_shape(f, n_total)
                 aligned.append(f[:1])
         return self._expand_feats(aligned, n_total)
 
@@ -447,8 +451,19 @@ class DecoderMixin:
                 t = n_total // f.shape[0]
                 aligned.append(f.unsqueeze(1).expand(-1, t, *f.shape[1:]).reshape(n_total, *f.shape[1:]))
             else:
+                self._warn_feat_shape(f, n_total)
                 aligned.append(f[:1])
         return self._expand_feats(aligned, n_total)
+
+    def _warn_feat_shape(self, f: torch.Tensor, n_total: int) -> None:
+        """Surface a feature/latent batch mismatch instead of silently reusing frame 0."""
+        if getattr(self, "_feat_shape_warned", False):
+            return
+        self._feat_shape_warned = True
+        logger.warning(
+            f"decode: feature batch {tuple(f.shape)} does not tile onto {n_total} frames; "
+            "broadcasting its first row (the render will not honour per-frame style)"
+        )
 
     def _decode_chunks(self, ae, lat: torch.Tensor, feats: list, bs: int, bound_dec=None) -> torch.Tensor:
         """Decode ``lat`` in mini-batches into one preallocated output tensor."""

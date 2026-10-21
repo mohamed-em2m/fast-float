@@ -292,6 +292,8 @@ See [`docs/BACKEND_SELECTION.md`](docs/BACKEND_SELECTION.md) for the measurement
 > The decoder is frequently *not* worth exporting: in our measurements the ONNX decoder ran at 0.82–0.88× eager because the eager postprocess is already fused, while `fmt` gained 4.07×. Always trust the generated config over intuition.
 >
 > TensorRT is also opt-in for this converter (`--trt`) and off by default. On a T4 the TRT engine for the decoder ran at **0.09× eager** with `max_abs=4.375` / `cosine=0.983` versus eager: ORT partitions the graph across TRT-FP16 and CUDA-FP32, which is both slow and visibly wrong. The converter now gates parity in uint8 frames (≤2 LSB max, ≤0.5 LSB mean) and writes `<model>.onnx.no_trt` so the runtime uses the same provider it validated.
+>
+> The decode path reads the artifact as NCHW float frames, so the runtime rejects an artifact whose output is not 4D NCHW with 3-4 channels at session build; a wrongly formatted graph falls back to eager instead of rendering scrambled frames.
 
 ---
 

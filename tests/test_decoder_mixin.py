@@ -5,6 +5,7 @@ import types
 import pytest
 import torch
 
+import fast_float.models.float.decoder as decoder_mod
 from fast_float.models.float.decoder import FloatDecoder
 
 
@@ -136,10 +137,34 @@ def test_quantize_is_a_view_for_channels_last():
     assert torch.equal(plain, cl)
 
     stored = x.clone().to(memory_format=torch.channels_last)
-    stored = stored.add_(1.0).mul_(127.5).clamp_(0.0, 255.0).to(torch.uint8)
+    stored = ((stored + 1.0) * 127.5).clamp_(0.0, 255.0).to(torch.uint8)
     permuted = stored.permute(0, 2, 3, 1)
     assert permuted.is_contiguous()
     assert permuted.contiguous() is permuted
+
+
+def test_quantize_does_not_mutate_its_input():
+    x = torch.randn(2, 3, 4, 5)
+    before = x.clone()
+    FloatDecoder._quantize_u8_hwc(x)
+    assert torch.equal(x, before)
+
+
+def test_untileable_feature_batch_warns_instead_of_failing_silently(monkeypatch):
+    model, _ = _model()
+    feats = [torch.randn(2, 8)]
+    # The app config logs to stderr through its own handler, so caplog sees nothing.
+    calls = []
+    monkeypatch.setattr(decoder_mod.logger, "warning", lambda msg: calls.append(msg))
+
+    aligned = model._align_feats_2d(feats, 3)
+
+    assert tuple(aligned[0].shape) == (3, 8)
+    assert len(calls) == 1
+    assert "does not tile onto 3 frames" in calls[0]
+    # Only once per model: a per-chunk warning would flood the log.
+    model._align_feats_2d(feats, 3)
+    assert len(calls) == 1
 
 
 def test_prepare_decoder_applies_channels_last_once(monkeypatch):
