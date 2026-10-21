@@ -69,17 +69,17 @@ else
   echo "found ${CKPT}"
 fi
 if [ ! -d "${EMO_DIR}" ]; then
-  echo "emotion model missing -> downloading (huggingface-cli)"
-  command -v huggingface-cli >/dev/null || pip_install "huggingface_hub[hf-transfer]"
-  huggingface-cli download r-f/wav2vec-english-speech-emotion-recognition \
+  echo "emotion model missing -> downloading (hf)"
+  command -v hf >/dev/null || pip_install "huggingface_hub[hf-transfer]"
+  hf download r-f/wav2vec-english-speech-emotion-recognition \
     --local-dir "${EMO_DIR}"
 else
   echo "found ${EMO_DIR}"
 fi
 if [ ! -d "${W2V_DIR}" ]; then
-  echo "wav2vec2-base missing -> downloading (huggingface-cli)"
-  command -v huggingface-cli >/dev/null || pip_install "huggingface_hub[hf-transfer]"
-  huggingface-cli download facebook/wav2vec2-base-960h \
+  echo "wav2vec2-base missing -> downloading (hf)"
+  command -v hf >/dev/null || pip_install "huggingface_hub[hf-transfer]"
+  hf download facebook/wav2vec2-base-960h \
     --local-dir "${W2V_DIR}"
 else
   echo "found ${W2V_DIR}"

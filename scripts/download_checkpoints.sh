@@ -8,13 +8,13 @@ cd "${PROJECT_ROOT}"
 
 mkdir -p checkpoints
 
-# gdown and huggingface-cli are project dependencies (uv sync) — just locate them.
+# gdown and hf are project dependencies (uv sync) — just locate them.
 if [ -x "${PROJECT_ROOT}/.venv/bin/gdown" ]; then
     GDOWN="${PROJECT_ROOT}/.venv/bin/gdown"
-    HF="${PROJECT_ROOT}/.venv/bin/huggingface-cli"
+    HF="${PROJECT_ROOT}/.venv/bin/hf"
 elif [ -x "${PROJECT_ROOT}/.venv/Scripts/gdown.exe" ]; then
     GDOWN="${PROJECT_ROOT}/.venv/Scripts/gdown.exe"
-    HF="${PROJECT_ROOT}/.venv/Scripts/huggingface-cli.exe"
+    HF="${PROJECT_ROOT}/.venv/Scripts/hf.exe"
 else
     echo "No .venv found — running 'uv sync --frozen' first."
     uv sync --frozen
