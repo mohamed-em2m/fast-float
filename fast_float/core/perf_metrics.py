@@ -28,6 +28,8 @@ importable in a plain API process and unit-testable without a GPU.
 from __future__ import annotations
 
 import math
+import threading
+from collections import deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -455,6 +457,140 @@ def fold_stage_seconds(totals: dict[str, dict[str, float]], stages: Iterable[str
     return float(sum(float(totals.get(stage, {}).get("total_s", 0.0)) for stage in stages))
 
 
+@dataclass
+class RequestSample:
+    """One completed generation request.
+
+    Filled from the pipeline's own measurements: the stage split (model vs
+    encode) comes from the timing collector, the delivery numbers (TTFF,
+    jitter, latency, drops) from the dispatcher's frame clock.
+    """
+
+    at: float = 0.0
+    target_fps: float = 25.0
+    frames: int = 0
+    model_seconds: float = 0.0
+    encode_seconds: float = 0.0
+    wall_seconds: float = 0.0
+    request_seconds: float = 0.0
+    preprocess_seconds: float = 0.0
+    ttff_ms: float | None = None
+    jitter_ms: float | None = None
+    dropped: int = 0
+    latency: LatencySummary = field(default_factory=LatencySummary)
+
+    @property
+    def model_fps(self) -> float:
+        """Frames per second of model time (ODE solve + decode, no encode)."""
+        return self.frames / self.model_seconds if self.model_seconds > 0 else 0.0
+
+    @property
+    def e2e_fps(self) -> float:
+        """Frames per second of wall time (model + encode + mux + write)."""
+        return self.frames / self.wall_seconds if self.wall_seconds > 0 else 0.0
+
+    @property
+    def rtf(self) -> float:
+        """Real-time factor: end-to-end fps divided by the target fps."""
+        return self.e2e_fps / self.target_fps if self.target_fps else 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "at": self.at,
+            "frames": self.frames,
+            "model_fps": self.model_fps,
+            "e2e_fps": self.e2e_fps,
+            "rtf": self.rtf,
+            "model_seconds": self.model_seconds,
+            "encode_seconds": self.encode_seconds,
+            "wall_seconds": self.wall_seconds,
+            "request_seconds": self.request_seconds,
+            "preprocess_seconds": self.preprocess_seconds,
+            "ttff_ms": self.ttff_ms,
+            "jitter_ms": self.jitter_ms,
+            "dropped": self.dropped,
+            "latency": self.latency.to_dict(),
+        }
+
+
+class RequestAccumulator:
+    """Rolling window of per-request samples.
+
+    Bounded (a deque) and thread-safe: one ``add`` per finished request, and
+    the percentiles are computed on read over the window.
+    """
+
+    def __init__(self, maxlen: int = 200) -> None:
+        self._samples: deque[RequestSample] = deque(maxlen=maxlen)
+        self._lock = threading.Lock()
+
+    def add(self, sample: RequestSample) -> None:
+        with self._lock:
+            self._samples.append(sample)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._samples)
+
+    @property
+    def maxlen(self) -> int:
+        return self._samples.maxlen or 0
+
+    @staticmethod
+    def _dist(values: Iterable[float | None]) -> dict[str, float]:
+        vals = [float(v) for v in values if v is not None]
+        if not vals:
+            return {"count": 0, "p50": 0.0, "p95": 0.0, "p99": 0.0, "mean": 0.0, "max": 0.0}
+        return {
+            "count": len(vals),
+            "p50": percentile(vals, 50),
+            "p95": percentile(vals, 95),
+            "p99": percentile(vals, 99),
+            "mean": sum(vals) / len(vals),
+            "max": max(vals),
+        }
+
+    def summary(self, recent: int = 8) -> dict[str, Any]:
+        """The rolling view: distributions across the window plus the last samples."""
+        with self._lock:
+            samples = list(self._samples)
+        if not samples:
+            return {
+                "count": 0,
+                "window": self.maxlen,
+                "model_fps": self._dist([]),
+                "e2e_fps": self._dist([]),
+                "rtf": self._dist([]),
+                "wall_seconds": self._dist([]),
+                "request_seconds": self._dist([]),
+                "preprocess_seconds": self._dist([]),
+                "ttff_ms": self._dist([]),
+                "jitter_ms": self._dist([]),
+                "latency_p95": self._dist([]),
+                "dropped_total": 0,
+                "drop_ratio": 0.0,
+                "recent": [],
+            }
+        dropped_total = sum(s.dropped for s in samples)
+        frames_total = sum(s.frames for s in samples)
+        return {
+            "count": len(samples),
+            "window": self.maxlen,
+            "model_fps": self._dist(s.model_fps for s in samples),
+            "e2e_fps": self._dist(s.e2e_fps for s in samples),
+            "rtf": self._dist(s.rtf for s in samples),
+            "wall_seconds": self._dist(s.wall_seconds for s in samples),
+            "request_seconds": self._dist(s.request_seconds for s in samples),
+            "preprocess_seconds": self._dist(s.preprocess_seconds for s in samples),
+            "ttff_ms": self._dist(s.ttff_ms for s in samples),
+            "jitter_ms": self._dist(s.jitter_ms for s in samples),
+            "latency_p95": self._dist(s.latency.p95_ms for s in samples if s.latency.count),
+            "dropped_total": dropped_total,
+            "drop_ratio": dropped_total / (dropped_total + frames_total) if (dropped_total + frames_total) else 0.0,
+            "recent": [s.to_dict() for s in samples[-recent:]],
+        }
+
+
 __all__ = [
     "ENCODE_STAGES",
     "MODEL_STAGES",
@@ -462,6 +598,8 @@ __all__ = [
     "FrameClock",
     "LatencySummary",
     "PerfMatrix",
+    "RequestAccumulator",
+    "RequestSample",
     "StreamMetrics",
     "fold_stage_seconds",
     "percentile",

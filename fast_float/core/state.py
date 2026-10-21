@@ -4,6 +4,8 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+from fast_float.core.perf_metrics import RequestAccumulator, RequestSample
+
 
 class AppState:
     """Shared application state containing runtime models, locks, and counters."""
@@ -50,6 +52,14 @@ class AppState:
             "total_postprocess_time": 0.0,
             "average_fps": 0.0,
         }
+        # Rolling window of per-request measurements (model fps, e2e fps, RTF,
+        # TTFF, latency percentiles, jitter, drops). Bounded, so a long-lived
+        # server does not grow it without limit.
+        self.perf_requests: RequestAccumulator = RequestAccumulator(maxlen=200)
+
+    def record_request_sample(self, sample: RequestSample) -> None:
+        """Add one finished request to the rolling performance window."""
+        self.perf_requests.add(sample)
 
     def initialize_runtime(self):
         """Initialize async primitives and executors."""

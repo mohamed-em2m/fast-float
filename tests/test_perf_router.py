@@ -8,6 +8,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from fast_float.core.perf_metrics import RequestAccumulator
 from fast_float.routers import perf
 
 
@@ -83,3 +84,24 @@ def test_benchmark_start_and_result(client, monkeypatch):
     assert body["status"] == "done"
     assert body["matrix"]["model_fps"] == 12.5
     assert body["elapsed_s"] is not None
+
+
+def test_requests_view_is_empty_before_any_request(client):
+    res = client.get("/perf/requests")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["count"] == 0
+    assert body["recent"] == []
+
+
+def test_requests_view_reports_the_rolling_window(client, monkeypatch):
+    from fast_float.core.perf_metrics import RequestSample
+
+    monkeypatch.setattr(perf.app_state, "perf_requests", RequestAccumulator(maxlen=10))
+    perf.app_state.perf_requests.add(RequestSample(frames=50, model_seconds=0.5, wall_seconds=1.0, target_fps=25.0))
+
+    body = client.get("/perf/requests").json()
+    assert body["count"] == 1
+    assert body["model_fps"]["p50"] == pytest.approx(100.0)
+    assert body["e2e_fps"]["p50"] == pytest.approx(50.0)
+    assert body["recent"][0]["frames"] == 50

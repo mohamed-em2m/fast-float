@@ -9,7 +9,7 @@ import {
   AlertTriangle,
   Signal,
 } from 'lucide-react';
-import { fetchPerfMatrix, startPerfBenchmark } from '../services/api';
+import { fetchPerfMatrix, fetchPerfRequests, startPerfBenchmark } from '../services/api';
 
 const POLL_MS = 3000;
 
@@ -39,14 +39,17 @@ function MetricRow({ icon: Icon, tone = 'text-cyan', label, value, hint }) {
 
 export default function PerfMatrixPanel({ onToast }) {
   const [state, setState] = useState(null);
+  const [requests, setRequests] = useState(null);
   const [busy, setBusy] = useState(false);
   const [levels, setLevels] = useState('1,4,8,16');
 
   useEffect(() => {
     let cancelled = false;
     const poll = async () => {
-      const next = await fetchPerfMatrix();
-      if (!cancelled && next) setState(next);
+      const [matrix, recent] = await Promise.all([fetchPerfMatrix(), fetchPerfRequests()]);
+      if (cancelled) return;
+      if (matrix) setState(matrix);
+      if (recent) setRequests(recent);
     };
     poll();
     const timer = setInterval(poll, POLL_MS);
@@ -90,6 +93,15 @@ export default function PerfMatrixPanel({ onToast }) {
   const perStreamUnderLoad = points.length
     ? points.map((point) => `${point.concurrency}: ${num(point.per_stream_fps, 1)}`).join('  ')
     : '--';
+
+  const requestCount = requests?.count || 0;
+  const recent = requests?.recent || [];
+  const dist = (key) => requests?.[key] || null;
+  const distPair = (key, digits = 1) => {
+    const d = dist(key);
+    if (!d || !d.count) return '--';
+    return `${num(d.p50, digits)} / ${num(d.p95, digits)}`;
+  };
 
   return (
     <div className="telemetry-section glass-panel perf-matrix-section">
@@ -264,6 +276,113 @@ export default function PerfMatrixPanel({ onToast }) {
           )}
         </>
       )}
+
+      {/* Rolling per-request view: what the box actually did, no synthetic load. */}
+      <div className="perf-sweep">
+        <h3 className="perf-subtitle">
+          Recent requests
+          <span className="perf-subtitle-note">
+            {requestCount ? `${requestCount} in the last ${requests?.window || 200}` : 'no requests yet'}
+          </span>
+        </h3>
+        {requestCount > 0 ? (
+          <>
+            <table className="perf-table">
+              <tbody>
+                <MetricRow
+                  icon={Activity}
+                  label="Model fps p50 / p95"
+                  value={distPair('model_fps', 2)}
+                  hint="across the window"
+                />
+                <MetricRow
+                  icon={Layers}
+                  tone="text-indigo"
+                  label="End-to-end fps p50 / p95"
+                  value={distPair('e2e_fps', 2)}
+                  hint="encode and write included"
+                />
+                <MetricRow
+                  icon={Signal}
+                  label="Real-time factor p50 / p95"
+                  value={distPair('rtf', 2)}
+                  hint="e2e fps / target fps"
+                />
+                <MetricRow
+                  icon={Timer}
+                  tone="text-indigo"
+                  label="Request time p50 / p95"
+                  value={`${num(dist('request_seconds')?.p50, 2)} / ${num(dist('request_seconds')?.p95, 2)} s`}
+                  hint="trigger to finished mp4"
+                />
+                <MetricRow
+                  icon={Timer}
+                  label="TTFF p50 / p95"
+                  value={distPair('ttff_ms', 0)}
+                  hint="live streams only"
+                />
+                <MetricRow
+                  icon={Signal}
+                  tone="text-indigo"
+                  label="Frame jitter p50 / p95"
+                  value={distPair('jitter_ms', 2)}
+                  hint="stddev of the delivery intervals"
+                />
+                <MetricRow
+                  icon={AlertTriangle}
+                  tone="text-amber"
+                  label="Dropped frames"
+                  value={`${requests?.dropped_total ?? 0} (${num((requests?.drop_ratio || 0) * 100, 3)}%)`}
+                  hint="over the window"
+                />
+              </tbody>
+            </table>
+
+            {recent.length > 0 && (
+              <table className="perf-table perf-sweep-table">
+                <thead>
+                  <tr>
+                    <th>finished</th>
+                    <th>frames</th>
+                    <th>model fps</th>
+                    <th>e2e fps</th>
+                    <th>rtf</th>
+                    <th>ttff</th>
+                    <th>dropped</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {recent
+                    .slice()
+                    .reverse()
+                    .map((sample) => (
+                      <tr key={sample.at}>
+                        <td className="perf-value">{new Date(sample.at * 1000).toLocaleTimeString()}</td>
+                        <td className="perf-value">{sample.frames}</td>
+                        <td className="perf-value">{num(sample.model_fps, 2)}</td>
+                        <td className="perf-value">{num(sample.e2e_fps, 2)}</td>
+                        <td className="perf-value">{num(sample.rtf, 2)}x</td>
+                        <td className="perf-value">
+                          {sample.ttff_ms === null || sample.ttff_ms === undefined
+                            ? '--'
+                            : `${num(sample.ttff_ms, 0)} ms`}
+                        </td>
+                        <td className="perf-value">{sample.dropped}</td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            )}
+          </>
+        ) : (
+          <div className="perf-notice">
+            <Signal size={14} />
+            <span>
+              The window fills itself with every finished request — no benchmark needed.
+            </span>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

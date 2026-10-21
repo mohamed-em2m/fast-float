@@ -9,6 +9,13 @@ from typing import Any
 
 import cv2
 
+from fast_float.core.perf_metrics import (
+    ENCODE_STAGES,
+    MODEL_STAGES,
+    LatencySummary,
+    RequestSample,
+    fold_stage_seconds,
+)
 from fast_float.core.state import app_state
 from fast_float.utils.chunking import (
     get_audio_duration_seconds,
@@ -236,7 +243,7 @@ async def generate_video(
         num_chunks = 1
 
         async with state.inference_lock:
-            with timing_run(f"request {request_id}"):
+            with timing_run(f"request {request_id}") as collector:
                 _apply_decode_batch_size(state, request_data)
                 if chunk_seconds > 0 and duration > chunk_seconds:
                     num_chunks, output_path = await _generate_chunked(
@@ -274,6 +281,9 @@ async def generate_video(
                         request_data,
                         dispatcher,
                     )
+                # Capture the stage split before the collector is reset: the
+                # model stages (ODE solve, encoders, decode) vs encode/mux.
+                stage_totals = collector.totals()
 
         timings["inference"] = time.time() - inference_start
         timings["total"] = time.time() - total_start_time
@@ -291,6 +301,27 @@ async def generate_video(
         stats["total_frames"] = stats.get("total_frames", 0) + frame_count
         if stats["total_inference_time"] > 0:
             stats["average_fps"] = stats["total_frames"] / stats["total_inference_time"]
+
+        # Rolling per-request sample: this is what feeds the "recent requests"
+        # half of the perf matrix in the UI.
+        clock = getattr(dispatcher, "clock", None) or getattr(getattr(dispatcher, "stream", None), "clock", None)
+        sample = RequestSample(
+            at=time.time(),
+            target_fps=float(fps or 25),
+            frames=frame_count,
+            model_seconds=fold_stage_seconds(stage_totals, MODEL_STAGES),
+            encode_seconds=fold_stage_seconds(stage_totals, ENCODE_STAGES),
+            wall_seconds=timings["inference"],
+            request_seconds=timings["total"],
+            preprocess_seconds=timings["preprocess"],
+            ttff_ms=clock.ttff_ms if clock is not None else None,
+            jitter_ms=clock.jitter_ms if clock is not None else None,
+            dropped=int(clock.dropped) if clock is not None else 0,
+            latency=clock.latency if clock is not None else LatencySummary(),
+        )
+        record = getattr(state, "record_request_sample", None)
+        if callable(record):
+            record(sample)
 
         state.set_progress(
             request_id,

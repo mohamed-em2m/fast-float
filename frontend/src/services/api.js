@@ -313,6 +313,25 @@ export async function fetchPerfMatrix() {
 }
 
 /**
+ * Fetch the rolling per-request view: distributions (p50/p95/p99) across the
+ * recent requests, plus the last few samples. Returns null when the backend
+ * does not answer.
+ */
+export async function fetchPerfRequests() {
+  try {
+    const res = await fetch(`${currentApiUrl}/perf/requests`);
+    if (!res.ok) {
+      logApiError('GET', '/perf/requests', null, res.status);
+      return null;
+    }
+    return await res.json();
+  } catch (err) {
+    logApiError('GET', '/perf/requests', err);
+    return null;
+  }
+}
+
+/**
  * Start a benchmark run on the backend. It holds the GPU (live requests queue
  * behind it), so the panel warns before the call. Returns the initial status.
  */

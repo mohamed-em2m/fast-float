@@ -107,6 +107,17 @@ async def perf_matrix() -> PerfMatrixResponse:
     return _snapshot()
 
 
+@router.get("/perf/requests")
+async def perf_requests() -> dict[str, Any]:
+    """The rolling per-request view: distributions across the recent requests.
+
+    Fed by every finished request (model fps, e2e fps, RTF, TTFF, latency
+    percentiles, jitter, drops). Unlike the benchmark sweep, this needs no
+    synthetic load - it is what the box actually did.
+    """
+    return app_state.perf_requests.summary()
+
+
 @router.post("/perf/benchmark", response_model=PerfMatrixResponse)
 async def start_benchmark(request: BenchmarkRequest) -> PerfMatrixResponse:
     """Start a benchmark run. Returns immediately; poll /perf/matrix."""

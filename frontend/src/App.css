@@ -1455,6 +1455,16 @@
   color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.06em;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.perf-subtitle-note {
+  font-size: 10.5px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-faint);
 }
 
 .perf-sweep-table th {

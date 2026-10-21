@@ -11,6 +11,8 @@ from fast_float.core.perf_metrics import (
     FrameClock,
     LatencySummary,
     PerfMatrix,
+    RequestAccumulator,
+    RequestSample,
     StreamMetrics,
     fold_stage_seconds,
     percentile,
@@ -154,6 +156,49 @@ def test_fold_stage_seconds_sums_only_the_named_stages():
     }
     assert fold_stage_seconds(totals, ("ode_solve", "decode")) == pytest.approx(3.0)
     assert fold_stage_seconds(totals, ("missing",)) == 0.0
+
+
+def test_request_sample_computes_fps_and_rtf():
+    sample = RequestSample(
+        frames=50,
+        model_seconds=0.5,
+        wall_seconds=1.0,
+        target_fps=25.0,
+    )
+    assert sample.model_fps == pytest.approx(100.0)
+    assert sample.e2e_fps == pytest.approx(50.0)
+    assert sample.rtf == pytest.approx(2.0)
+
+
+def test_request_accumulator_reports_percentiles_across_requests():
+    acc = RequestAccumulator(maxlen=5)
+    for i in range(1, 6):
+        acc.add(RequestSample(frames=50, model_seconds=1.0 / i, wall_seconds=1.0, target_fps=25.0))
+
+    summary = acc.summary()
+    assert summary["count"] == 5
+    assert summary["window"] == 5
+    assert summary["model_fps"]["p50"] == pytest.approx(150.0)  # sorted 50,100,150,200,250
+    assert summary["e2e_fps"]["p50"] == pytest.approx(50.0)
+    # every request had the same wall time, so the real-time factor is constant
+    assert summary["rtf"]["p50"] == pytest.approx(2.0)
+    assert summary["rtf"]["p95"] == pytest.approx(2.0)
+    assert len(summary["recent"]) == 5
+
+
+def test_request_accumulator_is_bounded():
+    acc = RequestAccumulator(maxlen=3)
+    for _ in range(10):
+        acc.add(RequestSample(frames=1, wall_seconds=1.0))
+    assert len(acc) == 3
+    assert acc.summary()["count"] == 3
+
+
+def test_request_accumulator_of_nothing_is_empty():
+    summary = RequestAccumulator().summary()
+    assert summary["count"] == 0
+    assert summary["model_fps"]["count"] == 0
+    assert summary["recent"] == []
 
 
 def test_timing_collector_exposes_stage_totals():
