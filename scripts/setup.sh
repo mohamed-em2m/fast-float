@@ -6,9 +6,13 @@
 # site-packages layout that never matched this project (it ships a python 3.10
 # venv), so it added nothing on any real box.
 
-set -e
-apt-get update
-apt-get install -y python3.10-dev build-essential
+# Policy of this script:
+#   * the environment build (uv -> venv -> deps -> ONNX stack) MUST succeed;
+#   * everything that only *enables* something (system packages, the optional
+#     codecs, the TensorRT layer, the checkpoint download) is best effort --
+#     a failure there must not abort the run and leave the box half-built.
+set -euo pipefail
+
 # Always resolve paths relative to the repo root (this script lives in scripts/)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -17,26 +21,67 @@ cd "${PROJECT_ROOT}"
 # Detect if running in Docker
 if [ "${IS_IT_RUN_IN_DOCKER:-}" = "true" ]; then
     echo "=== Running in Docker environment ==="
-    USE_SUDO=""
+elif [ "$(id -u)" -eq 0 ]; then
+    echo "=== Running as root ==="
 else
     echo "=== Running in local environment ==="
-    if command -v sudo >/dev/null 2>&1; then
-        USE_SUDO="sudo"
+fi
+
+# Run a command with root privileges -- apt needs them. Root runs it directly,
+# a normal user goes through sudo when sudo is available.
+run_as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
     else
-        USE_SUDO=""
+        "$@"
     fi
+}
+
+# Cache the sudo credential once (a timestamp) so the apt calls below ask for
+# the password a single time instead of once per package.
+if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+    sudo -v >/dev/null 2>&1 || true
 fi
 
 echo "=== Updating system packages ==="
-$USE_SUDO apt-get update -y
+# apt needs root. This block used to sit at the very top of the script, *before*
+# the sudo detection above, so on any normal (non-root) desktop it died with
+# "Could not open lock file /var/lib/apt/lists/lock - Permission denied" and
+# `set -e` aborted the whole setup before uv, the venv and the deps were even
+# touched. It also ran `apt-get update` twice (once here, once below).
+if ! run_as_root apt-get update -y; then
+    echo "⚠️ apt-get update failed — continuing (uv/pip do not need apt)."
+fi
 
 echo "=== Installing system dependencies ==="
-$USE_SUDO apt-get install -y python3.10 ffmpeg git wget curl
+# One package at a time: a single package the distro does not ship (e.g.
+# python3.10 on Ubuntu 24.04 without the deadsnakes PPA) would otherwise abort
+# the whole apt transaction and take ffmpeg/git/wget/curl down with it.
+install_system_pkg() {
+    local pkg="$1"
+    if ! run_as_root apt-get install -y "${pkg}"; then
+        echo "⚠️ could not install '${pkg}' — continuing."
+        return 0
+    fi
+}
+# ffmpeg: video encode/decode (NVENC + PyAV). git/wget/curl: tooling and the
+# uv/Node installers. build-essential + python3.10-dev: compiling a wheel that
+# has no prebuilt one (uv provisions its own interpreter when the system has
+# no python3.10, so these two are conveniences, not requirements).
+for pkg in ffmpeg git wget curl build-essential python3.10 python3.10-dev; do
+    install_system_pkg "${pkg}"
+done
 
 echo "=== Installing uv (package manager) ==="
+# uv installs into ~/.local/bin, which is not always on PATH: add it *before*
+# looking for uv so an existing installation is reused instead of re-downloaded
+# on every run.
+export PATH="${HOME}/.local/bin:${HOME}/.cargo/bin:${PATH}"
 if ! command -v uv >/dev/null 2>&1; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.local/bin:$PATH"
+    export PATH="${HOME}/.local/bin:${HOME}/.cargo/bin:${PATH}"
 fi
 echo "uv version: $(uv --version)"
 
@@ -48,7 +93,7 @@ echo "=== Ensuring Node for the Studio frontend (Vite 8 needs 20.19+/22.12+) ===
 # is missing or too old. Best effort -- a failure only disables the frontend
 # (run_all.sh re-checks and reports it), never the backend/ONNX pipeline.
 node_version_ok() {
-    local mm major minor
+    local mm="" major="" minor=""
     mm="$(node -p 'process.versions.node.split(".").slice(0,2).join(".")' 2>/dev/null)" || return 1
     major="${mm%%.*}"
     minor="${mm##*.}"
@@ -61,8 +106,11 @@ if command -v node >/dev/null 2>&1 && node_version_ok; then
     echo "found node $(node -v)"
 else
     echo "node $(node -v 2>/dev/null || echo '(missing)') is too old for Vite 8 -> installing Node 22"
-    if curl -fsSL https://deb.nodesource.com/setup_22.x | ${USE_SUDO} bash - \
-        && $USE_SUDO apt-get install -y nodejs; then
+    if curl -fsSL https://deb.nodesource.com/setup_22.x | run_as_root bash - \
+        && run_as_root apt-get install -y nodejs; then
+        # Drop the hashed path entry, otherwise bash keeps resolving the old
+        # binary and the version check below still sees Node 18.
+        hash -r
         echo "installed node $(node -v)"
     else
         echo "⚠️ Node upgrade failed — the frontend needs Node 20.19+/22.12+; the backend is unaffected."
@@ -84,13 +132,41 @@ fi
 
 echo "=== Syncing project environment (uv sync) ==="
 echo "--- Python comes from .python-version, deps from pyproject.toml + uv.lock ---"
+# The interpreter version is read from .python-version (the single source of
+# truth). `uv venv --python 3.10` hardcoded it, so the venv silently drifted
+# away from the file whenever the project moved to another patch release.
+REQUIRED_PY_VERSION="3.10"
+if [ -f "${PROJECT_ROOT}/.python-version" ]; then
+    _py_version="$(tr -d '[:space:]' < "${PROJECT_ROOT}/.python-version" 2>/dev/null || true)"
+    if [ -n "${_py_version}" ]; then
+        REQUIRED_PY_VERSION="${_py_version}"
+    fi
+fi
+echo "python version: ${REQUIRED_PY_VERSION}"
+
 # Reuse an existing venv: `--clear` used to wipe it on every run, forcing a fresh
 # ~7 GiB torch download plus a full re-extract of the layered ONNX/TensorRT
 # stack. On a box that is even moderately full the rebuild runs out of space
 # mid-way and leaves the env without TensorRT (or worse, without torch). Pass
 # --clear only when you really want a from-scratch environment.
+venv_python_version() {
+    [ -x "${1}" ] || return 1
+    "${1}" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null
+}
+if [ -x .venv/bin/python ]; then
+    _venv_py="$(venv_python_version .venv/bin/python || true)"
+    if [ "${_venv_py}" != "${REQUIRED_PY_VERSION}" ]; then
+        # Wrong interpreter: `uv sync` cannot satisfy requires-python with it,
+        # so the venv has to be rebuilt (torch et al. are re-installed by the
+        # `uv sync` below).
+        echo "existing .venv runs Python ${_venv_py:-?} but the project needs ${REQUIRED_PY_VERSION} -> recreating it"
+        # --force: the directory may be a half-written/corrupted venv, which
+        # uv refuses to clear without it.
+        uv venv --clear --force .venv --python "${REQUIRED_PY_VERSION}"
+    fi
+fi
 if [ ! -x .venv/bin/python ]; then
-    uv venv .venv --python 3.10
+    uv venv .venv --python "${REQUIRED_PY_VERSION}"
 fi
 # shellcheck source=/dev/null
 source .venv/bin/activate
@@ -229,13 +305,20 @@ except Exception as e:
     print("  onnxruntime import failed:", e)
 PY
 
-echo "=== Running checkpoint download script ==="
-chmod +x "${SCRIPT_DIR}/download_checkpoints.sh"
-"${SCRIPT_DIR}/download_checkpoints.sh"
-
 # TensorRT was installed above, together with the pinned ORT/onnx stack.
 
 echo "=== Creating results/checkpoints directories ==="
+# Before the download: a failed download must not leave the box without the
+# directories the app writes into.
 mkdir -p results checkpoints
+
+echo "=== Running checkpoint download script ==="
+chmod +x "${SCRIPT_DIR}/download_checkpoints.sh"
+# The weights live on the network (gdown / HuggingFace), so a flaky connection
+# must not throw away an environment that is otherwise set up: warn instead of
+# aborting, and let the user re-run scripts/download_checkpoints.sh.
+if ! "${SCRIPT_DIR}/download_checkpoints.sh"; then
+    echo "⚠️ checkpoint download failed — re-run scripts/download_checkpoints.sh when the network is back."
+fi
 
 echo "=== Setup completed successfully ==="
