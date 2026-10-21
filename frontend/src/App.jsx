@@ -5,6 +5,7 @@ import AudioEngine from './components/AudioEngine';
 import ParameterControls from './components/ParameterControls';
 import StudioStage from './components/StudioStage';
 import TelemetryDashboard from './components/TelemetryDashboard';
+import PerfMatrixPanel from './components/PerfMatrixPanel';
 import { generateVideo, blobToBase64, alignUrlToApi, fetchProgress } from './services/api';
 
 const DEFAULT_PORTRAIT = '/samples/portrait1.jpg';
@@ -204,6 +205,8 @@ export default function App() {
             latestResult={generationResult}
             history={history}
           />
+
+          <PerfMatrixPanel onToast={showToast} />
         </section>
       </main>
     </div>

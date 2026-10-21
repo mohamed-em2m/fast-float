@@ -293,6 +293,50 @@ export async function clearGpuMemory() {
   return await res.json();
 }
 
+/**
+ * Fetch the perf matrix: the speed/throughput + latency benchmark result.
+ * Returns { status, matrix, error, started_at, finished_at } or null when the
+ * backend does not answer (the panel then shows "no measurement yet").
+ */
+export async function fetchPerfMatrix() {
+  try {
+    const res = await fetch(`${currentApiUrl}/perf/matrix`);
+    if (!res.ok) {
+      logApiError('GET', '/perf/matrix', null, res.status);
+      return null;
+    }
+    return await res.json();
+  } catch (err) {
+    logApiError('GET', '/perf/matrix', err);
+    return null;
+  }
+}
+
+/**
+ * Start a benchmark run on the backend. It holds the GPU (live requests queue
+ * behind it), so the panel warns before the call. Returns the initial status.
+ */
+export async function startPerfBenchmark(options = {}) {
+  let res;
+  try {
+    res = await fetch(`${currentApiUrl}/perf/benchmark`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(options),
+    });
+  } catch (err) {
+    logApiError('POST', '/perf/benchmark', err);
+    throw new Error(`Cannot reach backend at ${currentApiUrl} — is it running?`);
+  }
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    const detail = errorData.detail || `Benchmark failed: ${res.status}`;
+    logApiError('POST', '/perf/benchmark', null, res.status);
+    throw new Error(detail);
+  }
+  return await res.json();
+}
+
 /** Generate talking portrait video */
 export async function generateVideo(payload) {
   // Probe first and send the POST exactly once to the reachable base —
