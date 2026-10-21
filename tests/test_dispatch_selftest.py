@@ -70,3 +70,40 @@ def test_self_test_can_be_skipped_for_benchmarks(monkeypatch):
 def test_selftest_env_parsing(monkeypatch, value, enabled):
     monkeypatch.setenv("FLOAT_SKIP_BACKEND_SELFTEST", value)
     assert dispatch._selftests_enabled() is enabled
+
+
+class _ProbeEnc(torch.nn.Module):
+    def forward(self, img, input_target=None, h_start=None):
+        b = img.shape[0]
+        return torch.zeros(b, 20), None, [torch.zeros(b, 8, 4, 4)]
+
+
+class _ProbeDec(torch.nn.Module):
+    def forward(self, latent, alpha=None, feats=None):
+        return torch.zeros(latent.shape[0], 3, 8, 8), None
+
+
+class _ProbeAE:
+    def __init__(self):
+        self.dec = _ProbeDec()
+        self.enc = _ProbeEnc()
+
+
+class _StubRunner:
+    batch = 1
+
+    def __init__(self, delta: float):
+        self.delta = delta
+
+    def __call__(self, latent, feats):
+        return torch.full((latent.shape[0], 3, 8, 8), self.delta)
+
+
+def test_decoder_selftest_rejects_a_frame_error_no_float_atol_would_notice():
+    # 0 -> 0.5 is 64 uint8 levels apart, yet it would pass the old
+    # image-space atol=1.0 gate.
+    assert dispatch._selftest_decoder(_ProbeAE(), _StubRunner(0.5), 8) is False
+
+
+def test_decoder_selftest_accepts_sub_lsb_drift():
+    assert dispatch._selftest_decoder(_ProbeAE(), _StubRunner(1e-4), 8) is True

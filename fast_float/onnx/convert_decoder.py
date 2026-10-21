@@ -27,7 +27,6 @@ import copy
 import os
 from collections import Counter
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,7 +39,7 @@ from fast_float.onnx.export import (
     export_module,
     make_session_from_args,
 )
-from fast_float.onnx.parity import benchmark, compare_outputs
+from fast_float.onnx.parity import U8_MAX_LSB, U8_MAX_MEAN_LSB, benchmark, compare_outputs, u8_lsb
 
 AE_PREFIX = "motion_autoencoder."
 
@@ -273,21 +272,8 @@ def _parse_batches(spec: str) -> list[int]:
 
 
 def _u8_lsb(ref, out) -> tuple[int, float]:
-    """Quantized-frame error: what the decode path actually writes.
-
-    ``_quantize_u8_hwc`` clamps to [-1, 1], scales by 127.5 and truncates, so a
-    sub-LSB float drift is invisible while a 4.4 drift is a broken face. Gating
-    here is meaningful at every precision; the old blanket ``fp16_tol`` (atol x
-    40) accepted any bounded output, which is how a decoder graph that was off
-    by 4.375 passed as "max_abs=4.375 cosine=0.98".
-    """
-
-    def q(x):
-        arr = np.asarray(x.detach().cpu() if torch.is_tensor(x) else x, dtype=np.float32)
-        return np.clip((arr + 1.0) * 127.5, 0.0, 255.0).astype(np.uint8)
-
-    d = np.abs(q(ref).astype(np.int16) - q(out).astype(np.int16))
-    return int(d.max()), float(d.mean())
+    """Quantized-frame error (see :func:`fast_float.onnx.parity.u8_lsb`)."""
+    return u8_lsb(ref, out)
 
 
 def _measure(dec_raw, sess, lat_t, feats_b, feed) -> dict:
@@ -431,8 +417,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # the video shows. 2 LSB max / 0.5 LSB mean is invisible on a 512x512 frame
     # and fails a structurally wrong graph (the broken TensorRT engine measured
     # max_abs=4.375, cosine=0.983 while "passing" atol=40).
-    ap.add_argument("--max-lsb", type=int, default=2, help="max uint8 frame error vs eager torch")
-    ap.add_argument("--max-mean-lsb", type=float, default=0.5, help="mean uint8 frame error vs eager torch")
+    ap.add_argument("--max-lsb", type=int, default=U8_MAX_LSB, help="max uint8 frame error vs eager torch")
+    ap.add_argument("--max-mean-lsb", type=float, default=U8_MAX_MEAN_LSB, help="mean uint8 frame error vs eager torch")
     ap.add_argument("--skip-parity", action="store_true")
     ap.add_argument("--bench-iters", type=int, default=10)
     ap.add_argument(

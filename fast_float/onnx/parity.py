@@ -4,6 +4,33 @@ from __future__ import annotations
 
 import numpy as np
 
+# Deployed-frame gate for the decoder: at 512x512, 2 LSB max / 0.5 LSB mean is
+# invisible on screen, while a structurally wrong graph (the TRT engine measured
+# max_abs=4.375, cosine=0.983) is not. Shared by the exporter and the runtime
+# install self-test so both judge the same thing.
+U8_MAX_LSB = 2
+U8_MAX_MEAN_LSB = 0.5
+
+
+def u8_lsb(ref, out) -> tuple[int, float]:
+    """Quantized-frame error: what the decode path actually writes.
+
+    ``_quantize_u8_hwc`` clamps to [-1, 1], scales by 127.5 and truncates, so a
+    sub-LSB float drift is invisible while a 4.4 drift is a broken face. Gating
+    here is meaningful at every precision; a float-space ``atol`` (40x for TRT
+    FP16) accepts any bounded output, which is how a decoder graph that was off
+    by 4.375 passed as "max_abs=4.375 cosine=0.98".
+    """
+
+    def q(x):
+        import torch
+
+        arr = np.asarray(x.detach().cpu() if torch.is_tensor(x) else x, dtype=np.float32)
+        return np.clip((arr + 1.0) * 127.5, 0.0, 255.0).astype(np.uint8)
+
+    d = np.abs(q(ref).astype(np.int16) - q(out).astype(np.int16))
+    return int(d.max()), float(d.mean())
+
 
 def _to_numpy(x) -> np.ndarray:
     import torch
@@ -23,20 +50,22 @@ def compare_outputs(
 ) -> dict[str, float]:
     """Compare two outputs. Returns metrics dict with an ``ok`` flag.
 
-    ``min_cosine``/``max_mean`` add a *functional-equivalence* branch for the
-    TensorRT FP16 path: an output that misses the elementwise gate still passes
-    when it is the same map (``cosine >= min_cosine`` and ``mean_abs <=
-    max_mean``). TRT FP16 rounds every accumulation in a deep stack, so on
-    bounded outputs (probability vectors, conv feature maps) a tight
-    elementwise gate measures FP16 rounding, not export correctness. The
-    decoder has relied on this branch since the first TRT run; pass ``None``
-    (the default) to keep the strict elementwise gate only.
+    ``min_cosine``/``max_mean`` are *hard floors*, not alternatives to the
+    elementwise gate: an output passes only when every floor that was supplied
+    holds. They let the TensorRT FP16 path pass on the functional branch when
+    the elementwise gate is too strict for absolute rounding drift (probability
+    vectors, conv feature maps), but they can never be skipped by a loose
+    ``atol``. That is exactly how a decoder graph off by 4.375 with cosine
+    0.9829 was reported as "PASS (atol=40)": the old code ORed the branches and
+    the cosine floor was never evaluated.
     """
     a, b = _to_numpy(a), _to_numpy(b)
     if a.shape != b.shape:
         return {
             "ok": False,
             "elementwise_ok": False,
+            "cosine_ok": False,
+            "mean_ok": False,
             "reason": f"shape mismatch torch={a.shape} onnx={b.shape}",
             "max_abs": float("inf"),
             "mean_abs": float("inf"),
@@ -45,19 +74,48 @@ def compare_outputs(
         }
     abs_diff = np.abs(a - b)
     denom = np.maximum(np.abs(b), 1e-12)
-    ok = bool(np.allclose(a, b, atol=atol, rtol=rtol))
     na, nb = np.linalg.norm(a.ravel()), np.linalg.norm(b.ravel())
     cosine = float(np.dot(a.ravel(), b.ravel()) / (na * nb + 1e-12))
     mean_abs = float(abs_diff.mean())
-    functional = min_cosine is not None and max_mean is not None and cosine >= min_cosine and mean_abs <= max_mean
+    elementwise_ok = bool(np.allclose(a, b, atol=atol, rtol=rtol))
+    cosine_ok = min_cosine is None or cosine >= min_cosine
+    mean_ok = max_mean is None or mean_abs <= max_mean
+    has_floor = min_cosine is not None or max_mean is not None
+    functional_ok = has_floor and cosine_ok and mean_ok
     return {
-        "ok": bool(ok or functional),
-        "elementwise_ok": ok,
+        "ok": bool((elementwise_ok or functional_ok) and cosine_ok and mean_ok),
+        "elementwise_ok": elementwise_ok,
+        "cosine_ok": bool(cosine_ok),
+        "mean_ok": bool(mean_ok),
         "max_abs": float(abs_diff.max()),
         "mean_abs": mean_abs,
         "max_rel": float((abs_diff / denom).max()),
         "cosine": cosine,
     }
+
+
+def is_significant(
+    candidate_ms: float,
+    candidate_mad: float,
+    baseline_ms: float,
+    baseline_mad: float,
+    min_gain: float = 1.10,
+    spread_factor: float = 3.0,
+) -> bool:
+    """Is ``candidate_ms`` a real win over ``baseline_ms``?
+
+    A speedup must clear two bars: the configured ``min_gain`` *and* more than
+    ``spread_factor`` times the run-to-run spread (median absolute deviation)
+    of both measurements. Without the second bar a 1.05x "win" inside a 2-3%
+    jitter band reselects a backend every run -- the refenc case, where
+    ``torch.compile`` was picked at 1.05x and paid a guard/recompile storm for
+    nothing.
+    """
+    if candidate_ms <= 0 or baseline_ms <= 0:
+        return False
+    if candidate_ms * min_gain >= baseline_ms:
+        return False
+    return (baseline_ms - candidate_ms) > spread_factor * max(candidate_mad, baseline_mad)
 
 
 def check_parity(

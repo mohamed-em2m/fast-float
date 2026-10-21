@@ -9,8 +9,10 @@ exported, then measures, on identical inputs at the deployed dtype:
   * ``onnx``    -- the exported graph on the ORT session (TRT -> CUDA -> CPU)
 
 Every accelerated candidate is parity-gated against eager, then the fastest
-candidate that beats eager by ``--min-gain`` wins. The result is written to a
-config YAML consumed at runtime by :mod:`fast_float.onnx.backends`.
+candidate that beats eager by ``--min-gain`` *and* by more than three times the
+run-to-run spread wins (see :func:`fast_float.onnx.parity.is_significant`). The
+result is written to a config YAML consumed at runtime by
+:mod:`fast_float.onnx.backends`.
 
 Note on composition: isolated per-component medians are a *pre-filter*, not the
 whole answer -- device round-trips and lost fusion mean a component that looks
@@ -52,7 +54,7 @@ from fast_float.onnx.backends import (
     save_backends,
 )
 from fast_float.onnx.export import FP16_MAX_MEAN, FP16_MIN_COSINE, fp16_tol
-from fast_float.onnx.parity import compare_outputs
+from fast_float.onnx.parity import compare_outputs, is_significant
 
 ONNX_FILES = {
     "emotion": "emotion_v1.onnx",
@@ -277,7 +279,13 @@ BUILDERS: dict[str, Callable] = {
 # --------------------------------------------------------------------------- #
 
 
-def _median_ms(fn, iters: int, warmup: int) -> float:
+def _median_ms(fn, iters: int, warmup: int) -> tuple[float, float]:
+    """Warmed median latency and its median absolute deviation, in ms.
+
+    The spread rides along so the selector can tell a real win from jitter
+    (see ``parity.is_significant``): a median alone hides that a 1.05x "win"
+    is inside the noise band.
+    """
     for _ in range(max(0, warmup)):
         fn()
     if torch.cuda.is_available():
@@ -290,7 +298,9 @@ def _median_ms(fn, iters: int, warmup: int) -> float:
             torch.cuda.synchronize()
         ts.append((time.perf_counter() - t0) * 1000.0)
     ts.sort()
-    return ts[len(ts) // 2]
+    med = ts[len(ts) // 2]
+    mad = sorted(abs(t - med) for t in ts)[len(ts) // 2]
+    return med, mad
 
 
 def _provider_label(providers) -> str | None:
@@ -353,8 +363,9 @@ def _round(metrics: dict[str, Any]) -> dict[str, Any]:
 
 def _select_component(name, case, args, builder, device, env=None) -> tuple[ComponentConfig, float, float]:
     metrics: dict[str, Any] = {}
-    eager_ms = _median_ms(lambda: case.module(*case.inputs), args.iters, args.warmup)
+    eager_ms, eager_mad = _median_ms(lambda: case.module(*case.inputs), args.iters, args.warmup)
     metrics["eager_ms"] = eager_ms
+    metrics["eager_mad_ms"] = eager_mad
     onnx_path = Path(args.onnx_dir) / ONNX_FILES[name]
 
     spec = BuildSpec(
@@ -373,7 +384,7 @@ def _select_component(name, case, args, builder, device, env=None) -> tuple[Comp
         extra={"out_path": str(onnx_path)},
     )
 
-    best_mode, best_provider, best_ms = "eager", None, eager_ms
+    best_mode, best_provider, best_ms, best_mad = "eager", None, eager_ms, eager_mad
 
     if not args.no_compile and hasattr(torch, "compile"):
         try:
@@ -381,11 +392,12 @@ def _select_component(name, case, args, builder, device, env=None) -> tuple[Comp
             t0 = time.perf_counter()
             compiled(*case.inputs)
             compile_s = time.perf_counter() - t0
-            cms = _median_ms(lambda: compiled(*case.inputs), args.iters, args.warmup)
+            cms, cmad = _median_ms(lambda: compiled(*case.inputs), args.iters, args.warmup)
             metrics["compile_ms"] = cms
+            metrics["compile_mad_ms"] = cmad
             metrics["compile_s"] = round(compile_s, 3)
-            if cms * args.min_gain < best_ms:
-                best_mode, best_provider, best_ms = "compile", None, cms
+            if is_significant(cms, cmad, best_ms, best_mad, args.min_gain):
+                best_mode, best_provider, best_ms, best_mad = "compile", None, cms, cmad
         except Exception as e:
             metrics["compile_error"] = f"{type(e).__name__}: {e}"
             print(f"[select:{name}] compile FAILED: {e}")
@@ -398,9 +410,10 @@ def _select_component(name, case, args, builder, device, env=None) -> tuple[Comp
             par = _parity(case, runtime, fp16)
             metrics["onnx_parity"] = _round(par)
             if par["ok"]:
-                oms = _median_ms(lambda: runtime(*case.inputs), args.iters, args.warmup)
+                oms, omad = _median_ms(lambda: runtime(*case.inputs), args.iters, args.warmup)
                 provider = _provider_label(providers)
                 metrics["onnx_ms"] = oms
+                metrics["onnx_mad_ms"] = omad
                 metrics["onnx_provider"] = provider
                 metrics["onnx_providers"] = providers
                 builder.record(
@@ -415,8 +428,8 @@ def _select_component(name, case, args, builder, device, env=None) -> tuple[Comp
                         parity=par,
                     )
                 )
-                if oms * args.min_gain < best_ms:
-                    best_mode, best_provider, best_ms = "onnx", provider, oms
+                if is_significant(oms, omad, best_ms, best_mad, args.min_gain):
+                    best_mode, best_provider, best_ms, best_mad = "onnx", provider, oms, omad
             else:
                 metrics["onnx_reason"] = "parity failed"
         except Exception as e:
@@ -426,9 +439,12 @@ def _select_component(name, case, args, builder, device, env=None) -> tuple[Comp
     speedup = eager_ms / max(best_ms, 1e-9)
     reason = None
     if best_mode == "eager":
-        reason = f"no candidate beat eager by {args.min_gain:.2f}x"
+        reason = f"no candidate beat eager by {args.min_gain:.2f}x outside the noise band"
     label = f"{best_mode}/{best_provider}" if best_provider else best_mode
-    print(f"[select:{name}] eager={eager_ms:.2f}ms -> {label} ({best_ms:.2f}ms, {speedup:.2f}x)")
+    print(
+        f"[select:{name}] eager={eager_ms:.2f}ms±{eager_mad:.2f} -> {label} "
+        f"({best_ms:.2f}ms±{best_mad:.2f}, {speedup:.2f}x)"
+    )
 
     cfg = ComponentConfig(
         name=name,
@@ -461,18 +477,21 @@ def _select_global(args, device) -> dict[str, Any] | None:
     try:
         gen, inputs = _build_generator(args, device)
         with torch.no_grad():
-            eager_ms = _median_ms(lambda: gen(*inputs), args.iters, args.warmup)
+            eager_ms, eager_mad = _median_ms(lambda: gen(*inputs), args.iters, args.warmup)
             compiled = torch.compile(gen, mode=args.compile_mode)
             t0 = time.perf_counter()
             compiled(*inputs)
             compile_s = time.perf_counter() - t0
-            cms = _median_ms(lambda: compiled(*inputs), args.iters, args.warmup)
+            cms, cmad = _median_ms(lambda: compiled(*inputs), args.iters, args.warmup)
         return {
             "kind": "global_generator",
             "eager_ms": eager_ms,
+            "eager_mad_ms": eager_mad,
             "compile_ms": cms,
+            "compile_mad_ms": cmad,
             "compile_s": round(compile_s, 3),
             "speedup": eager_ms / max(cms, 1e-9),
+            "significant": is_significant(cms, cmad, eager_ms, eager_mad, args.min_gain),
         }
     except Exception as e:
         print(f"[select:global] global compile FAILED: {e}")
@@ -599,9 +618,10 @@ def main(argv=None) -> int:
     if glob:
         print(f"[select:global] {glob}")
         # Advisory heuristic: a whole-Generator compile win promotes the two
-        # components it fuses, when they were left eager.
+        # components it fuses, when they were left eager. Same significance bar
+        # as per-component selection, so a jitter-sized win cannot flip it.
         if (
-            glob.get("speedup", 1.0) >= args.min_gain
+            glob.get("significant", False)
             and components.get("refenc", ComponentConfig("refenc")).mode == "eager"
             and components.get("decoder", ComponentConfig("decoder")).mode == "eager"
         ):

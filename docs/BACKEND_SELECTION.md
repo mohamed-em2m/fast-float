@@ -44,7 +44,8 @@ CUDA 12 sonames ORT needs come from torch's own `nvidia-*-cu12` deps. On the
 same T4 that means **both** the CUDA EP and the TensorRT EP load, all six units
 export and pass parity under **TRT FP16**, and `trt` is a real candidate again.
 `emotion`, `refenc`, `audio` and `fmt` need parity's functional-equivalence branch
-(cosine + bounded mean error) because their outputs are bounded/small-magnitude,
+(cosine + bounded mean error as **hard floors**, so a loose `atol` cannot skip
+them) because their outputs are bounded/small-magnitude,
 where FP16 drift is absolute — see `AGENT.md` §6.
 
 ## Components
@@ -111,14 +112,16 @@ defaults to all-`eager` when the YAML is missing/unreadable.
 ```bash
 python -m fast_float.onnx.select_backends \
     --onnx-dir ./onnx --out ./onnx/backends.generated.yaml \
-    [--hot-only] [--iters 30] [--min-gain 1.03] [--compile-mode default] \
+    [--hot-only] [--iters 30] [--min-gain 1.10] [--compile-mode default] \
     [--no-compile] [--no-onnx] [--no-global] [--dry-run] ${ORT_ARGS}
 ```
 
 - `--dry-run` writes the safe all-eager config + env fingerprint only (no model
   construction) — works on a CPU-only box.
 - A candidate is chosen only if it parity-passes and beats eager by
-  `--min-gain` (default 3%); otherwise the component stays `eager`.
+  `--min-gain` (default 10%) *and* by more than three times the measured
+  run-to-run spread (MAD); otherwise the component stays `eager`. A 3% gain
+  is inside the jitter band and used to reselect `torch.compile` every run.
 - The whole-`Generator` compile probe is recorded under `e2e` as advisory; a
   true end-to-end objective is still validated by the app's own bench (the
   isolated medians here do **not** compose — see above).

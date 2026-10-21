@@ -35,7 +35,7 @@ import os
 import torch
 
 from fast_float.onnx.backends import resolve_mode, resolve_use_trt
-from fast_float.onnx.parity import compare_outputs
+from fast_float.onnx.parity import U8_MAX_LSB, U8_MAX_MEAN_LSB, compare_outputs, u8_lsb
 from fast_float.onnx.registry import get as component_spec
 from fast_float.onnx.registry import post_load
 from fast_float.runtimes.dynamo.compiled import CompiledRuntime
@@ -130,7 +130,15 @@ def _selftest_decoder(ae, runner, image_size: int) -> bool:
     with torch.no_grad():
         ref = dec(lat, alpha=None, feats=feats)
         ref = ref[0] if isinstance(ref, (tuple, list)) else ref
-    return _cosine_ok(ref, runner(lat, feats), "decoder")
+        got = runner(lat, feats)
+    # Gate in the deployed uint8 frame domain. The old image-space gate
+    # (atol=1.0 on a [-1, 1] tensor, i.e. half the range) accepted a graph off
+    # by 4.375; 2 LSB is invisible on screen and fails a broken graph.
+    max_lsb, mean_lsb = u8_lsb(ref, got)
+    cosine = compare_outputs(ref, got)["cosine"]
+    ok = max_lsb <= U8_MAX_LSB and mean_lsb <= U8_MAX_MEAN_LSB
+    print(f"[backends:decoder] self-test max_lsb={max_lsb} mean_lsb={mean_lsb:.2f} cosine={cosine:.6f} ok={ok}")
+    return ok
 
 
 # --------------------------------------------------------------------------- #
