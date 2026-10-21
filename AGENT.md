@@ -348,6 +348,50 @@ uv run python fast_float/interfaces/gradio_interface.py
 uv run python fast_float/interfaces/float_live_app.py
 ```
 
+### 5. Convert to ONNX (on the target box)
+
+```bash
+# One command: weights -> deps -> TensorRT probe -> all six units -> selector.
+# The selector writes onnx/backends.generated.yaml (read at runtime).
+./scripts/convert_to_onnx.sh
+
+# Per unit (same converter, one artifact):
+./scripts/convert_fmt_to_onnx.sh          # -> onnx/fmt_step_v1.onnx
+./scripts/convert_wav2vec_to_onnx.sh      # -> onnx/wav2vec_v1.onnx
+
+# Env overrides: OUT_DIR, FMT_OUT, W2V_OUT, DEC_OUT, REF_OUT, EMO_OUT, CKPT,
+# EMO_DIR, W2V_DIR, DEC_BATCH, DEC_BATCHES, W2V_SECONDS,
+# ORT_ARGS (e.g. "--no-trt" / "--trt-fp32" / "--trt-max-batch 16"), SKIP_SELECT=1
+```
+
+In order: download the weights (float.pth via gdown, the two HF models),
+verify/repair the pinned ONNX stack, probe the TensorRT EP (installing
+TensorRT 10.9 if it is missing), run the six converters **independently**
+(one failure never stops the others), then run the per-component selector.
+Exit code 1 means at least one unit failed; the selector is skipped then and
+the runtime keeps the committed all-eager config. TensorRT engines are cached
+under `onnx/trt_cache/` — that cache is tied to the GPU and the TRT/CUDA
+versions, so delete it after either changes.
+
+**Every unit is gated before it is shipped.** A converter exports, then
+compares the artifact against the torch model and refuses to pass a graph that
+does not reproduce it (§8.6): a unit that cannot prove its graph fails, it
+does not ship a "probably fine" artifact. The two rules that decide whether a
+gate means anything:
+
+- compare against the **deployed** model, never against the module that was
+  traced (that blindness once shipped an FMT graph that was a different
+  model — see §8.6);
+- compare **the same computation on both sides**: the exporter pins both to
+  fp32, because TF32 alone moves a deep conv stack by tens of uint8 LSB.
+
+Two CLI renames bite in the weights step and are handled by the shared
+helpers in `scripts/_onnx_env.sh` (`gdown_download`, `hf_download`): gdown 6
+dropped the `--id` flag (the file id is positional now) and huggingface_hub
+1.0 renamed the CLI from `huggingface-cli` to `hf`. The helpers probe both
+spellings and fall back to the Python API, so a fresh env cannot abort the
+run.
+
 ---
 
 ## 7. API Reference
@@ -443,11 +487,18 @@ When editing or extending the codebase, follow these design patterns:
   `OptimizedInferenceAgent` right after the checkpoint loads, before the global
   optimisation pass). `FLOAT_DISABLE_BACKENDS=1` disables the whole pass;
   `FLOAT_MODE_<COMPONENT>` force-overrides one component (debug).
-- **No automatic runtime self-test or fallback** — parity/selection is validated
-  by the converter/selector scripts only (`python -m fast_float.onnx.select_backends`).
-  ORT providers (`trt → cuda → cpu`) fall back *inside* session creation.
-- **The `decoder` graph is static-batch, so it ships as a set.**
-  Each artifact is valid for exactly one `B`.
+- **Parity is validated by the converter/selector scripts** (`python -m fast_float.onnx.select_backends`),
+  **plus a one-shot self-test when a component is installed** at runtime: the
+  graph is only as good as the execution provider that loads it, and the
+  provider is chosen at runtime, not at export time. `apply_backends` probes
+  the components it substitutes (`direction`, `refenc`, `decoder`) against the
+  torch model, and `fmt` — which wires itself in its constructor, before the
+  checkpoint is loaded — in the same pass, once the weights are there. A graph
+  that does not reproduce the torch model is dropped and the component stays
+  `eager`. `FLOAT_SKIP_BACKEND_SELFTEST=1` skips the probes. ORT providers
+  (`trt → cuda → cpu`) fall back *inside* session creation.
+- **The `decoder` graph is static-batch, so it ships as a set.** Each artifact
+  is valid for exactly one `B`.
   `convert_decoder.py --batches 1,2,4,8,16` writes the
   primary `--batch` (default 8, matching the selector's `--dec-batch`) to `--out`
   and the rest to `<stem>_b<N>.onnx` siblings. `DecoderOnnx`
@@ -509,6 +560,12 @@ When editing or extending the codebase, follow these design patterns:
   FP16_MAX_MEAN`, the vector field is small-magnitude so the drift is
   absolute) — and dropped (component stays eager) when it does not reproduce
   the torch model. The wrong artifact scores cosine 0.958 and is rejected.
+- **A converter must not wire a runtime backend into the model it exports.**
+  `FlowMatchingTransformer` self-wires an ONNX backend in its constructor when
+  the config says `onnx` and the artifact exists — so the converter loaded
+  (and built a TensorRT engine for) the very artifact it was about to replace,
+  and the model could no longer be deep-copied for the parity snapshot. The
+  converter's builder passes `fmt_onnx_path=None` for that reason.
 - **A batch-shared scalar input must stay static.** `fmt` takes one scalar time
   value `t` (`torch.tensor([t_val])`, shape `[1]`, broadcast over the batch
   *inside* the graph) — it is not a batch-first tensor. `export_module` used to

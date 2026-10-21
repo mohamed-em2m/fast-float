@@ -3,10 +3,24 @@
 Strategy: dynamo export via torch.export (symbolic batch/length), no
 torchscript fallback. ``torch.export`` + ``torch.onnx.export(ExportedProgram)``
 is the modern flow: it decomposes SDPA/LayerNorm/diag_embed natively and
-marks dynamic dims symbolically. Converters keep their export-safe
-substitutions (manual attention, plain norm, matmul reformulation) — all
-dynamo-safe and equivalence-proven — plus static-batch modconv freezing,
-which stays because ONNX Conv ``group`` is static regardless of exporter.
+marks dynamic dims symbolically.
+
+**The exported graph must be the model the application runs.** A converter may
+still substitute an export-safe formulation (a matmul reformulation, a plain
+norm), but a substitution is only safe while it is *equivalent* -- and the
+equivalence has to be proven, not assumed: the FMT export once substituted a
+manual attention branch with an inverted mask, and the resulting graph was a
+different model (per-step cosine 0.94) that passed every gate, because the
+gate compared the graph against the very module it had traced. So:
+
+* export the deployed formulation wherever the exporter can take it (the FMT
+  attention, the decoder's dense modulated convs -- no ``groups=batch``
+  substitute: the ORT CUDA EP serves grouped convs only through a fallback
+  kernel that drifts ~90 uint8 LSB and is not reproducible);
+* gate the artifact against a snapshot of the **deployed** model, never
+  against the module that was traced;
+* compare the same computation on both sides (see ``use_tf32`` in
+  :func:`make_ort_session`).
 """
 
 from __future__ import annotations
