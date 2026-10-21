@@ -1,3 +1,12 @@
+"""styledecoder.py - StyleGAN2-based talking portrait decoder for FLOAT.
+
+Contains high-performance inference implementations for StyleDecoder modules,
+eliminating grouped convolutions (groups=batch), using separable depthwise FIR
+filtering, commuted last-level feature warping, and precomputed orthonormal bases.
+"""
+
+from __future__ import annotations
+
 import math
 
 import torch
@@ -9,13 +18,19 @@ from torch.nn import functional as F
 # ============================================================================
 
 
+def _hp(t: torch.Tensor) -> torch.Tensor:
+    """Detached copy at >= fp32 precision (keeps float64 as float64)."""
+    t = t.detach().clone()
+    return t.float() if t.dtype in (torch.float16, torch.bfloat16) else t
+
+
 def fused_leaky_relu(input, bias, negative_slope=0.2, scale=2**0.5):
-    """Supports both single and batched inputs via broadcasting"""
+    """Supports both single and batched inputs via broadcasting."""
     return F.leaky_relu(input + bias, negative_slope) * scale
 
 
 def upfirdn2d_native(input, kernel, up_x, up_y, down_x, down_y, pad_x0, pad_x1, pad_y0, pad_y1):
-    """Already supports batched inputs naturally"""
+    """Fallback native implementation of upfirdn2d."""
     _, minor, in_h, in_w = input.shape
     kernel_h, kernel_w = kernel.shape
     out = input.view(-1, minor, in_h, 1, in_w, 1)
@@ -41,12 +56,12 @@ def upfirdn2d_native(input, kernel, up_x, up_y, down_x, down_y, pad_x0, pad_x1, 
 
 
 def upfirdn2d(input, kernel, up=1, down=1, pad=(0, 0)):
-    """Already supports batched inputs"""
+    """Batched upfirdn2d wrapper."""
     return upfirdn2d_native(input, kernel, up, up, down, down, pad[0], pad[1], pad[0], pad[1])
 
 
 def make_kernel(k):
-    """Kernel creation - no batching needed"""
+    """Kernel creation helper."""
     k = torch.tensor(k, dtype=torch.float32)
     if k.ndim == 1:
         k = k[None, :] * k[:, None]
@@ -54,8 +69,20 @@ def make_kernel(k):
     return k
 
 
+def _identity_grid(h: int, w: int, device=None, dtype=torch.float32) -> torch.Tensor:
+    """Normalized [1, H, W, 2] sampling grid for grid_sample."""
+    if isinstance(device, torch.dtype):
+        dtype, device = device, None
+    grid_y, grid_x = torch.meshgrid(
+        torch.linspace(-1, 1, h, device=device, dtype=dtype),
+        torch.linspace(-1, 1, w, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    return torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+
+
 # ============================================================================
-# LEVEL 2: Basic modules (already batch-compatible)
+# LEVEL 2: Basic modules (FIR & normalization)
 # ============================================================================
 
 
@@ -67,7 +94,6 @@ class FusedLeakyReLU(nn.Module):
         self.scale = scale
 
     def forward(self, input):
-        """Already batch-compatible via broadcasting"""
         return fused_leaky_relu(input, self.bias, self.negative_slope, self.scale)
 
 
@@ -76,7 +102,6 @@ class PixelNorm(nn.Module):
         super().__init__()
 
     def forward(self, input):
-        """Already batch-compatible"""
         return input * torch.rsqrt(torch.mean(input**2, dim=1, keepdim=True) + 1e-8)
 
 
@@ -85,8 +110,94 @@ class MotionPixelNorm(nn.Module):
         super().__init__()
 
     def forward(self, input):
-        """Already batch-compatible"""
         return input * torch.rsqrt(torch.mean(input**2, dim=2, keepdim=True) + 1e-8)
+
+
+class FIRBlur(nn.Module):
+    """Depthwise conv FIR blur (separable 1D convs when possible)."""
+
+    def __init__(self, kernel2d: torch.Tensor, pad):
+        super().__init__()
+        p0, p1 = pad
+        assert p0 >= 0, "negative padding is not supported"
+        assert p1 >= 0, "negative padding is not supported"
+        self.pad = (int(p0), int(p1))
+        flipped = torch.flip(_hp(kernel2d), [0, 1])
+        u, s, vh = torch.linalg.svd(flipped)
+        self.separable = bool(s.numel() < 2 or s[1:].max() <= 1e-6 * s[0])
+        if self.separable:
+            root = s[0].sqrt()
+            self.register_buffer("k_col", (u[:, 0] * root).view(1, 1, -1, 1).contiguous(), persistent=False)
+            self.register_buffer("k_row", (vh[0] * root).view(1, 1, 1, -1).contiguous(), persistent=False)
+        else:
+            self.register_buffer("k2d", flipped.view(1, 1, *flipped.shape).contiguous(), persistent=False)
+
+    def forward(self, x):
+        c = x.shape[1]
+        p0, p1 = self.pad
+        x = F.pad(x, (p0, p1, p0, p1))
+        if self.separable:
+            k_row = self.k_row.to(dtype=x.dtype, device=x.device)
+            k_col = self.k_col.to(dtype=x.dtype, device=x.device)
+            x = F.conv2d(x, k_row.expand(c, 1, 1, -1), groups=c)
+            return F.conv2d(x, k_col.expand(c, 1, -1, 1), groups=c)
+        k2d = self.k2d.to(dtype=x.dtype, device=x.device)
+        return F.conv2d(x, k2d.expand(c, 1, -1, -1), groups=c)
+
+
+class Blur(nn.Module):
+    def __init__(self, kernel, pad, upsample_factor=1):
+        super().__init__()
+        kernel = make_kernel(kernel)
+        if upsample_factor > 1:
+            kernel = kernel * (upsample_factor**2)
+        self.register_buffer("kernel", kernel)
+        self.pad = pad
+        p0, p1 = pad
+        assert p0 >= 0, "negative padding is not supported"
+        assert p1 >= 0, "negative padding is not supported"
+        flipped = torch.flip(kernel.detach().float(), [0, 1])
+        u, s, vh = torch.linalg.svd(flipped)
+        self.separable = bool(s.numel() < 2 or s[1:].max() <= 1e-6 * s[0])
+        if self.separable:
+            root = s[0].sqrt()
+            self.register_buffer("k_col", (u[:, 0] * root).view(1, 1, -1, 1).contiguous(), persistent=False)
+            self.register_buffer("k_row", (vh[0] * root).view(1, 1, 1, -1).contiguous(), persistent=False)
+        else:
+            self.register_buffer("k2d", flipped.view(1, 1, *flipped.shape).contiguous(), persistent=False)
+
+    def forward(self, input):
+        c = input.shape[1]
+        p0, p1 = self.pad
+        x = F.pad(input, (p0, p1, p0, p1))
+        if self.separable:
+            k_row = self.k_row.to(dtype=x.dtype, device=x.device)
+            k_col = self.k_col.to(dtype=x.dtype, device=x.device)
+            x = F.conv2d(x, k_row.expand(c, 1, 1, -1), groups=c)
+            return F.conv2d(x, k_col.expand(c, 1, -1, 1), groups=c)
+        k2d = self.k2d.to(dtype=x.dtype, device=x.device)
+        return F.conv2d(x, k2d.expand(c, 1, -1, -1), groups=c)
+
+
+class FIRUp2(nn.Module):
+    """Depthwise conv_transpose2d upsampler."""
+
+    def __init__(self, up_module):
+        super().__init__()
+        assert up_module.factor == 2
+        kernel = _hp(up_module.kernel)  # already scaled by factor**2
+        kk = kernel.shape[0]
+        p0, _ = up_module.pad
+        self.crop = kk - 1 - p0
+        crop_end = kk - 2 - self.crop
+        assert self.crop == crop_end, "asymmetric crop: unsupported Upsample padding"
+        assert self.crop >= 0, "asymmetric crop: unsupported Upsample padding"
+        self.register_buffer("k", kernel.view(1, 1, kk, kk).contiguous(), persistent=False)
+
+    def forward(self, x):
+        c = x.shape[1]
+        k = self.k.to(dtype=x.dtype, device=x.device)
+        return F.conv_transpose2d(x, k.expand(c, 1, -1, -1), stride=2, padding=self.crop, groups=c)
 
 
 class Upsample(nn.Module):
@@ -99,9 +210,15 @@ class Upsample(nn.Module):
         pad0 = (p + 1) // 2 + factor - 1
         pad1 = p // 2
         self.pad = (pad0, pad1)
+        kk = kernel.shape[0]
+        self.crop = kk - 1 - pad0
+        self.register_buffer("k_up", kernel.view(1, 1, kk, kk).contiguous(), persistent=False)
 
     def forward(self, input):
-        """Already batch-compatible"""
+        if self.factor == 2 and self.pad[0] == (self.kernel.shape[0] - self.factor + 1) // 2 + self.factor - 1:
+            c = input.shape[1]
+            k = self.k_up.to(dtype=input.dtype, device=input.device)
+            return F.conv_transpose2d(input, k.expand(c, 1, -1, -1), stride=2, padding=self.crop, groups=c)
         return upfirdn2d(input, self.kernel, up=self.factor, down=1, pad=self.pad)
 
 
@@ -117,26 +234,11 @@ class Downsample(nn.Module):
         self.pad = (pad0, pad1)
 
     def forward(self, input):
-        """Already batch-compatible"""
         return upfirdn2d(input, self.kernel, up=1, down=self.factor, pad=self.pad)
 
 
-class Blur(nn.Module):
-    def __init__(self, kernel, pad, upsample_factor=1):
-        super().__init__()
-        kernel = make_kernel(kernel)
-        if upsample_factor > 1:
-            kernel = kernel * (upsample_factor**2)
-        self.register_buffer("kernel", kernel)
-        self.pad = pad
-
-    def forward(self, input):
-        """Already batch-compatible"""
-        return upfirdn2d(input, self.kernel, pad=self.pad)
-
-
 # ============================================================================
-# LEVEL 3: Convolution layers (already batch-compatible)
+# LEVEL 3: Convolution layers
 # ============================================================================
 
 
@@ -160,7 +262,6 @@ class EqualConv2d(nn.Module):
                 self.scale = 1.0
 
     def forward(self, input):
-        """Already batch-compatible"""
         w = self.weight * self.scale if self.scale != 1.0 else self.weight
         return F.conv2d(
             input,
@@ -190,7 +291,7 @@ class EqualLinear(nn.Module):
         self.lr_mul = lr_mul
 
     def fold_weights(self):
-        """Pre-multiply static scale and lr_mul into weight/bias parameters for export/inference."""
+        """Pre-multiply static scale and lr_mul into weight/bias parameters."""
         with torch.no_grad():
             if self.scale != 1.0:
                 self.weight.copy_(self.weight * self.scale)
@@ -200,7 +301,6 @@ class EqualLinear(nn.Module):
                 self.lr_mul = 1.0
 
     def forward(self, input):
-        """Already batch-compatible"""
         w = self.weight * self.scale if self.scale != 1.0 else self.weight
         b = self.bias
         if b is not None and self.lr_mul != 1.0:
@@ -222,7 +322,6 @@ class ScaledLeakyReLU(nn.Module):
         self.negative_slope = negative_slope
 
     def forward(self, input):
-        """Already batch-compatible"""
         return F.leaky_relu(input, negative_slope=self.negative_slope)
 
 
@@ -232,6 +331,12 @@ class ScaledLeakyReLU(nn.Module):
 
 
 class ModulatedConv2d(nn.Module):
+    """Dense modulated convolution without groups=batch.
+
+    Linearly scales the input channels by the style vector, applies a static dense conv,
+    and scales the output channels by demodulation d = rsqrt(style^2 @ w2 + eps).
+    """
+
     def __init__(
         self,
         in_channel,
@@ -274,6 +379,15 @@ class ModulatedConv2d(nn.Module):
         self.weight = nn.Parameter(torch.randn(1, out_channel, in_channel, kernel_size, kernel_size))
         self.modulation = EqualLinear(style_dim, in_channel, bias_init=1)
         self.demodulate = demodulate
+        self._w2_cache = None
+        self._w2_fp = None
+
+    def _get_w2(self, w):
+        fp = (w._version, w.data_ptr(), w.device, w.dtype)
+        if self._w2_cache is None or self._w2_fp != fp:
+            self._w2_cache = w.pow(2).sum((2, 3)).t().contiguous()
+            self._w2_fp = fp
+        return self._w2_cache
 
     def __repr__(self):
         return (
@@ -282,50 +396,28 @@ class ModulatedConv2d(nn.Module):
         )
 
     def forward(self, input, style):
-        """Enhanced to handle both single and batch inputs"""
-        batch, in_channel, height, width = input.shape
+        batch, _, _, _ = input.shape
 
-        # Modulation - already batch compatible
-        style = self.modulation(style).view(batch, 1, in_channel, 1, 1)
-        weight = self.scale * self.weight * style
+        style = self.modulation(style)
+        input = input * style.view(batch, -1, 1, 1)
 
-        if self.demodulate:
-            demod = torch.rsqrt(weight.pow(2).sum([2, 3, 4]) + 1e-8)
-            weight = weight * demod.view(batch, self.out_channel, 1, 1, 1)
-
-        weight = weight.view(batch * self.out_channel, in_channel, self.kernel_size, self.kernel_size)
+        w = (self.scale * self.weight[0]).to(dtype=input.dtype, device=input.device)
 
         if self.upsample:
-            input = input.contiguous().view(1, batch * in_channel, height, width)
-            weight = weight.view(batch, self.out_channel, in_channel, self.kernel_size, self.kernel_size)
-            weight = (
-                weight.transpose(1, 2)
-                .contiguous()
-                .reshape(
-                    batch * in_channel,
-                    self.out_channel,
-                    self.kernel_size,
-                    self.kernel_size,
-                )
-            )
-            out = F.conv_transpose2d(input, weight, padding=0, stride=2, groups=batch)
-            _, _, height, width = out.shape
-            out = out.view(batch, self.out_channel, height, width)
+            wt = w.transpose(0, 1).contiguous()
+            out = F.conv_transpose2d(input, wt, stride=2, padding=0)
             out = self.blur(out)
         elif self.downsample:
-            input = self.blur(input)
-            _, _, height, width = input.shape
-            input = input.contiguous().view(1, batch * in_channel, height, width)
-            weight = weight.contiguous()
-            out = F.conv2d(input, weight, padding=0, stride=2, groups=batch)
-            _, _, height, width = out.shape
-            out = out.view(batch, self.out_channel, height, width)
+            out = self.blur(input)
+            out = F.conv2d(out, w, padding=0, stride=2)
         else:
-            input = input.contiguous().view(1, batch * in_channel, height, width)
-            weight = weight.contiguous()
-            out = F.conv2d(input, weight, padding=self.padding, groups=batch)
-            _, _, height, width = out.shape
-            out = out.view(batch, self.out_channel, height, width)
+            out = F.conv2d(input, w, padding=self.padding)
+
+        if self.demodulate:
+            w2 = self._get_w2(w)
+            acc = torch.promote_types(style.dtype, torch.float32)
+            demod = torch.rsqrt(style.to(acc).square() @ w2.to(acc) + self.eps)
+            out = out * demod.to(out.dtype).view(batch, self.out_channel, 1, 1)
 
         return out
 
@@ -336,11 +428,9 @@ class NoiseInjection(nn.Module):
         self.weight = nn.Parameter(torch.zeros(1))
 
     def forward(self, image, noise=None):
-        """Already batch-compatible"""
         if noise is None:
             return image
-        else:
-            return image + self.weight * noise
+        return image + self.weight * noise
 
 
 class ConstantInput(nn.Module):
@@ -349,10 +439,8 @@ class ConstantInput(nn.Module):
         self.input = nn.Parameter(torch.randn(1, channel, size, size))
 
     def forward(self, input):
-        """Enhanced to handle variable batch sizes"""
         batch = input.shape[0]
-        out = self.input.repeat(batch, 1, 1, 1)
-        return out
+        return self.input.expand(batch, -1, -1, -1)
 
 
 class StyledConv(nn.Module):
@@ -382,7 +470,6 @@ class StyledConv(nn.Module):
         self.activate = FusedLeakyReLU(out_channel)
 
     def forward(self, input, style, noise=None):
-        """Already batch-compatible"""
         out = self.conv(input, style)
         out = self.noise(out, noise=noise)
         out = self.activate(out)
@@ -450,31 +537,28 @@ class ToRGB(nn.Module):
         self.conv = ConvLayer(in_channel, 3, 1)
         self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))
 
-    def forward(self, input, skip=None):
-        """Already batch-compatible"""
-        out = self.conv(input)
-        out = out + self.bias
+    def project(self, x):
+        """Linear 1x1 EqualConv2d part (commutes with warp * mask)."""
+        eq = self.conv[0]
+        w = (eq.weight * eq.scale).to(dtype=x.dtype, device=x.device)
+        return F.conv2d(x, w)
 
-        if skip is not None:
-            skip = self.upsample(skip)
-            out = out + skip
-
+    def finish(self, z, skip=None):
+        """FusedLeakyReLU activation + bias + upsampled skip."""
+        act = self.conv[1]
+        act_bias = act.bias.to(dtype=z.dtype, device=z.device)
+        bias = self.bias.to(dtype=z.dtype, device=z.device)
+        out = F.leaky_relu(z + act_bias, act.negative_slope) * act.scale + bias
+        if skip is not None and hasattr(self, "upsample"):
+            out = out + self.upsample(skip)
         return out
 
-
-def _identity_grid(h: int, w: int, device, dtype) -> torch.Tensor:
-    """Normalized ``[1, H, W, 2]`` sampling grid for ``grid_sample``.
-
-    Built functionally (no module state), so ``torch.compile`` never sees a
-    mutated attribute. The tensors are small (H*W*2) compared with the feature
-    maps they warp, so rebuilding them per call costs well under a millisecond.
-    """
-    grid_y, grid_x = torch.meshgrid(
-        torch.linspace(-1, 1, h, device=device, dtype=dtype),
-        torch.linspace(-1, 1, w, device=device, dtype=dtype),
-        indexing="ij",
-    )
-    return torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+    def forward(self, input, skip=None):
+        out = self.conv(input) + self.bias
+        if skip is not None and hasattr(self, "upsample"):
+            skip = self.upsample(skip)
+            out = out + skip
+        return out
 
 
 class ToFlow(nn.Module):
@@ -487,50 +571,26 @@ class ToFlow(nn.Module):
         self.conv = ModulatedConv2d(in_channel, 3, 1, style_dim, demodulate=False)
         self.bias = nn.Parameter(torch.zeros(1, 3, 1, 1))
 
-    def forward(self, input, style, feat, skip=None):
-        """Batch-compatible forward with a stateless coordinate grid.
-
-        The grid depends only on (h, w, dtype). It used to be built lazily and
-        stored with ``register_buffer`` *inside* forward, which made the module
-        mutate while tracing: TorchDynamo's ``hasattr(module, '_cached_grid')``
-        guard failed right after the first call and forced a full recompile of
-        the decoder (the single biggest part of boot time). Build it before the
-        trace instead — the tensors are tiny and created once per shape.
-        """
-        batch_size = input.size(0)
-        h, w = input.size(2), input.size(3)
-        grid = _identity_grid(h, w, input.device, input.dtype).expand(batch_size, -1, -1, -1)
-
-        out = self.conv(input, style)
-        out = out + self.bias
-
-        if skip is not None:
-            skip = self.upsample(skip)
-            out = out + skip
-
-        # Flow computation
+    def flow_and_mask(self, input, style, skip=None):
+        batch_size, _, h, w = input.shape
+        out = self.conv(input, style) + self.bias
+        if skip is not None and hasattr(self, "upsample"):
+            out = out + self.upsample(skip)
         sampler = torch.tanh(out[:, 0:2, :, :])
         mask = torch.sigmoid(out[:, 2:3, :, :])
-        flow = sampler.permute(0, 2, 3, 1) + grid  # B x h x w x 2
+        grid = _identity_grid(h, w, input.device, input.dtype).expand(batch_size, -1, -1, -1)
+        flow = sampler.permute(0, 2, 3, 1) + grid
+        return out, flow, mask
 
-        # --- Ensure batch sizes match for grid_sample ---
+    def forward(self, input, style, feat, skip=None):
+        batch_size = input.size(0)
+        out, flow, mask = self.flow_and_mask(input, style, skip)
         if feat.shape[0] != batch_size:
             if feat.shape[0] == 1:
-                # Expand instead of repeat (more efficient, no memory copy)
                 feat = feat.expand(batch_size, -1, -1, -1)
             else:
                 raise ValueError(f"Batch mismatch: feat batch={feat.shape[0]}, flow batch={batch_size}")
-
-        # Mask batch check (optimized)
-        if mask.shape[0] != batch_size:
-            raise ValueError(f"Mask batch mismatch: mask batch={mask.shape[0]}, feat batch={batch_size}")
-        # Optional: ensure mask batch matches too
-        if mask.shape[0] != feat.shape[0]:
-            raise ValueError(f"Mask batch mismatch: mask batch={mask.shape[0]}, feat batch={feat.shape[0]}")
-
-        # --- Warp features ---
         feat_warp = F.grid_sample(feat, flow, align_corners=False) * mask
-
         return feat_warp, feat_warp + input * (1.0 - mask), out, flow
 
 
@@ -543,22 +603,10 @@ class Direction(nn.Module):
     def __init__(self, motion_dim):
         super().__init__()
         self.weight = nn.Parameter(torch.randn(512, motion_dim))
-        # Q depends only on the (frozen) weight, but forward() recomputed
-        # torch.linalg.qr on EVERY call (once per decode micro-batch).
-        # Cache it. Invalidation is a cheap fingerprint (version + data_ptr +
-        # fp32 sum over ~10K elems): .data.copy_ bypasses the version counter,
-        # so version alone is not reliable.
         self._Q_cache = None
         self._Q_fp = None
 
     def _fingerprint(self, w):
-        # Deliberately no `.item()`: reading a scalar back forces a device sync
-        # on every forward, and it is what Dynamo reports as a graph break here
-        # (`Tensor.item()`), splitting the compiled decoder in two. This is
-        # still complete for every loader in the repo: in-place overlays
-        # (`param.copy_`, `load_state_dict`) bump `_version`, and replacing the
-        # parameter changes `data_ptr`. Only a raw `.data.copy_` would slip
-        # through, and nothing on the inference path does that.
         return (w._version, w.data_ptr(), w.device, w.dtype)
 
     def _orthonormal_basis(self):
@@ -572,32 +620,18 @@ class Direction(nn.Module):
         return self._Q_cache
 
     def forward(self, input):
-        """Enhanced to handle both single and batch inputs"""
+        """Matrix multiplication input @ Q.T supporting arbitrary batch shapes."""
         Q = self._orthonormal_basis()
-
         if input is None:
             return Q
-        else:
-            # Handle both shapes: [motion_dim] and [batch, motion_dim]
-            if input.dim() == 1:
-                input = input.unsqueeze(0)
-                squeeze_output = True
-            else:
-                squeeze_output = False
-
-            # Batch matrix multiplication
-            input_diag = torch.diag_embed(input)  # [batch, motion_dim, motion_dim]
-            out = torch.matmul(input_diag, Q.T)  # [batch, motion_dim, 512]
-            out = torch.sum(out, dim=1)  # [batch, 512]
-
-            if squeeze_output:
-                out = out.squeeze(0)
-
-            return out
+        q = Q.to(dtype=input.dtype, device=input.device)
+        if input.dim() == 1:
+            return (input.unsqueeze(0) @ q.t()).squeeze(0)
+        return input @ q.t()
 
 
 # ============================================================================
-# LEVEL 7: Top-level Synthesis module with full batch support
+# LEVEL 7: Top-level Synthesis module
 # ============================================================================
 
 
@@ -664,90 +698,416 @@ class Synthesis(nn.Module):
             in_channel = out_channel
 
         self.n_latent = self.log_size * 2 - 2
+        self.n_levels = len(self.to_flows)
 
-    def forward(self, wa, alpha, feats):
-        """
-        Enhanced forward pass supporting both single and batch inputs
+    def precompute(self, feats):
+        """Per-identity work: 3-channel RGB projection of the last warped feature map."""
+        if feats is None or len(feats) == 0:
+            return None
+        n = min(len(feats), self.n_levels)
+        return self.to_rgbs[n - 1].project(feats[n - 1])
 
-        Args:
-            wa: [batch, 512] or [512] - style latent codes
-            alpha: list of motion coefficients, each [batch, motion_dim] or [motion_dim]
-            feats: list of feature maps for warping
+    def forward(self, wa, alpha=None, feats=None, z_last=None):
+        if feats is None and isinstance(alpha, (list, tuple)):
+            feats = alpha
+            alpha = None
 
-        Returns:
-            img: Generated image(s)
-            flow: Optical flow field(s)
-        """
-        # Ensure wa is batched
         if wa.dim() == 1:
             wa = wa.unsqueeze(0)
             single_input = True
         else:
             single_input = False
 
-        wa.shape[0]
-
-        # Apply motion directions
-        if alpha is not None:
-            if len(alpha) > 1:
-                # Multi-direction case: target, source, start
-                directions_target = self.direction(alpha[0])
-                directions_source = self.direction(alpha[1])
-                directions_start = self.direction(alpha[2])
-                latent = wa + (directions_target - directions_start) + directions_source
+        if alpha is not None and len(alpha) > 0:
+            if len(alpha) >= 3:
+                latent = wa + (self.direction(alpha[0]) - self.direction(alpha[2])) + self.direction(alpha[1])
+            elif len(alpha) == 2:
+                latent = wa + (self.direction(alpha[0]) + self.direction(alpha[1]))
             else:
-                # Single direction case
-                directions = self.direction(alpha[0])
-                latent = wa + directions
+                latent = wa + self.direction(alpha[0])
         else:
             latent = wa
 
-        # Expand latent to all layers
-        inject_index = self.n_latent
-        latent = latent.unsqueeze(1).repeat(1, inject_index, 1)
-
-        # Initial layers
+        b = latent.shape[0]
         out = self.input(latent)
-        out = self.conv1(out, latent[:, 0])
+        out = self.conv1(out, latent)
 
-        # Progressive generation with flow warping
-        i = 1
-        skip = None
-        skip_flow = None
-        flow = None
+        n = min(len(feats), self.n_levels) if feats is not None else 0
+        skip = skip_flow = flow = None
 
-        for conv1, conv2, to_rgb, to_flow, feat in zip(
-            self.convs[::2], self.convs[1::2], self.to_rgbs, self.to_flows, feats, strict=False
-        ):
-            out = conv1(out, latent[:, i])
-            out = conv2(out, latent[:, i + 1])
+        for k in range(n):
+            conv1 = self.convs[2 * k]
+            conv2 = self.convs[2 * k + 1]
+            to_flow = self.to_flows[k]
+            to_rgb = self.to_rgbs[k]
+            feat = feats[k]
 
-            # Apply flow warping at specific resolutions
-            if out.size(2) == 8:
-                out_warp, out, skip_flow, _ = to_flow(out, latent[:, i + 2], feat)
-                skip = to_rgb(out_warp)
-            elif out.size(2) == 64:
-                out_warp, out, skip_flow, flow = to_flow(out, latent[:, i + 2], feat, skip_flow)
-                skip = to_rgb(out_warp, skip)
+            out = conv1(out, latent)
+            out = conv2(out, latent)
+
+            if k == n - 1:
+                # Last level: commute 1x1 conv to warp 3 channels instead of C channels
+                skip_flow, flw, mask = to_flow.flow_and_mask(out, latent, skip_flow)
+                z = z_last if z_last is not None else to_rgb.project(feat)
+                z = z.to(device=out.device, dtype=out.dtype)
+                if z.shape[0] != b:
+                    if z.shape[0] == 1:
+                        z = z.expand(b, -1, -1, -1)
+                    else:
+                        raise ValueError(f"Batch mismatch: z_last batch={z.shape[0]}, flow batch={b}")
+                skip = to_rgb.finish(F.grid_sample(z, flw, align_corners=False) * mask, skip)
             else:
-                out_warp, out, skip_flow, _ = to_flow(out, latent[:, i + 2], feat, skip_flow)
+                out_warp, out, skip_flow, flw = to_flow(out, latent, feat, skip_flow)
                 skip = to_rgb(out_warp, skip)
 
-            i += 2
+            if flw.shape[1] == 64:  # flow at 64x64
+                flow = flw
 
         img = skip
-
-        # If input was single, squeeze output
-        if single_input:
+        if single_input and img is not None:
             img = img.squeeze(0)
             if flow is not None:
                 flow = flow.squeeze(0)
 
         return img, flow
 
-    def synthesis(self, wa, alpha, feats):
-        """
-        Alias for forward() to maintain backward compatibility
-        Supports both single and batch processing
-        """
-        return self.forward(wa, alpha, feats)
+    def synthesis(self, wa, alpha=None, feats=None, z_last=None):
+        return self.forward(wa, alpha=alpha, feats=feats, z_last=z_last)
+
+    def to_infer(self, fold_blur: bool = False, dtype=None, channels_last: bool = False):
+        """Convert this Synthesis module into an optimized SynthesisInfer module."""
+        return SynthesisInfer.from_synthesis(self, fold_blur=fold_blur, dtype=dtype, channels_last=channels_last)
+
+
+# ============================================================================
+# LEVEL 8: Static-Buffer Inference Modules (SynthesisInfer)
+# ============================================================================
+
+
+class ModConvInfer(nn.Module):
+    def __init__(self, mc, fold_blur: bool = False):
+        super().__init__()
+        assert not mc.downsample, "downsample ModulatedConv2d is not supported"
+        w = _hp(mc.scale * mc.weight[0])  # [O, I, k, k]
+        self.demodulate = bool(mc.demodulate)
+        self.upsample = bool(mc.upsample)
+        self.padding = int(mc.padding)
+        self.fold_pad = 0
+        self.blur = None
+        if self.demodulate:
+            self.register_buffer("w2", w.pow(2).sum((2, 3)).t().contiguous(), persistent=False)  # [I, O]
+        if self.upsample:
+            wt = w.transpose(0, 1).contiguous()  # [I, O, k, k] (conv_transpose layout)
+            kk = mc.blur.kernel.shape[0]
+            k = w.shape[-1]
+            p0, _ = mc.blur.pad
+            crop = kk - 1 - p0
+            comp = k + kk - 1
+            foldable = fold_blur and crop >= 0 and 2 * crop == comp - 2
+            if foldable:
+                i, o = wt.shape[:2]
+                kern = _hp(mc.blur.kernel)
+                full = F.conv2d(
+                    wt.reshape(i * o, 1, k, k),
+                    torch.flip(kern, [0, 1]).view(1, 1, kk, kk),
+                    padding=kk - 1,
+                )
+                self.register_buffer(
+                    "w_conv", full.reshape(i, o, k + kk - 1, k + kk - 1).contiguous(), persistent=False
+                )
+                self.fold_pad = crop
+            else:
+                self.register_buffer("w_conv", wt, persistent=False)
+                self.blur = FIRBlur(mc.blur.kernel, mc.blur.pad)
+        else:
+            self.register_buffer("w_conv", w, persistent=False)
+
+    def forward(self, x, s):
+        b = x.shape[0]
+        x = x * s.view(b, -1, 1, 1)
+        w_conv = self.w_conv.to(dtype=x.dtype, device=x.device)
+        if self.upsample:
+            out = F.conv_transpose2d(x, w_conv, stride=2, padding=self.fold_pad)
+            if self.blur is not None:
+                out = self.blur(out)
+        else:
+            out = F.conv2d(x, w_conv, padding=self.padding)
+        if self.demodulate:
+            acc = torch.promote_types(s.dtype, torch.float32)
+            w2 = self.w2.to(dtype=acc, device=s.device)
+            d = torch.rsqrt(s.to(acc).square() @ w2 + 1e-8)
+            out = out * d.to(out.dtype).view(b, -1, 1, 1)
+        return out
+
+
+class StyledConvInfer(nn.Module):
+    def __init__(self, sc, fold_blur=False):
+        super().__init__()
+        self.conv = ModConvInfer(sc.conv, fold_blur=fold_blur)
+        self.register_buffer("bias", sc.activate.bias.detach().clone(), persistent=False)
+        self.neg = float(sc.activate.negative_slope)
+        self.scale = float(sc.activate.scale)
+
+    def forward(self, x, s):
+        out = self.conv(x, s)
+        bias = self.bias.to(dtype=out.dtype, device=out.device)
+        return F.leaky_relu(out + bias, self.neg) * self.scale
+
+
+class ToRGBInfer(nn.Module):
+    def __init__(self, tr):
+        super().__init__()
+        eq, act = tr.conv[0], tr.conv[1]
+        assert eq.bias is None, "bias in 1x1 conv is not supported"
+        assert eq.weight.shape[-1] == 1, "non-1x1 conv is not supported"
+        assert eq.stride == 1, "strided conv is not supported"
+        self.register_buffer("w", (eq.weight * eq.scale).detach().clone(), persistent=False)
+        self.register_buffer("act_bias", act.bias.detach().clone(), persistent=False)
+        self.register_buffer("bias", tr.bias.detach().clone(), persistent=False)
+        self.neg = float(act.negative_slope)
+        self.act_scale = float(act.scale)
+        self.up = FIRUp2(tr.upsample) if hasattr(tr, "upsample") else None
+
+    def project(self, x):
+        w = self.w.to(dtype=x.dtype, device=x.device)
+        return F.conv2d(x, w)
+
+    def finish(self, z, skip=None):
+        act_bias = self.act_bias.to(dtype=z.dtype, device=z.device)
+        bias = self.bias.to(dtype=z.dtype, device=z.device)
+        out = F.leaky_relu(z + act_bias, self.neg) * self.act_scale + bias
+        if skip is not None:
+            out = out + (self.up(skip) if self.up is not None else skip)
+        return out
+
+    def forward(self, x, skip=None):
+        return self.finish(self.project(x), skip)
+
+
+class ToFlowInfer(nn.Module):
+    def __init__(self, tf, res: int):
+        super().__init__()
+        self.conv = ModConvInfer(tf.conv)
+        self.register_buffer("bias", tf.bias.detach().clone(), persistent=False)
+        self.up = FIRUp2(tf.upsample) if hasattr(tf, "upsample") else None
+        self.register_buffer("grid", _identity_grid(res, res, dtype=_hp(tf.bias).dtype), persistent=False)
+
+    def flow_and_mask(self, x, s, skip=None):
+        b, _, h, w = x.shape
+        bias = self.bias.to(dtype=x.dtype, device=x.device)
+        out = self.conv(x, s) + bias
+        if skip is not None:
+            out = out + (self.up(skip) if self.up is not None else skip)
+        sampler = torch.tanh(out[:, 0:2])
+        mask = torch.sigmoid(out[:, 2:3])
+        if self.grid.shape[1] == h and self.grid.shape[2] == w:
+            grid = self.grid.to(dtype=x.dtype, device=x.device)
+        else:
+            grid = _identity_grid(h, w, dtype=x.dtype).to(x.device)
+        flow = sampler.permute(0, 2, 3, 1) + grid.expand(b, -1, -1, -1)
+        return out, flow, mask
+
+    def forward(self, x, s, feat, skip=None):
+        b = x.shape[0]
+        out, flow, mask = self.flow_and_mask(x, s, skip)
+        if feat.shape[0] != b:
+            if feat.shape[0] != 1:
+                raise ValueError(f"Batch mismatch: feat batch={feat.shape[0]}, flow batch={b}")
+            feat = feat.expand(b, -1, -1, -1)
+        feat_warp = F.grid_sample(feat, flow, align_corners=False) * mask
+        return feat_warp, feat_warp + x * (1.0 - mask), out, flow
+
+
+class DirectionInfer(nn.Module):
+    def __init__(self, direction):
+        super().__init__()
+        self.weight = getattr(direction, "weight", None)
+        q, _ = torch.linalg.qr(_hp(direction.weight) + 1e-8)
+        self.register_buffer("Q", q.contiguous(), persistent=False)
+
+    def forward(self, input):
+        if input is None:
+            return self.Q
+        q = self.Q.to(dtype=input.dtype, device=input.device)
+        if input.dim() == 1:
+            return (input.unsqueeze(0) @ q.t()).squeeze(0)
+        return input @ q.t()
+
+
+class SynthesisInfer(nn.Module):
+    """Drop-in inference decoder with pre-fused single-GEMM styles and frozen weights."""
+
+    def __init__(self, syn, fold_blur: bool = False):
+        super().__init__()
+        self.size = syn.size
+        self.style_dim = syn.style_dim
+        self.motion_dim = syn.motion_dim
+        self.channels = getattr(syn, "channels", None)
+        self.n_latent = getattr(syn, "n_latent", None)
+        self.n_levels = len(syn.to_flows)
+        self._ff_channels_last = False
+
+        self.direction = DirectionInfer(syn.direction)
+        self.register_buffer("const", syn.input.input.detach().clone(), persistent=False)
+
+        self.conv1 = StyledConvInfer(syn.conv1, fold_blur=fold_blur)
+        self.convs_a = nn.ModuleList()
+        self.convs_b = nn.ModuleList()
+        self.to_flows = nn.ModuleList()
+        self.to_rgbs = nn.ModuleList()
+        mods = [syn.conv1.conv.modulation]
+        for k in range(self.n_levels):
+            self.convs_a.append(StyledConvInfer(syn.convs[2 * k], fold_blur=fold_blur))
+            self.convs_b.append(StyledConvInfer(syn.convs[2 * k + 1], fold_blur=fold_blur))
+            self.to_flows.append(ToFlowInfer(syn.to_flows[k], res=2 ** (k + 3)))
+            self.to_rgbs.append(ToRGBInfer(syn.to_rgbs[k]))
+            mods += [
+                syn.convs[2 * k].conv.modulation,
+                syn.convs[2 * k + 1].conv.modulation,
+                syn.to_flows[k].conv.modulation,
+            ]
+
+        assert all(m.activation is None and m.bias is not None for m in mods)
+        w = torch.cat([(m.weight * m.scale).detach() for m in mods], dim=0)
+        b = torch.cat([(m.bias * m.lr_mul).detach() for m in mods], dim=0)
+        self.register_buffer("style_w", w.contiguous(), persistent=False)
+        self.register_buffer("style_b", b.contiguous(), persistent=False)
+        self.style_sizes = [int(m.weight.shape[0]) for m in mods]
+
+    @classmethod
+    @torch.no_grad()
+    def from_synthesis(cls, syn, fold_blur: bool = False, dtype=None, channels_last: bool = False):
+        if isinstance(syn, cls):
+            if dtype is not None:
+                syn.to(dtype)
+            if channels_last:
+                syn.channels_last()
+            return syn
+        params = list(syn.parameters())
+        if params:
+            dev = params[0].device
+        else:
+            bufs = list(syn.buffers())
+            dev = bufs[0].device if bufs else torch.device("cpu")
+        model = cls(syn, fold_blur=fold_blur).to(dev).eval()
+        model.requires_grad_(False)
+        if dtype is not None:
+            model.to(dtype)
+        if channels_last:
+            model.channels_last()
+        return model
+
+    def channels_last(self):
+        for m in self.modules():
+            for name in ("w_conv", "w", "const"):
+                t = getattr(m, name, None)
+                if isinstance(t, torch.Tensor) and t.dim() == 4:
+                    setattr(m, name, t.contiguous(memory_format=torch.channels_last))
+        self._ff_channels_last = True
+        return self
+
+    def precompute(self, feats):
+        """Per-identity work: RGB projection of the last warped feature map."""
+        if feats is None or len(feats) == 0:
+            return None
+        n = min(len(feats), self.n_levels)
+        return self.to_rgbs[n - 1].project(feats[n - 1])
+
+    def forward(self, wa, alpha=None, feats=None, z_last=None):
+        if feats is None and isinstance(alpha, (list, tuple)):
+            feats = alpha
+            alpha = None
+
+        single = wa.dim() == 1
+        if single:
+            wa = wa.unsqueeze(0)
+
+        if alpha is not None and len(alpha) > 0:
+            if len(alpha) >= 3:
+                latent = wa + (self.direction(alpha[0]) - self.direction(alpha[2])) + self.direction(alpha[1])
+            elif len(alpha) == 2:
+                latent = wa + (self.direction(alpha[0]) + self.direction(alpha[1]))
+            else:
+                latent = wa + self.direction(alpha[0])
+        else:
+            latent = wa
+
+        b = latent.shape[0]
+        style_w = self.style_w.to(dtype=latent.dtype, device=latent.device)
+        style_b = self.style_b.to(dtype=latent.dtype, device=latent.device)
+        styles = F.linear(latent, style_w, style_b).split(self.style_sizes, dim=1)
+
+        const = self.const.to(dtype=latent.dtype, device=latent.device)
+        out = const.expand(b, -1, -1, -1)
+        out = self.conv1(out, styles[0])
+
+        n = min(len(feats), self.n_levels) if feats is not None else 0
+        skip = skip_flow = flow = None
+        si = 1
+        for k in range(n):
+            out = self.convs_a[k](out, styles[si])
+            out = self.convs_b[k](out, styles[si + 1])
+            s_flow = styles[si + 2]
+            si += 3
+            to_flow, to_rgb, feat = self.to_flows[k], self.to_rgbs[k], feats[k]
+
+            if k == n - 1:
+                skip_flow, flw, mask = to_flow.flow_and_mask(out, s_flow, skip_flow)
+                z = z_last if z_last is not None else to_rgb.project(feat)
+                z = z.to(device=out.device, dtype=out.dtype)
+                if z.shape[0] != b:
+                    if z.shape[0] == 1:
+                        z = z.expand(b, -1, -1, -1)
+                    else:
+                        raise ValueError(f"Batch mismatch: z_last batch={z.shape[0]}, flow batch={b}")
+                skip = to_rgb.finish(F.grid_sample(z, flw, align_corners=False) * mask, skip)
+            else:
+                out_warp, out, skip_flow, flw = to_flow(out, s_flow, feat, skip_flow)
+                skip = to_rgb(out_warp, skip)
+
+            if flw.shape[1] == 64:
+                flow = flw
+
+        img = skip
+        if single and img is not None:
+            img = img.squeeze(0)
+            if flow is not None:
+                flow = flow.squeeze(0)
+        return img, flow
+
+    def synthesis(self, wa, alpha=None, feats=None, z_last=None):
+        return self.forward(wa, alpha=alpha, feats=feats, z_last=z_last)
+
+
+__all__ = [
+    "Blur",
+    "ConstantInput",
+    "ConvLayer",
+    "Direction",
+    "DirectionInfer",
+    "Downsample",
+    "EqualConv2d",
+    "EqualLinear",
+    "FIRBlur",
+    "FIRUp2",
+    "FusedLeakyReLU",
+    "ModConvInfer",
+    "ModulatedConv2d",
+    "MotionPixelNorm",
+    "NoiseInjection",
+    "PixelNorm",
+    "ScaledLeakyReLU",
+    "StyledConv",
+    "StyledConvInfer",
+    "Synthesis",
+    "SynthesisInfer",
+    "ToFlow",
+    "ToFlowInfer",
+    "ToRGB",
+    "ToRGBInfer",
+    "Upsample",
+    "fused_leaky_relu",
+    "make_kernel",
+    "upfirdn2d",
+    "upfirdn2d_native",
+]

@@ -234,6 +234,17 @@ def _apply_refenc(model, ae, opt) -> None:
 
 def _apply_decoder(model, ae, opt) -> None:
     mode = resolve_mode("decoder")
+    use_infer = os.environ.get("FLOAT_DISABLE_SYNTHESIS_INFER", "").strip().lower() not in {"1", "true", "yes", "on"}
+    if use_infer and hasattr(ae, "dec") and hasattr(ae.dec, "to_flows"):
+        try:
+            from fast_float.models.float.synthesis_infer import SynthesisInfer
+
+            if not isinstance(ae.dec, SynthesisInfer):
+                ae.dec = SynthesisInfer.from_synthesis(ae.dec)
+                logger.info("backends: decoder (eager) -> SynthesisInfer")
+        except Exception as e:
+            logger.warning(f"backends: SynthesisInfer upgrade failed ({e}); keeping original Synthesis")
+
     if mode == "eager":
         return
     if mode == "compile":
