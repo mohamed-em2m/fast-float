@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import suppress
 from dataclasses import replace
 from typing import Any
 
 import numpy as np
 
+from fast_float.core.perf_metrics import FrameClock
 from fast_float.streaming.dispatcher import FrameDispatcher
 from fast_float.streaming.types import StreamMeta
 
@@ -40,6 +42,9 @@ class LiveStream:
         self._loop = loop
         self._subs: set[asyncio.Queue] = set()
         self._meta_event = asyncio.Event()
+        # Delivery-side clock: how late each frame reached the transport, plus
+        # the dropped-frame count (see fast_float.core.perf_metrics).
+        self.clock: FrameClock | None = None
 
     # ---- lifecycle ---------------------------------------------------- #
     def start(self, meta: StreamMeta) -> None:
@@ -47,6 +52,11 @@ class LiveStream:
         self.meta = meta
         if meta.audio_path:
             self.audio_path = meta.audio_path
+        self.clock = FrameClock(
+            fps=meta.fps,
+            start_s=meta.started_at_s if meta.started_at_s is not None else time.monotonic(),
+            first_idx=meta.first_idx,
+        )
         # Waking an asyncio.Event is not thread-safe; hop onto the loop that
         # owns it (``opened`` runs on the generation thread).
         with suppress(RuntimeError):
@@ -98,8 +108,15 @@ class LiveStream:
     def publish(self, item: tuple) -> None:
         # No ``done`` guard here: publishes scheduled before finish() must be
         # delivered ahead of the (also queued) CLOSE sentinel.
+        if self.clock is not None and item[0] == "frame":
+            # item == ("frame", idx, pts_ms, ndarray)
+            self.clock.on_frame(item[1], item[2], time.monotonic())
         for q in list(self._subs):
             self._push(q, item)
+
+    def metrics(self) -> dict[str, Any]:
+        """Delivery metrics of this stream (TTFF, latency percentiles, drops)."""
+        return self.clock.to_dict() if self.clock is not None else {}
 
     def publish_threadsafe(self, item: tuple) -> None:
         with suppress(RuntimeError):  # loop already closed (shutdown)

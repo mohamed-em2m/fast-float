@@ -7,6 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
+from fast_float.core.perf_metrics import FrameClock
 from fast_float.core.state import app_state
 from fast_float.schemas.generation import WebRTCOfferRequest, WebRTCOfferResponse
 from fast_float.streaming.live import CLOSE
@@ -47,6 +48,18 @@ if AIORTC_AVAILABLE:
             self._fps = max(1.0, float(meta.fps or 25.0))
             self._next_at: float | None = None
             self._stopped = False
+            # Consumer-side clock: how late each frame reached the WebRTC
+            # encoder (TTFF, latency percentiles, pacing jitter, drops).
+            started = getattr(meta, "started_at_s", None)
+            self.clock = FrameClock(
+                fps=self._fps,
+                start_s=float(started) if started is not None else time.monotonic(),
+                first_idx=int(getattr(meta, "first_idx", 0) or 0),
+            )
+
+        def metrics(self) -> dict:
+            """Delivery metrics of this track (TTFF, p50/p95/p99, jitter, drops)."""
+            return self.clock.to_dict()
 
         def stop(self) -> None:
             self._stopped = True
@@ -70,6 +83,7 @@ if AIORTC_AVAILABLE:
                 if delay > 0:
                     await asyncio.sleep(delay)
                 self._next_at = max(self._next_at + 1.0 / self._fps, time.monotonic())
+                self.clock.on_frame(_idx, pts_ms, time.monotonic())
 
                 frame = av.VideoFrame.from_ndarray(
                     np.ascontiguousarray(frame_array),

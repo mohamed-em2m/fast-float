@@ -242,6 +242,7 @@ class StreamingVideoSaver:
                     channels=int(C),
                     request_id=str(getattr(self, "request_id", "") or ""),
                     audio_path=audio_path,
+                    started_at_s=time.monotonic(),
                 ),
                 stop_event=stop,
             )

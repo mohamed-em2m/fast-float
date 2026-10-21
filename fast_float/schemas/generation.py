@@ -104,6 +104,9 @@ class GenerationProgress(BaseModel):
     completed_chunks: int = 0
     percent: float = 0.0
     message: str = ""
+    # Delivery-side metrics of a live stream (TTFF, p50/p95/p99 latency,
+    # jitter, dropped frames). None when the request is not streaming.
+    delivery_metrics: dict[str, Any] | None = None
 
 
 class HealthResponse(BaseModel):

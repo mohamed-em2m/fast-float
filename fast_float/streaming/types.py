@@ -15,6 +15,11 @@ class StreamMeta:
     first_idx: int = 0
     total_frames: int | None = None
     audio_path: str | None = None
+    # Monotonic timestamp of the stream start. Consumers need it to measure how
+    # late a frame arrived relative to when it was due (see
+    # ``fast_float.core.perf_metrics.FrameClock``); without it, a consumer that
+    # subscribes late would compute a negative latency.
+    started_at_s: float | None = None
 
     def pts_ms(self, idx: int) -> float:
         """Timestamp of ``idx`` in milliseconds, relative to the stream start."""

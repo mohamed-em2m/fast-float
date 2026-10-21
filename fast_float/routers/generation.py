@@ -196,7 +196,16 @@ async def generation_progress(request_id: str):
     if record is None:
         raise HTTPException(status_code=404, detail="Unknown request id")
     allowed = set(GenerationProgress.model_fields)
-    return GenerationProgress(**{k: v for k, v in record.items() if k in allowed})
+    payload = {k: v for k, v in record.items() if k in allowed}
+    # Live streams also report their delivery metrics (TTFF, latency
+    # percentiles, jitter, drops) so the latency half of the perf matrix is
+    # observable in production, not only in the benchmark.
+    stream = app_state.live_streams.get(request_id)
+    if stream is not None:
+        metrics = stream.metrics()
+        if metrics:
+            payload["delivery_metrics"] = metrics
+    return GenerationProgress(**payload)
 
 
 @router.get("/download/{request_id}")
