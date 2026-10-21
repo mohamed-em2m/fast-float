@@ -455,6 +455,37 @@ When editing or extending the codebase, follow these design patterns:
   per call picks the smallest session covering the micro-batch (replicate-pad,
   trim). `_decoder_static_batch()` returns the *largest* available batch, so the
   decode tuner can size above the primary instead of being capped at it.
+- **An exported graph must be the model the application runs — and the parity
+  gate has to prove it.** `fmt`'s artifact decides the *motion latents*, so a
+  wrong graph does not degrade the picture a little, it produces different
+  motion. `FMT.Attention` has two implementations of the same math: the fused
+  SDPA branch (`use_fused_attn()` is True, so this is what production runs) and
+  the manual branch. They disagreed about the **polarity of the alignment
+  mask**: `enc_dec_mask` marks the frames *outside* the local ±`attention_window`
+  band, SDPA's `attn_mask=~mask` therefore keeps the band, but the manual
+  branch's `masked_fill(~mask, -inf)` masked the band out and attended to
+  *everything else* — the exact inverse. The converter exported the manual
+  branch (`fused_attn = False`) while the app ran the fused one, so
+  `fmt_step_v1.onnx` was a **different model**: per-step cosine 0.94, and the
+  final latent after a full CFG ODE scored cosine 0.81 against the torch path
+  (garbage frames). The converter's parity gate could not see it, because it
+  compared the graph against *the very module it had just traced*. Fixed by
+  (a) making both branches use the same polarity, (b) exporting the deployed
+  path instead of an export-only substitute, and (c) gating the artifact
+  against a **snapshot of the deployed model**, never against the traced
+  module. The same blindness applies to the selector: its eager reference must
+  be the deployed model, or a bad artifact passes selection and gets shipped.
+  `tests/test_fmt_attention_export.py` pins all of it.
+- **A constructor-wired backend still needs an install-time self-test.**
+  `emotion`/`audio`/`fmt` install their ONNX backend in their own constructor,
+  i.e. *before* the checkpoint is loaded, so `apply_backends` could not judge
+  them (the decoder/direction/refenc self-tests run there). A stale `fmt`
+  artifact therefore shipped broken frames with no complaint. `fmt` is now
+  verified in `apply_backends` — one CFG-shaped step, torch vs the graph,
+  gated functionally (`cosine >= FP16_MIN_COSINE`, `mean_abs <=
+  FP16_MAX_MEAN`, the vector field is small-magnitude so the drift is
+  absolute) — and dropped (component stays eager) when it does not reproduce
+  the torch model. The wrong artifact scores cosine 0.958 and is rejected.
 - **A batch-shared scalar input must stay static.** `fmt` takes one scalar time
   value `t` (`torch.tensor([t_val])`, shape `[1]`, broadcast over the batch
   *inside* the graph) — it is not a batch-first tensor. `export_module` used to

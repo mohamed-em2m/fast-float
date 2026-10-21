@@ -181,6 +181,18 @@ and `fast_float/onnx/dispatch.py` (`apply_backends`).
   A missing artifact still can't break startup — construction raises and is
   caught, logging a warning and leaving the component `eager`. ORT provider
   fallback (`trt → cuda → cpu`) happens *inside* `make_ort_session`.
+- **The parity reference is the *deployed* model, never the traced one.** A
+  graph compared against the module it was traced from proves nothing: the
+  `fmt` artifact used to be exported with an inverted attention mask (a
+  different model — per-step cosine 0.94) and passed every gate that way. The
+  converter now traces the deployed module and gates the artifact against a
+  snapshot of it; the selector's eager reference is the deployed model too.
+- **Install-time self-tests** (`apply_backends`): the components it
+  substitutes (`direction`, `refenc`, `decoder`) are probed against the torch
+  model, and `fmt` — which wires itself in its constructor, before the
+  checkpoint is loaded — is probed in the same pass, once the weights are
+  there. A graph that does not reproduce the torch model is dropped and the
+  component stays `eager`. `FLOAT_SKIP_BACKEND_SELFTEST=1` skips the probes.
 - **TensorRT profiles are built automatically at runtime**, not read from the
   config: every ONNX runner goes through `export.make_runtime_session`, which
   hands the dynamic-shape graph representative TRT profiles (derived from each

@@ -182,9 +182,11 @@ def _build_fmt(args, device) -> Case:
         num_heads=args.fmt_heads,
     )
     fmt = build_fmt(ns).to(device)
-    for blk in fmt.blocks:
-        if hasattr(blk, "attn"):
-            blk.attn.fused_attn = False
+    # The eager reference must be the *deployed* model, so the parity gate
+    # judges the shipped artifact against what the torch path runs. This used
+    # to force the manual attention branch ("fused_attn = False"), which made
+    # the reference a different model than the deployed one (inverted
+    # attention mask) and let a bad artifact pass selection unnoticed.
     module = FMTStepWrapper(fmt).eval().to(device)
     names = ["t", "x", "wa", "wr", "we", "prev_x", "prev_wa"]
     ins = sample_inputs(3, 0.5, 99, device)  # CFG 3B: the hot call

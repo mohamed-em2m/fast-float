@@ -22,7 +22,10 @@ Parity is validated by the converter/selector scripts (the config is the
 contract), plus a one-shot self-test when a component is installed here: the
 graph is only as good as the execution provider that loads it, and providers
 are chosen at runtime. ``FLOAT_SKIP_BACKEND_SELFTEST=1`` skips the probes.
-With the default all-eager config nothing is substituted.
+The constructor-wired components (``emotion``/``audio``/``fmt``) are verified
+the same way, once the checkpoint is loaded, and dropped if the artifact does
+not reproduce the torch model. With the default all-eager config nothing is
+substituted.
 
 Call once, after the checkpoint is loaded and the module is on its device.
 """
@@ -35,6 +38,7 @@ import os
 import torch
 
 from fast_float.onnx.backends import resolve_mode, resolve_use_trt
+from fast_float.onnx.export import FP16_MAX_MEAN, FP16_MIN_COSINE
 from fast_float.onnx.parity import U8_MAX_LSB, U8_MAX_MEAN_LSB, compare_outputs, u8_lsb
 from fast_float.onnx.registry import get as component_spec
 from fast_float.onnx.registry import post_load
@@ -139,6 +143,74 @@ def _selftest_decoder(ae, runner, image_size: int) -> bool:
     ok = max_lsb <= U8_MAX_LSB and mean_lsb <= U8_MAX_MEAN_LSB
     print(f"[backends:decoder] self-test max_lsb={max_lsb} mean_lsb={mean_lsb:.2f} cosine={cosine:.6f} ok={ok}")
     return ok
+
+
+def _selftest_fmt(fmt) -> bool:
+    """One FMT step, torch vs the installed ONNX graph (CFG-shaped batch).
+
+    The FMT artifact is the one that decides the *motion latents*, so a wrong
+    graph does not degrade the picture a little -- it produces different
+    motion. A stale artifact (e.g. one exported with the inverted attention
+    mask) has to be rejected here, at install time, instead of quietly
+    shipping broken frames.
+    """
+    opt = getattr(fmt, "opt", None)
+    device = _device_of(fmt)
+    n_clip = int(getattr(opt, "wav2vec_sec", 2.0) * getattr(opt, "fps", 25.0))
+    n_prev = int(getattr(opt, "num_prev_frames", 10))
+    dim_w = int(getattr(opt, "dim_w", 512))
+    dim_e = int(getattr(opt, "dim_e", 7))
+    g = torch.Generator(device="cpu").manual_seed(3)
+
+    def _rand(*shape):
+        return torch.randn(*shape, generator=g).to(device)
+
+    t = torch.tensor([0.5], device=device)
+    x = _rand(3, n_clip, dim_w)
+    wa = _rand(3, n_clip, dim_w)
+    wr = _rand(3, 1, dim_w)
+    we = _rand(3, 1, dim_e)
+    prev_x = _rand(3, n_prev, dim_w)
+    prev_wa = _rand(3, n_prev, dim_w)
+    with torch.no_grad():
+        ref = fmt.forward(t, x, wa, wr, we, prev_x, prev_wa, train=False)
+        got = fmt._onnx_backend.run_step(t, x, wa, wr, we, prev_x, prev_wa)
+    rep = compare_outputs(ref, got, atol=1e-3, rtol=1e-3)
+    # The vector field is small-magnitude, so the drift is absolute: judge it
+    # functionally (cosine + bounded mean), like the converter does for the
+    # TRT FP16 path. A wrong graph scores cosine ~0.94 and is rejected.
+    ok = bool(rep["cosine"] >= FP16_MIN_COSINE and rep["mean_abs"] <= FP16_MAX_MEAN)
+    print(
+        f"[backends:fmt] self-test cosine={rep['cosine']:.6f} "
+        f"mean_abs={rep['mean_abs']:.3e} max_abs={rep['max_abs']:.3e} ok={ok}"
+    )
+    return ok
+
+
+def _verify_constructor_backends(model) -> None:
+    """Check the components that wire themselves in their own constructor.
+
+    ``emotion``/``audio``/``fmt`` install their ONNX backend before the
+    checkpoint is loaded, so their artifact can only be judged now. A graph
+    that does not reproduce the torch model is dropped (the component stays
+    eager) -- the graph is only as good as the artifact and the provider that
+    loads it.
+    """
+    fmt = getattr(model, "fmt", None)
+    backend = getattr(fmt, "_onnx_backend", None)
+    if backend is None:
+        return
+    try:
+        if not _selftests_enabled() or _selftest_fmt(fmt):
+            return
+    except Exception as e:
+        logger.warning(f"backends: fmt ONNX self-test failed ({e}); eager")
+        fmt._onnx_backend = None
+        fmt._mode = "eager"
+        return
+    logger.warning("backends: fmt ONNX failed the parity self-test; eager")
+    fmt._onnx_backend = None
+    fmt._mode = "eager"
 
 
 # --------------------------------------------------------------------------- #
@@ -290,18 +362,29 @@ def apply_backends(model, opt=None):
     default all-eager config is a no-op. Never raises.
     """
     if os.environ.get("FLOAT_DISABLE_BACKENDS"):
+        # The constructor-wired components (emotion/audio/fmt) install
+        # themselves before this pass, so the flag does not reach them --
+        # but their artifact still has to be verified, because a wrong graph
+        # ships broken frames.
+        try:
+            _verify_constructor_backends(model)
+        except Exception as e:
+            logger.warning(f"backends: constructor backend verification failed ({e})")
         return model
     ae = getattr(model, "motion_autoencoder", None)
-    if ae is None:
-        return model
-    post = set(post_load())
-    for name, install in _INSTALLERS.items():
-        if name not in post:
-            continue
-        try:
-            install(model, ae, opt)
-        except Exception as e:
-            logger.warning(f"backends: {name} install failed ({e}); eager")
+    if ae is not None:
+        post = set(post_load())
+        for name, install in _INSTALLERS.items():
+            if name not in post:
+                continue
+            try:
+                install(model, ae, opt)
+            except Exception as e:
+                logger.warning(f"backends: {name} install failed ({e}); eager")
+    try:
+        _verify_constructor_backends(model)
+    except Exception as e:
+        logger.warning(f"backends: constructor backend verification failed ({e})")
     return model
 
 

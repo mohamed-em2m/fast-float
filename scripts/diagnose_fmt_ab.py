@@ -212,9 +212,10 @@ def main(argv=None) -> int:
         num_heads=8,
     )
     fmt = build_fmt(ns).to(device)
-    for blk in fmt.blocks:
-        if hasattr(blk, "attn"):
-            blk.attn.fused_attn = False
+    # The torch reference must be the *deployed* model (same attention path
+    # the application runs). Forcing the manual branch here compared the
+    # graph against a different model, which is exactly the blind spot this
+    # probe is meant to close.
     fmt_eager = copy.deepcopy(fmt)
     fmt_eager._onnx_backend = None
     fmt_eager._mode = "eager"
