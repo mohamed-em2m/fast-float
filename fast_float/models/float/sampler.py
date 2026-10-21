@@ -42,7 +42,13 @@ def stack_latent_parts(parts, n_items: int) -> torch.Tensor:
     slice. Re-add the batch dim before joining, and reject a batch that does not
     match the requested items instead of slicing silently.
     """
-    pieces = [p.unsqueeze(0) if p.ndim == 2 else p for p in parts]
+    pieces = []
+    for p in parts:
+        if p.ndim == 2:
+            p = p.unsqueeze(0)
+        elif p.ndim != 3:
+            raise RuntimeError(f"sampler chunk has shape {tuple(p.shape)} (expected [N, T, dim] or [T, dim])")
+        pieces.append(p)
     if not pieces:
         raise RuntimeError("sampler yielded no latent chunks")
     lat_all = torch.cat(pieces, dim=1)

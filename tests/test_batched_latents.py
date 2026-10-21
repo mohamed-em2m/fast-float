@@ -47,3 +47,8 @@ def test_three_dimensional_parts_are_not_rebatched():
 def test_empty_sampler_output_is_an_error():
     with pytest.raises(RuntimeError, match="no latent chunks"):
         stack_latent_parts([], 1)
+
+
+def test_one_dimensional_chunk_is_rejected_clearly():
+    with pytest.raises(RuntimeError, match="expected \\[N, T, dim\\] or \\[T, dim\\]"):
+        stack_latent_parts([torch.randn(128)], 1)
