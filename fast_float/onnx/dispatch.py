@@ -34,7 +34,7 @@ import os
 
 import torch
 
-from fast_float.onnx.backends import resolve_mode
+from fast_float.onnx.backends import resolve_mode, resolve_use_trt
 from fast_float.onnx.parity import compare_outputs
 from fast_float.onnx.registry import get as component_spec
 from fast_float.onnx.registry import post_load
@@ -181,7 +181,12 @@ def _apply_direction(model, ae, opt) -> None:
         # No automatic parity probe: the converter/selector scripts validate;
         # the config is the contract.
         motion_dim = int(target.weight.shape[1])
-        runner = DirectionOnnx(path, opt_shapes={"x": [1, motion_dim]}, device_id=_primary_device_id(opt))
+        runner = DirectionOnnx(
+            path,
+            opt_shapes={"x": [1, motion_dim]},
+            device_id=_primary_device_id(opt),
+            use_trt=resolve_use_trt("direction"),
+        )
         if _selftests_enabled() and not _selftest_direction(target, runner):
             logger.warning("backends: direction ONNX failed the parity self-test; eager")
             return
@@ -216,6 +221,7 @@ def _apply_refenc(model, ae, opt) -> None:
             torch_fallback=enc,
             opt_shapes={"img": [1, 3, size, size]},
             device_id=_primary_device_id(opt),
+            use_trt=resolve_use_trt("refenc"),
         )
         if _selftests_enabled() and not _selftest_refenc(enc, runner, size):
             logger.warning("backends: refenc ONNX failed the parity self-test; eager")
@@ -239,7 +245,7 @@ def _apply_decoder(model, ae, opt) -> None:
         return
     path = _path(opt, "decoder_onnx_path", component_spec("decoder").onnx_default)
     try:
-        runner = DecoderOnnx(path, device_id=_primary_device_id(opt))
+        runner = DecoderOnnx(path, device_id=_primary_device_id(opt), use_trt=resolve_use_trt("decoder"))
         if _selftests_enabled() and not _selftest_decoder(ae, runner, _image_size(opt)):
             logger.warning("backends: decoder ONNX failed the parity self-test; eager")
             return

@@ -313,6 +313,7 @@ class FlowMatchingTransformer(BaseModel):
         onnx_path = getattr(opt, "fmt_onnx_path", "./onnx/fmt_step_v1.onnx")
         if self._mode == "onnx" and onnx_path and os.path.exists(onnx_path):
             try:
+                from fast_float.onnx.backends import resolve_use_trt
                 from fast_float.onnx.runtime import FMTStepBackend
 
                 n_clip = int(self.opt.wav2vec_sec * self.opt.fps)
@@ -332,6 +333,7 @@ class FlowMatchingTransformer(BaseModel):
                         "prev_x": [1, n_prev, dim_w],
                         "prev_wa": [1, n_prev, dim_w],
                     },
+                    use_trt=resolve_use_trt("fmt"),
                 )
                 logger.info(
                     f"FlowMatchingTransformer: ONNX backend constructed {onnx_path} "

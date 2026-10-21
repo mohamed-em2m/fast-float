@@ -485,6 +485,7 @@ def make_runtime_session(
     use_gpu: bool | None = None,
     fp16: bool = True,
     device_id: int | None = None,
+    use_trt: bool | None = None,
 ):
     """ORT session for a *runtime* component with automatic TensorRT profiles.
 
@@ -525,7 +526,7 @@ def make_runtime_session(
     sess = make_ort_session(
         onnx_path,
         use_gpu=use_gpu,
-        use_trt=use_gpu and not no_trt,
+        use_trt=use_gpu and not no_trt and (use_trt is None or bool(use_trt)),
         trt_fp16=fp16,
         trt_min_shapes=mn,
         trt_opt_shapes=op,

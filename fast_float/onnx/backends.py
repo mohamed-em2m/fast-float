@@ -265,6 +265,21 @@ def resolve_provider(name: str) -> str | None:
     return get_config().component(name).provider
 
 
+def resolve_use_trt(name: str) -> bool | None:
+    """Whether ``name`` may run on TensorRT (``None`` = unconstrained).
+
+    The selector records the provider it benchmarked and parity-checked the
+    artifact on; ``cuda``/``cpu`` means it was validated *without* TRT, so the
+    runtime must not silently upgrade it (TRT's partitioned engine changes the
+    numerics and was the source of the broken decoder frames).
+    """
+    try:
+        provider = resolve_provider(name)
+    except Exception:
+        return None
+    return False if provider in ("cuda", "cpu") else None
+
+
 def maybe_compile(module, name: str):
     """Return ``torch.compile(module)`` when the config selects ``compile``.
 
@@ -350,5 +365,6 @@ __all__ = [
     "maybe_compile",
     "resolve_mode",
     "resolve_provider",
+    "resolve_use_trt",
     "save_backends",
 ]

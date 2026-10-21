@@ -268,6 +268,8 @@ The config is **hardware-specific** and generated on the target box — never ha
 
 For each unit the script exports (`torch.export` → ONNX), runs a **parity check** against the PyTorch reference, **benchmarks** warmed latency, and records only the units that actually win. The generated file is `onnx/backends.generated.yaml`.
 
+The `provider` recorded per unit is honoured at load time: a unit the selector benchmarked and parity-checked on `cuda`/`cpu` is never silently upgraded to TensorRT later (TRT's partitioned engine changes the numerics, which is how the broken decoder frames got deployed).
+
 Resolution order at runtime:
 
 1. `$FLOAT_BACKENDS_CONFIG` (explicit path)
