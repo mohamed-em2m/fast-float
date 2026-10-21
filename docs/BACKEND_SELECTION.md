@@ -201,8 +201,8 @@ and `fast_float/onnx/dispatch.py` (`apply_backends`).
   `cudnn.allow_tf32=False`), which makes the residual the graph's own error
   again (1 LSB measured). The runtime self-test cannot pin the provider (the
   deployed session is TF32 for speed), so it judges the provider by the mean
-  (0.5 LSB = invisible) plus a cosine floor (0.999) and reports the max as
-  information.
+  (2 LSB — the provider's TF32 path alone moves this stack by ~0.5 LSB mean)
+  plus a cosine floor (0.999) and reports the max as information.
 - **The decoder graph is the model.** It used to substitute a grouped conv
   (`groups=batch`); the ORT CUDA EP serves grouped convs only through a
   fallback kernel that drifts ~90 uint8 LSB from torch's and is not

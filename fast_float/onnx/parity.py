@@ -14,6 +14,17 @@ import numpy as np
 U8_MAX_LSB = 2
 U8_MAX_MEAN_LSB = 0.5
 
+# Provider-level floor for the decoder: the *provider*, not the graph, sets
+# the precision here. The ORT CUDA EP runs fp32 matmuls/convs on TF32
+# tensor cores, and through the decoder's 22-conv stack that alone moves the
+# frames by ~0.5 uint8 LSB on average (max ~50 LSB on a few pixels) -- so the
+# runtime install self-test cannot use the 0.5 LSB floor: it would reject an
+# artifact the exporter already proved exact. 2 LSB mean (0.8% of the range) is
+# still invisible on a 512x512 frame, while a structurally wrong graph (the
+# broken TensorRT engine: max_abs 4.375) measures ~23 LSB mean and a cosine of
+# 0.983, so both floors still reject it.
+U8_MAX_PROVIDER_MEAN_LSB = 2.0
+
 
 def u8_lsb(ref, out) -> tuple[int, float]:
     """Quantized-frame error: what the decode path actually writes.

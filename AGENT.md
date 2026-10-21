@@ -474,7 +474,8 @@ When editing or extending the codebase, follow these design patterns:
   `cudnn.allow_tf32=False` inside `_deterministic_cudnn()`), which makes the
   residual the graph's own error again (1 LSB). The runtime install self-test
   cannot pin the provider (the deployed session is TF32 for speed), so it
-  judges the *provider* by the mean (0.5 LSB = invisible) plus a cosine floor
+  judges the *provider* by the mean (2 LSB — the provider's TF32 path alone
+  moves this stack by ~0.5 LSB mean) plus a cosine floor
   (0.999) and reports the max as information; a structurally wrong graph
   (max_abs 4.375, cosine 0.983) still fails both floors.
 - **An exported graph must be the model the application runs — and the parity
