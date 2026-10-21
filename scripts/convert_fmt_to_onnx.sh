@@ -22,7 +22,7 @@ echo "=== [1/3] weights ==="
 if [ ! -f "${CKPT}" ]; then
   echo "float.pth missing -> downloading (gdown)"
   command -v gdown >/dev/null || pip_install gdown
-  gdown --id 1rvWuM12cyvNvBQNCLmG4Fr2L1rpjQBF0 -O "${CKPT}"
+  gdown_download 1rvWuM12cyvNvBQNCLmG4Fr2L1rpjQBF0 "${CKPT}"
 else
   echo "found ${CKPT}"
 fi

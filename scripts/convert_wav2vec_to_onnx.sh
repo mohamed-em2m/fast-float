@@ -26,15 +26,14 @@ echo "=== [1/3] weights ==="
 if [ ! -f "${CKPT}" ]; then
   echo "float.pth missing -> downloading (gdown)"
   command -v gdown >/dev/null || pip_install gdown
-  gdown --id 1rvWuM12cyvNvBQNCLmG4Fr2L1rpjQBF0 -O "${CKPT}"
+  gdown_download 1rvWuM12cyvNvBQNCLmG4Fr2L1rpjQBF0 "${CKPT}"
 else
   echo "found ${CKPT}"
 fi
 if [ ! -d "${W2V_DIR}" ]; then
-  echo "wav2vec2 model missing -> downloading (hf)"
-  command -v hf >/dev/null || pip_install "huggingface_hub[hf-transfer]"
-  hf download facebook/wav2vec2-base-960h \
-    --local-dir "${W2V_DIR}"
+  echo "wav2vec2 model missing -> downloading (huggingface)"
+  command -v hf >/dev/null || command -v huggingface-cli >/dev/null || pip_install "huggingface_hub[hf-transfer]"
+  hf_download facebook/wav2vec2-base-960h "${W2V_DIR}"
 else
   echo "found ${W2V_DIR}"
 fi
