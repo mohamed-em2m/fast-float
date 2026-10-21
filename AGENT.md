@@ -447,14 +447,36 @@ When editing or extending the codebase, follow these design patterns:
   by the converter/selector scripts only (`python -m fast_float.onnx.select_backends`).
   ORT providers (`trt → cuda → cpu`) fall back *inside* session creation.
 - **The `decoder` graph is static-batch, so it ships as a set.**
-  `ModulatedConv2d` bakes `groups=batch` into the graph, making each artifact
-  valid for exactly one `B`. `convert_decoder.py --batches 1,2,4,8,16` writes the
+  Each artifact is valid for exactly one `B`.
+  `convert_decoder.py --batches 1,2,4,8,16` writes the
   primary `--batch` (default 8, matching the selector's `--dec-batch`) to `--out`
   and the rest to `<stem>_b<N>.onnx` siblings. `DecoderOnnx`
   (`runtimes/onnx/runner.py`) discovers the siblings, loads them **lazily**, and
   per call picks the smallest session covering the micro-batch (replicate-pad,
   trim). `_decoder_static_batch()` returns the *largest* available batch, so the
   decode tuner can size above the primary instead of being capped at it.
+- **The decoder graph is the model itself — do not substitute grouped convs.**
+  The deployed `ModulatedConv2d` is a *dense* modulated convolution (the style
+  is folded into the input channels; no `groups`). An older export substituted
+  a grouped variant (`groups=batch` baked into the ONNX attribute) to make the
+  batch static, and the ORT CUDA EP can only serve grouped convs through its
+  **fallback** kernel: measured against torch it drifts ~90 uint8 LSB (fp32 on
+  both sides!) and is not even run-to-run reproducible, so the artifact could
+  not reproduce the frames the eager path produces. The export now traces the
+  model as-is (still at a fixed batch, so the artifact set and the runtime's
+  pad/trim are unchanged) and the parity gate measures 1 LSB.
+- **A parity check must compare the same computation on both sides.** TF32
+  rounds every accumulation to a 10-bit mantissa; through the decoder's 22-conv
+  stack that alone moves the output by ~40 uint8 LSB — far more than the
+  2 LSB the frame gate allows — so comparing a TF32 ORT session against a TF32
+  torch model measures the *kernels*, not the graph. The converter therefore
+  pins **both** sides to fp32 (`make_session_from_args(..., use_tf32=False)` and
+  `cudnn.allow_tf32=False` inside `_deterministic_cudnn()`), which makes the
+  residual the graph's own error again (1 LSB). The runtime install self-test
+  cannot pin the provider (the deployed session is TF32 for speed), so it
+  judges the *provider* by the mean (0.5 LSB = invisible) plus a cosine floor
+  (0.999) and reports the max as information; a structurally wrong graph
+  (max_abs 4.375, cosine 0.983) still fails both floors.
 - **An exported graph must be the model the application runs — and the parity
   gate has to prove it.** `fmt`'s artifact decides the *motion latents*, so a
   wrong graph does not degrade the picture a little, it produces different

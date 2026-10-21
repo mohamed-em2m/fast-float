@@ -60,8 +60,11 @@ Consequences that shape the architecture:
 - `fmt` exports **only the single vector-field step**; the ODE loop, CFG combine
   and chunk autoregression stay in Python (`FMT._forward_step`). CFG `b=3` is the
   hot shape.
-- `decoder` bakes `groups=batch` into its convs → a **static-batch** artifact;
+- `decoder` is a **static-batch** artifact (the graph is traced at a fixed B);
   build enumerates candidate batches and runtime pads/trims (`_decode_u8`).
+  The graph is the *model* — dense modulated convs, no `groups=batch`
+  substitute (the ORT CUDA EP serves grouped convs only through a fallback
+  kernel that drifts ~90 uint8 LSB and is not reproducible).
 - `emotion` and `fmt` have **hard** TRT profile bounds (min length 16000;
   fixed clip). Exceeding them is an ORT hard error; only `fmt` currently catches
   it (`_forward_step` sets `_onnx_backend=None` → **sticky** degradation).

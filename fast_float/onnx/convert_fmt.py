@@ -104,6 +104,11 @@ def build_fmt(args) -> FlowMatchingTransformer:
         audio_dropout_prob=0.1,
         ref_dropout_prob=0.1,
         emotion_dropout_prob=0.1,
+        # No runtime ONNX backend: the converter exports the *torch* model, and
+        # wiring a session here would load the very artifact this run
+        # replaces (and make the model un-deepcopyable for the parity
+        # snapshot).
+        fmt_onnx_path=None,
     )
     fmt = FlowMatchingTransformer(opt)
     if os.path.exists(args.ckpt):

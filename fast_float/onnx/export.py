@@ -292,6 +292,7 @@ def make_ort_session(
     trt_opt_shapes: dict[str, Sequence[int]] | None = None,
     trt_max_shapes: dict[str, Sequence[int]] | None = None,
     device_id: int | None = None,
+    use_tf32: bool | None = None,
 ):
     """ORT InferenceSession, provider chain TRT -> CUDA -> CPU.
 
@@ -306,6 +307,14 @@ def make_ort_session(
     the default EXHAUSTIVE search can pick a workspace-hungry algorithm and
     hard-FAIL allocation (bogus ~17 GB request observed). DEFAULT stays
     correct for all lengths at negligible speed cost.
+
+    ``use_tf32`` pins the CUDA EP's TF32 path (ORT default: on). TF32 rounds
+    every accumulation to a 10-bit mantissa; through a deep conv stack that
+    drifts far enough to see: the decoder differs by ~40 uint8 LSB between two
+    TF32 implementations and by ~1 LSB in fp32. A parity check that compares a
+    graph against the torch model must therefore pin *both* sides to the same
+    precision -- pass ``use_tf32=False`` for the session and disable
+    ``cudnn.allow_tf32`` in torch.
 
     With ``require_gpu=True`` a missing CUDA/TRT provider raises instead of
     silently benchmarking CPU.
@@ -343,12 +352,10 @@ def make_ort_session(
                 )
             )
         if "CUDAExecutionProvider" in available:
-            gpu_providers.append(
-                (
-                    "CUDAExecutionProvider",
-                    {"device_id": dev_id, "cudnn_conv_algo_search": "DEFAULT"},
-                )
-            )
+            cuda_opts = {"device_id": dev_id, "cudnn_conv_algo_search": "DEFAULT"}
+            if use_tf32 is not None:
+                cuda_opts["use_tf32"] = 1 if use_tf32 else 0
+            gpu_providers.append(("CUDAExecutionProvider", cuda_opts))
     if use_gpu and require_gpu and not gpu_providers:
         raise RuntimeError(
             "GPU requested but no CUDA/TRT execution provider available "
@@ -442,7 +449,7 @@ def add_ort_args(ap, default_max_batch: int = 8):
     )
 
 
-def make_session_from_args(onnx_path: str, args, opt_shapes=None, extra_dynamic=None):
+def make_session_from_args(onnx_path: str, args, opt_shapes=None, extra_dynamic=None, use_tf32: bool | None = None):
     """Build an ORT session from shared CLI flags (chain TRT -> CUDA -> CPU).
 
     ``opt_shapes`` maps each *dynamic* input to a representative shape so the
@@ -451,6 +458,10 @@ def make_session_from_args(onnx_path: str, args, opt_shapes=None, extra_dynamic=
     callers to relax parity tolerances -- it is True only when the TensorRT
     FP16 EP is *actually* active (a requested-but-unloadable TRT must not relax
     the CUDA/CPU parity gate).
+
+    ``use_tf32=False`` pins the CUDA EP to full precision. Parity checks that
+    compare a graph against the torch model need both sides in the same
+    precision (TF32 alone moves a deep conv stack by tens of uint8 LSB).
     """
     use_gpu = torch.cuda.is_available() and not getattr(args, "cpu_ort", False)
     use_trt = use_gpu and not getattr(args, "no_trt", False)
@@ -473,6 +484,7 @@ def make_session_from_args(onnx_path: str, args, opt_shapes=None, extra_dynamic=
         trt_min_shapes=mn,
         trt_opt_shapes=op,
         trt_max_shapes=mx,
+        use_tf32=use_tf32,
     )
     return sess, (fp16 and "TensorrtExecutionProvider" in sess.get_providers())
 

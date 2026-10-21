@@ -138,9 +138,19 @@ def _selftest_decoder(ae, runner, image_size: int) -> bool:
     # Gate in the deployed uint8 frame domain. The old image-space gate
     # (atol=1.0 on a [-1, 1] tensor, i.e. half the range) accepted a graph off
     # by 4.375; 2 LSB is invisible on screen and fails a broken graph.
+    #
+    # The *provider* is judged by the mean (0.5 LSB = invisible) and by the
+    # cosine (structurally sound), not by the max: the provider runs TF32 by
+    # default, and TF32 alone moves this 22-conv stack by ~40 LSB between two
+    # implementations. A structurally wrong graph (the broken TensorRT engine:
+    # max_abs 4.375, cosine 0.983) fails both floors.
     max_lsb, mean_lsb = u8_lsb(ref, got)
     cosine = compare_outputs(ref, got)["cosine"]
-    ok = max_lsb <= U8_MAX_LSB and mean_lsb <= U8_MAX_MEAN_LSB
+    # An all-zero reference has no meaningful cosine (it comes out 0), so
+    # there the per-pixel criterion decides.
+    degenerate = float(ref.detach().abs().max()) == 0.0
+    structural = max_lsb <= U8_MAX_LSB if degenerate else cosine >= _MIN_COSINE
+    ok = mean_lsb <= U8_MAX_MEAN_LSB and structural
     print(f"[backends:decoder] self-test max_lsb={max_lsb} mean_lsb={mean_lsb:.2f} cosine={cosine:.6f} ok={ok}")
     return ok
 

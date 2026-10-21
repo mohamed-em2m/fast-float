@@ -26,6 +26,40 @@ ONNX_PIN="onnx>=1.17,<1.19"
 ONNXSCRIPT_PIN="onnxscript==0.7.2"
 ORT_MAX="1.24"
 
+# gdown renamed its flags between majors: 5.x still has the (deprecated)
+# ``--id`` flag, 6.x dropped it and takes the Drive file id as the positional
+# argument. Probe the installed build instead of assuming one of them, or the
+# weights step aborts the whole conversion on a fresh env.
+gdown_download() {
+  local id="$1" out="$2"
+  local bin="${GDOWN:-gdown}"
+  if "${bin}" --help 2>&1 | grep -q -- "--id"; then
+    "${bin}" --id "${id}" -O "${out}"
+  else
+    "${bin}" "${id}" -O "${out}"
+  fi
+}
+
+# huggingface_hub 1.0 renamed the CLI from ``huggingface-cli`` to ``hf`` and
+# dropped the old entry point, so a fresh env has no ``huggingface-cli`` at
+# all. Use whichever binary exists and fall back to the Python API (always
+# present with the package).
+hf_download() {
+  local repo="$1" dest="$2"
+  if command -v hf >/dev/null 2>&1; then
+    hf download "${repo}" --local-dir "${dest}"
+  elif command -v huggingface-cli >/dev/null 2>&1; then
+    huggingface-cli download "${repo}" --local-dir "${dest}"
+  else
+    "${PY}" - "${repo}" "${dest}" <<'PY'
+import sys
+from huggingface_hub import snapshot_download
+
+snapshot_download(repo_id=sys.argv[1], local_dir=sys.argv[2])
+PY
+  fi
+}
+
 # Activate the project venv (if present) and route installs through uv.
 # Sets PY, PIP_REINSTALL and defines pip_install/pip_uninstall.
 use_project_venv() {

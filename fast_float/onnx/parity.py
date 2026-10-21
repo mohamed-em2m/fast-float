@@ -6,8 +6,11 @@ import numpy as np
 
 # Deployed-frame gate for the decoder: at 512x512, 2 LSB max / 0.5 LSB mean is
 # invisible on screen, while a structurally wrong graph (the TRT engine measured
-# max_abs=4.375, cosine=0.983) is not. Shared by the exporter and the runtime
-# install self-test so both judge the same thing.
+# max_abs=4.375, cosine=0.983) is not. The exporter uses both floors (it
+# compares the graph against the model in a common precision, so the residual
+# is the graph's own error); the runtime install self-test uses the mean floor
+# plus a cosine floor, because there the *provider* is in the loop and TF32
+# alone moves this 22-conv stack by ~40 LSB between two implementations.
 U8_MAX_LSB = 2
 U8_MAX_MEAN_LSB = 0.5
 

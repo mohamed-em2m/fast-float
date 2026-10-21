@@ -23,10 +23,20 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+
+# Repo-root bootstrap: running this file directly puts scripts/ on sys.path,
+# not the repo root, so ``import fast_float`` would fail. Only the repo root is
+# added -- never fast_float/ itself, whose onnx/ subpackage would shadow the
+# pip `onnx` dependency.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from fast_float.onnx.convert_fmt import CLIP_FRAMES, PREV_FRAMES, build_fmt
 
@@ -222,7 +232,13 @@ def main(argv=None) -> int:
     print(f"yaml-wired backend: {'yes' if fmt._onnx_backend is not None else 'no'}")
 
     backend = fmt._onnx_backend
-    if backend is None and args.force_onnx:
+    if backend is None and (args.force_onnx or os.path.exists(args.onnx)):
+        # The converter's builder never wires a runtime backend (it would load
+        # the very artifact the conversion replaces), so the yaml-wired case
+        # only happens when the *application* built the model. Fall back to the
+        # artifact on disk -- that is what the probe is about.
+        if not args.force_onnx:
+            print(f"no yaml-wired backend; using the artifact on disk ({args.onnx})")
         backend = make_backend(fmt, args.onnx, not args.no_trt, args.max_batch)
     if backend is None:
         print("No ONNX backend wired (config says eager and --force-onnx not given). Nothing to compare.")

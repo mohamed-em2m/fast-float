@@ -6,36 +6,41 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
+# Shared helpers: the gdown flag and the huggingface CLI were both renamed
+# between majors, so the download step must not assume one spelling.
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/_onnx_env.sh"
+use_project_venv
+
 mkdir -p checkpoints
 
-# gdown and hf are project dependencies (uv sync) — just locate them.
-if [ -x "${PROJECT_ROOT}/.venv/bin/gdown" ]; then
+# gdown and the huggingface CLI are project dependencies (uv sync) — just
+# locate gdown; the CLI itself is probed by the shared helper (it was renamed
+# from huggingface-cli to hf).
+if [ ! -x "${GDOWN:-}" ] && [ -x "${PROJECT_ROOT}/.venv/bin/gdown" ]; then
     GDOWN="${PROJECT_ROOT}/.venv/bin/gdown"
-    HF="${PROJECT_ROOT}/.venv/bin/hf"
-elif [ -x "${PROJECT_ROOT}/.venv/Scripts/gdown.exe" ]; then
-    GDOWN="${PROJECT_ROOT}/.venv/Scripts/gdown.exe"
-    HF="${PROJECT_ROOT}/.venv/Scripts/hf.exe"
-else
+fi
+if [ ! -x "${GDOWN:-}" ]; then
     echo "No .venv found — running 'uv sync --frozen' first."
     uv sync --frozen
     GDOWN="${PROJECT_ROOT}/.venv/bin/gdown"
-    HF="${PROJECT_ROOT}/.venv/bin/hf"
 fi
+export GDOWN
 
 echo "=== Downloading float.pth ==="
 if [ -f "checkpoints/float.pth" ]; then
     echo "checkpoints/float.pth already exists, skipping."
 else
-    "${GDOWN}" --id 1rvWuM12cyvNvBQNCLmG4Fr2L1rpjQBF0 -O checkpoints/float.pth
+    gdown_download 1rvWuM12cyvNvBQNCLmG4Fr2L1rpjQBF0 checkpoints/float.pth
 fi
 
 echo "=== Downloading wav2vec emotion model ==="
-"${HF}" download r-f/wav2vec-english-speech-emotion-recognition \
-  --local-dir ./checkpoints/wav2vec-english-speech-emotion-recognition
+hf_download r-f/wav2vec-english-speech-emotion-recognition \
+  ./checkpoints/wav2vec-english-speech-emotion-recognition
 
 echo "=== Downloading wav2vec2-base-960h ==="
-"${HF}" download facebook/wav2vec2-base-960h \
-  --local-dir ./checkpoints/wav2vec2-base-960h
+hf_download facebook/wav2vec2-base-960h \
+  ./checkpoints/wav2vec2-base-960h
 
 echo "=== Checkpoints ready ==="
 ls -la checkpoints/
