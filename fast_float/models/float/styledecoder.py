@@ -383,7 +383,8 @@ class ModulatedConv2d(nn.Module):
         self._w2_fp = None
 
     def _get_w2(self, w):
-        fp = (w._version, w.data_ptr(), w.device, w.dtype)
+        ver = 0 if w.is_inference() else getattr(w, "_version", 0)
+        fp = (ver, w.data_ptr(), w.device, w.dtype)
         if self._w2_cache is None or self._w2_fp != fp:
             self._w2_cache = w.pow(2).sum((2, 3)).t().contiguous()
             self._w2_fp = fp
@@ -607,7 +608,8 @@ class Direction(nn.Module):
         self._Q_fp = None
 
     def _fingerprint(self, w):
-        return (w._version, w.data_ptr(), w.device, w.dtype)
+        ver = 0 if w.is_inference() else getattr(w, "_version", 0)
+        return (ver, w.data_ptr(), w.device, w.dtype)
 
     def _orthonormal_basis(self):
         """Cached Q factor of weight. Recomputed only if weight changed."""
