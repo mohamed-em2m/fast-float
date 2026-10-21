@@ -275,9 +275,9 @@ def _apply_decoder(model, ae, opt) -> None:
 
 
 _INSTALLERS = {
+    "decoder": _apply_decoder,
     "direction": _apply_direction,
     "refenc": _apply_refenc,
-    "decoder": _apply_decoder,
 }
 
 
