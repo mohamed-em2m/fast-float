@@ -33,6 +33,24 @@ def _noise_generator(seed: int, device) -> torch.Generator:
     return g
 
 
+def stack_latent_parts(parts, n_items: int) -> torch.Tensor:
+    """Join ``sample`` chunks into one ``[N, T, dim]`` latent tensor.
+
+    ``sample`` drops the batch dim when ``B == 1`` (it yields ``[T, dim]``), so
+    a single-item request used to become ``[T, 2*dim]`` after ``cat(dim=1)`` and
+    then fail with "too many indices for tensor of dimension 2" at the per-item
+    slice. Re-add the batch dim before joining, and reject a batch that does not
+    match the requested items instead of slicing silently.
+    """
+    pieces = [p.unsqueeze(0) if p.ndim == 2 else p for p in parts]
+    if not pieces:
+        raise RuntimeError("sampler yielded no latent chunks")
+    lat_all = torch.cat(pieces, dim=1)
+    if lat_all.ndim != 3 or lat_all.shape[0] != n_items:
+        raise RuntimeError(f"sampler yielded {tuple(lat_all.shape)} for {n_items} items (expected [N, T, dim])")
+    return lat_all
+
+
 def _initial_noise(noise_gens, batch: int, frames: int, dim: int, device) -> torch.Tensor:
     """Draw the ODE's initial latent for a batch.
 

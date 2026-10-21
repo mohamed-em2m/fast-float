@@ -33,6 +33,7 @@ from fast_float.core.nvenc_encoder import (
 )
 from fast_float.core.options import InferenceOptions
 from fast_float.core.simple_encoder import SimpleVideoEncoder
+from fast_float.models.float.sampler import stack_latent_parts
 from fast_float.utils.timing import timed, timing_scope
 
 torch.backends.cudnn.benchmark = True
@@ -539,8 +540,8 @@ class OptimizedInferenceAgent:
                         seeds=seeds,
                         s_r=s_r,
                     )
-                )  # each piece is [N, T_slice, dim_w] (s_r already added)
-                lat_all = torch.cat(parts, dim=1)  # [N, T_full, dim_w]
+                )  # each piece is [N, T_slice, dim_w] (s_r already added), or [T_slice, dim_w] when N == 1
+                lat_all = stack_latent_parts(parts, len(items))  # [N, T_full, dim_w]
 
                 for i, it in enumerate(items):
                     # duration is seconds -> frames (samples*fps/sr == seconds*fps).
