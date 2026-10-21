@@ -72,6 +72,47 @@ def test_runtime_session_forwards_the_trt_veto(monkeypatch, tmp_path):
     assert seen["use_trt"] is True
 
 
+def test_builder_runtime_honours_the_trt_veto(monkeypatch, tmp_path):
+    """The selector must benchmark the provider serving will actually use.
+
+    Regression: ``OnnxBuilder.runtime`` called ``make_ort_session`` directly, so
+    a ``.no_trt``-vetoed decoder was benchmarked on TensorRT while
+    ``make_runtime_session`` deployed it on the CUDA EP -- the selector chose
+    from a candidate config the runtime would never load.
+    """
+    from fast_float.builders.onnx.builder import OnnxBuilder
+    from fast_float.builders.spec import BuildSpec
+    from fast_float.onnx import export
+
+    seen = {}
+
+    def fake_make_ort_session(path, **kwargs):
+        seen.clear()
+        seen.update(kwargs)
+        return _StubSession()
+
+    monkeypatch.setattr(export, "make_ort_session", fake_make_ort_session)
+    monkeypatch.setattr(export.torch.cuda, "is_available", lambda: True)
+
+    onnx_path = tmp_path / "decoder_v1.onnx"
+    onnx_path.write_bytes(b"stub")
+    spec = BuildSpec(
+        component="decoder",
+        backend="onnx",
+        input_names=("latent",),
+        precision="fp16",
+        extra={"out_path": str(onnx_path)},
+    )
+    builder = OnnxBuilder()
+
+    builder.runtime(spec, device_id=0)
+    assert seen["use_trt"] is True
+
+    (tmp_path / f"decoder_v1.onnx{export.TRT_DISABLED_MARKER}").write_text("veto\n", encoding="utf-8")
+    builder.runtime(spec, device_id=0)
+    assert seen["use_trt"] is False
+
+
 class _StubSession:
     def get_providers(self):
         return ["CPUExecutionProvider"]

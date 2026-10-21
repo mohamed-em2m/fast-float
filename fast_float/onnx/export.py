@@ -18,7 +18,8 @@ from collections.abc import Sequence
 import torch
 
 # Sidecar suffix a converter drops next to an artifact it could only validate
-# without TensorRT; ``make_runtime_session`` honours it.
+# without TensorRT; ``make_runtime_session`` (serving) and ``OnnxBuilder.runtime``
+# (selection) both honour it via ``trt_vetoed``.
 TRT_DISABLED_MARKER = ".no_trt"
 
 
@@ -476,6 +477,23 @@ def make_session_from_args(onnx_path: str, args, opt_shapes=None, extra_dynamic=
     return sess, (fp16 and "TensorrtExecutionProvider" in sess.get_providers())
 
 
+def trt_vetoed(onnx_path: str) -> bool:
+    """True when a ``<model>.onnx.no_trt`` sidecar vetoes TensorRT for the artifact.
+
+    A converter drops the sidecar when the graph neither runs faithfully nor
+    quickly on the TensorRT EP (see ``convert_decoder._mark_no_trt``). Everything
+    that *serves* or *measures* the artifact must agree on that veto, or the
+    selector benchmarks an engine the deployment never loads.
+
+    Deliberately *not* consulted by :func:`make_session_from_args`: the decoder
+    converter builds a TensorRT session on purpose to re-validate the EP and
+    clear a stale sidecar.
+    """
+    if not TRT_DISABLED_MARKER:
+        return False
+    return os.path.exists(f"{onnx_path}{TRT_DISABLED_MARKER}")
+
+
 def make_runtime_session(
     onnx_path: str,
     opt_shapes: dict[str, Sequence[int]] | None = None,
@@ -512,7 +530,7 @@ def make_runtime_session(
     # ``convert_decoder._mark_no_trt``): TRT ran 10x slower *and* failed the
     # uint8 parity gate on the frame decoder, and the runtime must not pick it
     # back up just because the EP is available.
-    no_trt = TRT_DISABLED_MARKER and os.path.exists(f"{onnx_path}{TRT_DISABLED_MARKER}")
+    no_trt = trt_vetoed(onnx_path)
     if no_trt:
         print(f"[ort] {os.path.basename(onnx_path)}: TRT vetoed by {TRT_DISABLED_MARKER}; using CUDA EP")
     mn = op = mx = None

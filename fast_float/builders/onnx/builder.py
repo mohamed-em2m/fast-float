@@ -109,11 +109,18 @@ class OnnxBuilder(BuilderSession):
 
         Builds the ORT session from the spec's provider chain / precision /
         TRT knobs (the same knobs ``make_session_from_args`` exposes), so the
-        selector measures the runtime contract instead of a raw session.
+        selector measures the runtime contract instead of a raw session. A
+        ``.no_trt`` sidecar on the artifact drops TRT from the chain, matching
+        what ``make_runtime_session`` will do when serving it.
         """
         import torch
 
-        from fast_float.onnx.export import make_ort_session, trt_optimization_profiles
+        from fast_float.onnx.export import (
+            TRT_DISABLED_MARKER,
+            make_ort_session,
+            trt_optimization_profiles,
+            trt_vetoed,
+        )
         from fast_float.runtimes.onnx.runner import OrtRuntime
 
         chain = tuple(spec.provider_chain or ())
@@ -121,6 +128,12 @@ class OnnxBuilder(BuilderSession):
         # GPU EP and raise (mirrors ``make_session_from_args``).
         use_gpu = ("cuda" in chain or "trt" in chain) and torch.cuda.is_available()
         use_trt = use_gpu and "trt" in chain
+        # Serving acts on the convert-time veto (``make_runtime_session`` skips
+        # TRT for a ``<model>.onnx.no_trt`` artifact), so measuring the TRT
+        # engine here would benchmark a provider the deployment never loads.
+        if use_trt and trt_vetoed(self.out_path(spec)):
+            use_trt = False
+            print(f"[select] {spec.component}: TRT vetoed by {TRT_DISABLED_MARKER}; measuring the CUDA EP")
         mn = op = mx = None
         if use_trt and spec.opt_shapes:
             mn, op, mx = trt_optimization_profiles(
