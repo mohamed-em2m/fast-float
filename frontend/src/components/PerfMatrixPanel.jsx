@@ -19,21 +19,33 @@ function num(value, digits = 1, suffix = '') {
   return `${Number(value).toFixed(digits)}${suffix}`;
 }
 
-function ms(value) {
+function ms(value, digits = 1) {
   if (value === null || value === undefined || Number.isNaN(value)) return '--';
-  return `${Number(value).toFixed(1)} ms`;
+  return `${Number(value).toFixed(digits)} ms`;
 }
 
+function clockTime(seconds) {
+  if (!seconds) return '';
+  return new Date(seconds * 1000).toLocaleTimeString();
+}
+
+/**
+ * One metric: label (+ hint) on the left, the number in the shared,
+ * right-aligned value column. Every row has the same height, so the two
+ * halves of the panel keep their dividers on the same lines.
+ */
 function MetricRow({ icon: Icon, tone = 'text-cyan', label, value, hint }) {
   return (
-    <tr>
-      <td className="perf-label">
+    <div className="perf-row">
+      <div className="perf-row-label">
         <Icon size={14} className={tone} />
-        <span>{label}</span>
-      </td>
-      <td className="perf-value">{value}</td>
-      <td className="perf-hint">{hint}</td>
-    </tr>
+        <div className="perf-row-text">
+          <span className="perf-row-title">{label}</span>
+          <span className="perf-row-hint">{hint}</span>
+        </div>
+      </div>
+      <div className="perf-row-value">{value}</div>
+    </div>
   );
 }
 
@@ -91,26 +103,36 @@ export default function PerfMatrixPanel({ onToast }) {
   const running = status === 'running' || busy;
 
   const perStreamUnderLoad = points.length
-    ? points.map((point) => `${point.concurrency}: ${num(point.per_stream_fps, 1)}`).join('  ')
+    ? `${num(points[points.length - 1].worst_stream_fps, 1)} @ ${points[points.length - 1].concurrency} streams`
     : '--';
 
   const requestCount = requests?.count || 0;
   const recent = requests?.recent || [];
   const dist = (key) => requests?.[key] || null;
-  const distPair = (key, digits = 1) => {
+  const distPair = (key, digits = 1, suffix = '') => {
     const d = dist(key);
     if (!d || !d.count) return '--';
-    return `${num(d.p50, digits)} / ${num(d.p95, digits)}`;
+    return `${num(d.p50, digits, suffix)} / ${num(d.p95, digits, suffix)}`;
   };
+  const split = baseline
+    ? `${num(baseline.model_seconds, 2)} / ${num(baseline.encode_seconds, 2)} / ${num(
+        baseline.other_seconds,
+        2
+      )} s`
+    : '--';
 
   return (
-    <div className="telemetry-section glass-panel perf-matrix-section">
+    <div className="telemetry-section glass-panel perf-panel">
       <div className="section-header">
         <div className="section-title-wrap">
           <Gauge size={18} className="section-icon text-cyan" />
           <h2 className="section-title">Performance Matrix</h2>
+          {state?.finished_at ? (
+            <span className="perf-subtitle-note">measured {clockTime(state.finished_at)}</span>
+          ) : null}
         </div>
         <div className="perf-actions">
+          <span className="perf-levels-label">streams</span>
           <input
             className="perf-levels-input"
             value={levels}
@@ -120,12 +142,13 @@ export default function PerfMatrixPanel({ onToast }) {
             disabled={running}
           />
           <button
-            className="btn-icon-subtle"
+            className="btn-primary btn-sm perf-run"
             onClick={runBenchmark}
             disabled={running}
             title="Measure the matrix on this GPU"
           >
-            {running ? <Loader2 size={15} className="spin" /> : <Play size={15} />}
+            {running ? <Loader2 size={14} className="spin" /> : <Play size={14} />}
+            {running ? 'Measuring' : 'Measure'}
           </button>
         </div>
       </div>
@@ -140,155 +163,174 @@ export default function PerfMatrixPanel({ onToast }) {
       {running && (
         <div className="perf-notice">
           <Loader2 size={14} className="spin" />
-          <span>Benchmark running — measuring model-only fps, end-to-end fps and the concurrency sweep.</span>
+          <span>
+            Benchmark running — measuring model-only fps, end-to-end fps and the concurrency sweep.
+          </span>
         </div>
       )}
 
       {!matrix && !running && status !== 'error' && (
         <div className="perf-notice">
           <Signal size={14} />
-          <span>No measurement yet. Press play to measure this GPU (it holds the model while it runs).</span>
+          <span>
+            No measurement yet. Press measure to benchmark this GPU (it holds the model while it runs).
+          </span>
         </div>
       )}
 
-      {matrix && (
-        <>
-          <table className="perf-table">
-            <tbody>
-              <MetricRow
-                icon={Activity}
-                label="Throughput fps (model-only)"
-                value={num(matrix.model_fps, 2)}
-                hint="ODE solve + encoders + decode, no encode"
-              />
-              <MetricRow
-                icon={Layers}
-                tone="text-indigo"
-                label="End-to-end fps"
-                value={num(matrix.e2e_fps, 2)}
-                hint="encode, composite, mux and write included"
-              />
-              <MetricRow
-                icon={Signal}
-                label="Real-time factor"
-                value={`${num(matrix.rtf, 2)}x`}
-                hint={`against a ${num(matrix.target_fps, 0)} fps target`}
-              />
-              <MetricRow
-                icon={Gauge}
-                tone="text-indigo"
-                label="Streams per GPU at real-time"
-                value={matrix.streams_at_realtime ?? '--'}
-                hint="largest sweep level that still holds the target"
-              />
-              <MetricRow
-                icon={Timer}
-                label="Per-stream fps under load"
-                value={perStreamUnderLoad}
-                hint="streams: fps"
-              />
-            </tbody>
-          </table>
+      {/* Two mirrored halves: speed/throughput on the left, latency on the right.
+          Both use the same row layout, so every number shares one column. */}
+      <div className="perf-metrics">
+        <section className="perf-metric-col">
+          <h3 className="perf-subtitle">Speed and throughput</h3>
+          <MetricRow
+            icon={Activity}
+            label="Throughput fps (model-only)"
+            value={num(matrix?.model_fps, 2)}
+            hint="ODE solve + decode, no encode"
+          />
+          <MetricRow
+            icon={Layers}
+            tone="text-indigo"
+            label="End-to-end fps"
+            value={num(matrix?.e2e_fps, 2)}
+            hint="encode, composite, mux, write"
+          />
+          <MetricRow
+            icon={Signal}
+            label="Real-time factor"
+            value={matrix ? `${num(matrix.rtf, 2)}x` : '--'}
+            hint={`against a ${num(matrix?.target_fps ?? 25, 0)} fps target`}
+          />
+          <MetricRow
+            icon={Gauge}
+            tone="text-indigo"
+            label="Streams at real-time"
+            value={matrix ? matrix.streams_at_realtime : '--'}
+            hint="largest level at the target fps"
+          />
+          <MetricRow
+            icon={Timer}
+            label="Per-stream fps under load"
+            value={perStreamUnderLoad}
+            hint="worst stream of the sweep"
+          />
+          <MetricRow
+            icon={Layers}
+            tone="text-indigo"
+            label="Model / encode / other"
+            value={split}
+            hint="seconds of one single-stream run"
+          />
+        </section>
 
-          <table className="perf-table">
-            <tbody>
-              <MetricRow
-                icon={Timer}
-                label="Time to first frame (TTFF)"
-                value={ms(baseline?.ttff_ms)}
-                hint="trigger to the first frame at the transport"
-              />
-              <MetricRow
-                icon={Timer}
-                tone="text-indigo"
-                label="Audio-in to video-out"
-                value={ms(baseline?.audio_in_to_video_out_ms)}
-                hint="offline mode: equals TTFF"
-              />
-              <MetricRow
-                icon={Timer}
-                tone="text-indigo"
-                label="Conversational latency"
-                value={ms(baseline?.conversational_latency_ms)}
-                hint="stop speaking to avatar moving"
-              />
-              <MetricRow
-                icon={Activity}
-                label="p50 / p95 / p99 latency"
-                value={`${num(latency?.p50_ms, 1)} / ${num(latency?.p95_ms, 1)} / ${num(latency?.p99_ms, 1)} ms`}
-                hint="per frame, vs its presentation time"
-              />
-              <MetricRow
-                icon={Signal}
-                tone="text-indigo"
-                label="Frame-time jitter"
-                value={ms(baseline?.jitter_ms)}
-                hint="stddev of the delivery intervals"
-              />
-              <MetricRow
-                icon={AlertTriangle}
-                tone="text-amber"
-                label="Dropped frames"
-                value={`${baseline?.dropped ?? 0} (${num((baseline?.drop_ratio || 0) * 100, 2)}%)`}
-                hint="overflow or too-late frames"
-              />
-            </tbody>
-          </table>
+        <section className="perf-metric-col">
+          <h3 className="perf-subtitle">Latency</h3>
+          <MetricRow
+            icon={Timer}
+            label="Time to first frame (TTFF)"
+            value={ms(baseline?.ttff_ms)}
+            hint="trigger to first frame at transport"
+          />
+          <MetricRow
+            icon={Timer}
+            tone="text-indigo"
+            label="Audio-in to video-out"
+            value={ms(baseline?.audio_in_to_video_out_ms)}
+            hint="offline mode: equals TTFF"
+          />
+          <MetricRow
+            icon={Timer}
+            tone="text-indigo"
+            label="Conversational latency"
+            value={ms(baseline?.conversational_latency_ms)}
+            hint="stop speaking to avatar moving"
+          />
+          <MetricRow
+            icon={Activity}
+            label="p50 / p95 / p99 latency"
+            value={
+              latency?.count
+                ? `${num(latency.p50_ms, 1)} / ${num(latency.p95_ms, 1)} / ${num(latency.p99_ms, 1)}`
+                : '--'
+            }
+            hint="ms per frame, vs its due time"
+          />
+          <MetricRow
+            icon={Signal}
+            tone="text-indigo"
+            label="Frame-time jitter"
+            value={ms(baseline?.jitter_ms, 2)}
+            hint="stddev of the delivery intervals"
+          />
+          <MetricRow
+            icon={AlertTriangle}
+            tone="text-amber"
+            label="Dropped frames"
+            value={
+              baseline
+                ? `${baseline.dropped ?? 0} (${num((baseline.drop_ratio || 0) * 100, 2)}%)`
+                : '--'
+            }
+            hint="overflow or too-late frames"
+          />
+        </section>
+      </div>
 
-          {points.length > 0 && (
-            <div className="perf-sweep">
-              <h3 className="perf-subtitle">Concurrency sweep</h3>
-              <table className="perf-table perf-sweep-table">
-                <thead>
-                  <tr>
-                    <th>streams</th>
-                    <th>aggregate fps</th>
-                    <th>per-stream fps</th>
-                    <th>worst stream</th>
-                    <th>rtf</th>
-                    <th>model share</th>
-                    <th>dropped</th>
+      {points.length > 0 && (
+        <section className="perf-block">
+          <h3 className="perf-subtitle">
+            Concurrency sweep
+            <span className="perf-subtitle-note">streams sharing one GPU</span>
+          </h3>
+          <div className="perf-table-wrap">
+            <table className="perf-data-table">
+              <thead>
+                <tr>
+                  <th>streams</th>
+                  <th>aggregate fps</th>
+                  <th>per-stream fps</th>
+                  <th>worst stream</th>
+                  <th>rtf</th>
+                  <th>model share</th>
+                  <th>dropped</th>
+                </tr>
+              </thead>
+              <tbody>
+                {points.map((point) => (
+                  <tr key={point.concurrency}>
+                    <td>{point.concurrency}</td>
+                    <td>{num(point.aggregate_fps, 2)}</td>
+                    <td>{num(point.per_stream_fps, 2)}</td>
+                    <td>{num(point.worst_stream_fps, 2)}</td>
+                    <td>{num(point.rtf, 2)}x</td>
+                    <td>{num((point.gpu_saturation || 0) * 100, 1)}%</td>
+                    <td>{point.dropped}</td>
                   </tr>
-                </thead>
-                <tbody>
-                  {points.map((point) => (
-                    <tr key={point.concurrency}>
-                      <td className="perf-value">{point.concurrency}</td>
-                      <td className="perf-value">{num(point.aggregate_fps, 2)}</td>
-                      <td className="perf-value">{num(point.per_stream_fps, 2)}</td>
-                      <td className="perf-value">{num(point.worst_stream_fps, 2)}</td>
-                      <td className="perf-value">{num(point.rtf, 2)}x</td>
-                      <td className="perf-value">{num(point.gpu_saturation * 100, 1)}%</td>
-                      <td className="perf-value">{point.dropped}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-
-          {Array.isArray(matrix.notes) && matrix.notes.length > 0 && (
-            <ul className="perf-notes">
-              {matrix.notes.map((note) => (
-                <li key={note}>{note}</li>
-              ))}
-            </ul>
-          )}
-        </>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
       )}
 
       {/* Rolling per-request view: what the box actually did, no synthetic load. */}
-      <div className="perf-sweep">
+      <section className="perf-block">
         <h3 className="perf-subtitle">
           Recent requests
           <span className="perf-subtitle-note">
-            {requestCount ? `${requestCount} in the last ${requests?.window || 200}` : 'no requests yet'}
+            {requestCount
+              ? `${requestCount} in the last ${requests?.window || 200} · ${requests?.dropped_total || 0} dropped (${
+                  requests?.drop_ratio ? num(requests.drop_ratio * 100, 3) : '0'
+                }%)`
+              : 'no requests yet'}
           </span>
         </h3>
+
         {requestCount > 0 ? (
           <>
-            <table className="perf-table">
-              <tbody>
+            <div className="perf-metrics">
+              <section className="perf-metric-col">
                 <MetricRow
                   icon={Activity}
                   label="Model fps p50 / p95"
@@ -305,84 +347,87 @@ export default function PerfMatrixPanel({ onToast }) {
                 <MetricRow
                   icon={Signal}
                   label="Real-time factor p50 / p95"
-                  value={distPair('rtf', 2)}
+                  value={distPair('rtf', 2, 'x')}
                   hint="e2e fps / target fps"
                 />
+              </section>
+              <section className="perf-metric-col">
                 <MetricRow
                   icon={Timer}
                   tone="text-indigo"
                   label="Request time p50 / p95"
-                  value={`${num(dist('request_seconds')?.p50, 2)} / ${num(dist('request_seconds')?.p95, 2)} s`}
+                  value={distPair('request_seconds', 2, ' s')}
                   hint="trigger to finished mp4"
                 />
                 <MetricRow
                   icon={Timer}
                   label="TTFF p50 / p95"
-                  value={distPair('ttff_ms', 0)}
+                  value={distPair('ttff_ms', 0, ' ms')}
                   hint="live streams only"
                 />
                 <MetricRow
                   icon={Signal}
                   tone="text-indigo"
                   label="Frame jitter p50 / p95"
-                  value={distPair('jitter_ms', 2)}
+                  value={distPair('jitter_ms', 2, ' ms')}
                   hint="stddev of the delivery intervals"
                 />
-                <MetricRow
-                  icon={AlertTriangle}
-                  tone="text-amber"
-                  label="Dropped frames"
-                  value={`${requests?.dropped_total ?? 0} (${num((requests?.drop_ratio || 0) * 100, 3)}%)`}
-                  hint="over the window"
-                />
-              </tbody>
-            </table>
+              </section>
+            </div>
 
             {recent.length > 0 && (
-              <table className="perf-table perf-sweep-table">
-                <thead>
-                  <tr>
-                    <th>finished</th>
-                    <th>frames</th>
-                    <th>model fps</th>
-                    <th>e2e fps</th>
-                    <th>rtf</th>
-                    <th>ttff</th>
-                    <th>dropped</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {recent
-                    .slice()
-                    .reverse()
-                    .map((sample) => (
-                      <tr key={sample.at}>
-                        <td className="perf-value">{new Date(sample.at * 1000).toLocaleTimeString()}</td>
-                        <td className="perf-value">{sample.frames}</td>
-                        <td className="perf-value">{num(sample.model_fps, 2)}</td>
-                        <td className="perf-value">{num(sample.e2e_fps, 2)}</td>
-                        <td className="perf-value">{num(sample.rtf, 2)}x</td>
-                        <td className="perf-value">
-                          {sample.ttff_ms === null || sample.ttff_ms === undefined
-                            ? '--'
-                            : `${num(sample.ttff_ms, 0)} ms`}
-                        </td>
-                        <td className="perf-value">{sample.dropped}</td>
-                      </tr>
-                    ))}
-                </tbody>
-              </table>
+              <div className="perf-table-wrap">
+                <table className="perf-data-table">
+                  <thead>
+                    <tr>
+                      <th>finished</th>
+                      <th>frames</th>
+                      <th>model fps</th>
+                      <th>e2e fps</th>
+                      <th>rtf</th>
+                      <th>ttff</th>
+                      <th>dropped</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {recent
+                      .slice()
+                      .reverse()
+                      .map((sample) => (
+                        <tr key={sample.at}>
+                          <td>{clockTime(sample.at)}</td>
+                          <td>{sample.frames}</td>
+                          <td>{num(sample.model_fps, 2)}</td>
+                          <td>{num(sample.e2e_fps, 2)}</td>
+                          <td>{num(sample.rtf, 2)}x</td>
+                          <td>
+                            {sample.ttff_ms === null || sample.ttff_ms === undefined
+                              ? '--'
+                              : ms(sample.ttff_ms, 0)}
+                          </td>
+                          <td>{sample.dropped}</td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              </div>
             )}
           </>
         ) : (
           <div className="perf-notice">
             <Signal size={14} />
-            <span>
-              The window fills itself with every finished request — no benchmark needed.
-            </span>
+            <span>The window fills itself with every finished request — no benchmark needed.</span>
           </div>
         )}
-      </div>
+      </section>
+
+      {Array.isArray(matrix?.notes) && matrix.notes.length > 0 && (
+        <ul className="perf-notes">
+          {matrix.notes.map((note) => (
+            <li key={note}>{note}</li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

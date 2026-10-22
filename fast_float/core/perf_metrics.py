@@ -339,6 +339,7 @@ class ConcurrencyPoint:
             "worst_stream_fps": self.worst_stream_fps,
             "rtf": self.rtf,
             "at_realtime": self.at_realtime,
+            "gpu_saturation": self.gpu_saturation,
             "dropped": self.dropped,
             "streams": [s.to_dict() for s in self.streams],
         }

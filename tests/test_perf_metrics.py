@@ -102,6 +102,8 @@ def test_concurrency_point_reports_worst_stream_and_realtime():
     assert point.rtf == pytest.approx(1.0)
     assert point.at_realtime is False
     assert point.gpu_saturation == pytest.approx(0.75)
+    # the UI reads the saturation out of the payload, so it has to be there
+    assert point.to_dict()["gpu_saturation"] == pytest.approx(0.75)
 
 
 def test_perf_matrix_counts_streams_at_realtime():
