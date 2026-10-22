@@ -185,11 +185,86 @@ browser shows it, with the frames in sync with the audio.*
 - **A/V sync in the file path.** The `/generate` → MP4 path is unaffected and
   keeps its own muxing.
 
-## 8. Open decisions
+## 8. Decisions taken
 
-1. **LiveKit Cloud or self-hosted?** (self-hosted fits this repo; Cloud is
-   faster for a first contact.)
-2. **Keep aiortc as a flag-gated fallback for one release?** (recommended yes.)
-3. **Is the conversational mode in scope now?** I would do "generate → watch
-   live" first: it reuses today's pipeline and needs no LLM/TTS, and it
-   de-risks the whole integration before we add a conversation loop.
+| decision | answer |
+| --- | --- |
+| LiveKit deployment | **self-hosted** (`docker-compose.livekit.yml`, the LiveKit server container; a TLS domain and `wss://` in production) |
+| aiortc | **kept as a flag-gated fallback** for one release, then removed |
+| scope of the first milestone | the **live mode** (generate → watch live). The conversational agent (STT/LLM/TTS) comes after |
+| avatar | FLOAT, always. No hosted avatar service |
+
+## 9. The dependency finding that shapes the worker
+
+`livekit` (the RTC SDK) requires **`numpy>=1.26`**; this repository pins
+`numpy==1.24.4` because `onnx<1.17` needs numpy 1.x. They cannot coexist in
+one environment:
+
+```
+uv pip install --dry-run "livekit>=1.1"
+ - numpy==1.24.4
+ + numpy==2.2.6      # <- would break the onnx/onnxruntime stack
+```
+
+So the split is:
+
+- the **API process** stays as it is (numpy 1.24.4, onnx<1.17) and only needs
+  `livekit-api` — the *token* API, which is numpy-free and installs cleanly
+  (it is an optional dependency group: `uv sync --group livekit`);
+- the **avatar worker**, if it needs the RTC SDK, gets its **own uv project**
+  (its own lockfile, numpy 2 + torch + onnxruntime) — or avoids the SDK
+  altogether by publishing over RTMP (below).
+
+## 10. Phase 0 — done: the server side of the transport
+
+Implemented and verified:
+
+- `fast_float/livekit/settings.py` — the env-driven config (`LIVEKIT_URL`,
+  `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `LIVEKIT_TOKEN_TTL_S`,
+  `LIVEKIT_ROOM_PREFIX`).
+- `fast_float/livekit/tokens.py` — mints the room grant with the official
+  `livekit-api` (`AccessToken` + `VideoGrants`). The API secret never leaves
+  the server; a viewer token has `can_publish=False` by default.
+- `fast_float/routers/livekit.py` — `GET /livekit/status` (is it configured?)
+  and `POST /livekit/token` (mint a room-scoped token).
+- `docker-compose.livekit.yml` — the self-hosted server.
+- `tests/test_livekit_tokens.py` — 10 tests: the settings, the room-name
+  validation, the claim shape, the publish flag, and the endpoint's
+  503/400/200 paths.
+
+**Verified end to end** against a real self-hosted server: a token minted by
+`fast_float.livekit.tokens.issue_token` was accepted by the LiveKit
+container, and the official RTC SDK joined the room as that identity and
+disconnected cleanly. So the claim format is right, not just plausible.
+
+To try it:
+
+```bash
+docker compose -f docker-compose.livekit.yml up -d
+export LIVEKIT_URL=ws://127.0.0.1:7880
+export LIVEKIT_API_KEY=devkey
+export LIVEKIT_API_SECRET=devsecretdevsecretdevsecretdevsecret
+uv sync --group livekit          # livekit-api (numpy-free)
+curl -s localhost:8000/livekit/status
+curl -s -X POST localhost:8000/livekit/token -H 'content-type: application/json' \
+     -d '{"room": "float-demo"}'
+```
+
+## 11. The transport decision still to settle: SDK publisher vs RTMP ingest
+
+The worker has to get H.264 (or raw frames) into the room, and there are two
+ways:
+
+| | SDK publisher (`AvatarRunner`) | RTMP ingest |
+| --- | --- | --- |
+| encode | libwebrtc **software** (VP8/VP9) — our NVENC path is bypassed | **NVENC**, unchanged: the pipeline's H.264 goes straight out |
+| dependencies | needs the RTC SDK → numpy 2 → a **separate uv project** for the worker | none (ffmpeg + an RTMP URL) |
+| latency | lowest (~100 ms) | adds the ingest buffer (~1 s) |
+| A/V | the worker publishes synced audio + video | whatever we mux into the file |
+| fit with the avatar-worker model | exact | we are the *publisher*, not a worker |
+
+Our pipeline already produces an H.264 file with NVENC, so the RTMP route is
+dramatically cheaper to build and keeps the GPU encode. The SDK route is
+better for the *conversational* mode, where the worker must react to audio
+that arrives live. This is worth measuring before Phase 1 is built, because
+it decides whether the worker needs its own environment at all.
