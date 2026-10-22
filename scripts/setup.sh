@@ -181,6 +181,17 @@ source .venv/bin/activate
 # failure this script has to survive on a 50 GiB disk.
 uv sync --inexact
 
+echo "=== Installing livekit dependency group (livekit-api token SDK) ==="
+# livekit-api provides token generation and the LiveKit server API (REST).
+# The RTC SDK (livekit) requires numpy>=1.26 and is intentionally NOT in this
+# group because numpy is pinned to 1.24.4 for onnx<1.17 compatibility; it runs
+# in a separate worker environment (see docs/LIVEKIT_INTEGRATION.md).
+# --inexact: preserve the ONNX / TensorRT layers that a plain uv sync --group
+# would prune (it treats any unlisted package as an orphan and removes it).
+if ! uv sync --group livekit --inexact; then
+    echo "Warning: livekit-api install failed -- LiveKit token generation will be unavailable."
+fi
+
 echo "=== Installing optional video codecs (torchcodec) ==="
 # torchcodec is optional; install if compatible binary wheel exists for torch/cuda
 uv pip install --python .venv/bin/python torchcodec || echo "⚠️ torchcodec install skipped or unavailable for current platform/PyTorch version (PyAV and FFmpeg NVENC remain available)."
