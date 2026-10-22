@@ -258,13 +258,26 @@ ways:
 | | SDK publisher (`AvatarRunner`) | RTMP ingest |
 | --- | --- | --- |
 | encode | libwebrtc **software** (VP8/VP9) — our NVENC path is bypassed | **NVENC**, unchanged: the pipeline's H.264 goes straight out |
-| dependencies | needs the RTC SDK → numpy 2 → a **separate uv project** for the worker | none (ffmpeg + an RTMP URL) |
+| dependencies | needs the RTC SDK → numpy 2 → a **separate uv project** for the worker | the **Ingress service** (a separate container) + Redis |
 | latency | lowest (~100 ms) | adds the ingest buffer (~1 s) |
 | A/V | the worker publishes synced audio + video | whatever we mux into the file |
 | fit with the avatar-worker model | exact | we are the *publisher*, not a worker |
 
-Our pipeline already produces an H.264 file with NVENC, so the RTMP route is
-dramatically cheaper to build and keeps the GPU encode. The SDK route is
-better for the *conversational* mode, where the worker must react to audio
-that arrives live. This is worth measuring before Phase 1 is built, because
-it decides whether the worker needs its own environment at all.
+Measured on the self-hosted server (the container's listeners, not the docs):
+the core server has **no RTMP listener** — only 7880 (http/ws) and 7881
+(rtc). `LIVEKIT_RTMP_ENABLED` / `LIVEKIT_RTMP_PORT` do not exist in this
+version; the only RTMP-related flag is `--ingress.rtmp_base_url`, i.e. RTMP
+ingest belongs to the separate **Ingress service**, which also needs Redis.
+So the RTMP route is two more containers, not a flag.
+
+That splits the two modes cleanly:
+
+- **the live mode** (generate → watch) can publish the NVENC'd H.264 through
+  the **Ingress service** and needs neither the RTC SDK nor a second
+  environment — at the price of the ingress buffer;
+- **the conversational mode** (Phase 3) needs the SDK publisher, because the
+  worker has to react to audio that arrives live — and therefore the separate
+  numpy-2 project.
+
+So the live mode can ship without touching the numpy pin at all, and the
+second environment is only needed when the conversation loop starts.
