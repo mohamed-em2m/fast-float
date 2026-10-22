@@ -51,9 +51,16 @@ export default function StudioStage({
   const pcRef = useRef(null);
   const liveKitSessionRef = useRef(null);
 
-  // Check LiveKit availability once on mount to conditionally show the transport option.
+  // Check LiveKit availability on mount and whenever the active API URL changes.
   useEffect(() => {
-    fetchLiveKitStatus().then((status) => setLiveKitAvailable(!!status.configured));
+    const checkLiveKit = () => {
+      fetchLiveKitStatus()
+        .then((status) => setLiveKitAvailable(!!status.configured))
+        .catch(() => setLiveKitAvailable(false));
+    };
+    checkLiveKit();
+    window.addEventListener('float:api_url_changed', checkLiveKit);
+    return () => window.removeEventListener('float:api_url_changed', checkLiveKit);
   }, []);
 
   // Cycle progress stages smoothly during generation

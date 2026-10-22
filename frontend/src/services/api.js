@@ -47,6 +47,19 @@ export const DEFAULT_API_URL =
     : sameOriginApiBase();
 
 function resolveInitialApiUrl() {
+  if (typeof window !== 'undefined') {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const urlParam = params.get('api') || params.get('backend');
+      if (urlParam) {
+        const clean = urlParam.trim().replace(/\/$/, '');
+        localStorage.setItem('float_api_url', clean);
+        return clean;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
   const stored = localStorage.getItem('float_api_url');
   // Drop a stale loopback URL when the page is served from a public host —
   // it can only ever point back at the user's own machine.
@@ -96,12 +109,18 @@ export function alignUrlToApi(url) {
 export function setApiUrl(url) {
   currentApiUrl = url.replace(/\/$/, '');
   localStorage.setItem('float_api_url', currentApiUrl);
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('float:api_url_changed', { detail: currentApiUrl }));
+  }
 }
 
 /** Forget any stored override and fall back to the default (proxy) base. */
 export function resetApiUrl() {
   localStorage.removeItem('float_api_url');
   currentApiUrl = DEFAULT_API_URL;
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('float:api_url_changed', { detail: currentApiUrl }));
+  }
   return currentApiUrl;
 }
 
