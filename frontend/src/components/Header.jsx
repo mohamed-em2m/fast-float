@@ -108,6 +108,14 @@ export default function Header({ onToast }) {
   const handleSaveDirect = (e) => {
     e?.preventDefault();
     const value = trimmedInput || DEFAULT_API_URL;
+    // Reject if the user pasted the full page URL (e.g. http://localhost:3000/?api=https://...)
+    try {
+      const u = new URL(value);
+      if (u.search.includes('api=') || u.search.includes('backend=')) {
+        setConfigError('That looks like a page URL, not an API base URL. Paste only the backend address (e.g. https://my-server.com).');
+        return;
+      }
+    } catch { /* non-absolute URL — let setApiUrl handle it */ }
     setApiUrl(value);
     setLiveKitUrlOverride(liveKitUrlInput);
     failuresRef.current = 0;

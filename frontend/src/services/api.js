@@ -46,6 +46,21 @@ export const DEFAULT_API_URL =
     ? import.meta.env.VITE_API_URL.replace(/\/$/, '')
     : sameOriginApiBase();
 
+/**
+ * Returns true when a stored/entered value looks like a browser page URL
+ * rather than a bare API base — e.g. it contains `?api=` or `?backend=`.
+ * These must never be used as the API base URL.
+ */
+function looksLikePageUrl(url) {
+  if (!url) return false;
+  try {
+    const u = new URL(url);
+    return u.search.includes('api=') || u.search.includes('backend=');
+  } catch {
+    return false;
+  }
+}
+
 function resolveInitialApiUrl() {
   if (typeof window !== 'undefined') {
     try {
@@ -54,6 +69,9 @@ function resolveInitialApiUrl() {
       if (urlParam) {
         const clean = urlParam.trim().replace(/\/$/, '');
         localStorage.setItem('float_api_url', clean);
+        // Remove the ?api= param from the browser URL so it never leaks into
+        // subsequent candidate generation or loopback-fallback logic.
+        try { window.history.replaceState({}, '', window.location.pathname); } catch { /* ignore */ }
         return clean;
       }
     } catch {
@@ -61,6 +79,13 @@ function resolveInitialApiUrl() {
     }
   }
   const stored = localStorage.getItem('float_api_url');
+  // Reject a stored value that looks like a full page URL (e.g. the user
+  // accidentally pasted http://localhost:3000/?api=https://... into the
+  // Config modal). Fall back to the default so the UI isn't permanently stuck.
+  if (stored && looksLikePageUrl(stored)) {
+    localStorage.removeItem('float_api_url');
+    return DEFAULT_API_URL;
+  }
   // Drop a stale loopback URL when the page is served from a public host —
   // it can only ever point back at the user's own machine.
   if (stored && isLoopbackUrl(stored) && !isLoopbackHost(window.location.hostname)) {
@@ -166,6 +191,12 @@ export async function testApiUrl(base) {
  * a custom LAN IP or domain is left alone. Port and protocol preserved.
  */
 export function getApiCandidates() {
+  // Guard: if currentApiUrl somehow contains ?api= (page URL leaked in),
+  // reset it so we don't generate broken loopback candidates.
+  if (looksLikePageUrl(currentApiUrl)) {
+    currentApiUrl = DEFAULT_API_URL;
+    localStorage.removeItem('float_api_url');
+  }
   const ordered = [currentApiUrl];
   try {
     const u = new URL(currentApiUrl, window.location.origin);
