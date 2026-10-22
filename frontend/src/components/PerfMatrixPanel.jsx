@@ -422,11 +422,14 @@ export default function PerfMatrixPanel({ onToast }) {
       </section>
 
       {Array.isArray(matrix?.notes) && matrix.notes.length > 0 && (
-        <ul className="perf-notes">
-          {matrix.notes.map((note) => (
-            <li key={note}>{note}</li>
-          ))}
-        </ul>
+        <details className="perf-notes-details">
+          <summary>measurement notes</summary>
+          <ul className="perf-notes">
+            {matrix.notes.map((note) => (
+              <li key={note}>{note}</li>
+            ))}
+          </ul>
+        </details>
       )}
     </div>
   );

@@ -161,10 +161,14 @@ export default function App() {
       {/* Navigation Header */}
       <Header onToast={showToast} />
 
-      {/* Main Studio Grid */}
+      {/* Main Studio Grid
+          The grid is filled column-first and paired row by row, so the
+          Reference Portrait sits level with the Studio Canvas, the audio
+          panel with the telemetry hub, and the parameters with the perf
+          matrix. Every row shares one height, so the cards match. */}
       <main className="studio-main-grid">
         {/* Left Column: Creator Workbench */}
-        <section className="workbench-col">
+        <>
           <PortraitCanvas
             imagePreview={imagePreview}
             setImagePreview={setImagePreview}
@@ -185,10 +189,10 @@ export default function App() {
             params={params}
             setParams={setParams}
           />
-        </section>
+        </>
 
         {/* Right Column: Stage & Telemetry */}
-        <section className="stage-col">
+        <>
           <StudioStage
             onGenerate={handleGenerate}
             isGenerating={isGenerating}
@@ -207,7 +211,7 @@ export default function App() {
           />
 
           <PerfMatrixPanel onToast={showToast} />
-        </section>
+        </>
       </main>
     </div>
   );
