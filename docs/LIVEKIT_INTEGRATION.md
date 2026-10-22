@@ -7,27 +7,22 @@ rendering the video — LiveKit moves the pixels, the rooms and the viewers.
 This plan is grounded in the [LiveKit avatar docs](https://docs.livekit.io/agents/models/avatar/),
 the [`AvatarRunner` reference](https://docs.livekit.io/reference/python/livekit/agents/voice/avatar/),
 the [voice AI quickstart](https://docs.livekit.io/agents/start/voice-ai/) and the
-[AvatarTalk plugin](https://docs.livekit.io/agents/models/avatar/plugins/avatartalk/)
-— the plugin is the *template* for how a provider plugs in, not a dependency.
+[custom avatar worker docs](https://docs.livekit.io/agents/models/avatar/#custom-avatar-workers).
 
-## 1. The decision that shapes everything
+## 1. The decision
 
-"LiveKit as the main WebRTC backend" has two possible meanings, and they
-lead to very different work:
+**LiveKit is the transport; FLOAT is the avatar.** We implement FLOAT as a
+custom avatar worker on LiveKit's `AvatarRunner`: it joins the room as a
+second participant and publishes synchronised audio + video, exactly like the
+hosted avatar providers do — except the renderer is our own model, running on
+our own GPU, with no per-second billing and no external avatar service.
 
-| | meaning | outcome |
-| --- | --- | --- |
-| **A** | LiveKit is the **transport**; FLOAT is the avatar, implemented as a custom avatar worker (`AvatarRunner`) | FLOAT stays the product; LiveKit replaces aiortc + the raw WebSocket transport |
-| **B** | LiveKit + **AvatarTalk** is the avatar; their service renders the video | we buy video time (1 s of credits per second of video) and FLOAT leaves the loop |
+The hosted-provider plugins (AvatarTalk, D-ID, Simli, …) were studied as the
+reference implementation of that shape, and are deliberately **not** part of
+this plan: they render the video themselves, which would take FLOAT out of
+the loop entirely.
 
-**The plan is A as the backbone, with B added later as a second provider
-behind the same interface** (Phase 5). B is then a *configuration switch* in
-the Studio ("avatar: FLOAT / AvatarTalk"), not a rewrite — and it gives us a
-free quality/latency benchmark against a commercial avatar.
-
-The AvatarTalk plugin is worth reading closely for exactly one reason: it
-shows the shape of every provider integration we will write — *a participant
-that publishes synchronised audio + video into the room*.
+Everything below follows from that one choice.
 
 ## 2. Target architecture
 
@@ -51,7 +46,7 @@ Two different LiveKit participation modes, and they matter:
 
 ## 3. The constraint that decides the design: FLOAT is not a streaming avatar
 
-A provider like AvatarTalk renders continuously from the audio that arrives.
+A hosted provider renders continuously from the audio that arrives.
 FLOAT cannot, and the plan has to respect that:
 
 - FLOAT conditions on a **2 s audio window** (`wav2vec_sec=2` → 50 frames) and
@@ -168,15 +163,6 @@ browser shows it, with the frames in sync with the audio.*
   room), and the "streams per GPU at real time" measured with *real* viewers
   instead of the synthetic sweep.
 
-### Phase 5 — AvatarTalk as a second provider (optional, 1 day)
-
-- Wrap `avatartalk.AvatarSession(avatar=..., emotion=...)` in our provider
-  interface: `await avatar.start(session, room=ctx.room)`,
-  `await avatar.wait_for_join()`.
-- The Studio gets an "avatar: FLOAT / AvatarTalk" switch, and we get a
-  quality/latency A/B against a commercial avatar. Cost: AvatarTalk bills
-  1 s of video time per second of video.
-
 ## 6. Risks
 
 | risk | mitigation |
@@ -201,10 +187,9 @@ browser shows it, with the frames in sync with the audio.*
 
 ## 8. Open decisions
 
-1. **A only, or A + B?** (I recommend A now, B as Phase 5.)
-2. **LiveKit Cloud or self-hosted?** (self-hosted fits this repo; Cloud is
+1. **LiveKit Cloud or self-hosted?** (self-hosted fits this repo; Cloud is
    faster for a first contact.)
-3. **Keep aiortc as a flag-gated fallback for one release?** (recommended yes.)
-4. **Is the conversational mode in scope now?** I would do "generate → watch
+2. **Keep aiortc as a flag-gated fallback for one release?** (recommended yes.)
+3. **Is the conversational mode in scope now?** I would do "generate → watch
    live" first: it reuses today's pipeline and needs no LLM/TTS, and it
    de-risks the whole integration before we add a conversation loop.
