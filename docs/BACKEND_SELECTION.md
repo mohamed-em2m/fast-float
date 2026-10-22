@@ -44,7 +44,8 @@ CUDA 12 sonames ORT needs come from torch's own `nvidia-*-cu12` deps. On the
 same T4 that means **both** the CUDA EP and the TensorRT EP load, all six units
 export and pass parity under **TRT FP16**, and `trt` is a real candidate again.
 `emotion`, `refenc`, `audio` and `fmt` need parity's functional-equivalence branch
-(cosine + bounded mean error) because their outputs are bounded/small-magnitude,
+(cosine + bounded mean error as **hard floors**, so a loose `atol` cannot skip
+them) because their outputs are bounded/small-magnitude,
 where FP16 drift is absolute — see `AGENT.md` §6.
 
 ## Components
@@ -111,14 +112,16 @@ defaults to all-`eager` when the YAML is missing/unreadable.
 ```bash
 python -m fast_float.onnx.select_backends \
     --onnx-dir ./onnx --out ./onnx/backends.generated.yaml \
-    [--hot-only] [--iters 30] [--min-gain 1.03] [--compile-mode default] \
+    [--hot-only] [--iters 30] [--min-gain 1.10] [--compile-mode default] \
     [--no-compile] [--no-onnx] [--no-global] [--dry-run] ${ORT_ARGS}
 ```
 
 - `--dry-run` writes the safe all-eager config + env fingerprint only (no model
   construction) — works on a CPU-only box.
 - A candidate is chosen only if it parity-passes and beats eager by
-  `--min-gain` (default 3%); otherwise the component stays `eager`.
+  `--min-gain` (default 10%) *and* by more than three times the measured
+  run-to-run spread (MAD); otherwise the component stays `eager`. A 3% gain
+  is inside the jitter band and used to reselect `torch.compile` every run.
 - The whole-`Generator` compile probe is recorded under `e2e` as advisory; a
   true end-to-end objective is still validated by the app's own bench (the
   isolated medians here do **not** compose — see above).
@@ -178,6 +181,35 @@ and `fast_float/onnx/dispatch.py` (`apply_backends`).
   A missing artifact still can't break startup — construction raises and is
   caught, logging a warning and leaving the component `eager`. ORT provider
   fallback (`trt → cuda → cpu`) happens *inside* `make_ort_session`.
+- **The parity reference is the *deployed* model, never the traced one.** A
+  graph compared against the module it was traced from proves nothing: the
+  `fmt` artifact used to be exported with an inverted attention mask (a
+  different model — per-step cosine 0.94) and passed every gate that way. The
+  converter now traces the deployed module and gates the artifact against a
+  snapshot of it; the selector's eager reference is the deployed model too.
+- **Install-time self-tests** (`apply_backends`): the components it
+  substitutes (`direction`, `refenc`, `decoder`) are probed against the torch
+  model, and `fmt` — which wires itself in its constructor, before the
+  checkpoint is loaded — is probed in the same pass, once the weights are
+  there. A graph that does not reproduce the torch model is dropped and the
+  component stays `eager`. `FLOAT_SKIP_BACKEND_SELFTEST=1` skips the probes.
+- **A parity check must compare the same computation on both sides.** TF32
+  rounds every accumulation to a 10-bit mantissa; through the decoder's
+  22-conv stack that alone moves the output by ~40 uint8 LSB — more than the
+  2 LSB the frame gate allows. The converter therefore pins **both** sides to
+  fp32 (`make_session_from_args(..., use_tf32=False)` plus
+  `cudnn.allow_tf32=False`), which makes the residual the graph's own error
+  again (1 LSB measured). The runtime self-test cannot pin the provider (the
+  deployed session is TF32 for speed), so it judges the provider by the mean
+  (2 LSB — the provider's TF32 path alone moves this stack by ~0.5 LSB mean)
+  plus a cosine floor (0.999) and reports the max as information.
+- **The decoder graph is the model.** It used to substitute a grouped conv
+  (`groups=batch`); the ORT CUDA EP serves grouped convs only through a
+  fallback kernel that drifts ~90 uint8 LSB from torch's and is not
+  run-to-run reproducible, so the artifact could not reproduce the frames the
+  eager path produces. The graph is now traced from the model itself (dense
+  modulated convs, still at a fixed batch, so the artifact set and the
+  runtime's pad/trim are unchanged).
 - **TensorRT profiles are built automatically at runtime**, not read from the
   config: every ONNX runner goes through `export.make_runtime_session`, which
   hands the dynamic-shape graph representative TRT profiles (derived from each

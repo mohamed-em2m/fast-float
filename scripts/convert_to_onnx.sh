@@ -10,6 +10,18 @@
 # always attempted; a summary at the end shows PASS/FAIL per unit.
 set -euo pipefail
 
+# Recursion guard: prevent any nested subshells or callers from looping on this script
+if [ "${FLOAT_CONVERT_RUNNING:-0}" = "1" ]; then
+  echo "WARN: convert_to_onnx.sh is already executing; skipping recursive call."
+  exit 0
+fi
+export FLOAT_CONVERT_RUNNING=1
+
+cleanup_convert() {
+  export FLOAT_CONVERT_RUNNING=0
+}
+trap cleanup_convert EXIT
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
@@ -32,66 +44,63 @@ REF_OUT="${REF_OUT:-${OUT_DIR}/refenc_v1.onnx}"
 CKPT="${CKPT:-./checkpoints/float.pth}"
 EMO_DIR="${EMO_DIR:-./checkpoints/wav2vec-english-speech-emotion-recognition}"
 W2V_DIR="${W2V_DIR:-./checkpoints/wav2vec2-base-960h}"
-# Decoder bakes a STATIC batch per artifact (grouped conv). Export a set
-# (DEC_BATCHES) and let the runtime pick the smallest session covering a
-# micro-batch; DEC_BATCH is the primary artifact (also the selector's
-# --dec-batch). The wav2vec audio graph keeps batch AND frames dynamic
-# (W2V_SECONDS only sizes the parity probe), so no pad/trim is needed there.
-DEC_BATCH="${DEC_BATCH:-8}"
-DEC_BATCHES="${DEC_BATCHES:-1,2,4,8,16}"
+# Decoder bakes a STATIC batch per artifact. With static batch padding,
+# a single target batch (DEC_BATCH) covers all chunk sizes. Default DEC_BATCHES
+# to DEC_BATCH to avoid looping through 5 redundant batch exports (1,2,4,8,16).
+DEC_BATCH="${DEC_BATCH:-4}"
+DEC_BATCHES="${DEC_BATCHES:-${DEC_BATCH}}"
 W2V_SECONDS="${W2V_SECONDS:-3.0}"
 # Extra flags forwarded to every converter, e.g. ORT_ARGS="--no-trt" to force
 # the CUDA EP, ORT_ARGS="--trt-fp32" for FP32 TensorRT, or
 # ORT_ARGS="--trt-max-batch 16". Default: TensorRT FP16 engine-cached.
 ORT_ARGS="${ORT_ARGS:-}"
-read -r -a ORT_ARGS_ARR <<< "${ORT_ARGS}" || true
+ORT_ARGS_ARR=()
+if [ -n "${ORT_ARGS}" ]; then
+  read -r -a ORT_ARGS_ARR <<< "${ORT_ARGS}"
+fi
 mkdir -p "${OUT_DIR}" checkpoints
 
 echo "=== [1/8] weights ==="
 if [ ! -f "${CKPT}" ]; then
   echo "float.pth missing -> downloading (gdown)"
   command -v gdown >/dev/null || pip_install gdown
-  gdown --id 1rvWuM12cyvNvBQNCLmG4Fr2L1rpjQBF0 -O "${CKPT}"
+  gdown_download 1rvWuM12cyvNvBQNCLmG4Fr2L1rpjQBF0 "${CKPT}"
 else
   echo "found ${CKPT}"
 fi
 if [ ! -d "${EMO_DIR}" ]; then
-  echo "emotion model missing -> downloading (huggingface-cli)"
-  command -v huggingface-cli >/dev/null || pip_install "huggingface_hub[hf-transfer]"
-  huggingface-cli download r-f/wav2vec-english-speech-emotion-recognition \
-    --local-dir "${EMO_DIR}"
+  echo "emotion model missing -> downloading (huggingface)"
+  command -v hf >/dev/null || command -v huggingface-cli >/dev/null || pip_install "huggingface_hub[hf-transfer]"
+  hf_download r-f/wav2vec-english-speech-emotion-recognition "${EMO_DIR}"
 else
   echo "found ${EMO_DIR}"
 fi
 if [ ! -d "${W2V_DIR}" ]; then
-  echo "wav2vec2-base missing -> downloading (huggingface-cli)"
-  command -v huggingface-cli >/dev/null || pip_install "huggingface_hub[hf-transfer]"
-  huggingface-cli download facebook/wav2vec2-base-960h \
-    --local-dir "${W2V_DIR}"
+  echo "wav2vec2-base missing -> downloading (huggingface)"
+  command -v hf >/dev/null || command -v huggingface-cli >/dev/null || pip_install "huggingface_hub[hf-transfer]"
+  hf_download facebook/wav2vec2-base-960h "${W2V_DIR}"
 else
   echo "found ${W2V_DIR}"
 fi
 
 echo "=== [2/8] python deps ==="
-python -c "import torch; print('torch', torch.__version__, 'cuda=', torch.cuda.is_available())"
+"${PY}" -c "import torch; print('torch', torch.__version__, 'cuda=', torch.cuda.is_available())"
 # Verify (and repair) the pinned onnx stack; aborts on failure (prerequisite).
 ensure_onnx_stack
 
 echo "=== [2.5/8] tensorRT probe ==="
-if [ "$(python -c 'import torch;print(torch.cuda.is_available())' 2>/dev/null)" = "True" ]; then
+if [ "$("${PY}" -c 'import torch;print(torch.cuda.is_available())' 2>/dev/null)" = "True" ]; then
   # Put the pip CUDA/TensorRT lib dirs on the loader path *before* probing:
-  # probe_trt loads ORT's TRT provider lib, which dlopens libnvinfer/libcublas,
-  # and a fresh python has none of them on its default path (this is why the
-  # probe used to report "not available" even when TensorRT worked).
   augment_ort_libs
   if probe_trt; then
     echo "TensorRT EP available (engines cached under ${OUT_DIR}/trt_cache)"
   else
-    echo "TensorRT EP NOT available -> running scripts/install_tensorrt.sh"
-    PY="${PY}" bash "${SCRIPT_DIR}/install_tensorrt.sh" || true
-    # The installer runs in a subshell (its exports don't reach us) and may have
-    # installed new lib dirs, so re-augment before re-probing.
-    augment_ort_libs
+    if [ "${TRT_INSTALL_ATTEMPTED:-0}" = "0" ]; then
+      export TRT_INSTALL_ATTEMPTED=1
+      echo "TensorRT EP NOT available -> running scripts/install_tensorrt.sh"
+      PY="${PY}" bash "${SCRIPT_DIR}/install_tensorrt.sh" || true
+      augment_ort_libs
+    fi
     if probe_trt; then
       echo "TensorRT EP now available"
     else
@@ -121,29 +130,29 @@ run_unit() {
 set +e
 
 run_unit "[3/8] convert: emotion (unit 1)" \
-  python -m fast_float.onnx.convert_emotion \
+  "${PY}" -m fast_float.onnx.convert_emotion \
     --ckpt "${CKPT}" --emo-dir "${EMO_DIR}" --out "${EMO_OUT}" "${ORT_ARGS_ARR[@]}"
 
 run_unit "[4/8] convert: fmt step (unit 2)" \
-  python -m fast_float.onnx.convert_fmt \
+  "${PY}" -m fast_float.onnx.convert_fmt \
     --ckpt "${CKPT}" --out "${FMT_OUT}" "${ORT_ARGS_ARR[@]}"
 
 run_unit "[5/8] convert: direction (unit 3)" \
-  python -m fast_float.onnx.convert_direction \
+  "${PY}" -m fast_float.onnx.convert_direction \
     --ckpt "${CKPT}" --out "${DIR_OUT}" "${ORT_ARGS_ARR[@]}"
 
 run_unit "[6/8] convert: audio encoder (unit 4)" \
-  python -m fast_float.onnx.convert_wav2vec \
+  "${PY}" -m fast_float.onnx.convert_wav2vec \
     --ckpt "${CKPT}" --w2v-dir "${W2V_DIR}" --out "${W2V_OUT}" \
     --seconds "${W2V_SECONDS}" "${ORT_ARGS_ARR[@]}"
 
 run_unit "[7/8] convert: frame decoder (unit 5)" \
-  python -m fast_float.onnx.convert_decoder \
+  "${PY}" -m fast_float.onnx.convert_decoder \
     --ckpt "${CKPT}" --out "${DEC_OUT}" --batch "${DEC_BATCH}" \
     --batches "${DEC_BATCHES}" "${ORT_ARGS_ARR[@]}"
 
 run_unit "[8/8] convert: reference encoder (unit 6)" \
-  python -m fast_float.onnx.convert_refenc \
+  "${PY}" -m fast_float.onnx.convert_refenc \
     --ckpt "${CKPT}" --out "${REF_OUT}" "${ORT_ARGS_ARR[@]}"
 
 set -e
@@ -175,7 +184,7 @@ else
   if [ "${SKIP_SELECT:-0}" = "1" ]; then
     echo "SKIP_SELECT=1 -> skipping (runtime defaults to all-eager)"
   else
-    python -m fast_float.onnx.select_backends \
+    "${PY}" -m fast_float.onnx.select_backends \
       --onnx-dir "${OUT_DIR}" --out "${OUT_DIR}/backends.generated.yaml" \
       --ckpt "${CKPT}" --emo-dir "${EMO_DIR}" --w2v-dir "${W2V_DIR}" \
       --dec-batch "${DEC_BATCH}" --seconds "${W2V_SECONDS}" \

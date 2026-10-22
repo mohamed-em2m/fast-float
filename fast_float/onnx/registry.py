@@ -103,7 +103,7 @@ REGISTRY: dict[str, ComponentSpec] = {
         min_cosine=0.995,
         max_mean=0.05,
         onnx_default="./onnx/decoder_v1.onnx",
-        notes="static batch baked into grouped convs; runtime pads/trims to it; only per-GPU-replicated component",
+        notes="static batch per artifact (the graph is traced at a fixed B); runtime pads/trims to it; only per-GPU-replicated component",
     ),
     "refenc": ComponentSpec(
         name="refenc",

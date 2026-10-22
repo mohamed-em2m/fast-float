@@ -31,3 +31,9 @@ class Generator(BaseModel):
         wa, alpha, feats = self.enc(img_source, img_drive, h_start)
         img_recon, flow = self.dec(wa, alpha, feats)
         return {"d_hat": img_recon, "flow": flow}
+
+    def to_infer(self, fold_blur: bool = False, dtype=None, channels_last: bool = False):
+        """Convert generator's decoder to optimized SynthesisInfer."""
+        if hasattr(self.dec, "to_infer"):
+            self.dec = self.dec.to_infer(fold_blur=fold_blur, dtype=dtype, channels_last=channels_last)
+        return self

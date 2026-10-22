@@ -115,6 +115,32 @@ class TimingCollector:
     def _gpu_ms(self, stage: _Stage) -> list[float]:
         return [self._elapsed_ms(ev) for ev in stage.gpu_events]
 
+    def totals(self) -> dict[str, dict[str, float]]:
+        """Per-stage totals, for callers that need the numbers (not the table).
+
+        Returns ``{stage: {count, total_s, mean_s, max_s, p95_s, gpu_total_s}}``.
+        ``total_s`` is the summed *wall* time of the stage, which is what a
+        throughput split (model vs encode) needs; ``gpu_total_s`` is the summed
+        CUDA-event time.
+        """
+        with self._lock:
+            stages = {name: _Stage(list(st.walls), list(st.gpu_events)) for name, st in self._stages.items()}
+        out: dict[str, dict[str, float]] = {}
+        for name, st in stages.items():
+            n = len(st.walls)
+            if not n:
+                continue
+            ordered = sorted(st.walls)
+            out[name] = {
+                "count": n,
+                "total_s": sum(st.walls),
+                "mean_s": sum(st.walls) / n,
+                "max_s": max(st.walls),
+                "p95_s": ordered[min(n - 1, max(0, math.ceil(0.95 * n) - 1))],
+                "gpu_total_s": sum(self._gpu_ms(st)) / 1000.0,
+            }
+        return out
+
     def flush(self) -> None:
         """Emit the aggregated summary via the ``fast_float`` logger (INFO)."""
         with self._lock:

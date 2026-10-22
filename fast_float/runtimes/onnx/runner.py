@@ -50,6 +50,7 @@ class _OnnxRunner(RuntimeSession, nn.Module):
         extra_dynamic: dict | None = None,
         max_batch: int | None = None,
         device_id: int | None = None,
+        use_trt: bool | None = None,
     ):
         super().__init__(device_id=device_id)
         if not os.path.exists(onnx_path):
@@ -59,6 +60,7 @@ class _OnnxRunner(RuntimeSession, nn.Module):
         self._opt_shapes = opt_shapes
         self._extra_dynamic = extra_dynamic
         self._max_batch = max_batch
+        self._use_trt = use_trt
         self.session, _ = make_runtime_session(
             self.path,
             opt_shapes=opt_shapes,
@@ -66,6 +68,7 @@ class _OnnxRunner(RuntimeSession, nn.Module):
             max_batch=max_batch,
             use_gpu=self.use_gpu,
             device_id=self.device_id,
+            use_trt=use_trt,
         )
         self._io_failed = False
 
@@ -127,6 +130,7 @@ class _OnnxRunner(RuntimeSession, nn.Module):
             max_batch=self._max_batch,
             use_gpu=self.use_gpu,
             device_id=self.device_id,
+            use_trt=self._use_trt,
         )
         self._io_failed = False
         self._refresh_io()
@@ -165,6 +169,7 @@ class DirectionOnnx(_OnnxRunner):
         extra_dynamic: dict | None = None,
         max_batch: int | None = None,
         device_id: int | None = None,
+        use_trt: bool | None = None,
     ):
         super().__init__(
             onnx_path,
@@ -173,6 +178,7 @@ class DirectionOnnx(_OnnxRunner):
             extra_dynamic=extra_dynamic,
             max_batch=max_batch,
             device_id=device_id,
+            use_trt=use_trt,
         )
         self._refresh_io()
 
@@ -191,6 +197,7 @@ class DirectionOnnx(_OnnxRunner):
             extra_dynamic=self._extra_dynamic,
             max_batch=self._max_batch,
             device_id=device_id if device_id is not None else self.device_id,
+            use_trt=self._use_trt,
         )
 
     def _io_shapes(self, b: int):
@@ -240,6 +247,7 @@ class RefEncOnnx(_OnnxRunner):
         extra_dynamic: dict | None = None,
         max_batch: int | None = None,
         device_id: int | None = None,
+        use_trt: bool | None = None,
     ):
         super().__init__(
             onnx_path,
@@ -248,6 +256,7 @@ class RefEncOnnx(_OnnxRunner):
             extra_dynamic=extra_dynamic,
             max_batch=max_batch,
             device_id=device_id,
+            use_trt=use_trt,
         )
         self.fc = fc
         self._torch_fallback = torch_fallback
@@ -266,6 +275,7 @@ class RefEncOnnx(_OnnxRunner):
             extra_dynamic=self._extra_dynamic,
             max_batch=self._max_batch,
             device_id=device_id if device_id is not None else self.device_id,
+            use_trt=self._use_trt,
         )
 
     def _io_shapes(self, b: int):
@@ -352,6 +362,7 @@ class DecoderOnnx(_OnnxRunner):
         extra_dynamic: dict | None = None,
         max_batch: int | None = None,
         device_id: int | None = None,
+        use_trt: bool | None = None,
     ):
         if not os.path.exists(onnx_path):
             raise FileNotFoundError(f"ONNX not found: {onnx_path}")
@@ -361,6 +372,7 @@ class DecoderOnnx(_OnnxRunner):
         self._opt_shapes = opt_shapes
         self._extra_dynamic = extra_dynamic
         self._max_batch = max_batch
+        self._use_trt = use_trt
         self._io_failed = False
         self._sessions: dict = {}
         self._io: dict = {}
@@ -386,6 +398,15 @@ class DecoderOnnx(_OnnxRunner):
         b = shape0[0] if shape0 else None
         out = session.get_outputs()[0]
         out_shape = tuple(out.shape or ())
+        # The decode path quantizes with ``_quantize_u8_hwc``, i.e. it reads the
+        # graph output as NCHW float frames in [-1, 1]. A converter/format change
+        # that emits NHWC (or a non-frame tensor) would otherwise deploy and
+        # render scrambled pictures: fail here instead so dispatch falls back to
+        # eager. Static shapes are guaranteed by the converter (dynamic_axes={}).
+        if len(out_shape) != 4:
+            raise ValueError(f"decoder artifact must output NCHW frames [b, C, H, W], got shape {out_shape}")
+        if all(isinstance(d, int) for d in out_shape) and out_shape[1] not in (3, 4):
+            raise ValueError(f"decoder artifact must output NCHW frames [b, C, H, W] with C in 3..4, got {out_shape}")
         return {
             "path": path,
             "latent_name": ins[0].name,
@@ -403,6 +424,7 @@ class DecoderOnnx(_OnnxRunner):
             max_batch=self._max_batch,
             use_gpu=self.use_gpu,
             device_id=self.device_id,
+            use_trt=self._use_trt,
         )
         return session, self._read_io(session, path)
 
@@ -439,6 +461,7 @@ class DecoderOnnx(_OnnxRunner):
             extra_dynamic=self._extra_dynamic,
             max_batch=self._max_batch,
             device_id=device_id if device_id is not None else self.device_id,
+            use_trt=self._use_trt,
         )
 
     def _rebind(self, device_id: int) -> None:

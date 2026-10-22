@@ -11,8 +11,9 @@ This document provides system architecture, coding patterns, directory layouts, 
 This repository (**`float-fast`**) provides:
 
 1. **High-Performance FastAPI Server**: Hardware-accelerated inference with NVENC video encoding, HTTP byte-range streaming, and WebRTC signaling.
-2. **Gradio Interfaces**: Batch generator (`gradio_interface.py`) and live audio streaming (`float_live_app.py`).
-3. **Modern Python Architecture**: Modular subpackages managed by `uv` with pinned PyTorch CUDA 12.6 wheels.
+2. **Live Preview Transports**: frames tapped straight off the decoder and pushed to browsers while the request is still generating — raw frames over WebSocket, or an aiortc video track over WebRTC (`live: true`).
+3. **Gradio Interfaces**: Batch generator (`gradio_interface.py`) and live audio streaming (`float_live_app.py`).
+4. **Modern Python Architecture**: Modular subpackages managed by `uv` with pinned PyTorch CUDA 12.6 wheels.
 
 ---
 
@@ -48,7 +49,7 @@ float-fast/
 │   ├── float.pth
 │   ├── wav2vec2-base-960h/
 │   └── wav2vec-english-speech-emotion-recognition/
-└── fast_float/                     # Main Python application package
+├── fast_float/                     # Main Python application package
     ├── __init__.py
     ├── main.py                     # FastAPI application entrypoint with lifespan
     ├── initialize_env.py           # Multi-path environment initialization
@@ -62,7 +63,12 @@ float-fast/
     │   ├── __init__.py             # Aggregate APIRouter
     │   ├── generation.py           # POST /generate, GET /download/{id}, GET /stream/{id}
     │   ├── health.py               # GET /health, GET /gpu, POST /gpu/clear
+    │   ├── streaming.py            # WS /ws/stream/{request_id} (live raw frames)
     │   └── webrtc.py               # POST /offer (WebRTC SDP signaling & media player)
+    ├── streaming/                  # Per-request frame tap feeding live transports
+    │   ├── types.py                # StreamMeta (fps/size/channels/first_idx/pts_ms)
+    │   ├── dispatcher.py           # FrameDispatcher + FrameQueue (live | lossless)
+    │   └── live.py                 # LiveStream fan-out + LiveStreamDispatcher
     ├── schemas/                    # Pydantic V2 data models & options
     │   ├── __init__.py
     │   ├── base_options.py         # BaseOptions argparse configuration parser
@@ -98,6 +104,11 @@ float-fast/
     └── options/                    # Backward-compatibility shims for legacy imports
         ├── __init__.py
         └── base_options.py
+├── tests/                          # pytest suite (dispatcher, live stream, backends)
+└── frontend/                       # React 19 + Vite studio UI
+    └── src/                        # App.jsx, StudioStage.jsx, services/api.js, ...
+        ├── services/live.js        # WS protocol client
+        └── components/LivePreview.jsx  # WS canvas / WebRTC <video> live preview
 ```
 
 ---
@@ -337,6 +348,50 @@ uv run python fast_float/interfaces/gradio_interface.py
 uv run python fast_float/interfaces/float_live_app.py
 ```
 
+### 5. Convert to ONNX (on the target box)
+
+```bash
+# One command: weights -> deps -> TensorRT probe -> all six units -> selector.
+# The selector writes onnx/backends.generated.yaml (read at runtime).
+./scripts/convert_to_onnx.sh
+
+# Per unit (same converter, one artifact):
+./scripts/convert_fmt_to_onnx.sh          # -> onnx/fmt_step_v1.onnx
+./scripts/convert_wav2vec_to_onnx.sh      # -> onnx/wav2vec_v1.onnx
+
+# Env overrides: OUT_DIR, FMT_OUT, W2V_OUT, DEC_OUT, REF_OUT, EMO_OUT, CKPT,
+# EMO_DIR, W2V_DIR, DEC_BATCH, DEC_BATCHES, W2V_SECONDS,
+# ORT_ARGS (e.g. "--no-trt" / "--trt-fp32" / "--trt-max-batch 16"), SKIP_SELECT=1
+```
+
+In order: download the weights (float.pth via gdown, the two HF models),
+verify/repair the pinned ONNX stack, probe the TensorRT EP (installing
+TensorRT 10.9 if it is missing), run the six converters **independently**
+(one failure never stops the others), then run the per-component selector.
+Exit code 1 means at least one unit failed; the selector is skipped then and
+the runtime keeps the committed all-eager config. TensorRT engines are cached
+under `onnx/trt_cache/` — that cache is tied to the GPU and the TRT/CUDA
+versions, so delete it after either changes.
+
+**Every unit is gated before it is shipped.** A converter exports, then
+compares the artifact against the torch model and refuses to pass a graph that
+does not reproduce it (§8.6): a unit that cannot prove its graph fails, it
+does not ship a "probably fine" artifact. The two rules that decide whether a
+gate means anything:
+
+- compare against the **deployed** model, never against the module that was
+  traced (that blindness once shipped an FMT graph that was a different
+  model — see §8.6);
+- compare **the same computation on both sides**: the exporter pins both to
+  fp32, because TF32 alone moves a deep conv stack by tens of uint8 LSB.
+
+Two CLI renames bite in the weights step and are handled by the shared
+helpers in `scripts/_onnx_env.sh` (`gdown_download`, `hf_download`): gdown 6
+dropped the `--id` flag (the file id is positional now) and huggingface_hub
+1.0 renamed the CLI from `huggingface-cli` to `hf`. The helpers probe both
+spellings and fall back to the Python API, so a fresh env cannot abort the
+run.
+
 ---
 
 ## 7. API Reference
@@ -350,7 +405,8 @@ uv run python fast_float/interfaces/float_live_app.py
 | `GET` | `/health` | System health, model status, FPS stats, and warmup progress (`warming_up`, `warmup_stage`, `warmup_elapsed_s`) |
 | `GET` | `/gpu` | Real-time GPU VRAM allocated and reserved in GB |
 | `POST` | `/gpu/clear` | Clear CUDA cache and run garbage collection |
-| `POST` | `/offer` | WebRTC SDP negotiation for real-time video playback |
+| `POST` | `/offer` | WebRTC SDP negotiation for real-time video playback (add `"live": true` + `"stream_id"` to attach an in-flight generation's live track) |
+| `WS` | `/ws/stream/{request_id}` | Live raw RGB(A) frames while `/generate` is running (see §8.9) |
 
 ### Example `/generate` Request Body
 
@@ -431,18 +487,85 @@ When editing or extending the codebase, follow these design patterns:
   `OptimizedInferenceAgent` right after the checkpoint loads, before the global
   optimisation pass). `FLOAT_DISABLE_BACKENDS=1` disables the whole pass;
   `FLOAT_MODE_<COMPONENT>` force-overrides one component (debug).
-- **No automatic runtime self-test or fallback** — parity/selection is validated
-  by the converter/selector scripts only (`python -m fast_float.onnx.select_backends`).
-  ORT providers (`trt → cuda → cpu`) fall back *inside* session creation.
-- **The `decoder` graph is static-batch, so it ships as a set.**
-  `ModulatedConv2d` bakes `groups=batch` into the graph, making each artifact
-  valid for exactly one `B`. `convert_decoder.py --batches 1,2,4,8,16` writes the
+- **Parity is validated by the converter/selector scripts** (`python -m fast_float.onnx.select_backends`),
+  **plus a one-shot self-test when a component is installed** at runtime: the
+  graph is only as good as the execution provider that loads it, and the
+  provider is chosen at runtime, not at export time. `apply_backends` probes
+  the components it substitutes (`direction`, `refenc`, `decoder`) against the
+  torch model, and `fmt` — which wires itself in its constructor, before the
+  checkpoint is loaded — in the same pass, once the weights are there. A graph
+  that does not reproduce the torch model is dropped and the component stays
+  `eager`. `FLOAT_SKIP_BACKEND_SELFTEST=1` skips the probes. ORT providers
+  (`trt → cuda → cpu`) fall back *inside* session creation.
+- **The `decoder` graph is static-batch, so it ships as a set.** Each artifact
+  is valid for exactly one `B`.
+  `convert_decoder.py --batches 1,2,4,8,16` writes the
   primary `--batch` (default 8, matching the selector's `--dec-batch`) to `--out`
   and the rest to `<stem>_b<N>.onnx` siblings. `DecoderOnnx`
   (`runtimes/onnx/runner.py`) discovers the siblings, loads them **lazily**, and
   per call picks the smallest session covering the micro-batch (replicate-pad,
   trim). `_decoder_static_batch()` returns the *largest* available batch, so the
   decode tuner can size above the primary instead of being capped at it.
+- **The decoder graph is the model itself — do not substitute grouped convs.**
+  The deployed `ModulatedConv2d` is a *dense* modulated convolution (the style
+  is folded into the input channels; no `groups`). An older export substituted
+  a grouped variant (`groups=batch` baked into the ONNX attribute) to make the
+  batch static, and the ORT CUDA EP can only serve grouped convs through its
+  **fallback** kernel: measured against torch it drifts ~90 uint8 LSB (fp32 on
+  both sides!) and is not even run-to-run reproducible, so the artifact could
+  not reproduce the frames the eager path produces. The export now traces the
+  model as-is (still at a fixed batch, so the artifact set and the runtime's
+  pad/trim are unchanged) and the parity gate measures 1 LSB.
+- **A parity check must compare the same computation on both sides.** TF32
+  rounds every accumulation to a 10-bit mantissa; through the decoder's 22-conv
+  stack that alone moves the output by ~40 uint8 LSB — far more than the
+  2 LSB the frame gate allows — so comparing a TF32 ORT session against a TF32
+  torch model measures the *kernels*, not the graph. The converter therefore
+  pins **both** sides to fp32 (`make_session_from_args(..., use_tf32=False)` and
+  `cudnn.allow_tf32=False` inside `_deterministic_cudnn()`), which makes the
+  residual the graph's own error again (1 LSB). The runtime install self-test
+  cannot pin the provider (the deployed session is TF32 for speed), so it
+  judges the *provider* by the mean (2 LSB — the provider's TF32 path alone
+  moves this stack by ~0.5 LSB mean) plus a cosine floor
+  (0.999) and reports the max as information; a structurally wrong graph
+  (max_abs 4.375, cosine 0.983) still fails both floors.
+- **An exported graph must be the model the application runs — and the parity
+  gate has to prove it.** `fmt`'s artifact decides the *motion latents*, so a
+  wrong graph does not degrade the picture a little, it produces different
+  motion. `FMT.Attention` has two implementations of the same math: the fused
+  SDPA branch (`use_fused_attn()` is True, so this is what production runs) and
+  the manual branch. They disagreed about the **polarity of the alignment
+  mask**: `enc_dec_mask` marks the frames *outside* the local ±`attention_window`
+  band, SDPA's `attn_mask=~mask` therefore keeps the band, but the manual
+  branch's `masked_fill(~mask, -inf)` masked the band out and attended to
+  *everything else* — the exact inverse. The converter exported the manual
+  branch (`fused_attn = False`) while the app ran the fused one, so
+  `fmt_step_v1.onnx` was a **different model**: per-step cosine 0.94, and the
+  final latent after a full CFG ODE scored cosine 0.81 against the torch path
+  (garbage frames). The converter's parity gate could not see it, because it
+  compared the graph against *the very module it had just traced*. Fixed by
+  (a) making both branches use the same polarity, (b) exporting the deployed
+  path instead of an export-only substitute, and (c) gating the artifact
+  against a **snapshot of the deployed model**, never against the traced
+  module. The same blindness applies to the selector: its eager reference must
+  be the deployed model, or a bad artifact passes selection and gets shipped.
+  `tests/test_fmt_attention_export.py` pins all of it.
+- **A constructor-wired backend still needs an install-time self-test.**
+  `emotion`/`audio`/`fmt` install their ONNX backend in their own constructor,
+  i.e. *before* the checkpoint is loaded, so `apply_backends` could not judge
+  them (the decoder/direction/refenc self-tests run there). A stale `fmt`
+  artifact therefore shipped broken frames with no complaint. `fmt` is now
+  verified in `apply_backends` — one CFG-shaped step, torch vs the graph,
+  gated functionally (`cosine >= FP16_MIN_COSINE`, `mean_abs <=
+  FP16_MAX_MEAN`, the vector field is small-magnitude so the drift is
+  absolute) — and dropped (component stays eager) when it does not reproduce
+  the torch model. The wrong artifact scores cosine 0.958 and is rejected.
+- **A converter must not wire a runtime backend into the model it exports.**
+  `FlowMatchingTransformer` self-wires an ONNX backend in its constructor when
+  the config says `onnx` and the artifact exists — so the converter loaded
+  (and built a TensorRT engine for) the very artifact it was about to replace,
+  and the model could no longer be deep-copied for the parity snapshot. The
+  converter's builder passes `fmt_onnx_path=None` for that reason.
 - **A batch-shared scalar input must stay static.** `fmt` takes one scalar time
   value `t` (`torch.tensor([t_val])`, shape `[1]`, broadcast over the batch
   *inside* the graph) — it is not a batch-first tensor. `export_module` used to
@@ -660,3 +783,105 @@ When editing or extending the codebase, follow these design patterns:
 - In PowerShell, chain with `cmd1; if ($?) { cmd2 }` (there is no `&&`).
 - Validate `.sh` changes against an LF, BOM-free copy if `bash -n` complains —
   committed scripts that fail locally usually only have CRLF line endings.
+
+### 9. Live streaming (frame dispatcher → WebSocket / WebRTC)
+
+**Why a tap, not a second pipeline.** Generation is GPU-bound and writes MP4 as
+fast as it can; live transports need the *same* frames as they leave the decoder.
+`fast_float/streaming/` is a per-request hook fed by the writer thread — it never
+re-runs inference.
+
+**The dispatcher theorem (locked — do not "fix" one leg by breaking another).**
+Pick any two of {contiguous `idx`, bounded memory, never block the producer}:
+
+| mode | queue | drops | producer |
+| --- | --- | --- | --- |
+| `live` (default) | bounded by `max_queue_frames` | oldest frames, reported as gaps | never blocked |
+| `lossless` | bounded by `max_queue_frames` | none — blocks up to `submit_timeout_ms`, then disables | throttled by design |
+
+- `FrameDispatcher` owns `idx`: `submit(frames)` numbers frames from `_cursor` in
+  submission order, so chunked generation is continuous with no `frame_base`
+  plumbing. `pts_ms = (idx - first_idx) * 1000 / fps`.
+- `submit()` **copies** before returning; the pipeline recycles pinned pool
+  buffers immediately (`pool.put(buf)` right after `submit`). Never hand
+  `submit()` a buffer you keep mutating.
+- Hooks (`open` → `dispatch`/`gap` → `close`) run on the **delivery thread**, in
+  order. Keep them fast; `max_dispatch_ms`/`stall_limits` disable a stalling tap.
+- `max_lag_ms` is a bound in **media time**, not wall clock — a wall-clock bound
+  starves any stream whose generation is slower than real time.
+- Defaults: `max_queue_frames=50`, `max_lag_ms=1000`, `gap_timeout_ms=0`,
+  `submit_timeout_ms=2000`, `close_timeout=2.0`, `max_dispatch_ms=250`,
+  `stall_limits=3`, `dispatch_granularity="batch"`, `abort_on_error=False`,
+  `fail_fast_on_open=False`. `LiveStreamDispatcher` overrides granularity to
+  `"frame"` with `max_queue_frames=64`, `max_lag_ms=1500`.
+
+**Pipeline wiring** (already applied — follow the same shape for new writers):
+`inference_and_save(..., dispatcher=)` calls `dispatcher.bind(StreamMeta(...))`
+once per run, `dispatcher.submit(buf[:n].numpy())` in **all three** writer
+branches *before* `pool.put(buf)`, and `dispatcher.error(exc)` on writer failure.
+`generate_video` owns the terminal `await asyncio.to_thread(dispatcher.shutdown)`
+in its outermost `finally` (so preprocessing failures shut down too).
+`run_inference` / `generate` forward the tap; the batched path warns and ignores
+it.
+
+**`LiveStream` fan-out.** `LiveStreamDispatcher.dispatch`/`gap` publish tuples
+`("frame", idx, pts_ms, ndarray)` / `("gap", start, end, reason)`; `finish()` adds
+the `CLOSE` sentinel. Subscribers are `asyncio.Queue`s that drop the oldest item
+when full. **Every loop interaction from a non-loop thread must go through
+`call_soon_threadsafe`** — `start()` (called by `bind` on the writer thread) and
+`finish()`/`publish_threadsafe()` do. A direct `Event.set()` from the pipeline
+thread hangs `wait_meta()` for its full timeout. `finish()` defers the sentinel
+through the loop so already-scheduled publishes land first, and `publish()` has
+no `done` guard for the same reason. `subscribe()` happens **before**
+`wait_meta()` so the first decoded frames are not published to nobody (frames
+published before a subscriber exists are lost by design — live, not replay).
+
+**WS protocol** (`fast_float/routers/streaming.py`, `HEADER = struct.Struct(">III")`):
+
+| direction | payload |
+| --- | --- |
+| server → | `{"type":"meta","fps","width","height","channels","first_idx","total_frames","has_audio"}` |
+| server → | binary `[u32 idx][u32 count][u32 pts_ms][rgb(a) bytes]`, one frame per message |
+| server → | `{"type":"gap","start","end","reason"}` · `{"type":"done","result"}` · `{"type":"error","message"}` |
+
+Close codes: `4404` (unknown/finished request), `4408` (no metadata — the
+stream's `error` is forwarded in the message). `WAIT_TIMEOUT_S=15` (POST/WS race)
+and `META_TIMEOUT_S=30` are module constants so tests can monkeypatch them. A
+slow reader loses frames; it never backpressures the GPU.
+
+**WebRTC** (`routers/webrtc.py`): `"live": true` routes to `_live_offer`, which
+subscribes **before** `wait_meta`, registers the subscription in `_live_subs`
+**before** `addTrack`, and wraps subscribe→hand-off in
+`except BaseException: stream.unsubscribe(queue)` — a cancelled offer must not
+leave a queue in the stream for the stream's lifetime. `LiveVideoTrack` paces at
+`meta.fps`, sets `pts = pts_ms * 90` with `time_base=1/90000`, and uses
+`format="rgba"` for 4-channel frames. Request audio is attached as a
+`MediaPlayer` (approximate A/V sync: video trails generation, audio starts at
+the offer). `_cleanup_peer` stops the track, unsubscribes, pushes `CLOSE`, and
+stops the audio player's tracks. The browser must declare `recvonly` video+audio
+transceivers *before* `createOffer` and must merge remote tracks
+(`attachRemoteTrack`) instead of assigning `event.streams[0]` blindly.
+
+**`/generate` integration:** register the stream in `app_state.live_streams`
+*before* the semaphore (so a fast WS attach finds it), force
+`chunk_batch_size=1`, pass `dispatcher=`, `finish(result=...)` on success, and
+`_close_live(...)` on 429 / `BaseException` / `finally`. `_close_live` only pops
+the registry entry when that id still maps to *this* stream. Every failure path
+must call `finish(...)` so watchers never hang.
+
+**Known limits (by design — do not "fix" casually):**
+
+- `app_state.live_streams` is **per process** → single worker only; multi-worker
+  deployments need a broker/broadcast layer.
+- WS ships raw RGB (~19.6 MB/s at 512²×25 fps) and the browser converts with a
+  per-pixel JS loop. Prefer WebRTC for bandwidth-limited clients.
+- No WS auto-reconnect; a vanished client is reaped by ASGI pings and by send
+  failures.
+- `dispatcher.error()` is still invoked from the writer thread (not the delivery
+  thread) — keep it side-effect free / logging-only.
+
+**Tests:** `tests/test_frame_dispatcher.py` (live/lossless, gaps, lag,
+shutdown, stats) and `tests/test_live_stream.py` (fan-out, drop-oldest, WS
+round-trip, and an end-to-end `TestClient` run through the real delivery thread —
+the regression guard for cross-thread wake-ups). Patch `WAIT_TIMEOUT_S` down when
+adding WS tests so failures are fast.

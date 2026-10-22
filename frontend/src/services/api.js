@@ -293,6 +293,69 @@ export async function clearGpuMemory() {
   return await res.json();
 }
 
+/**
+ * Fetch the perf matrix: the speed/throughput + latency benchmark result.
+ * Returns { status, matrix, error, started_at, finished_at } or null when the
+ * backend does not answer (the panel then shows "no measurement yet").
+ */
+export async function fetchPerfMatrix() {
+  try {
+    const res = await fetch(`${currentApiUrl}/perf/matrix`);
+    if (!res.ok) {
+      logApiError('GET', '/perf/matrix', null, res.status);
+      return null;
+    }
+    return await res.json();
+  } catch (err) {
+    logApiError('GET', '/perf/matrix', err);
+    return null;
+  }
+}
+
+/**
+ * Fetch the rolling per-request view: distributions (p50/p95/p99) across the
+ * recent requests, plus the last few samples. Returns null when the backend
+ * does not answer.
+ */
+export async function fetchPerfRequests() {
+  try {
+    const res = await fetch(`${currentApiUrl}/perf/requests`);
+    if (!res.ok) {
+      logApiError('GET', '/perf/requests', null, res.status);
+      return null;
+    }
+    return await res.json();
+  } catch (err) {
+    logApiError('GET', '/perf/requests', err);
+    return null;
+  }
+}
+
+/**
+ * Start a benchmark run on the backend. It holds the GPU (live requests queue
+ * behind it), so the panel warns before the call. Returns the initial status.
+ */
+export async function startPerfBenchmark(options = {}) {
+  let res;
+  try {
+    res = await fetch(`${currentApiUrl}/perf/benchmark`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(options),
+    });
+  } catch (err) {
+    logApiError('POST', '/perf/benchmark', err);
+    throw new Error(`Cannot reach backend at ${currentApiUrl} — is it running?`);
+  }
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    const detail = errorData.detail || `Benchmark failed: ${res.status}`;
+    logApiError('POST', '/perf/benchmark', null, res.status);
+    throw new Error(detail);
+  }
+  return await res.json();
+}
+
 /** Generate talking portrait video */
 export async function generateVideo(payload) {
   // Probe first and send the POST exactly once to the reachable base —
@@ -323,8 +386,33 @@ export async function generateVideo(payload) {
   return await res.json();
 }
 
+/**
+ * Attach a remote track to a <video>, merging tracks into one MediaStream.
+ *
+ * aiortc gives every sender its own stream id, so audio and video arrive in
+ * separate MediaStream objects. Assigning `event.streams[0]` on each ontrack
+ * would replace the previous one and drop whichever track came first.
+ */
+export function attachRemoteTrack(videoEl, event) {
+  if (!videoEl) return null;
+  let media = videoEl.srcObject;
+  // Reuse the element's stream only while it is still live: a stopped stream
+  // keeps its ended tracks and can make the element ignore the new ones.
+  if (!(media instanceof MediaStream) || !media.getTracks().some((t) => t.readyState === 'live')) {
+    media = new MediaStream();
+    videoEl.srcObject = media;
+  }
+  const streams = event.streams ?? [];
+  const incoming = streams.length ? streams.flatMap((s) => s.getTracks()) : [event.track];
+  for (const track of incoming) {
+    if (track && !media.getTracks().some((t) => t.id === track.id)) media.addTrack(track);
+  }
+  return media;
+}
+
 /** Establish WebRTC peer connection using /offer */
-export async function createWebRtcSession(streamId, onTrackCallback, onStateCallback) {
+export async function createWebRtcSession(streamId, onTrackCallback, onStateCallback, options = {}) {
+  const { live = false } = options;
   const pc = new RTCPeerConnection({
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -349,14 +437,18 @@ export async function createWebRtcSession(streamId, onTrackCallback, onStateCall
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
 
-  const res = await fetch(`${currentApiUrl}/offer`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+  const offerBody = () =>
+    JSON.stringify({
       sdp: pc.localDescription.sdp,
       type: pc.localDescription.type,
       stream_id: streamId,
-    }),
+      live,
+    });
+
+  const res = await fetch(`${currentApiUrl}/offer`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: offerBody(),
   }).catch(async (err) => {
     // Single retry path: find a reachable base first, then send once.
     logApiError('POST', '/offer', err);
@@ -364,11 +456,7 @@ export async function createWebRtcSession(streamId, onTrackCallback, onStateCall
     return fetch(`${currentApiUrl}/offer`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sdp: pc.localDescription.sdp,
-        type: pc.localDescription.type,
-        stream_id: streamId,
-      }),
+      body: offerBody(),
     });
   }).catch((err2) => {
     pc.close();

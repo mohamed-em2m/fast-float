@@ -4,13 +4,23 @@ Exports the deployed decode path ``ae.dec(latent, alpha=None, feats)`` and
 returns img only (decode uses out[0]; flow is unused there).
 
 Constraints (baked at trace time, verified in parity):
-- STATIC batch per artifact: ModulatedConv2d bakes ``groups=batch`` as an ONNX
-  attribute, so each graph is valid for exactly one B. We export a *set*
-  (``--batches``, default 1,2,4,8,16): the primary ``--batch`` (also the
-  selector's ``--dec-batch``) goes to ``--out`` and the rest to
-  ``<stem>_b<N>.onnx`` siblings. ``DecoderOnnx`` then picks the smallest
-  session covering a micro-batch and replicate-pads/trims to it — instead of
-  always padding up to the single largest graph.
+- STATIC batch per artifact: the graph is traced at a fixed B, so each graph
+  is valid for exactly one B. We export a *set* (``--batches``, default
+  1,2,4,8,16): the primary ``--batch`` (also the selector's ``--dec-batch``)
+  goes to ``--out`` and the rest to ``<stem>_b<N>.onnx`` siblings.
+  ``DecoderOnnx`` then picks the smallest session covering a micro-batch and
+  replicate-pads/trims to it — instead of always padding up to the single
+  largest graph.
+- The graph is the *model itself*: the deployed ``ModulatedConv2d`` is a dense
+  modulated convolution (the style is folded into the input channels, no
+  ``groups``). An earlier export substituted a grouped variant (``groups=batch``
+  baked into the ONNX attribute); the ORT CUDA EP can only serve grouped convs
+  through its fallback kernel, which drifts ~90 uint8 LSB from torch's and is
+  not run-to-run reproducible — the artifact then could not reproduce the
+  frames the eager path produces.
+- Parity is judged in the *deployed* uint8 domain (2 LSB max / 0.5 LSB mean)
+  with **both sides in fp32**: TF32 alone moves this 22-conv stack by ~40
+  uint8 LSB, which would drown the graph's own error.
 - alpha=None path: decode never blends directions; the direction branches
   are not in the graph.
 - feats structure (count/shapes) is self-discovered by running the reference
@@ -29,133 +39,56 @@ from collections import Counter
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from fast_float.models.float.generator import Generator
-from fast_float.models.float.styledecoder import ModulatedConv2d
 from fast_float.onnx.export import (
+    TRT_DISABLED_MARKER,
     add_ort_args,
     export_module,
-    fp16_tol,
     make_session_from_args,
 )
-from fast_float.onnx.parity import benchmark, compare_outputs
+from fast_float.onnx.parity import U8_MAX_LSB, U8_MAX_MEAN_LSB, benchmark, compare_outputs, u8_lsb
 
 AE_PREFIX = "motion_autoencoder."
 
 
 @contextlib.contextmanager
 def _deterministic_cudnn():
-    """Force deterministic cuDNN for parity (repeat-diff must be exactly 0).
+    """Force deterministic, full-precision cuDNN for parity (repeat-diff must be 0).
 
     Bench runs outside this context with deployed flags. Parity compares two
     deterministic computations (torch-det vs ORT), so residual diff is true
     graph divergence, not kernel noise.
+
+    TF32 is disabled as well: it rounds every accumulation to a 10-bit
+    mantissa, and through this 22-conv stack that alone moves the output by
+    ~40 uint8 LSB. The ORT side of the comparison is pinned to fp32 as well
+    (``use_tf32=False``), so both sides compute the *same* thing and the
+    residual is the graph's divergence -- which is what the gate is for.
     """
     b, d = torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic
+    cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
     try:
         yield
     finally:
         torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic = b, d
+        torch.backends.cudnn.allow_tf32 = cudnn_tf32
+        torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
 
 
-class _StaticModConv(nn.Module):
-    """ModulatedConv2d with batch baked to a Python int.
-
-    Pre-scales weights and folds modulation EqualLinear parameters so the
-    forward graph contains zero Tensor-scalar multiplications (avoiding
-    dynamo FX type promotion crashes: 'prim.device != aten.mul').
-    """
-
-    def __init__(self, src: ModulatedConv2d, batch: int):
-        super().__init__()
-        self.batch = batch
-        self.eps = src.eps
-        self.kernel_size = src.kernel_size
-        self.in_channel = src.in_channel
-        self.out_channel = src.out_channel
-        self.upsample = src.upsample
-        self.downsample = src.downsample
-        self.scale = 1.0
-        self.padding = src.padding
-        self.demodulate = src.demodulate
-        # Pre-scale weight to eliminate scalar * Tensor multiplication in FX graph
-        self.weight = nn.Parameter(src.weight.data * src.scale)
-        if hasattr(src.modulation, "fold_weights"):
-            src.modulation.fold_weights()
-        self.modulation = src.modulation
-        if hasattr(src, "blur"):
-            self.blur = src.blur
-
-    def forward(self, input, style):
-        batch = self.batch
-        style = self.modulation(style).view(batch, 1, self.in_channel, 1, 1)
-        weight = self.weight * style
-        if self.demodulate:
-            demod = torch.rsqrt(weight.pow(2).sum([2, 3, 4]) + 1e-8)
-            weight = weight * demod.view(batch, self.out_channel, 1, 1, 1)
-        weight = weight.view(
-            batch * self.out_channel,
-            self.in_channel,
-            self.kernel_size,
-            self.kernel_size,
-        )
-        _, _, height, width = input.shape
-        if self.upsample:
-            input = input.contiguous().view(1, batch * self.in_channel, height, width)
-            weight = weight.view(
-                batch,
-                self.out_channel,
-                self.in_channel,
-                self.kernel_size,
-                self.kernel_size,
-            )
-            weight = (
-                weight.transpose(1, 2)
-                .contiguous()
-                .reshape(
-                    batch * self.in_channel,
-                    self.out_channel,
-                    self.kernel_size,
-                    self.kernel_size,
-                )
-            )
-            out = F.conv_transpose2d(input, weight, padding=0, stride=2, groups=batch)
-            _, _, height, width = out.shape
-            out = out.view(batch, self.out_channel, height, width)
-            out = self.blur(out)
-        elif self.downsample:
-            input = self.blur(input)
-            _, _, height, width = input.shape
-            input = input.contiguous().view(1, batch * self.in_channel, height, width)
-            weight = weight.contiguous()
-            out = F.conv2d(input, weight, padding=0, stride=2, groups=batch)
-            _, _, height, width = out.shape
-            out = out.view(batch, self.out_channel, height, width)
-        else:
-            input = input.contiguous().view(1, batch * self.in_channel, height, width)
-            weight = weight.contiguous()
-            out = F.conv2d(input, weight, padding=self.padding, groups=batch)
-            _, _, height, width = out.shape
-            out = out.view(batch, self.out_channel, height, width)
-        return out
-
-
-def _freeze_modconvs(dec, batch: int) -> int:
-    """Replace every ModulatedConv2d with its static-batch twin (shared params) and fold static weights."""
+def _fold_static_weights(dec) -> int:
+    """Fold the static scales of the plain convs / linears (as the eager model does)."""
+    folded = 0
     for m in dec.modules():
         if hasattr(m, "fold_weights"):
             m.fold_weights()
-    targets = []
-    for parent in dec.modules():
-        for name, child in parent.named_children():
-            if type(child) is ModulatedConv2d:
-                targets.append((parent, name, child))
-    for parent, name, child in targets:
-        setattr(parent, name, _StaticModConv(child, batch))
-    return len(targets)
+            folded += 1
+    return folded
 
 
 class DecoderExport(nn.Module):
@@ -189,6 +122,7 @@ def _build_generator(ckpt_path: str, image_size: int, channel_mult: float, devic
         .to(device)
         .eval()
     )
+
     if os.path.exists(ckpt_path):
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         tops = Counter(k.split(".")[0] for k in sd)
@@ -215,15 +149,24 @@ def _build_generator(ckpt_path: str, image_size: int, channel_mult: float, devic
 
 
 def freeze_decoder_for_batch(dec_raw, n_feats: int, batch: int) -> DecoderExport:
-    """Fresh frozen (static-batch) export module built from the *unfrozen* dec.
+    """Export module for one static decode batch, built from the *deployed* dec.
 
-    ``ModulatedConv2d`` bakes ``groups=batch`` into an ONNX attribute, so each
-    static batch needs its own graph. Deep-copy first: ``_freeze_modconvs``
-    mutates in place and we must keep the raw (dynamic-batch) decoder intact
-    for the parity reference and for the other batches.
+    The deployed ``ModulatedConv2d`` already computes a **dense** convolution
+    with the style folded into the input channels -- it does not use
+    ``groups=batch`` (the model was refactored to "dense modulated convolution
+    without groups=batch"). The old export substituted a grouped variant
+    (``groups=batch`` baked into the ONNX attribute), which the ORT CUDA EP
+    can only serve through its *fallback* grouped-conv kernel: that kernel
+    drifts ~90 uint8 LSB from torch's grouped conv and is not even
+    run-to-run reproducible, so the shipped artifact could not reproduce the
+    frames the eager path produces.
+
+    So the graph is now the model itself, traced at a fixed batch. Deep-copy
+    first: folding the static scales mutates in place, and the raw decoder
+    stays the parity reference.
     """
     clone = copy.deepcopy(dec_raw)
-    _freeze_modconvs(clone, batch)
+    _fold_static_weights(clone)
     return DecoderExport(clone, n_feats).eval()
 
 
@@ -246,7 +189,7 @@ def build_decoder_module(
     dec_raw = gen.dec
     module = freeze_decoder_for_batch(dec_raw, len(feats1), batch)
 
-    # Equivalence proof (dynamic vs frozen), then report.
+    # Equivalence proof (the exported copy vs the model it was copied from).
     with torch.no_grad(), _deterministic_cudnn():
         lat_b = torch.randn(batch, 512, device=device)
         feats_b = [f.expand(batch, *f.shape[1:]).contiguous() for f in feats1]
@@ -254,11 +197,11 @@ def build_decoder_module(
         out_dyn2 = _img(dec_raw(lat_b, alpha=None, feats=feats_b))
     repeat = (out_dyn - out_dyn2).abs().max().item()
     with torch.no_grad(), _deterministic_cudnn():
-        out_frozen = _img(module.dec(lat_b, alpha=None, feats=feats_b))
+        out_copy = _img(module.dec(lat_b, alpha=None, feats=feats_b))
     print(
-        f"[model] froze decoder to static batch {batch}; "
+        f"[model] decoder graph for static batch {batch}; "
         f"repeat-diff={repeat:.3e} "
-        f"dyn-vs-frozen max_abs={(out_dyn - out_frozen).abs().max().item():.3e}"
+        f"model-vs-export-copy max_abs={(out_dyn - out_copy).abs().max().item():.3e}"
     )
     return module, dec_raw, feats1
 
@@ -270,57 +213,124 @@ def _parse_batches(spec: str) -> list[int]:
     return out
 
 
+def _u8_lsb(ref, out) -> tuple[int, float]:
+    """Quantized-frame error (see :func:`fast_float.onnx.parity.u8_lsb`)."""
+    return u8_lsb(ref, out)
+
+
+def _measure(dec_raw, sess, lat_t, feats_b, feed) -> dict:
+    """torch (dynamic dec) vs this session, in the deployed uint8 domain."""
+    with torch.no_grad(), _deterministic_cudnn():
+        ref_img = _img(dec_raw(lat_t, alpha=None, feats=feats_b))
+        ort_img = sess.run(None, feed)[0]
+    max_lsb, mean_lsb = _u8_lsb(ref_img, ort_img)
+    return {
+        "max_lsb": max_lsb,
+        "mean_lsb": mean_lsb,
+        "cosine": compare_outputs(ref_img, ort_img)["cosine"],
+    }
+
+
+def _gate(rep: dict, args) -> bool:
+    return rep["max_lsb"] <= args.max_lsb and rep["mean_lsb"] <= args.max_mean_lsb
+
+
+def _mark_no_trt(onnx_path: str) -> str:
+    marker = f"{onnx_path}{TRT_DISABLED_MARKER}"
+    with open(marker, "w", encoding="utf-8") as f:
+        f.write(
+            "TensorRT EP is vetoed for this decoder artifact: it either failed the uint8 "
+            "parity gate or the artifact was validated without it (see convert_decoder).\n"
+        )
+    return marker
+
+
+def _veto_or_clear_trt(onnx_path: str, b: int, trt_on: bool) -> bool:
+    """Keep the shipped artifact and the runtime on the same execution provider.
+
+    The runtime (``make_runtime_session``) always tries TensorRT first, so a
+    graph validated on the CUDA EP must leave the ``.no_trt`` sidecar behind or
+    production would silently run the provider that was *not* checked - exactly
+    how a 10x-slower, visibly wrong decoder shipped before.
+    """
+    marker = f"{onnx_path}{TRT_DISABLED_MARKER}"
+    if trt_on:
+        if os.path.exists(marker):
+            os.remove(marker)
+            return True
+        return False
+    if not os.path.exists(marker):
+        _mark_no_trt(onnx_path)
+        print(f"[parity:dec_b{b}] wrote {os.path.basename(marker)}: runtime will skip TensorRT")
+    return False
+
+
 def _run_parity(dec_raw, args, device, b, feats1, feat_names, onnx_path) -> None:
     """Eager (dynamic dec) vs the static ONNX graph for one batch, then bench."""
+    g = torch.Generator(device="cpu").manual_seed(777)
+    lat_t = torch.randn(b, 512, generator=g).to(device)
+    feats_b = [f.expand(b, *f.shape[1:]).contiguous() for f in feats1]
+    feed = {
+        "latent": lat_t.detach().cpu().numpy(),
+        **{n: f.detach().cpu().numpy() for n, f in zip(feat_names, feats_b, strict=False)},
+    }
+    gate_desc = f"gate: max_lsb<={args.max_lsb}, mean_lsb<={args.max_mean_lsb:g}"
+
     # Static batch -> fully static graph, no TRT shape profiles needed.
-    sess, fp16 = make_session_from_args(onnx_path, args)
-    atol, rtol = fp16_tol(args.atol, fp16), fp16_tol(args.rtol, fp16)
-    min_cos = 0.995 if fp16 else args.min_cosine
-    max_mean = fp16_tol(args.max_mean, fp16)
-    with torch.no_grad(), _deterministic_cudnn():
-        g = torch.Generator(device="cpu").manual_seed(777)
-        lat_t = torch.randn(b, 512, generator=g).to(device)
-        feats_b = [f.expand(b, *f.shape[1:]).contiguous() for f in feats1]
-        ref_img = _img(dec_raw(lat_t, alpha=None, feats=feats_b))
-        ort_img = sess.run(
-            None,
-            {
-                "latent": lat_t.detach().cpu().numpy(),
-                **{n: f.detach().cpu().numpy() for n, f in zip(feat_names, feats_b, strict=False)},
-            },
-        )[0]
-        rep = compare_outputs(ref_img, ort_img, atol=atol, rtol=rtol)
-        cos_ok = rep["cosine"] >= min_cos
-        mean_ok = rep["mean_abs"] <= max_mean
-        status = "PASS" if (rep["ok"] or (cos_ok and mean_ok)) else "FAIL"
-        print(
-            f"[parity:dec_b{b}] {status} "
-            f"max_abs={rep['max_abs']:.3e} mean_abs={rep['mean_abs']:.3e} "
-            f"max_rel={rep['max_rel']:.3e} cosine={rep['cosine']:.6f} "
-            f"(atol={atol:g}, rtol={rtol:g})"
-        )
-        if not (rep["ok"] or (cos_ok and mean_ok)):
+    # The parity session is pinned to fp32 (no TF32) so both sides of the
+    # comparison compute the same thing: TF32 alone moves this 22-conv stack
+    # by ~40 uint8 LSB, which would drown the graph's own error.
+    sess, _fp16 = make_session_from_args(onnx_path, args, use_tf32=False)
+    trt_on = "TensorrtExecutionProvider" in sess.get_providers()
+    rep = _measure(dec_raw, sess, lat_t, feats_b, feed)
+    print(
+        f"[parity:dec_b{b}] max_lsb={rep['max_lsb']} mean_lsb={rep['mean_lsb']:.3f} "
+        f"cosine={rep['cosine']:.6f} ({gate_desc}{'' if trt_on else ', no TRT'})"
+    )
+    if not _gate(rep, args):
+        if not trt_on:
             raise RuntimeError(
-                f"decoder parity FAILED (b{b}): cosine={rep['cosine']:.6f} (min={min_cos}), "
-                f"mean_abs={rep['mean_abs']:.3e} (max={max_mean})"
+                f"decoder parity FAILED (b{b}): max_lsb={rep['max_lsb']} (max={args.max_lsb}), "
+                f"mean_lsb={rep['mean_lsb']:.3f} (max={args.max_mean_lsb:g}), "
+                f"cosine={rep['cosine']:.6f}, providers={sess.get_providers()}"
             )
-        gate = "elementwise" if rep["ok"] else "functional (cosine+mean)"
-        print(f"[parity:dec_b{b}] passed via {gate} gate (cosine={rep['cosine']:.6f}, mean_abs={rep['mean_abs']:.3e})")
+        # TRT cannot run this graph faithfully (and is far slower): rebuild the
+        # session on the CUDA EP, re-gate, and leave a marker so the runtime
+        # never re-enables TRT for the artifact we just shipped.
+        print(f"[parity:dec_b{b}] FAIL on TensorRT (max_lsb={rep['max_lsb']}) - retrying on the CUDA EP")
+        fallback = copy.copy(args)
+        fallback.no_trt = True
+        sess, _fp16 = make_session_from_args(onnx_path, fallback, use_tf32=False)
+        trt_on = "TensorrtExecutionProvider" in sess.get_providers()
+        rep = _measure(dec_raw, sess, lat_t, feats_b, feed)
+        print(
+            f"[parity:dec_b{b}] max_lsb={rep['max_lsb']} mean_lsb={rep['mean_lsb']:.3f} "
+            f"cosine={rep['cosine']:.6f} ({gate_desc}, no TRT)"
+        )
+        if not _gate(rep, args):
+            raise RuntimeError(
+                f"decoder parity FAILED (b{b}) with and without TensorRT: "
+                f"max_lsb={rep['max_lsb']} (max={args.max_lsb}), "
+                f"mean_lsb={rep['mean_lsb']:.3f} (max={args.max_mean_lsb:g})"
+            )
+    cleared = _veto_or_clear_trt(onnx_path, b, trt_on)
+    if cleared:
+        print(f"[parity:dec_b{b}] cleared stale {TRT_DISABLED_MARKER} (TRT passes now)")
+    print(f"[parity:dec_b{b}] PASS")
+
     # Bench OUTSIDE deterministic cuDNN so torch runs its deployed kernels
     # (deterministic disables cuDNN autotuning and would inflate speedup).
     if args.bench_iters > 0:
         with torch.no_grad():
-            lat_np = lat_t.detach().cpu().numpy()
-            feats_np = {n: f.detach().cpu().numpy() for n, f in zip(feat_names, feats_b, strict=False)}
             benchmark(
                 lambda: dec_raw(lat_t, alpha=None, feats=feats_b),
-                lambda: sess.run(None, {"latent": lat_np, **feats_np}),
+                lambda: sess.run(None, feed),
                 name=f"dec_b{b}",
                 iters=args.bench_iters,
             )
 
 
-def main(argv=None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Convert frame decoder to ONNX")
     ap.add_argument("--ckpt", default="./checkpoints/float.pth")
     ap.add_argument("--out", default="./onnx/decoder_v1.onnx")
@@ -328,7 +338,7 @@ def main(argv=None) -> int:
     ap.add_argument("--channel-mult", type=float, default=1.0)
     ap.add_argument(
         "--batches",
-        default="1,2,4,8,16",
+        default="4,8,16",
         help="static decode batches to export (one artifact each); the runtime "
         "picks the smallest session covering a micro-batch instead of always "
         "padding up to the largest",
@@ -336,7 +346,7 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--batch",
         type=int,
-        default=8,
+        default=4,
         help="PRIMARY static batch written to --out (matches the selector's "
         "--dec-batch); extra batches land in <stem>_b<N>.onnx siblings",
     )
@@ -347,20 +357,40 @@ def main(argv=None) -> int:
         help="seed for random init (irrelevant when ckpt overlays all)",
     )
     ap.add_argument("--opset", type=int, default=17)
-    # Nondeterminism note: cuDNN conv_transpose2d uses atomic-add kernels, so
-    # parity runs under _deterministic_cudnn (repeat-diff must print 0.0).
-    # On random weights the warp stack is chaotic: kernel summation order
-    # alone leaves ~0.7 max_abs (mean ~1e-3, cosine 0.9999+). Trained weights
-    # run far tighter — the GPU-box run is the true numeric gate. The tripwire
-    # for structural breaks is mean_abs + cosine, not max_abs.
-    ap.add_argument("--atol", type=float, default=1.0)
-    ap.add_argument("--rtol", type=float, default=1e-2)
-    ap.add_argument("--min-cosine", type=float, default=0.998)
-    ap.add_argument("--max-mean", type=float, default=0.05)
+    # Parity is gated in the *deployed* uint8 domain: the decode path clamps to
+    # [-1, 1], scales by 127.5 and truncates, so float-space max_abs is not what
+    # the video shows. 2 LSB max / 0.5 LSB mean is invisible on a 512x512 frame
+    # and fails a structurally wrong graph (the broken TensorRT engine measured
+    # max_abs=4.375, cosine=0.983 while "passing" atol=40).
+    ap.add_argument("--max-lsb", type=int, default=U8_MAX_LSB, help="max uint8 frame error vs eager torch")
+    ap.add_argument("--max-mean-lsb", type=float, default=U8_MAX_MEAN_LSB, help="mean uint8 frame error vs eager torch")
     ap.add_argument("--skip-parity", action="store_true")
     ap.add_argument("--bench-iters", type=int, default=10)
+    ap.add_argument(
+        "--trt",
+        action="store_true",
+        help="opt in to the TensorRT EP for the parity session; off by default "
+        "because TRT partitions this graph (10x slower) and misses the uint8 gate",
+    )
     add_ort_args(ap)
-    args = ap.parse_args(argv)
+    return ap
+
+
+def _parse_args(argv=None):
+    """Parse flags and make TensorRT opt-in for this converter.
+
+    A TRT session for this decoder was measured at 0.09x eager with a 4.375
+    max_abs error, so the default parity session (and therefore the shipped
+    artifact's ``.no_trt`` sidecar) must be the CUDA EP. ``--trt`` restores the
+    old behaviour for a box where TRT has been re-validated.
+    """
+    args = _build_parser().parse_args(argv)
+    args.no_trt = bool(args.no_trt) or not args.trt
+    return args
+
+
+def main(argv=None) -> int:
+    args = _parse_args(argv)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     batches = sorted(set(_parse_batches(args.batches)) | {int(args.batch)})

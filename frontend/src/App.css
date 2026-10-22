@@ -56,6 +56,10 @@
   /* glass-panel's backdrop-filter makes this a stacking context; raise it so the
      settings popover paints above the video/stage panels below the header. */
   z-index: 1000;
+  /* On a phone the title and the actions do not fit on one line: let the
+     actions wrap instead of pushing the whole page sideways. */
+  flex-wrap: wrap;
+  gap: 12px;
 }
 
 .header-brand {
@@ -106,6 +110,9 @@
   display: flex;
   align-items: center;
   gap: 12px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  min-width: 0;
 }
 
 .status-pill {
@@ -293,13 +300,20 @@
 .studio-main-grid {
   display: grid;
   grid-template-columns: 460px 1fr;
+  /* Three rows, filled column-first: the cards of the left column keep their
+     order, and every row pairs one left card with one right card, so the
+     Reference Portrait is level with the Studio Canvas. */
+  grid-template-rows: repeat(3, auto);
+  grid-auto-flow: column;
   gap: 24px;
-  align-items: start;
+  align-items: stretch;
 }
 
 @media (max-width: 1100px) {
   .studio-main-grid {
     grid-template-columns: 1fr;
+    grid-template-rows: none;
+    grid-auto-flow: row;
   }
 }
 
@@ -410,7 +424,10 @@
 
 .portrait-preview-container {
   width: 100%;
-  max-height: 320px;
+  /* Grows with the card so the preview fills the space that the Studio
+     Canvas panel sets (the card is stretched to match its row). */
+  flex: 1;
+  min-height: 220px;
   position: relative;
   display: flex;
   align-items: center;
@@ -419,7 +436,8 @@
 
 .portrait-preview-img {
   width: 100%;
-  height: 280px;
+  height: 100%;
+  max-height: 440px;
   object-fit: cover;
   display: block;
 }
@@ -569,11 +587,16 @@
   display: flex;
   flex-direction: column;
   gap: 14px;
+  /* Fills the card when it is stretched to match the telemetry panel. */
+  flex: 1;
+  min-height: 0;
 }
 
 .waveform-canvas-box {
   width: 100%;
   height: 100px;
+  min-height: 100px;
+  flex: 1;
   background: var(--bg-card-inner);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
@@ -1031,6 +1054,119 @@
   width: 100%;
 }
 
+/* Live (WebSocket / WebRTC) preview */
+.live-preview {
+  width: 100%;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.live-preview-media {
+  width: 100%;
+  max-height: 520px;
+  object-fit: contain;
+  display: block;
+  background: #000000;
+}
+
+.live-preview-overlay {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  right: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  pointer-events: none;
+  font-size: 13px;
+}
+
+.live-preview-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(18, 22, 36, 0.85);
+  backdrop-filter: blur(8px);
+  padding: 6px 12px;
+  border-radius: var(--radius-md);
+  color: var(--text-main);
+}
+
+.live-preview-status--live .live-preview-dot {
+  background-color: var(--danger);
+  animation: livePulse 1.4s infinite ease-in-out;
+}
+
+.live-preview-status--error {
+  color: var(--danger);
+}
+
+.live-preview-gaps {
+  background: rgba(18, 22, 36, 0.85);
+  backdrop-filter: blur(8px);
+  padding: 6px 10px;
+  border-radius: var(--radius-md);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.live-preview-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex: 0 0 auto;
+}
+
+/* Transport selector */
+.transport-selector {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.transport-selector-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  margin-right: 4px;
+}
+
+.transport-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  font-size: 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+  background: rgba(18, 22, 36, 0.6);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.transport-btn:hover:not(:disabled) {
+  border-color: var(--cyan);
+  color: var(--text-main);
+}
+
+.transport-btn.is-active {
+  border-color: var(--cyan);
+  background: rgba(6, 182, 212, 0.12);
+  color: var(--text-main);
+}
+
+.transport-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .stage-toolbar {
   display: flex;
   align-items: center;
@@ -1183,6 +1319,8 @@
   gap: 10px;
   border-top: 1px solid var(--border-subtle);
   padding-top: 14px;
+  /* Sits at the bottom of the panel when the card is stretched. */
+  margin-top: auto;
 }
 
 .history-title {
@@ -1231,7 +1369,6 @@
   color: #ffffff;
   flex-shrink: 0;
 }
-
 .status-label {
   font-weight: 500;
   white-space: nowrap;
@@ -1256,4 +1393,309 @@
   display: flex;
   justify-content: center;
   padding: 4px 0 2px;
+  /* Anchors the last row of the parameters card to the bottom, so the card
+     matches the height of the panel it is paired with. */
+  margin-top: auto;
+}
+
+/* ---- Performance matrix panel ---------------------------------------- */
+/* One shared row layout for every metric: label (+ hint) on the left, the
+   number in a fixed right-aligned column. The two halves are mirrored, so
+   the panel reads as two balanced columns instead of ragged tables. */
+.perf-panel {
+  gap: 16px;
+  /* The panel is a flex child, so its width follows the app grid, not the
+     viewport: size the two-column layout off the panel itself. */
+  container-type: inline-size;
+}
+
+.perf-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.perf-levels-label {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+}
+
+.perf-levels-input {
+  width: 104px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-card-inner);
+  color: var(--text-main);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-align: center;
+}
+
+.perf-levels-input:focus {
+  outline: none;
+  border-color: var(--border-active);
+}
+
+.perf-levels-input:disabled {
+  opacity: 0.5;
+}
+
+.perf-run {
+  padding: 6px 14px;
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.perf-run:disabled {
+  opacity: 0.65;
+  cursor: progress;
+}
+
+.perf-metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0 34px;
+  align-items: start;
+}
+
+@container (max-width: 700px) {
+  .perf-metrics {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+
+  .perf-row {
+    grid-template-columns: minmax(0, 1fr) 124px;
+  }
+
+  .perf-panel .section-header {
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .perf-subtitle-note {
+    display: none;
+  }
+}
+
+.perf-metric-col {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.perf-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 200px;
+  align-items: center;
+  gap: 14px;
+  /* Fixed height: the two halves of the panel must keep their dividers on
+     the same lines, so every row is exactly the same size. */
+  height: 52px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.perf-row:last-child {
+  border-bottom: none;
+}
+
+.perf-row-label {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  min-width: 0;
+}
+
+.perf-row-label svg {
+  margin-top: 2px;
+  flex-shrink: 0;
+}
+
+.perf-row-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.perf-row-title {
+  font-size: 13px;
+  color: var(--text-main);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.perf-row-hint {
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.perf-row-value {
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 13.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-main);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.perf-block {
+  margin-top: 2px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.perf-subtitle {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.perf-subtitle-note {
+  font-size: 10.5px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+}
+
+/* Data tables (sweep + recent requests) share one look: first column left,
+   every number right-aligned in a monospace grid. They are wider than a
+   phone, so they scroll sideways instead of stretching the page. */
+.perf-table-wrap {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
+.perf-data-table {
+  width: 100%;
+  min-width: 520px;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.perf-data-table th {
+  padding: 7px 8px;
+  text-align: right;
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid var(--border-subtle);
+  white-space: nowrap;
+}
+
+.perf-data-table th:first-child {
+  text-align: left;
+}
+
+.perf-data-table td {
+  padding: 7px 8px;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-main);
+  border-bottom: 1px solid var(--border-subtle);
+  white-space: nowrap;
+}
+
+.perf-data-table td:first-child {
+  text-align: left;
+  font-family: var(--font-sans);
+  color: var(--text-muted);
+}
+
+.perf-data-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.perf-data-table tbody tr:hover td {
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.perf-notes {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.perf-notes-details {
+  margin-top: 2px;
+}
+
+.perf-notes-details summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-faint);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  list-style: none;
+}
+
+.perf-notes-details summary::-webkit-details-marker {
+  display: none;
+}
+
+.perf-notes-details summary::before {
+  content: '▸ ';
+}
+
+.perf-notes-details[open] summary::before {
+  content: '▾ ';
+}
+
+.perf-notes-details[open] summary {
+  margin-bottom: 4px;
+}
+
+.perf-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-card-inner);
+  color: var(--text-muted);
+  font-size: 12.5px;
+}
+
+.perf-notice-error {
+  border-color: rgba(244, 63, 94, 0.45);
+  color: var(--danger);
+}
+
+.spin {
+  animation: perf-spin 1s linear infinite;
+}
+
+@keyframes perf-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }

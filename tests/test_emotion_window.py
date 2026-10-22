@@ -51,7 +51,10 @@ def _length_emotion_graph(path) -> None:
 def emotion_backend(tmp_path):
     path = tmp_path / "emotion_v1.onnx"
     _length_emotion_graph(path)
-    return EmotionOnnxBackend(str(path))
+    # A CPU session on purpose: these tests are about the *non-TRT* behaviour
+    # (no length clamp). On a box where the TensorRT EP loads, the default
+    # session would be a TRT one and the clamp would apply.
+    return EmotionOnnxBackend(str(path), use_gpu=False)
 
 
 def test_cpu_session_passes_the_whole_clip(emotion_backend):

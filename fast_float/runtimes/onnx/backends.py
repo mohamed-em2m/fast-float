@@ -76,6 +76,7 @@ class EmotionOnnxBackend(RuntimeSession):
         extra_dynamic: dict | None = None,
         max_batch: int | None = None,
         device_id: int | None = None,
+        use_trt: bool | None = None,
     ):
         super().__init__(device_id=device_id)
         if not os.path.exists(onnx_path):
@@ -88,6 +89,7 @@ class EmotionOnnxBackend(RuntimeSession):
             max_batch=max_batch,
             use_gpu=use_gpu,
             device_id=device_id,
+            use_trt=use_trt,
         )
         self.input_name = self.session.get_inputs()[0].name
         out = self.session.get_outputs()[0]
@@ -139,7 +141,7 @@ class EmotionOnnxBackend(RuntimeSession):
             except Exception as e:
                 self._io_failed = True
                 print(f"[backends:iobinding] disabled ({e}); using host path")
-        wav_np = a.detach().to("cpu", dtype=torch.float32).numpy()
+        wav_np = a.detach().to("cpu", dtype=torch.float32).contiguous().numpy()
         probs = self._run(wav_np)
         return torch.from_numpy(probs).to(device=device, dtype=torch.float32)
 
@@ -172,6 +174,7 @@ class Wav2vecOnnxBackend(RuntimeSession):
         extra_dynamic: dict | None = None,
         max_batch: int | None = None,
         device_id: int | None = None,
+        use_trt: bool | None = None,
     ):
         super().__init__(device_id=device_id)
         if not os.path.exists(onnx_path):
@@ -238,7 +241,7 @@ class Wav2vecOnnxBackend(RuntimeSession):
             except Exception as e:
                 self._io_failed = True
                 print(f"[backends:iobinding] disabled ({e}); using host path")
-        feats_np = conv_feats.detach().to("cpu", dtype=torch.float32).numpy()
+        feats_np = conv_feats.detach().to("cpu", dtype=torch.float32).contiguous().numpy()
         out = self._run(feats_np)
         return torch.from_numpy(out).to(device=device, dtype=torch.float32)
 
@@ -271,6 +274,7 @@ class FMTStepBackend(RuntimeSession):
         extra_dynamic: dict | None = None,
         max_batch: int | None = None,
         device_id: int | None = None,
+        use_trt: bool | None = None,
     ):
         super().__init__(device_id=device_id, degrade_on_error="sticky")
         if not os.path.exists(onnx_path):
@@ -283,6 +287,7 @@ class FMTStepBackend(RuntimeSession):
             max_batch=max_batch,
             use_gpu=use_gpu,
             device_id=device_id,
+            use_trt=use_trt,
         )
         out = self.session.get_outputs()[0]
         self.output_name = out.name
@@ -391,7 +396,7 @@ class FMTStepBackend(RuntimeSession):
                 self._io_failed = True
                 print(f"[backends:iobinding] disabled ({e}); using host path")
         feed = {
-            name: val.detach().to("cpu", dtype=torch.float32).numpy()
+            name: val.detach().to("cpu", dtype=torch.float32).contiguous().numpy()
             for name, val in zip(self.INPUTS, (t, x, wa, wr, we, prev_x, prev_wa), strict=False)
         }
         out = self._run(feed)

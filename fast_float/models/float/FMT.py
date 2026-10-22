@@ -112,7 +112,16 @@ class Attention(nn.Module):
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
+        # ``mask`` is the alignment band from ``enc_dec_mask``: it is True
+        # *outside* the local +/-``attention_window`` frame band and False
+        # inside it, so ``~mask`` is the set of frames a query may attend to.
+        # Both branches below must select exactly that set -- they used to
+        # disagree (``~mask`` in the manual branch inverted the band), and the
+        # ONNX converter exported the manual one while production ran the
+        # fused one, so the exported graph was a *different model* (measured
+        # cosine 0.94 per step, i.e. garbage motion latents).
         if self.fused_attn:
+            # SDPA's bool mask means "participate", so ``~mask`` keeps the band.
             x = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -124,7 +133,10 @@ class Attention(nn.Module):
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
             if mask is not None:
-                attn = attn.masked_fill(~mask, float("-inf"))
+                # Mask out everything the band does not allow, i.e. the
+                # positions where ``mask`` is True -- the complement of the
+                # fused branch's ``attn_mask=~mask``.
+                attn = attn.masked_fill(mask, float("-inf"))
             attn = attn.softmax(dim=-1)
             attn = self.attn_drop(attn)
             x = attn @ v
@@ -313,6 +325,7 @@ class FlowMatchingTransformer(BaseModel):
         onnx_path = getattr(opt, "fmt_onnx_path", "./onnx/fmt_step_v1.onnx")
         if self._mode == "onnx" and onnx_path and os.path.exists(onnx_path):
             try:
+                from fast_float.onnx.backends import resolve_use_trt
                 from fast_float.onnx.runtime import FMTStepBackend
 
                 n_clip = int(self.opt.wav2vec_sec * self.opt.fps)
@@ -332,6 +345,7 @@ class FlowMatchingTransformer(BaseModel):
                         "prev_x": [1, n_prev, dim_w],
                         "prev_wa": [1, n_prev, dim_w],
                     },
+                    use_trt=resolve_use_trt("fmt"),
                 )
                 logger.info(
                     f"FlowMatchingTransformer: ONNX backend constructed {onnx_path} "

@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import datetime
+import math
 import os
 import tempfile
 import time
@@ -8,6 +9,13 @@ from typing import Any
 
 import cv2
 
+from fast_float.core.perf_metrics import (
+    ENCODE_STAGES,
+    MODEL_STAGES,
+    LatencySummary,
+    RequestSample,
+    fold_stage_seconds,
+)
 from fast_float.core.state import app_state
 from fast_float.utils.chunking import (
     get_audio_duration_seconds,
@@ -47,6 +55,7 @@ def run_inference_blocking(
     image_path: str,
     audio_path: str,
     request_data: dict[str, Any],
+    dispatcher: Any | None = None,
 ) -> str:
     """Synchronous inference runner invoked within ThreadPoolExecutor."""
     return agent.run_inference(
@@ -61,6 +70,7 @@ def run_inference_blocking(
         no_crop=request_data.get("no_crop", False),
         seed=request_data.get("seed", 25),
         verbose=True,
+        dispatcher=dispatcher,
     )
 
 
@@ -69,6 +79,7 @@ def run_inference_batched_blocking(
     items: list,
     image_path: str,
     request_data: dict[str, Any],
+    dispatcher: Any | None = None,
 ) -> list:
     """Synchronous batched-chunk inference runner invoked within ThreadPoolExecutor."""
     # One seed per chunk (assigned by the caller from its position in the
@@ -88,6 +99,7 @@ def run_inference_batched_blocking(
         seed=request_data.get("seed", 25),
         seeds=seeds,
         verbose=True,
+        dispatcher=dispatcher,
     )
 
 
@@ -160,6 +172,7 @@ async def generate_video(
     request_data: dict[str, Any],
     request_id: str,
     state=app_state,
+    dispatcher: Any | None = None,
 ) -> tuple[str, dict[str, float]]:
     """Complete pipeline to process inputs, run model inference, and return final video.
 
@@ -216,6 +229,11 @@ async def generate_video(
         if state.inference_lock is None:
             state.inference_lock = asyncio.Lock()
 
+        if dispatcher is not None:
+            # The pipeline binds with the chunk path; live transports need the
+            # full request audio for playback.
+            dispatcher.set_audio_path(audio_path)
+
         # 4. Decide single-pass vs chunked based on audio length
         chunk_seconds = float(request_data.get("chunk_seconds", 0.0) or 0.0)
         overlap_seconds = float(request_data.get("chunk_overlap_seconds", 0.5) or 0.0)
@@ -225,7 +243,7 @@ async def generate_video(
         num_chunks = 1
 
         async with state.inference_lock:
-            with timing_run(f"request {request_id}"):
+            with timing_run(f"request {request_id}") as collector:
                 _apply_decode_batch_size(state, request_data)
                 if chunk_seconds > 0 and duration > chunk_seconds:
                     num_chunks, output_path = await _generate_chunked(
@@ -242,6 +260,7 @@ async def generate_video(
                         encoder,
                         fps,
                         temp_files,
+                        dispatcher,
                     )
                 else:
                     state.set_progress(
@@ -260,7 +279,11 @@ async def generate_video(
                         image_path,
                         audio_path,
                         request_data,
+                        dispatcher,
                     )
+                # Capture the stage split before the collector is reset: the
+                # model stages (ODE solve, encoders, decode) vs encode/mux.
+                stage_totals = collector.totals()
 
         timings["inference"] = time.time() - inference_start
         timings["total"] = time.time() - total_start_time
@@ -278,6 +301,27 @@ async def generate_video(
         stats["total_frames"] = stats.get("total_frames", 0) + frame_count
         if stats["total_inference_time"] > 0:
             stats["average_fps"] = stats["total_frames"] / stats["total_inference_time"]
+
+        # Rolling per-request sample: this is what feeds the "recent requests"
+        # half of the perf matrix in the UI.
+        clock = getattr(dispatcher, "clock", None) or getattr(getattr(dispatcher, "stream", None), "clock", None)
+        sample = RequestSample(
+            at=time.time(),
+            target_fps=float(fps or 25),
+            frames=frame_count,
+            model_seconds=fold_stage_seconds(stage_totals, MODEL_STAGES),
+            encode_seconds=fold_stage_seconds(stage_totals, ENCODE_STAGES),
+            wall_seconds=timings["inference"],
+            request_seconds=timings["total"],
+            preprocess_seconds=timings["preprocess"],
+            ttff_ms=clock.ttff_ms if clock is not None else None,
+            jitter_ms=clock.jitter_ms if clock is not None else None,
+            dropped=int(clock.dropped) if clock is not None else 0,
+            latency=clock.latency if clock is not None else LatencySummary(),
+        )
+        record = getattr(state, "record_request_sample", None)
+        if callable(record):
+            record(sample)
 
         state.set_progress(
             request_id,
@@ -327,6 +371,9 @@ async def generate_video(
             except Exception:
                 pass
         raise
+    finally:
+        if dispatcher is not None:
+            await asyncio.to_thread(dispatcher.shutdown)
 
 
 async def _generate_chunked(
@@ -343,6 +390,7 @@ async def _generate_chunked(
     encoder: str,
     fps: int,
     temp_files: list,
+    dispatcher: Any | None = None,
 ) -> tuple[int, str]:
     """Render each audio chunk, then merge. Returns (chunk_count, merged_path)."""
     chunks = split_wav_into_chunks(audio_path, chunk_seconds, overlap_seconds, out_dir=res_dir)
@@ -385,7 +433,7 @@ async def _generate_chunked(
             percent=round(done / num_chunks * 90, 1),
             message=f"{done}/{num_chunks} chunks{batch_note}",
         )
-        if len(g) == 1:
+        if len(g) == 1 and batch_size <= 1:
             ch = g[0]
             chunk_out = os.path.join(res_dir, f"{stamp}_{request_id}_chunk{idx:03d}.mp4")
             # Same request seed, shifted by the chunk's position in the audio:
@@ -399,6 +447,7 @@ async def _generate_chunked(
                 image_path,
                 ch["path"],
                 chunk_request,
+                dispatcher,
             )
             chunk_videos.append(chunk_out)
             temp_files.append(chunk_out)
@@ -422,6 +471,12 @@ async def _generate_chunked(
                         "duration": ch["duration"],
                         "out_path": chunk_out,
                         "seed": _chunk_seed(request_data, idx),
+                        # The batched path decodes fewer frames instead of
+                        # trimming the overlap in the merge, which turns the
+                        # merge into a stream copy (no second encode pass).
+                        # ceil matches ffmpeg's `trim=start=<overlap>`: frames
+                        # whose PTS is below the cut are dropped.
+                        "trim_frames": math.ceil(overlap_seconds * fps) if idx > 0 else 0,
                     }
                 )
                 idx += 1
@@ -432,6 +487,7 @@ async def _generate_chunked(
                 items,
                 image_path,
                 request_data,
+                dispatcher,
             )
             for o in outs:
                 chunk_videos.append(o)
@@ -448,14 +504,19 @@ async def _generate_chunked(
     )
 
     merged_path = os.path.join(res_dir, f"{stamp}_{request_id}.mp4")
+    # With chunk_batch_size > 1 every group goes through the batched path, which
+    # already dropped the overlapping head frames; merging is then a lossless
+    # stream copy. The sequential path still needs the filter trim.
+    merge_overlap = 0.0 if batch_size > 1 else overlap_seconds
     with timed("merge", chunks=num_chunks):
         await loop.run_in_executor(
             state.executor,
             merge_mp4_chunks,
             chunk_videos,
             merged_path,
-            overlap_seconds,
+            merge_overlap,
             encoder,
             fps,
+            audio_path,
         )
     return num_chunks, merged_path

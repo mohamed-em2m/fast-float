@@ -8,6 +8,7 @@ from fast_float.models.float.FMT import FlowMatchingTransformer
 from fast_float.models.float.generator import Generator
 from fast_float.models.float.sampler import FloatSampler, SamplerMixin
 from fast_float.models.float.styledecoder import Direction, Synthesis
+from fast_float.models.float.synthesis_infer import SynthesisInfer
 from fast_float.models.float.video_pipeline import SaveVideoPipeline, StreamingVideoSaver
 
 __all__ = [
@@ -25,4 +26,5 @@ __all__ = [
     "SaveVideoPipeline",
     "StreamingVideoSaver",
     "Synthesis",
+    "SynthesisInfer",
 ]

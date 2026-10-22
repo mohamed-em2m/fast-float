@@ -175,6 +175,59 @@ def _has_audio_stream(path: str) -> bool:
         return False
 
 
+def _mux_audio_if_missing(video_path: str, audio_path: str | None) -> None:
+    """Attach ``audio_path`` to a video-only output, copying the video stream.
+
+    The batched chunk path encodes video-only chunks (its NVENC writer has no
+    audio input), unlike the single-pass/sequential path which muxes each
+    chunk. Without this, a chunked download is silent.
+    """
+    if not audio_path or not os.path.exists(audio_path):
+        return
+    if _has_audio_stream(video_path):
+        return
+
+    tmp_path = f"{video_path}.mux.mp4"
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                video_path,
+                "-i",
+                audio_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+                tmp_path,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        os.replace(tmp_path, video_path)
+    except Exception as e:
+        logger.warning(f"Audio mux failed: {e}")
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 def _concat_stream_copy(paths: list[str], output_path: str) -> bool:
     """Concatenate MP4s by stream copy (fast, lossless). False on any failure."""
     list_path = None
@@ -295,22 +348,30 @@ def merge_mp4_chunks(
     overlap_seconds: float = 0.0,
     encoder: str | None = None,
     fps: int = 25,
+    audio_path: str | None = None,
 ) -> str:
     """Merge per-chunk MP4s into one file, trimming overlap between chunks."""
     if not chunk_paths:
         raise ValueError("No chunk videos to merge")
     if len(chunk_paths) == 1:
         shutil.copy(chunk_paths[0], output_path)
+        _mux_audio_if_missing(output_path, audio_path)
         return output_path
 
     overlap = max(0.0, float(overlap_seconds))
-    with_audio = all(_has_audio_stream(p) for p in chunk_paths)
 
     # Fastest path: no trim needed and identical codecs -> straight stream copy.
-    if overlap < 0.01 and with_audio and _concat_stream_copy(chunk_paths, output_path):
+    # Works with or without an audio track (the batched chunk path encodes
+    # video-only chunks, so requiring audio here forced a full re-encode).
+    if overlap < 0.01 and _concat_stream_copy(chunk_paths, output_path):
         logger.info(f"🔗 Merged {len(chunk_paths)} chunks via stream copy")
+        _mux_audio_if_missing(output_path, audio_path)
         return output_path
 
+    # Probe for audio only on the re-encode path; on the copy path this would
+    # cost one ffprobe process per chunk for nothing.
+    with_audio = all(_has_audio_stream(p) for p in chunk_paths)
     logger.info(f"🔗 Merging {len(chunk_paths)} chunks via filter (overlap={overlap}s, audio={with_audio})")
     _concat_filter(chunk_paths, output_path, overlap, encoder, fps, with_audio)
+    _mux_audio_if_missing(output_path, audio_path)
     return output_path

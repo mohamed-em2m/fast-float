@@ -8,13 +8,20 @@ import {
   Zap,
   Gauge
 } from 'lucide-react';
-import { createWebRtcSession, getApiUrl } from '../services/api';
+import { attachRemoteTrack, createWebRtcSession, getApiUrl } from '../services/api';
+import LivePreview from './LivePreview';
 
 const GENERATION_STAGES = [
   { label: 'Preprocessing Audio & Image', icon: '🎧' },
   { label: 'Encoding Motion Latent Flow', icon: '⚡' },
   { label: 'Solving Transformer ODE Trajectory', icon: '🧠' },
   { label: 'NVENC Hardware Frame Compression', icon: '🎬' },
+];
+
+const TRANSPORTS = [
+  { id: 'mp4', label: 'MP4', title: 'Render the whole video, then play the file' },
+  { id: 'ws', label: 'WebSocket', title: 'Watch frames live over a WebSocket' },
+  { id: 'webrtc', label: 'WebRTC', title: 'Watch frames live over WebRTC (lowest latency)' },
 ];
 
 export default function StudioStage({
@@ -24,6 +31,9 @@ export default function StudioStage({
   generationResult,
   hasAudio,
   onToast,
+  transport = 'mp4',
+  setTransport,
+  liveRequestId,
 }) {
   const [currentStageIndex, setCurrentStageIndex] = useState(0);
   const [useWebRtc, setUseWebRtc] = useState(false);
@@ -98,12 +108,14 @@ export default function StudioStage({
       setWebRtcConnected(false);
       if (pcRef.current) pcRef.current.close();
       stopTracks(webRtcVideoRef.current?.srcObject);
+      if (webRtcVideoRef.current) webRtcVideoRef.current.srcObject = null;
 
       const pc = await createWebRtcSession(
         generationResult.request_id,
         (event) => {
-          if (webRtcVideoRef.current && event.streams && event.streams[0]) {
-            webRtcVideoRef.current.srcObject = event.streams[0];
+          // Audio and video can arrive as separate streams; merge the tracks
+          // instead of letting the last ontrack replace the first.
+          if (attachRemoteTrack(webRtcVideoRef.current, event)) {
             setWebRtcConnected(true);
           }
         },
@@ -203,6 +215,24 @@ export default function StudioStage({
         </button>
       </div>
 
+      {/* Transport selector */}
+      <div className="transport-selector" role="group" aria-label="Stream transport">
+        <span className="transport-selector-label">Transport</span>
+        {TRANSPORTS.map((opt) => (
+          <button
+            key={opt.id}
+            type="button"
+            className={`transport-btn ${transport === opt.id ? 'is-active' : ''}`}
+            onClick={() => setTransport?.(opt.id)}
+            disabled={isGenerating}
+            title={opt.title}
+          >
+            {opt.id !== 'mp4' && <span className="live-dot" />}
+            {opt.label}
+          </button>
+        ))}
+      </div>
+
       {/* Progress Overlay during Generation */}
       {isGenerating && (
         <div className="generation-progress-box">
@@ -225,7 +255,13 @@ export default function StudioStage({
 
       {/* Video Viewport */}
       <div className="video-viewport-wrapper">
-        {useWebRtc ? (
+        {isGenerating && liveRequestId && transport !== 'mp4' ? (
+          <LivePreview
+            requestId={liveRequestId}
+            transport={transport}
+            onStatus={(message) => onToast?.(message || 'Live stream ended', 'error')}
+          />
+        ) : useWebRtc ? (
           <div className="webrtc-player-box">
             <video
               ref={webRtcVideoRef}

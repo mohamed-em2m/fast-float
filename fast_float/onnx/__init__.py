@@ -22,6 +22,7 @@ from fast_float.onnx.export import (
     make_runtime_session,
     make_session_from_args,
     trt_optimization_profiles,
+    trt_vetoed,
 )
 from fast_float.onnx.parity import check_parity
 
@@ -44,6 +45,7 @@ __all__ = [
     "make_session_from_args",
     "save_backends",
     "trt_optimization_profiles",
+    "trt_vetoed",
 ]
 
 # ``fast_float.onnx.runtime`` re-exports the ctor-wired ORT backends, which live

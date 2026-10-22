@@ -16,6 +16,13 @@ Structural CLI flags (--fmt-depth, --dim-h, ...) must match the deploy
 opt; the app runs a live torch-vs-ONNX probe at init and falls back to
 torch on any mismatch.
 
+The exported graph must be the *deployed* graph: the module is traced
+exactly as the application builds it, and the parity gate compares the
+ONNX output against a snapshot of that deployed model — never against the
+module that was traced. Comparing a graph with itself proves nothing,
+which is how an inverted attention mask (a different model: per-step
+cosine 0.94) once passed every gate and shipped.
+
 Usage (from repo root):
     python -m fast_float.onnx.convert_fmt --out ./onnx/fmt_step_v1.onnx
 """
@@ -23,6 +30,7 @@ Usage (from repo root):
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import sys
 from pathlib import Path
@@ -96,6 +104,11 @@ def build_fmt(args) -> FlowMatchingTransformer:
         audio_dropout_prob=0.1,
         ref_dropout_prob=0.1,
         emotion_dropout_prob=0.1,
+        # No runtime ONNX backend: the converter exports the *torch* model, and
+        # wiring a session here would load the very artifact this run
+        # replaces (and make the model un-deepcopyable for the parity
+        # snapshot).
+        fmt_onnx_path=None,
     )
     fmt = FlowMatchingTransformer(opt)
     if os.path.exists(args.ckpt):
@@ -157,9 +170,17 @@ def main(argv=None) -> int:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     fmt = build_fmt(args).to(device)
-    for blk in fmt.blocks:
-        if hasattr(blk, "attn"):
-            blk.attn.fused_attn = False
+    # Export the *deployed* graph: the attention implementation is whatever
+    # ``use_fused_attn()`` selects, i.e. exactly what production runs. The
+    # converter used to force the manual branch ("fused_attn = False"), but
+    # that branch masked the opposite set of frames (see FMT.Attention), so
+    # the artifact was a different model than the one that generated the
+    # frames -- and the parity gate below could not see it, because it
+    # compared the graph against the very module it had just exported.
+    attn_mode = "unknown"
+    if len(fmt.blocks) and hasattr(fmt.blocks[0], "attn"):
+        attn_mode = "fused" if getattr(fmt.blocks[0].attn, "fused_attn", False) else "manual"
+    print(f"[export] attention path: {attn_mode} (the deployed one)")
     module = FMTStepWrapper(fmt).eval().to(device)
 
     trace = sample_inputs(2, 0.5, 0, device)  # batch 2: dynamic batch mark
@@ -192,6 +213,13 @@ def main(argv=None) -> int:
         print(f"[export] note: {note}")
 
     if not args.skip_parity:
+        # The parity reference is a *snapshot of the deployed model*, taken
+        # before the export, and never the module that was exported. Comparing
+        # a graph against the module it was traced from proves nothing about
+        # the model the application runs -- that blind spot is how a graph
+        # with an inverted attention mask (a different model: cosine 0.94 per
+        # step) passed every gate and shipped.
+        deployed = copy.deepcopy(fmt)
         sess, fp16 = make_session_from_args(
             info["path"],
             args,
@@ -225,7 +253,16 @@ def main(argv=None) -> int:
             ]
             for name, batch, t_val, seed in cases:
                 args_in = sample_inputs(batch, t_val, seed, device)
-                ref = module(*args_in)
+                # Reference = the deployed torch model, never the traced module.
+                ref = deployed.forward(*args_in, train=False)
+                exported = module(*args_in)
+                drift = (ref - exported).abs().max().item()
+                if drift > 1e-4:
+                    raise RuntimeError(
+                        f"the exported module is not the deployed model "
+                        f"(max_abs={drift:.3e}); the graph would not reproduce "
+                        f"the frames the torch path generates"
+                    )
                 feed = {k: v.cpu().numpy() for k, v in zip(names, args_in, strict=False)}
                 ort_out = sess.run(None, feed)[0]
                 check_parity(ref, ort_out, name=name, atol=atol, rtol=rtol, **func)

@@ -5,6 +5,8 @@ venv/
 /onnx/
 /temp/
 results/
+.antigravitycli
+.ipynb_checkpoints
 experiments/
 tmp/
 *.pth

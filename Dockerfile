@@ -10,9 +10,9 @@ WORKDIR /app
 # Copy everything
 COPY . .
 ENV IS_IT_RUN_IN_DOCKER=true
-# Run the unified setup script
-RUN chmod +x ./setup.sh
-RUN ./setup.sh
+# Run the unified setup script (it lives in scripts/)
+RUN chmod +x ./scripts/setup.sh
+RUN ./scripts/setup.sh
 
 # Expose port (Cloud Run uses $PORT env variable)
 EXPOSE 8080

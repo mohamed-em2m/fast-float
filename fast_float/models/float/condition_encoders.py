@@ -73,6 +73,7 @@ class AudioEncoder(BaseModel):
             onnx_path = self.DEFAULT_ONNX_PATH
         if self._mode == "onnx" and onnx_path and os.path.exists(onnx_path) and not opt.only_last_features:
             try:
+                from fast_float.onnx.backends import resolve_use_trt
                 from fast_float.onnx.runtime import Wav2vecOnnxBackend
 
                 feat_frames = self.num_frames_for_clip + self.num_prev_frames
@@ -80,6 +81,7 @@ class AudioEncoder(BaseModel):
                     onnx_path,
                     opt_shapes={"conv_feats": [1, feat_frames, 512]},
                     extra_dynamic={"conv_feats": {1: (10, 2000)}},
+                    use_trt=resolve_use_trt("audio"),
                 )
                 if backend.out_dim is not None and backend.out_dim != opt.dim_w:
                     raise ValueError(f"ONNX out_dim={backend.out_dim} != dim_w={opt.dim_w}")
@@ -194,6 +196,7 @@ class Audio2Emotion(nn.Module):
             onnx_path = self.DEFAULT_ONNX_PATH
         if self._mode == "onnx" and onnx_path and os.path.exists(onnx_path):
             try:
+                from fast_float.onnx.backends import resolve_use_trt
                 from fast_float.onnx.runtime import EmotionOnnxBackend
 
                 emo_len = int(16000 * 3.0)
@@ -201,6 +204,7 @@ class Audio2Emotion(nn.Module):
                     onnx_path,
                     opt_shapes={"input_values": [1, emo_len]},
                     extra_dynamic={"input_values": {1: (16000, 160000)}},
+                    use_trt=resolve_use_trt("emotion"),
                 )
                 logger.info(f"Audio2Emotion: using ONNX backend {onnx_path} (providers={self._onnx_backend.providers})")
             except Exception as e:

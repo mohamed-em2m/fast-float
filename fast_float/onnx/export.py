@@ -3,10 +3,24 @@
 Strategy: dynamo export via torch.export (symbolic batch/length), no
 torchscript fallback. ``torch.export`` + ``torch.onnx.export(ExportedProgram)``
 is the modern flow: it decomposes SDPA/LayerNorm/diag_embed natively and
-marks dynamic dims symbolically. Converters keep their export-safe
-substitutions (manual attention, plain norm, matmul reformulation) — all
-dynamo-safe and equivalence-proven — plus static-batch modconv freezing,
-which stays because ONNX Conv ``group`` is static regardless of exporter.
+marks dynamic dims symbolically.
+
+**The exported graph must be the model the application runs.** A converter may
+still substitute an export-safe formulation (a matmul reformulation, a plain
+norm), but a substitution is only safe while it is *equivalent* -- and the
+equivalence has to be proven, not assumed: the FMT export once substituted a
+manual attention branch with an inverted mask, and the resulting graph was a
+different model (per-step cosine 0.94) that passed every gate, because the
+gate compared the graph against the very module it had traced. So:
+
+* export the deployed formulation wherever the exporter can take it (the FMT
+  attention, the decoder's dense modulated convs -- no ``groups=batch``
+  substitute: the ORT CUDA EP serves grouped convs only through a fallback
+  kernel that drifts ~90 uint8 LSB and is not reproducible);
+* gate the artifact against a snapshot of the **deployed** model, never
+  against the module that was traced;
+* compare the same computation on both sides (see ``use_tf32`` in
+  :func:`make_ort_session`).
 """
 
 from __future__ import annotations
@@ -16,6 +30,11 @@ import os
 from collections.abc import Sequence
 
 import torch
+
+# Sidecar suffix a converter drops next to an artifact it could only validate
+# without TensorRT; ``make_runtime_session`` (serving) and ``OnnxBuilder.runtime``
+# (selection) both honour it via ``trt_vetoed``.
+TRT_DISABLED_MARKER = ".no_trt"
 
 
 def _as_tuple(inputs):
@@ -55,7 +74,7 @@ def _ensure_batch2(args, skip=()):
     ``skip`` holds positional indices that must not be touched: duplicating a
     *shared* input (the FMT scalar time ``t``, which is deliberately shape
     ``[1]`` and broadcast inside the graph) would both falsify its shape and
-    get dim 0 marked dynamic, which TensorRT then mis-resolves across the
+    get dim 0 marked dynamic, which TensorRT then resolves wrongly across the
     rank-1/rank-3 inputs.
     """
     out = []
@@ -287,6 +306,7 @@ def make_ort_session(
     trt_opt_shapes: dict[str, Sequence[int]] | None = None,
     trt_max_shapes: dict[str, Sequence[int]] | None = None,
     device_id: int | None = None,
+    use_tf32: bool | None = None,
 ):
     """ORT InferenceSession, provider chain TRT -> CUDA -> CPU.
 
@@ -301,6 +321,14 @@ def make_ort_session(
     the default EXHAUSTIVE search can pick a workspace-hungry algorithm and
     hard-FAIL allocation (bogus ~17 GB request observed). DEFAULT stays
     correct for all lengths at negligible speed cost.
+
+    ``use_tf32`` pins the CUDA EP's TF32 path (ORT default: on). TF32 rounds
+    every accumulation to a 10-bit mantissa; through a deep conv stack that
+    drifts far enough to see: the decoder differs by ~40 uint8 LSB between two
+    TF32 implementations and by ~1 LSB in fp32. A parity check that compares a
+    graph against the torch model must therefore pin *both* sides to the same
+    precision -- pass ``use_tf32=False`` for the session and disable
+    ``cudnn.allow_tf32`` in torch.
 
     With ``require_gpu=True`` a missing CUDA/TRT provider raises instead of
     silently benchmarking CPU.
@@ -338,12 +366,10 @@ def make_ort_session(
                 )
             )
         if "CUDAExecutionProvider" in available:
-            gpu_providers.append(
-                (
-                    "CUDAExecutionProvider",
-                    {"device_id": dev_id, "cudnn_conv_algo_search": "DEFAULT"},
-                )
-            )
+            cuda_opts = {"device_id": dev_id, "cudnn_conv_algo_search": "DEFAULT"}
+            if use_tf32 is not None:
+                cuda_opts["use_tf32"] = 1 if use_tf32 else 0
+            gpu_providers.append(("CUDAExecutionProvider", cuda_opts))
     if use_gpu and require_gpu and not gpu_providers:
         raise RuntimeError(
             "GPU requested but no CUDA/TRT execution provider available "
@@ -437,7 +463,7 @@ def add_ort_args(ap, default_max_batch: int = 8):
     )
 
 
-def make_session_from_args(onnx_path: str, args, opt_shapes=None, extra_dynamic=None):
+def make_session_from_args(onnx_path: str, args, opt_shapes=None, extra_dynamic=None, use_tf32: bool | None = None):
     """Build an ORT session from shared CLI flags (chain TRT -> CUDA -> CPU).
 
     ``opt_shapes`` maps each *dynamic* input to a representative shape so the
@@ -446,6 +472,10 @@ def make_session_from_args(onnx_path: str, args, opt_shapes=None, extra_dynamic=
     callers to relax parity tolerances -- it is True only when the TensorRT
     FP16 EP is *actually* active (a requested-but-unloadable TRT must not relax
     the CUDA/CPU parity gate).
+
+    ``use_tf32=False`` pins the CUDA EP to full precision. Parity checks that
+    compare a graph against the torch model need both sides in the same
+    precision (TF32 alone moves a deep conv stack by tens of uint8 LSB).
     """
     use_gpu = torch.cuda.is_available() and not getattr(args, "cpu_ort", False)
     use_trt = use_gpu and not getattr(args, "no_trt", False)
@@ -468,8 +498,26 @@ def make_session_from_args(onnx_path: str, args, opt_shapes=None, extra_dynamic=
         trt_min_shapes=mn,
         trt_opt_shapes=op,
         trt_max_shapes=mx,
+        use_tf32=use_tf32,
     )
     return sess, (fp16 and "TensorrtExecutionProvider" in sess.get_providers())
+
+
+def trt_vetoed(onnx_path: str) -> bool:
+    """True when a ``<model>.onnx.no_trt`` sidecar vetoes TensorRT for the artifact.
+
+    A converter drops the sidecar when the graph neither runs faithfully nor
+    quickly on the TensorRT EP (see ``convert_decoder._mark_no_trt``). Everything
+    that *serves* or *measures* the artifact must agree on that veto, or the
+    selector benchmarks an engine the deployment never loads.
+
+    Deliberately *not* consulted by :func:`make_session_from_args`: the decoder
+    converter builds a TensorRT session on purpose to re-validate the EP and
+    clear a stale sidecar.
+    """
+    if not TRT_DISABLED_MARKER:
+        return False
+    return os.path.exists(f"{onnx_path}{TRT_DISABLED_MARKER}")
 
 
 def make_runtime_session(
@@ -481,6 +529,7 @@ def make_runtime_session(
     use_gpu: bool | None = None,
     fp16: bool = True,
     device_id: int | None = None,
+    use_trt: bool | None = None,
 ):
     """ORT session for a *runtime* component with automatic TensorRT profiles.
 
@@ -502,8 +551,16 @@ def make_runtime_session(
         use_gpu = torch.cuda.is_available()
     if max_batch is None:
         max_batch = int(os.environ.get("FLOAT_TRT_MAX_BATCH", "16"))
+    # A converter can veto TensorRT for one artifact by dropping a
+    # ``<model>.onnx.no_trt`` sidecar next to it (see
+    # ``convert_decoder._mark_no_trt``): TRT ran 10x slower *and* failed the
+    # uint8 parity gate on the frame decoder, and the runtime must not pick it
+    # back up just because the EP is available.
+    no_trt = trt_vetoed(onnx_path)
+    if no_trt:
+        print(f"[ort] {os.path.basename(onnx_path)}: TRT vetoed by {TRT_DISABLED_MARKER}; using CUDA EP")
     mn = op = mx = None
-    if use_gpu and opt_shapes:
+    if use_gpu and opt_shapes and not no_trt:
         mn, op, mx = trt_optimization_profiles(
             opt_shapes,
             min_batch=min_batch,
@@ -513,7 +570,7 @@ def make_runtime_session(
     sess = make_ort_session(
         onnx_path,
         use_gpu=use_gpu,
-        use_trt=use_gpu,
+        use_trt=use_gpu and not no_trt and (use_trt is None or bool(use_trt)),
         trt_fp16=fp16,
         trt_min_shapes=mn,
         trt_opt_shapes=op,
