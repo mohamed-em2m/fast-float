@@ -55,7 +55,7 @@ export default function StudioStage({
 
   // Check LiveKit availability once on mount to conditionally show the transport option.
   useEffect(() => {
-    fetchLiveKitStatus().then((status) => setLiveKitAvailable(!!status.configured));
+    fetchLiveKitStatus().then((status) => { const configured = !!status.configured; setLiveKitAvailable(configured); if (!configured && transport === 'livekit') setTransport?.('mp4'); });
   }, []);
 
   // Cycle progress stages smoothly during generation
