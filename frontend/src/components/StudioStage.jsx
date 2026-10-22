@@ -9,6 +9,7 @@ import {
   Gauge
 } from 'lucide-react';
 import { attachRemoteTrack, createWebRtcSession, getApiUrl } from '../services/api';
+import { connectLiveKitSession, fetchLiveKitStatus, triggerLiveKitPublish } from '../services/livekit';
 import LivePreview from './LivePreview';
 
 const GENERATION_STAGES = [
@@ -18,10 +19,13 @@ const GENERATION_STAGES = [
   { label: 'NVENC Hardware Frame Compression', icon: '🎬' },
 ];
 
-const TRANSPORTS = [
+// All transports; LiveKit entry is filtered out at runtime when the server
+// reports configured=false so the option never shows for unconfigured installs.
+const ALL_TRANSPORTS = [
   { id: 'mp4', label: 'MP4', title: 'Render the whole video, then play the file' },
+  { id: 'livekit', label: 'LiveKit', title: 'Watch frames live over LiveKit SFU (WebRTC)' },
+  { id: 'webrtc', label: 'WebRTC', title: 'Watch frames live over WebRTC (aiortc)' },
   { id: 'ws', label: 'WebSocket', title: 'Watch frames live over a WebSocket' },
-  { id: 'webrtc', label: 'WebRTC', title: 'Watch frames live over WebRTC (lowest latency)' },
 ];
 
 export default function StudioStage({
@@ -38,11 +42,21 @@ export default function StudioStage({
   const [currentStageIndex, setCurrentStageIndex] = useState(0);
   const [useWebRtc, setUseWebRtc] = useState(false);
   const [webRtcConnected, setWebRtcConnected] = useState(false);
+  const [useLiveKit, setUseLiveKit] = useState(false);
+  const [liveKitConnected, setLiveKitConnected] = useState(false);
+  // null = unknown (checking), true/false = server responded
+  const [liveKitAvailable, setLiveKitAvailable] = useState(null);
   const [isDownloading, setIsDownloading] = useState(false);
 
   const videoRef = useRef(null);
   const webRtcVideoRef = useRef(null);
   const pcRef = useRef(null);
+  const liveKitSessionRef = useRef(null);
+
+  // Check LiveKit availability once on mount to conditionally show the transport option.
+  useEffect(() => {
+    fetchLiveKitStatus().then((status) => setLiveKitAvailable(!!status.configured));
+  }, []);
 
   // Cycle progress stages smoothly during generation
   useEffect(() => {
@@ -77,7 +91,18 @@ export default function StudioStage({
     setWebRtcConnected(false);
   };
 
-  // Clean up WebRTC peer connection
+  const handleStopLiveKit = () => {
+    // livekit-client manages its own media elements; calling disconnect() on
+    // the session object (returned by connectLiveKitSession) is sufficient.
+    if (liveKitSessionRef.current) {
+      liveKitSessionRef.current.disconnect();
+      liveKitSessionRef.current = null;
+    }
+    setUseLiveKit(false);
+    setLiveKitConnected(false);
+  };
+
+  // Clean up WebRTC peer connection and LiveKit session
   useEffect(() => {
     return () => {
       try {
@@ -89,8 +114,44 @@ export default function StudioStage({
         pcRef.current.close();
         pcRef.current = null;
       }
+      if (liveKitSessionRef.current) {
+        liveKitSessionRef.current.disconnect();
+        liveKitSessionRef.current = null;
+      }
     };
   }, []);
+
+  const handleStartLiveKit = async () => {
+    if (!generationResult?.request_id) return;
+    try {
+      handleStopWebRtc();
+      setUseLiveKit(true);
+      setLiveKitConnected(false);
+
+      // Trigger publishing of completed file or stream
+      await triggerLiveKitPublish(generationResult.request_id);
+
+      const session = await connectLiveKitSession({
+        room: generationResult.request_id,
+        videoElement: webRtcVideoRef.current,
+        onStatus: (state) => {
+          if (state === 'live') setLiveKitConnected(true);
+          if (state === 'failed' || state === 'error') {
+            setLiveKitConnected(false);
+            if (onToast) onToast('LiveKit stream failed — back to MP4', 'error');
+            handleStopLiveKit();
+          }
+          if (state === 'done') setLiveKitConnected(false);
+        },
+      });
+      liveKitSessionRef.current = session;
+      if (onToast) onToast('LiveKit stream established!', 'success');
+    } catch (e) {
+      console.error('LiveKit streaming error', e);
+      if (onToast) onToast(`LiveKit stream failed: ${e.message}`, 'error');
+      setUseLiveKit(false);
+    }
+  };
 
   const handleWebRtcState = (state) => {
     if (state === 'connected') setWebRtcConnected(true);
@@ -218,7 +279,7 @@ export default function StudioStage({
       {/* Transport selector */}
       <div className="transport-selector" role="group" aria-label="Stream transport">
         <span className="transport-selector-label">Transport</span>
-        {TRANSPORTS.map((opt) => (
+        {ALL_TRANSPORTS.filter((opt) => opt.id !== 'livekit' || liveKitAvailable !== false).map((opt) => (
           <button
             key={opt.id}
             type="button"
@@ -261,6 +322,23 @@ export default function StudioStage({
             transport={transport}
             onStatus={(message) => onToast?.(message || 'Live stream ended', 'error')}
           />
+        ) : useLiveKit ? (
+          <div className="webrtc-player-box">
+            <video
+              ref={webRtcVideoRef}
+              autoPlay
+              playsInline
+              controls
+              className="stage-video"
+            />
+            <div className="webrtc-status-overlay">
+              <span className="live-dot" />
+              <span>{liveKitConnected ? 'LiveKit SFU Connected' : 'Connecting to LiveKit Room...'}</span>
+              <button className="btn-secondary btn-xs" onClick={handleStopLiveKit}>
+                Switch to Standard MP4
+              </button>
+            </div>
+          </div>
         ) : useWebRtc ? (
           <div className="webrtc-player-box">
             <video
@@ -317,25 +395,47 @@ export default function StudioStage({
         <div className="toolbar-right">
           {generationResult && (
             <>
-              {/* WebRTC Live Stream Toggle */}
-              {!useWebRtc ? (
-                <button
-                  type="button"
-                  className="btn-secondary btn-sm"
-                  onClick={handleStartWebRtc}
-                  title="Stream video via WebRTC peer connection"
-                >
-                  <Radio size={15} />
-                  <span>WebRTC Stream</span>
-                </button>
+              {/* LiveKit / WebRTC Live Stream Toggle */}
+              {transport === 'livekit' ? (
+                !useLiveKit ? (
+                  <button
+                    type="button"
+                    className="btn-secondary btn-sm"
+                    onClick={handleStartLiveKit}
+                    title="Stream video via LiveKit SFU"
+                  >
+                    <Radio size={15} />
+                    <span>LiveKit Stream</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn-secondary btn-sm"
+                    onClick={handleStopLiveKit}
+                  >
+                    <span>Close LiveKit</span>
+                  </button>
+                )
               ) : (
-                <button
-                  type="button"
-                  className="btn-secondary btn-sm"
-                  onClick={handleStopWebRtc}
-                >
-                  <span>Close WebRTC</span>
-                </button>
+                !useWebRtc ? (
+                  <button
+                    type="button"
+                    className="btn-secondary btn-sm"
+                    onClick={handleStartWebRtc}
+                    title="Stream video via WebRTC peer connection"
+                  >
+                    <Radio size={15} />
+                    <span>WebRTC Stream</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn-secondary btn-sm"
+                    onClick={handleStopWebRtc}
+                  >
+                    <span>Close WebRTC</span>
+                  </button>
+                )
               )}
 
               {/* Copy URL */}

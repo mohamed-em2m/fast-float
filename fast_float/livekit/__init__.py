@@ -1,18 +1,48 @@
-"""LiveKit integration: the transport for the live preview and the avatar.
+"""LiveKit integration: the transport for the live preview and the avatar."""
 
-The API process only needs the *token* API (``livekit-api``, numpy-free) to
-mint room grants for the browser. The RTC SDK (``livekit``) requires
-``numpy>=1.26`` and therefore cannot live in this environment, which pins
-``numpy==1.24.4`` for ``onnx<1.17`` — the avatar worker gets its own project
-(see ``docs/LIVEKIT_INTEGRATION.md``).
-"""
-
-from fast_float.livekit.settings import LiveKitSettings
+from fast_float.livekit.agent import (
+    DEFAULT_AGENT_IDENTITY,
+    DEFAULT_AVATAR_IDENTITY,
+    ConversationalAgent,
+)
+from fast_float.livekit.generator import (
+    BYTES_PER_FRAME,
+    SAMPLES_PER_FRAME,
+    FloatVideoGenerator,
+    LiveStreamVideoGenerator,
+    MediaFileVideoGenerator,
+)
+from fast_float.livekit.settings import LiveKitSettings, valid_room_name
 from fast_float.livekit.tokens import IssuedToken, LiveKitUnavailable, issue_token
+from fast_float.livekit.worker import (
+    DEFAULT_AVATAR_NAME,
+    AvatarOptions,
+    AvatarRunner,
+    LiveKitLiveStreamPublisher,
+    LiveKitMediaFilePublisher,
+    publish_live_stream_task,
+    publish_media_file_task,
+)
 
 __all__ = [
+    "BYTES_PER_FRAME",
+    "DEFAULT_AGENT_IDENTITY",
+    "DEFAULT_AVATAR_IDENTITY",
+    "DEFAULT_AVATAR_NAME",
+    "SAMPLES_PER_FRAME",
+    "AvatarOptions",
+    "AvatarRunner",
+    "ConversationalAgent",
+    "FloatVideoGenerator",
     "IssuedToken",
+    "LiveKitLiveStreamPublisher",
+    "LiveKitMediaFilePublisher",
     "LiveKitSettings",
     "LiveKitUnavailable",
+    "LiveStreamVideoGenerator",
+    "MediaFileVideoGenerator",
     "issue_token",
+    "publish_live_stream_task",
+    "publish_media_file_task",
+    "valid_room_name",
 ]

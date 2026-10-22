@@ -16,3 +16,8 @@ wav2vec2-base-960h/
 wav2vec-english-speech-emotion-recognition/
 results/
 *.egg-info
+.deepeval
+.antigravitycli
+.ipynb_checkpoints
+.mypy_cache
+.ruff_cache

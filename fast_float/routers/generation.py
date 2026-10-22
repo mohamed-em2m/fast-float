@@ -20,6 +20,11 @@ from fast_float.utils.media import TARGET_IMAGE_SIZE
 
 router = APIRouter(tags=["generation"])
 
+# Holds references to background tasks created by this module so the GC
+# cannot collect them before they complete.  Entries are discarded via
+# done-callback, keeping the set small.
+_bg_tasks: set[asyncio.Task] = set()
+
 # How long a request waits for a free generation slot before getting a 429.
 # Inference takes minutes; holding the connection open for all of it would
 # exhaust the server's connection pool, so we fail fast instead of queueing.
@@ -94,6 +99,22 @@ async def generate(request: GenerationRequest):
         # per-frame transport.
         if int(getattr(request, "chunk_batch_size", 1) or 1) > 1:
             logger.info(f"[{request_id}] live stream: forcing chunk_batch_size=1")
+
+        try:
+            from fast_float.livekit.settings import LiveKitSettings
+
+            lk_settings = LiveKitSettings.from_env()
+            if lk_settings.configured:
+                from fast_float.livekit.worker import publish_live_stream_task
+
+                _t = asyncio.create_task(
+                    publish_live_stream_task(live_dispatcher.stream, room_name=request_id, settings=lk_settings)
+                )
+                _bg_tasks.add(_t)
+                _t.add_done_callback(_bg_tasks.discard)
+                logger.info(f"[{request_id}] spawned LiveKit avatar publisher for room {request_id}")
+        except Exception as exc:
+            logger.debug(f"[{request_id}] livekit publisher auto-spawn skipped: {exc}")
 
     try:
         await asyncio.wait_for(app_state.request_semaphore.acquire(), timeout=ACQUIRE_TIMEOUT_S)

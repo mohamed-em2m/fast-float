@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { attachRemoteTrack, createWebRtcSession } from '../services/api';
 import { openLiveSocket } from '../services/live';
+import { connectLiveKitSession } from '../services/livekit';
 
 const STATUS_LABEL = {
   idle: 'Idle',
@@ -15,6 +16,7 @@ const STATUS_LABEL = {
  *
  * transport === 'ws'      raw frames over WebSocket, drawn to a canvas
  * transport === 'webrtc'  the same frames re-encoded by aiortc into <video>
+ * transport === 'livekit' frames streamed via LiveKit SFU into <video>
  */
 export default function LivePreview({ requestId, transport, onStatus }) {
   const canvasRef = useRef(null);
@@ -91,6 +93,48 @@ export default function LivePreview({ requestId, transport, onStatus }) {
       };
     }
 
+    if (transport === 'livekit') {
+      let livekitSession = null;
+      const videoEl = videoRef.current;
+
+      connectLiveKitSession({
+        room: requestId,
+        videoElement: videoEl,
+        onStatus: (s) => {
+          report(s);
+          if (s === 'live' && videoEl) {
+            videoEl.play().catch(() => {});
+          }
+        },
+      })
+        .then((session) => {
+          if (cancelled) {
+            session.disconnect();
+            return;
+          }
+          livekitSession = session;
+        })
+        .catch((err) => {
+          console.warn('[livekit] connection failed:', err);
+          report('error');
+          onStatusRef.current?.(err.message);
+        });
+
+      return () => {
+        cancelled = true;
+        try {
+          livekitSession?.disconnect();
+        } catch {
+          /* ignore */
+        }
+        try {
+          videoEl?.srcObject?.getTracks().forEach((track) => track.stop());
+        } catch {
+          /* ignore */
+        }
+      };
+    }
+
     // WebRTC: negotiation starts immediately; the server attaches the live
     // track (and the request audio) to the peer it creates for this offer.
     let pc = null;
@@ -155,7 +199,7 @@ export default function LivePreview({ requestId, transport, onStatus }) {
         <span className={`live-preview-status live-preview-status--${status}`}>
           <span className="live-preview-dot" />
           {STATUS_LABEL[status] ?? status}
-          {transport === 'ws' ? ' · WebSocket' : ' · WebRTC'}
+          {transport === 'ws' ? ' · WebSocket' : transport === 'livekit' ? ' · LiveKit' : ' · WebRTC'}
         </span>
         {gaps > 0 && <span className="live-preview-gaps">{gaps} dropped</span>}
       </div>

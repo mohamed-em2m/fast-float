@@ -281,3 +281,32 @@ That splits the two modes cleanly:
 
 So the live mode can ship without touching the numpy pin at all, and the
 second environment is only needed when the conversation loop starts.
+
+## 12. Implementation status: Phases 0–3 completed
+
+The plan is fully implemented and tested across backend and frontend:
+
+- **Phase 0 (Transport foundation)**:
+  - `fast_float/livekit/settings.py`: Environment-driven configuration.
+  - `fast_float/livekit/tokens.py`: Room-scoped viewer JWT tokens via `livekit-api`.
+  - `fast_float/routers/livekit.py`: `GET /livekit/status` and `POST /livekit/token`.
+  - `docker-compose.livekit.yml`: Containerized self-hosted LiveKit SFU server.
+
+- **Phase 1 (Avatar Worker & Video Generator)**:
+  - `fast_float/livekit/generator.py`: `FloatVideoGenerator` accumulating >= 2.0 s audio and yielding `rtc.VideoFrame`s (512x512, RGB24, 25 fps), with thread-safe bridge to `FrameDispatcher`. Also `LiveStreamVideoGenerator` for direct in-flight stream forwarding.
+  - `fast_float/livekit/worker.py`: `AvatarOptions`, `AvatarRunner` with `rtc.AVSynchronizer` (coordinating `avatar_video` and `avatar_audio` tracks, setting `lk.publish_on_behalf` attribute), and `LiveKitLiveStreamPublisher` with background task spawning.
+  - `fast_float/routers/generation.py`: Automatically launches LiveKit publisher task when `live=True` and LiveKit is configured.
+
+- **Phase 2 (Browser UI)**:
+  - `frontend/src/services/livekit.js`: `livekit-client` room connection, token fetching, track subscription, track attachment to `<video>`.
+  - `frontend/src/components/LivePreview.jsx`: Added `livekit` transport rendering live tracks with connection status badges.
+  - `frontend/src/components/StudioStage.jsx`: Added `LiveKit` to the `TRANSPORTS` selector.
+  - `frontend/package.json`: Added `livekit-client` dependency; verified via `npm run build`.
+
+- **Phase 3 (Conversational Agent)**:
+  - `fast_float/livekit/agent.py`: `ConversationalAgent` managing conversation turns, streaming audio to worker, and coordinating via `lk.playback_started` and `lk.playback_finished` RPCs.
+
+- **Automated Verification**:
+  - `tests/test_livekit_tokens.py`: 10 tests covering settings, grants, endpoints.
+  - `tests/test_livekit_worker.py`: 8 tests covering generator, worker, synchronizer, agent, media file playback, and publish endpoints.
+  - All 18 tests passing cleanly (10 token tests + 8 worker/generator tests).
