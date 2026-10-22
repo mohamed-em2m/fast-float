@@ -17,6 +17,27 @@ import { getApiUrl } from './api';
  * is visiting from a remote LAN IP or domain, rewrite the host to window.location.hostname.
  * Also upgrades ws: to wss: when accessed over HTTPS to prevent mixed content blocks.
  */
+
+/**
+ * LocalStorage key for user-configured LiveKit SFU URL override.
+ */
+const LIVEKIT_STORAGE_KEY = 'float_livekit_url';
+
+export function getLiveKitUrlOverride() {
+  if (typeof window === 'undefined') return '';
+  return localStorage.getItem(LIVEKIT_STORAGE_KEY) || '';
+}
+
+export function setLiveKitUrlOverride(url) {
+  if (typeof window === 'undefined') return;
+  const clean = (url || '').trim();
+  if (clean) {
+    localStorage.setItem(LIVEKIT_STORAGE_KEY, clean);
+  } else {
+    localStorage.removeItem(LIVEKIT_STORAGE_KEY);
+  }
+}
+
 export function alignLiveKitUrl(url) {
   if (!url) return url;
   try {
@@ -108,7 +129,8 @@ export async function connectLiveKitSession({
 
   // 1. Get token
   const tokenData = await fetchLiveKitToken(roomName);
-  const livekitUrl = alignLiveKitUrl(tokenData.url);
+  const overrideUrl = getLiveKitUrlOverride();
+  const livekitUrl = alignLiveKitUrl(overrideUrl || tokenData.url);
   const token = tokenData.token;
 
   // 2. Create LiveKit Room

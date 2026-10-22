@@ -7,7 +7,7 @@ import {
   Cpu,
   RefreshCw
 } from 'lucide-react';
-import { fetchLiveKitStatus } from '../services/livekit';
+import { fetchLiveKitStatus, getLiveKitUrlOverride, setLiveKitUrlOverride } from '../services/livekit';
 import { fetchHealth, fetchGpuMetrics, clearGpuMemory, getApiUrl, setApiUrl, resetApiUrl, isDefaultApiUrl, testApiUrl, isLoopbackUrl, isPageOnLoopback, DEFAULT_API_URL } from '../services/api';
 
 // Consecutive failed polls before the pill flips to Disconnected. A single
@@ -22,6 +22,7 @@ export default function Header({ onToast }) {
   const [liveKitStatus, setLiveKitStatus] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [apiUrlInput, setApiUrlInput] = useState(getApiUrl());
+  const [liveKitUrlInput, setLiveKitUrlInput] = useState(getLiveKitUrlOverride());
   const [configError, setConfigError] = useState(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
@@ -90,6 +91,7 @@ export default function Header({ onToast }) {
       // Verify before committing so a typo can't strand the whole studio.
       const hData = await testApiUrl(value);
       setApiUrl(value);
+      setLiveKitUrlOverride(liveKitUrlInput);
       failuresRef.current = 0;
       if (hData && typeof hData === 'object') setHealth(hData);
       setIsOnline(true);
@@ -103,15 +105,29 @@ export default function Header({ onToast }) {
     }
   };
 
+  const handleSaveDirect = (e) => {
+    e?.preventDefault();
+    const value = trimmedInput || DEFAULT_API_URL;
+    setApiUrl(value);
+    setLiveKitUrlOverride(liveKitUrlInput);
+    failuresRef.current = 0;
+    setShowSettings(false);
+    if (onToast) onToast(`Saved direct endpoint: ${value}`, 'info');
+    checkStatus();
+  };
+
   const openSettings = () => {
     setApiUrlInput(getApiUrl());
+    setLiveKitUrlInput(getLiveKitUrlOverride());
     setConfigError(null);
     setShowSettings(true);
   };
 
   const handleResetApiUrl = () => {
     const base = resetApiUrl();
+    setLiveKitUrlOverride('');
     setApiUrlInput(base);
+    setLiveKitUrlInput('');
     setConfigError(null);
     failuresRef.current = 0;
     if (onToast) onToast('Reset to default endpoint', 'info');
@@ -199,18 +215,54 @@ export default function Header({ onToast }) {
 
       {/* Settings Modal Popover */}
       {showSettings && (
-        <div className="settings-popover glass-panel">
-          <h3 className="settings-title">Backend Connection</h3>
+        <div className="settings-popover glass-panel" style={{ width: '380px' }}>
+          <h3 className="settings-title">Server & Network Configuration</h3>
 
           <div className="settings-active">
             <span className="settings-label">
-              Active endpoint {hasOverride ? '(custom override)' : '(default proxy)'}
+              Active API Endpoint {hasOverride ? '(custom override)' : '(default proxy)'}
             </span>
             <code className="settings-active-url">{activeUrl}</code>
+            {getLiveKitUrlOverride() && (
+              <span className="settings-label" style={{ marginTop: '4px' }}>
+                LiveKit Override: <code className="settings-active-url">{getLiveKitUrlOverride()}</code>
+              </span>
+            )}
           </div>
 
           <form onSubmit={handleSaveApiUrl}>
-            <label className="settings-label" htmlFor="api-url-input">API base URL</label>
+            {/* Direct Presets for API */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+              <label className="settings-label" htmlFor="api-url-input" style={{ marginBottom: 0 }}>
+                API Base URL (FastAPI)
+              </label>
+              <div style={{ display: 'flex', gap: '4px' }}>
+                <button
+                  type="button"
+                  className="btn-secondary btn-xs"
+                  onClick={() => {
+                    const host = typeof window !== 'undefined' ? window.location.hostname || '127.0.0.1' : '127.0.0.1';
+                    setApiUrlInput(`http://${host}:8000`);
+                    setConfigError(null);
+                  }}
+                  title="Direct to backend server port 8000"
+                >
+                  Direct (:8000)
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary btn-xs"
+                  onClick={() => {
+                    setApiUrlInput(DEFAULT_API_URL);
+                    setConfigError(null);
+                  }}
+                  title="Route through same-origin Vite proxy"
+                >
+                  Proxy (/api)
+                </button>
+              </div>
+            </div>
+
             <input
               id="api-url-input"
               type="text"
@@ -224,15 +276,55 @@ export default function Header({ onToast }) {
 
             {loopbackWarning && (
               <p className="settings-warning">
-                This page is served from {window.location.host} — <code>localhost</code> there
-                points at the visitor's own machine, so this endpoint may be unreachable remotely.
+                This page is served from {window.location.host} — <code>localhost</code> points at the visitor's machine.
               </p>
             )}
+
+            {/* LiveKit SFU URL Section */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px', marginTop: '10px' }}>
+              <label className="settings-label" htmlFor="livekit-url-input" style={{ marginBottom: 0 }}>
+                LiveKit SFU URL (WebSocket)
+              </label>
+              <div style={{ display: 'flex', gap: '4px' }}>
+                <button
+                  type="button"
+                  className="btn-secondary btn-xs"
+                  onClick={() => {
+                    const host = typeof window !== 'undefined' ? window.location.hostname || '127.0.0.1' : '127.0.0.1';
+                    setLiveKitUrlInput(`ws://${host}:7880`);
+                  }}
+                  title="Direct to LiveKit SFU port 7880"
+                >
+                  Direct (:7880)
+                </button>
+                {liveKitUrlInput && (
+                  <button
+                    type="button"
+                    className="btn-secondary btn-xs"
+                    onClick={() => setLiveKitUrlInput('')}
+                    title="Clear override to receive URL from backend"
+                  >
+                    Auto
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <input
+              id="livekit-url-input"
+              type="text"
+              value={liveKitUrlInput}
+              onChange={(e) => setLiveKitUrlInput(e.target.value)}
+              placeholder="ws://127.0.0.1:7880 (default auto-aligned)"
+              className="settings-input"
+              spellCheck={false}
+              autoComplete="off"
+            />
+
             {configError && <p className="settings-error">{configError}</p>}
 
             <p className="settings-hint">
-              Leave as the default to route through the same-origin <code>/api</code> proxy.
-              Set a full URL only to talk to the FastAPI server directly.
+              Use <code>Direct (:8000)</code> to talk straight to FastAPI, or <code>Proxy (/api)</code> for reverse proxying.
             </p>
 
             <div className="settings-buttons">
@@ -241,6 +333,7 @@ export default function Header({ onToast }) {
                 className="btn-secondary btn-sm"
                 disabled={isSaving}
                 onClick={handleResetApiUrl}
+                title="Reset all URLs to factory defaults"
               >
                 Reset
               </button>
@@ -251,6 +344,15 @@ export default function Header({ onToast }) {
                 onClick={() => setShowSettings(false)}
               >
                 Cancel
+              </button>
+              <button
+                type="button"
+                className="btn-secondary btn-sm"
+                disabled={isSaving}
+                onClick={handleSaveDirect}
+                title="Save URLs directly without checking connection"
+              >
+                Save Direct
               </button>
               <button type="submit" className="btn-primary btn-sm" disabled={isSaving}>
                 {isSaving ? 'Testing…' : 'Test & Save'}
