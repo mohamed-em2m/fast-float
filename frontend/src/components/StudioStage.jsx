@@ -19,9 +19,7 @@ const GENERATION_STAGES = [
   { label: 'NVENC Hardware Frame Compression', icon: '🎬' },
 ];
 
-// All transports; LiveKit entry is filtered out at runtime when the server
-// reports configured=false so the option never shows for unconfigured installs.
-const ALL_TRANSPORTS = [
+const TRANSPORTS = [
   { id: 'mp4', label: 'MP4', title: 'Render the whole video, then play the file' },
   { id: 'livekit', label: 'LiveKit', title: 'Watch frames live over LiveKit SFU (WebRTC)' },
   { id: 'webrtc', label: 'WebRTC', title: 'Watch frames live over WebRTC (aiortc)' },
@@ -55,7 +53,7 @@ export default function StudioStage({
 
   // Check LiveKit availability once on mount to conditionally show the transport option.
   useEffect(() => {
-    fetchLiveKitStatus().then((status) => { const configured = !!status.configured; setLiveKitAvailable(configured); if (!configured && transport === 'livekit') setTransport?.('mp4'); });
+    fetchLiveKitStatus().then((status) => setLiveKitAvailable(!!status.configured));
   }, []);
 
   // Cycle progress stages smoothly during generation
@@ -279,7 +277,7 @@ export default function StudioStage({
       {/* Transport selector */}
       <div className="transport-selector" role="group" aria-label="Stream transport">
         <span className="transport-selector-label">Transport</span>
-        {ALL_TRANSPORTS.filter((opt) => opt.id !== 'livekit' || liveKitAvailable !== false).map((opt) => (
+        {TRANSPORTS.map((opt) => (
           <button
             key={opt.id}
             type="button"
@@ -395,47 +393,46 @@ export default function StudioStage({
         <div className="toolbar-right">
           {generationResult && (
             <>
-              {/* LiveKit / WebRTC Live Stream Toggle */}
-              {transport === 'livekit' ? (
-                !useLiveKit ? (
-                  <button
-                    type="button"
-                    className="btn-secondary btn-sm"
-                    onClick={handleStartLiveKit}
-                    title="Stream video via LiveKit SFU"
-                  >
-                    <Radio size={15} />
-                    <span>LiveKit Stream</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    className="btn-secondary btn-sm"
-                    onClick={handleStopLiveKit}
-                  >
-                    <span>Close LiveKit</span>
-                  </button>
-                )
+              {/* LiveKit Stream Toggle */}
+              {!useLiveKit ? (
+                <button
+                  type="button"
+                  className="btn-secondary btn-sm"
+                  onClick={handleStartLiveKit}
+                  title="Stream video via LiveKit SFU (WebRTC)"
+                >
+                  <Radio size={15} />
+                  <span>LiveKit Stream</span>
+                </button>
               ) : (
-                !useWebRtc ? (
-                  <button
-                    type="button"
-                    className="btn-secondary btn-sm"
-                    onClick={handleStartWebRtc}
-                    title="Stream video via WebRTC peer connection"
-                  >
-                    <Radio size={15} />
-                    <span>WebRTC Stream</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    className="btn-secondary btn-sm"
-                    onClick={handleStopWebRtc}
-                  >
-                    <span>Close WebRTC</span>
-                  </button>
-                )
+                <button
+                  type="button"
+                  className="btn-secondary btn-sm"
+                  onClick={handleStopLiveKit}
+                >
+                  <span>Close LiveKit</span>
+                </button>
+              )}
+
+              {/* WebRTC Peer Stream Toggle */}
+              {!useWebRtc ? (
+                <button
+                  type="button"
+                  className="btn-secondary btn-sm"
+                  onClick={handleStartWebRtc}
+                  title="Stream video via WebRTC peer connection"
+                >
+                  <Radio size={15} />
+                  <span>WebRTC Stream</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="btn-secondary btn-sm"
+                  onClick={handleStopWebRtc}
+                >
+                  <span>Close WebRTC</span>
+                </button>
               )}
 
               {/* Copy URL */}

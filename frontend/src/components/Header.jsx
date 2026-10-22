@@ -1,11 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Sparkles,
+  Radio,
   Trash2,
   Settings,
   Cpu,
   RefreshCw
 } from 'lucide-react';
+import { fetchLiveKitStatus } from '../services/livekit';
 import { fetchHealth, fetchGpuMetrics, clearGpuMemory, getApiUrl, setApiUrl, resetApiUrl, isDefaultApiUrl, testApiUrl, isLoopbackUrl, isPageOnLoopback, DEFAULT_API_URL } from '../services/api';
 
 // Consecutive failed polls before the pill flips to Disconnected. A single
@@ -17,6 +19,7 @@ export default function Header({ onToast }) {
   const [health, setHealth] = useState(null);
   const [gpu, setGpu] = useState(null);
   const [isOnline, setIsOnline] = useState(false);
+  const [liveKitStatus, setLiveKitStatus] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [apiUrlInput, setApiUrlInput] = useState(getApiUrl());
   const [configError, setConfigError] = useState(null);
@@ -33,6 +36,7 @@ export default function Header({ onToast }) {
   const checkStatus = async () => {
     try {
       const hData = await fetchHealth();
+      fetchLiveKitStatus().then((lk) => setLiveKitStatus(lk)).catch(() => setLiveKitStatus({ configured: false }));
       setHealth(hData);
       failuresRef.current = 0;
       setIsOnline(true);
@@ -137,6 +141,17 @@ export default function Header({ onToast }) {
             {isOnline
               ? (health?.model_loaded ? 'Model Ready' : 'Server Online')
               : 'Disconnected'}
+          </span>
+        </div>
+
+        {/* LiveKit SFU Status Pill */}
+        <div
+          className={`status-pill ${liveKitStatus?.configured ? 'status-online' : 'status-offline'}`}
+          title={liveKitStatus?.configured ? `LiveKit SFU Active (${liveKitStatus.url})` : 'LiveKit SFU Standby (run docker-compose.livekit.yml)'}
+        >
+          <Radio size={13} style={{ marginRight: '5px' }} />
+          <span className="status-label">
+            {liveKitStatus?.configured ? 'LiveKit Ready' : 'LiveKit Standby'}
           </span>
         </div>
 
