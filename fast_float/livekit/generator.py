@@ -51,24 +51,45 @@ _QUEUE_SENTINEL = object()
 
 
 class _LiveKitDispatcherBridge(FrameDispatcher):
-    """Bridge FrameDispatcher events to an asyncio.Queue on the event loop."""
+    """Bridge FrameDispatcher events to an asyncio.Queue on the event loop.
 
-    def __init__(self, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop) -> None:
+    Every frame leaves the producer already paired with its exact
+    ``BYTES_PER_FRAME`` audio slice, so a frame dropped here takes its own
+    audio with it. (Reading the audio from shared state on the consumer side
+    desynced A/V by one slice per dropped frame.)
+    """
+
+    def __init__(
+        self,
+        queue: asyncio.Queue,
+        loop: asyncio.AbstractEventLoop,
+        audio_pcm: bytes,
+    ) -> None:
         super().__init__()
         self._queue = queue
         self._loop = loop
+        self._audio_pcm = audio_pcm
+        self._audio_cursor = 0
 
     def dispatch(self, idx: int, frames: np.ndarray, pts_ms: float) -> None:
+        if self._loop.is_closed():
+            return
         if frames.ndim == 3:
-            frames_to_push = [(idx, frames, pts_ms)]
+            items = [(idx, frames, pts_ms)]
         else:
-            frames_to_push = [(idx + i, frames[i], pts_ms + (i * (1000.0 / TARGET_FPS))) for i in range(len(frames))]
+            items = [(idx + i, frames[i], pts_ms + (i * (1000.0 / TARGET_FPS))) for i in range(len(frames))]
+        for item in items:
+            self._loop.call_soon_threadsafe(self._push_sync, (*item, self._next_audio_slice()))
 
-        for item in frames_to_push:
-            if not self._loop.is_closed():
-                self._loop.call_soon_threadsafe(self._push_sync, item)
+    def _next_audio_slice(self) -> bytes | None:
+        """The next BYTES_PER_FRAME slice of the chunk's PCM, or None past the end."""
+        start = self._audio_cursor
+        end = start + BYTES_PER_FRAME
+        self._audio_cursor = end
+        data = self._audio_pcm[start:end]
+        return data if len(data) == BYTES_PER_FRAME else None
 
-    def _push_sync(self, item: tuple[int, np.ndarray, float]) -> None:
+    def _push_sync(self, item: tuple[int, np.ndarray, float, bytes | None]) -> None:
         with contextlib.suppress(asyncio.QueueFull):
             self._queue.put_nowait(item)
 
@@ -98,16 +119,10 @@ class FloatVideoGenerator:
     ) -> None:
         self.agent = agent
         self.image_path = image_path
-        # Prefer the running loop (inside async context) to avoid the
-        # DeprecationWarning from get_event_loop() in Python >= 3.10.
-        if loop is not None:
-            self.loop = loop
-        else:
-            try:
-                self.loop = asyncio.get_running_loop()
-            except RuntimeError:
-                # Called from sync context (e.g. tests); create a fresh loop.
-                self.loop = asyncio.new_event_loop()
+        # The inference task is scheduled on a *running* loop: without one the
+        # task would be created on a loop that never runs and audio pushes
+        # would silently produce zero frames. Fail loudly instead.
+        self.loop = loop or asyncio.get_running_loop()
         self.width = width
         self.height = height
         self.fps = fps
@@ -116,7 +131,6 @@ class FloatVideoGenerator:
 
         self._audio_pcm = bytearray()
         self._frame_queue: asyncio.Queue = asyncio.Queue(maxsize=128)
-        self._current_chunk_audio: bytes | None = None
         self._stopped = False
         self._inference_running = False
         self._frame_count = 0
@@ -154,7 +168,6 @@ class FloatVideoGenerator:
         self._inference_running = True
         chunk_bytes = bytes(self._audio_pcm[: MIN_AUDIO_SAMPLES * 2])
         del self._audio_pcm[: MIN_AUDIO_SAMPLES * 2]
-        self._current_chunk_audio = chunk_bytes
 
         task = self.loop.create_task(self._run_chunk_inference(chunk_bytes))
         self._bg_tasks.add(task)
@@ -177,7 +190,7 @@ class FloatVideoGenerator:
                         wav_file.writeframes(pcm_bytes)
 
                 try:
-                    bridge = _LiveKitDispatcherBridge(self._frame_queue, self.loop)
+                    bridge = _LiveKitDispatcherBridge(self._frame_queue, self.loop, pcm_bytes)
                     if self.agent is not None and self.image_path:
                         from fast_float.core.service import run_inference_blocking
 
@@ -201,14 +214,14 @@ class FloatVideoGenerator:
                             bridge,
                         )
                     else:
-                        # Fallback test pattern: 50 frames
+                        # Fallback test pattern: 50 frames, no audio attached
                         for i in range(50):
                             pts_ms = (self._frame_count + i) * (1000.0 / self.fps)
                             pattern = np.zeros((self.height, self.width, 3), dtype=np.uint8)
                             pattern[:, :, 0] = (i * 5) % 255
                             pattern[:, :, 1] = 120
                             pattern[:, :, 2] = 180
-                            await self._frame_queue.put((self._frame_count + i, pattern, pts_ms))
+                            await self._frame_queue.put((self._frame_count + i, pattern, pts_ms, None))
                 finally:
                     if os.path.exists(tmp_audio_path):
                         with contextlib.suppress(OSError):
@@ -238,13 +251,12 @@ class FloatVideoGenerator:
             self._frame_queue.put_nowait(_QUEUE_SENTINEL)
 
     async def __aiter__(self) -> AsyncIterator[Any]:
-        chunk_frame_idx = 0
         while True:
             item = await self._frame_queue.get()
             if item is _QUEUE_SENTINEL or item is CLOSE:
                 break
 
-            idx, frame_array, pts_ms = item
+            idx, frame_array, pts_ms, audio_data = item
 
             if not self._first_frame_emitted:
                 self._first_frame_emitted = True
@@ -265,20 +277,9 @@ class FloatVideoGenerator:
                 data = np.ascontiguousarray(frame_array).tobytes()
                 video_frame = rtc.VideoFrame(w, h, rtc.VideoBufferType.RGB24, data)
 
-                # Pair with matching 40ms audio slice
                 audio_frame = None
-                if self._current_chunk_audio:
-                    start_b = (chunk_frame_idx % 50) * BYTES_PER_FRAME
-                    end_b = start_b + BYTES_PER_FRAME
-                    slice_data = self._current_chunk_audio[start_b:end_b]
-                    if len(slice_data) == BYTES_PER_FRAME:
-                        audio_frame = rtc.AudioFrame(
-                            slice_data,
-                            self.sample_rate,
-                            1,
-                            SAMPLES_PER_FRAME,
-                        )
-                chunk_frame_idx += 1
+                if audio_data:
+                    audio_frame = rtc.AudioFrame(audio_data, self.sample_rate, 1, SAMPLES_PER_FRAME)
 
                 yield (video_frame, audio_frame) if audio_frame else video_frame
             else:

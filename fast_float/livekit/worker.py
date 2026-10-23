@@ -36,6 +36,72 @@ from fast_float.streaming.live import LiveStream
 
 logger = logging.getLogger(__name__)
 
+# Publisher registries. Double-publishing the same request into the same room
+# joins two participants with the *same* worker identity (deriving from
+# request_id), which LiveKit resolves by disconnecting one of them: both
+# spawn sites (/generate auto-spawn and POST /livekit/publish) therefore go
+# through `spawn_*_publish_task`, which refuses a second task for the same key.
+_live_publish_jobs: dict[str, asyncio.Task[None]] = {}
+_media_publish_jobs: dict[tuple[str, str], asyncio.Task[None]] = {}
+
+
+def _track_job(registry: dict, key: Any, task: asyncio.Task[None]) -> asyncio.Task[None]:
+    registry[key] = task
+    task.add_done_callback(lambda _t: registry.pop(key, None))
+    return task
+
+
+def live_publish_active(request_id: str) -> bool:
+    """True when a LiveKit publisher is already running for this request."""
+    task = _live_publish_jobs.get(request_id)
+    return task is not None and not task.done()
+
+
+def spawn_live_publish_task(
+    stream: LiveStream,
+    room_name: str,
+    settings: LiveKitSettings | None = None,
+) -> asyncio.Task[None] | None:
+    """Spawn the background publisher for ``stream`` unless one is already active.
+
+    Returns the running task, or ``None`` when a publisher for this
+    ``request_id`` already exists (the caller should report "already publishing").
+    """
+    if live_publish_active(stream.request_id):
+        logger.info(f"[livekit-pub] {stream.request_id} is already publishing; ignoring duplicate request")
+        return None
+    task = _track_job(
+        _live_publish_jobs,
+        stream.request_id,
+        asyncio.get_running_loop().create_task(
+            publish_live_stream_task(stream, room_name=room_name, settings=settings)
+        ),
+    )
+    return task
+
+
+def spawn_media_publish_task(
+    file_path: str,
+    room_name: str,
+    settings: LiveKitSettings | None = None,
+    loop: bool = False,
+) -> asyncio.Task[None] | None:
+    """Spawn the background publisher for a finished file, deduped per (file, room)."""
+    key = (file_path, room_name)
+    existing = _media_publish_jobs.get(key)
+    if existing is not None and not existing.done():
+        logger.info(f"[livekit-pub] {file_path} is already publishing into {room_name}; ignoring duplicate request")
+        return None
+    task = _track_job(
+        _media_publish_jobs,
+        key,
+        asyncio.get_running_loop().create_task(
+            publish_media_file_task(file_path, room_name=room_name, settings=settings, loop=loop)
+        ),
+    )
+    return task
+
+
 DEFAULT_AVATAR_IDENTITY = "float-avatar"
 DEFAULT_AVATAR_NAME = "FLOAT Avatar"
 
@@ -316,8 +382,10 @@ class LiveKitMediaFilePublisher:
         self._stopped = False
 
     async def run(self) -> None:
-        if not RTC_AVAILABLE or not self.settings.configured:
-            return
+        if not RTC_AVAILABLE:
+            raise RuntimeError("LiveKit RTC SDK is not available in this environment")
+        if not self.settings.configured:
+            raise RuntimeError("LiveKit settings not configured")
 
         token_result = issue_token(
             url=self.settings.url,
@@ -393,6 +461,9 @@ __all__ = [
     "AvatarRunner",
     "LiveKitLiveStreamPublisher",
     "LiveKitMediaFilePublisher",
+    "live_publish_active",
     "publish_live_stream_task",
     "publish_media_file_task",
+    "spawn_live_publish_task",
+    "spawn_media_publish_task",
 ]

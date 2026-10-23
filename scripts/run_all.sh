@@ -14,6 +14,11 @@
 #   CORS_ORIGINS    origins the backend allows
 #                   (default http://localhost:${FRONTEND_PORT})
 #   NGPUS           number of GPUs for decoding (default 1)
+#   LIVEKIT_START   auto (default) = start the LiveKit SFU container when
+#                   Docker is available; yes = require it; no = skip
+#   LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET
+#                   LiveKit SFU endpoint + dev credentials; must match the
+#                   keys the LiveKit server was started with
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,8 +37,54 @@ export NGPUS="${NGPUS:-1}"
 # Unbuffered Python so backend errors appear in the combined log immediately.
 export PYTHONUNBUFFERED=1
 
+# --- LiveKit SFU (live-transport preview) -------------------------------------
+# The backend reads LIVEKIT_URL/KEY/SECRET (LiveKitSettings.from_env) and the
+# docker-compose.livekit.yml server uses the same keys as its tokens, so both
+# halves must agree: export one source of truth here. Defaults are the dev
+# credentials the compose file also falls back to.
+LIVEKIT_API_KEY="${LIVEKIT_API_KEY:-devkey}"
+LIVEKIT_API_SECRET="${LIVEKIT_API_SECRET:-secret}"
+LIVEKIT_URL="${LIVEKIT_URL:-ws://127.0.0.1:7880}"
+export LIVEKIT_API_KEY LIVEKIT_API_SECRET LIVEKIT_URL
+LIVEKIT_START="${LIVEKIT_START:-auto}"
+
+livekit_server_start() {
+    if ! command -v docker >/dev/null 2>&1; then
+        if [ "${LIVEKIT_START}" = "yes" ]; then
+            echo "❌ LIVEKIT_START=yes but docker is not installed."
+            return 1
+        fi
+        echo "ℹ️  docker not found — LiveKit SFU not started (live transport falls back to MP4)."
+        return 0
+    fi
+    if docker compose -f "${PROJECT_ROOT}/docker-compose.livekit.yml" up -d; then
+        echo "🟢 LiveKit SFU running at ${LIVEKIT_URL} (left running; stop with:"
+        echo "   docker compose -f docker-compose.livekit.yml down)"
+    else
+        return 1
+    fi
+}
+if [ "${LIVEKIT_START}" = "auto" ] || [ "${LIVEKIT_START}" = "yes" ]; then
+    livekit_server_start || { echo "LiveKit start failed — continuing without the live transport."; true; }
+fi
+
 # --- Prerequisites -----------------------------------------------------------
 command -v uv >/dev/null 2>&1 || { echo "❌ 'uv' not found on PATH. Run ./scripts/setup.sh first."; exit 1; }
+
+# --- Auto-bootstrap: one command must run everything --------------------------
+# No project venv yet -> run the full setup (uv, Node, deps, checkpoints)
+# before starting anything.
+if [ ! -x "${PROJECT_ROOT}/.venv/bin/python" ]; then
+    echo "📦 .venv missing -> running the full setup first (scripts/setup.sh)..."
+    bash "${SCRIPT_DIR}/setup.sh"
+fi
+# Top up the LiveKit RTC SDK when a fresh `uv sync` removed it again (it is
+# installed --no-deps on top of the lock, so uv sync can prune it silently).
+if ! uv run --frozen --no-sync python -c "import livekit.rtc" 2>/dev/null; then
+    echo "📦 LiveKit RTC SDK missing from the venv -> installing (--no-deps)..."
+    uv pip install --python .venv/bin/python --no-deps "livekit>=1.1" \
+        || echo "⚠️ livekit install failed — the live transport falls back to MP4."
+fi
 
 # Vite 8 / rolldown import `node:util`'s `styleText`, which only exists on Node
 # >= 20.12 (LTS 20.19+/22.12+). Node 18 resolves the import fine and then dies

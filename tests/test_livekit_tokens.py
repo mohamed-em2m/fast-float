@@ -109,6 +109,18 @@ def test_token_endpoint_mints_a_token(client):
     assert claims["video"]["canPublish"] is False
 
 
+def test_token_endpoint_ignores_a_client_publish_request(client):
+    # The browser is only ever a viewer: even when the client body asks for
+    # publishing rights, the endpoint mints a subscriber-only token. (The
+    # request field was removed; extra JSON keys are ignored.)
+    body = client.post(
+        "/livekit/token",
+        json={"room": "float-abc", "name": "Studio", "can_publish": True},
+    ).json()
+    claims = jwt.decode(body["token"], API_SECRET, algorithms=["HS256"])
+    assert claims["video"]["canPublish"] is False
+
+
 def test_token_endpoint_generates_a_room_when_omitted(client):
     body = client.post("/livekit/token", json={}).json()
     assert body["room"].startswith("float-")

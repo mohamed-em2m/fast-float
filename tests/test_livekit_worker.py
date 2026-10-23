@@ -21,6 +21,8 @@ from fast_float.livekit.generator import (
 from fast_float.livekit.worker import (
     AvatarOptions,
     AvatarRunner,
+    live_publish_active,
+    spawn_live_publish_task,
 )
 from fast_float.routers.livekit import router as livekit_router
 from fast_float.streaming.live import LiveStream
@@ -39,6 +41,12 @@ def api_client(monkeypatch):
     monkeypatch.setenv("LIVEKIT_URL", "ws://127.0.0.1:7880")
     monkeypatch.setenv("LIVEKIT_API_KEY", "devkey")
     monkeypatch.setenv("LIVEKIT_API_SECRET", "devsecretdevsecretdevsecretdevsecret")
+    # The publish endpoint refuses to spawn when the RTC SDK is missing (503);
+    # force the flag so endpoint tests run on boxes without the SDK too.
+    if not RTC_AVAILABLE:
+        import fast_float.livekit.worker as worker
+
+        monkeypatch.setattr(worker, "RTC_AVAILABLE", True)
     app = FastAPI()
     app.include_router(livekit_router)
     with TestClient(app) as client:
@@ -176,7 +184,13 @@ def test_publish_endpoint_starts_live_publisher(api_client):
     stream = LiveStream("req-active", loop)
     app_state.live_streams["req-active"] = stream
 
-    with patch("fast_float.livekit.worker.publish_live_stream_task") as mock_task:
+    spawn_calls = {"count": 0}
+
+    async def _never_finish(*args, **kwargs):
+        spawn_calls["count"] += 1
+        await asyncio.sleep(3600)
+
+    with patch("fast_float.livekit.worker.publish_live_stream_task", _never_finish):
         res = api_client.post("/livekit/publish/req-active", json={"room": "custom-room"})
         assert res.status_code == 200
         data = res.json()
@@ -184,13 +198,33 @@ def test_publish_endpoint_starts_live_publisher(api_client):
         assert data["type"] == "live"
         assert data["room"] == "custom-room"
         assert data["request_id"] == "req-active"
+        assert spawn_calls["count"] == 1
+
+        # A second publish trigger for the same request must not spawn another
+        # publisher: both would join the room with the same worker identity and
+        # LiveKit would drop one of them.
+        res = api_client.post("/livekit/publish/req-active", json={"room": "custom-room"})
+        assert res.status_code == 200
+        assert res.json()["status"] == "already_publishing"
+        assert spawn_calls["count"] == 1
+
+    # task cleanup between tests: the blocking task from this test must not
+    # leak into the next one through the registry
+    import fast_float.livekit.worker as worker
+
+    for job in list(worker._live_publish_jobs.values()):
+        job.cancel()
+
+
+async def _never_finish_media(*args, **kwargs):
+    await asyncio.sleep(3600)
 
 
 def test_publish_endpoint_starts_file_publisher(api_client):
     with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp:
         app_state.active_streams["req-done"] = tmp.name
 
-        with patch("fast_float.livekit.worker.publish_media_file_task") as mock_task:
+        with patch("fast_float.livekit.worker.publish_media_file_task", _never_finish_media):
             res = api_client.post("/livekit/publish/req-done", json={"room": "done-room"})
             assert res.status_code == 200
             data = res.json()
@@ -198,3 +232,138 @@ def test_publish_endpoint_starts_file_publisher(api_client):
             assert data["type"] == "file"
             assert data["room"] == "done-room"
             assert data["request_id"] == "req-done"
+
+    import fast_float.livekit.worker as worker
+
+    for job in list(worker._media_publish_jobs.values()):
+        job.cancel()
+
+
+def test_spawn_live_publish_task_dedupes():
+    async def _test():
+        stream = LiveStream("req-dup", asyncio.get_running_loop())
+        stream.request_id = "req-dup"
+        with patch("fast_float.livekit.worker.publish_live_stream_task") as mock_task:
+            first = spawn_live_publish_task(stream, room_name="r1")
+            assert first is not None
+            second = spawn_live_publish_task(stream, room_name="r1")
+            assert second is None
+            assert mock_task.call_count == 1
+            assert live_publish_active("req-dup") is True
+            first.cancel()
+
+    asyncio.run(_test())
+
+
+def test_conversation_session_wiring():
+    if not RTC_AVAILABLE:
+        pytest.skip("RTC SDK not available")
+
+    async def _test():
+        import time
+
+        from fast_float.livekit import session as sess
+        from fast_float.livekit.settings import LiveKitSettings
+
+        def _slow_inference(agent, *args, **kwargs):
+            # Real inference takes seconds; keep the chunk busy so the flag
+            # under test is observable deterministically.
+            time.sleep(0.5)
+            return "ok"
+
+        settings = LiveKitSettings(
+            url="ws://127.0.0.1:7880",
+            api_key="devkey",
+            api_secret="devsecretdevsecretdevsecretdevsecret",
+        )
+        try:
+            app_state.agent = MagicMock()
+            fake_room = MagicMock()
+            fake_room.connect = AsyncMock()
+            fake_room.local_participant = MagicMock()
+            fake_room.local_participant.publish_track = AsyncMock()
+            fake_room.local_participant.set_attributes = AsyncMock()
+            fake_room.disconnect = AsyncMock()
+
+            with (
+                patch.object(ConversationalAgent, "connect", AsyncMock()) as agent_connect,
+                patch("fast_float.livekit.session.rtc") as rtc_mod,
+                patch("fast_float.core.service.run_inference_blocking", _slow_inference),
+            ):
+                rtc_mod.Room.return_value = fake_room
+                session = sess.ConversationSession(
+                    "room-conv-test",
+                    settings=settings,
+                    image_path="./images/img.jpg",
+                    tts_fn=lambda text: np.zeros(1600, dtype=np.int16).tobytes(),
+                )
+                await session.start()
+
+                assert session.agent is not None
+                assert session.runner is not None
+                assert session.runner.agent_identity == session.agent.identity
+                assert fake_room.connect.call_count == 1
+                # avatar video + audio published into the worker room
+                assert fake_room.local_participant.publish_track.call_count == 2
+
+                await session.speak("Hello there")
+                await asyncio.sleep(0.05)
+                assert session.generator._inference_running
+
+                await session.stop()
+                assert session.is_stopped
+                agent_connect.assert_awaited_once()
+        finally:
+            app_state.agent = None
+
+    asyncio.run(_test())
+
+
+def test_conversation_start_reports_warmup(api_client):
+    res = api_client.post("/livekit/conversation/start", json={})
+    assert res.status_code == 503
+    assert "warming up" in res.json()["detail"]
+
+
+def test_conversation_endpoints_flow(api_client, monkeypatch):
+    import types
+
+    import fast_float.routers.livekit as lk_router_module
+
+    fake_session = types.SimpleNamespace(
+        room_name="room-conv",
+        identity="float-agent",
+        avatar_identity="avatar-room-conv",
+        tts_fn=lambda text: b"",
+        is_stopped=False,
+        speak=AsyncMock(),
+    )
+
+    async def fake_start(room_name, **kwargs):
+        return fake_session
+
+    async def fake_stop(room_name):
+        fake_session.is_stopped = True
+
+    monkeypatch.setattr(lk_router_module, "start_session", fake_start)
+    monkeypatch.setattr(lk_router_module, "stop_session", fake_stop)
+    monkeypatch.setattr(lk_router_module, "get_session", lambda room: fake_session)
+    monkeypatch.setattr(app_state, "agent", MagicMock())
+
+    res = api_client.post("/livekit/conversation/start", json={"room": "room-conv"})
+    assert res.status_code == 200
+    assert res.json() == {
+        "status": "ready",
+        "room": "room-conv",
+        "identity": "float-agent",
+        "avatar_identity": "avatar-room-conv",
+        "tts": True,
+    }
+
+    res = api_client.post("/livekit/conversation/speak", json={"room": "room-conv", "text": "hi"})
+    assert res.status_code == 200
+    assert res.json()["status"] == "speaking"
+
+    res = api_client.post("/livekit/conversation/stop", json={"room": "room-conv"})
+    assert res.status_code == 200
+    assert res.json() == {"room": "room-conv", "status": "stopped", "had_session": True}

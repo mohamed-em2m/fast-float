@@ -181,15 +181,56 @@ source .venv/bin/activate
 # failure this script has to survive on a 50 GiB disk.
 uv sync --inexact
 
-echo "=== Installing livekit dependency group (livekit-api token SDK) ==="
-# livekit-api provides token generation and the LiveKit server API (REST).
-# The RTC SDK (livekit) requires numpy>=1.26 and is intentionally NOT in this
-# group because numpy is pinned to 1.24.4 for onnx<1.17 compatibility; it runs
-# in a separate worker environment (see docs/LIVEKIT_INTEGRATION.md).
-# --inexact: preserve the ONNX / TensorRT layers that a plain uv sync --group
-# would prune (it treats any unlisted package as an orphan and removes it).
+echo "=== Installing LiveKit SDK (token API + RTC SDK) ==="
+# 1. The token API (livekit-api) is numpy-free and a normal dependency group.
+#    --inexact: preserve the ONNX / TensorRT layers that a plain uv sync
+#    --group would prune (it treats any unlisted package as an orphan and
+#    removes them).
 if ! uv sync --group livekit --inexact; then
     echo "Warning: livekit-api install failed -- LiveKit token generation will be unavailable."
+fi
+# 2. The RTC SDK (livekit) — needed by the avatar worker / publisher tasks
+#    (fast_float/livekit/worker.py). Its wheel *declares* numpy>=2.0, but uv
+#    would then unpin the project's numpy==1.24.4 (needed by onnx<1.17).
+#    Verified at runtime: the SDK works correctly with numpy 1.24.4, and all
+#    of its real dependencies (protobuf, aiofiles, ...) are already in this
+#    venv — so install it WITHOUT its dependency resolution (--no-deps) and
+#    re-assert numpy afterwards to be safe against a drifted lock.
+if ! uv pip install --python .venv/bin/python --no-deps "livekit>=1.1"; then
+    echo "Warning: livekit RTC SDK install failed -- LiveKit live-transport publishing will be unavailable."
+fi
+if ! uv pip install --python .venv/bin/python "numpy==1.24.4"; then
+    echo "Warning: numpy re-pin failed — check 'uv pip list | grep numpy'."
+fi
+# Probe: both halves of the LiveKit stack must import (with the pinned numpy).
+if uv run --frozen --no-sync python - <<'PY'
+from livekit import api as livekit_api
+from livekit import rtc
+
+token = livekit_api.AccessToken("probe-key", "probe-secret").with_grants(
+    livekit_api.VideoGrants(room_join=True, room="probe")
+).to_jwt()
+import numpy  # noqa: F401
+print("  livekit-api ok, rtc ok, numpy", numpy.__version__, "- token minted (len", len(token), ")")
+PY
+then
+    echo "LiveKit SDK installed."
+else
+    echo "⚠️ LiveKit SDK probe failed — LiveKit transport will be unavailable."
+fi
+
+echo "=== Starting the LiveKit SFU server container (best effort) ==="
+# The dev server (docker-compose.livekit.yml) plus the dev keys already set in
+# the environment above make the live transport usable right after setup.
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    if docker compose -f "${PROJECT_ROOT}/docker-compose.livekit.yml" up -d; then
+        echo "LiveKit SFU running on ws://127.0.0.1:7880 (stop: docker compose -f docker-compose.livekit.yml down)"
+    else
+        echo "⚠️ LiveKit server container failed to start — scripts/run_all.sh retries it."
+    fi
+else
+    echo "docker not found — the live transport falls back to MP4 until the LiveKit"
+    echo "server is started (docker compose -f docker-compose.livekit.yml up -d)."
 fi
 
 echo "=== Installing optional video codecs (torchcodec) ==="

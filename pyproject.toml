@@ -88,10 +88,12 @@ dependencies = [
 dev = ["pytest>=8.0,<9"]
 # LiveKit transport (optional).
 #   uv sync --group livekit
-# The API process only needs the token API, which is numpy-free and installs
-# cleanly here. The RTC SDK (`livekit`) requires numpy>=1.26 and CANNOT live
-# in this environment: numpy is pinned to 1.24.4 for onnx<1.17. The avatar
-# worker therefore gets its own project (see docs/LIVEKIT_INTEGRATION.md).
+# Token generation needs only livekit-api, which is numpy-free and installs
+# cleanly here. The avatar worker additionally uses the RTC SDK (`livekit`):
+# its wheels *declare* numpy>=2, but at runtime they work fine with this
+# project's numpy==1.24.4 pin (onnx<1.17 compatibility) — scripts/setup.sh
+# therefore installs the SDK with `uv pip install --no-deps livekit` after the
+# group sync, never letting uv bump numpy. See docs/LIVEKIT_INTEGRATION.md.
 livekit = ["livekit-api>=1.2"]
 
 # Flat scripts layout (no installable package) — manage the env only.
