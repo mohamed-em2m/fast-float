@@ -90,6 +90,15 @@ async def livekit_status(request: Request) -> dict[str, Any]:
     # Only advertise the built-in responder once its UDP socket actually bound.
     if stun_urls and not settings.stun_urls and app_state.stun_port is None:
         stun_urls = []
+    # Complete ICE list for the raw WebRTC transport: STUN plus optional TURN.
+    # Secrets are never returned; coturn REST credentials are short-lived.
+    ice_servers = [
+        dict(server)
+        for server in settings.resolved_ice_servers(
+            _request_host(request),
+            stun_available=bool(stun_urls),
+        )
+    ]
     return {
         "configured": settings.configured,
         "url": settings.url or None,
@@ -97,6 +106,8 @@ async def livekit_status(request: Request) -> dict[str, Any]:
         "room_prefix": settings.room_prefix,
         "token_ttl_s": settings.token_ttl_s,
         "stun_urls": stun_urls,
+        "ice_servers": ice_servers,
+        "turn_urls": list(settings.turn_urls),
         "stun_port": app_state.stun_port,
         # The WebSocket live transport still exists, but it is a last resort:
         # the frontend falls back from LiveKit to raw WebRTC first.

@@ -50,6 +50,13 @@ export default function StudioStage({
   const webRtcVideoRef = useRef(null);
   const pcRef = useRef(null);
   const liveKitSessionRef = useRef(null);
+  // App's showToast is an inline function, so keep it in a ref: otherwise the
+  // fallback callback identity changes on every progress tick and restarts the
+  // live transport effect (renegotiating WebRTC once per second).
+  const onToastRef = useRef(onToast);
+  useEffect(() => {
+    onToastRef.current = onToast;
+  }, [onToast]);
 
   // Check LiveKit availability on mount and whenever the active API URL changes.
   useEffect(() => {
@@ -57,9 +64,11 @@ export default function StudioStage({
       fetchLiveKitStatus()
         .then((status) => {
           setLiveKitAvailable(!!status.configured);
-          // Feed the deployment's own STUN list (self-hosted coturn or cloud)
-          // to the raw WebRTC transport; empty keeps the Google default.
-          setIceServers(status.stun_urls);
+          // Feed the deployment's own ICE list (STUN + optional TURN) to the
+          // raw WebRTC transport. Prefer the complete `ice_servers` payload;
+          // fall back to the older `stun_urls` shape from an older backend.
+          // An explicit empty list disables the Google default.
+          setIceServers(status.ice_servers?.length ? status.ice_servers : status.stun_urls);
         })
         .catch(() => setLiveKitAvailable(false));
     };
@@ -75,22 +84,28 @@ export default function StudioStage({
   useEffect(() => {
     if (liveKitAvailable === false && transport === 'livekit') {
       setTransport?.('webrtc');
-      if (onToast) onToast('LiveKit unavailable — switched to WebRTC via the main server', 'error');
+      const toast = onToastRef.current;
+      if (toast) toast('LiveKit unavailable — switched to WebRTC via the main server', 'error');
     }
-  }, [liveKitAvailable, transport, setTransport, onToast]);
+  }, [liveKitAvailable, transport, setTransport]);
 
-  const handleLiveFallback = useCallback(() => {
-    const next = transport === 'livekit' ? 'webrtc' : 'ws';
-    setTransport?.(next);
-    if (onToast) {
-      onToast(
-        next === 'webrtc'
-          ? 'LiveKit SFU failed — switched to WebRTC via the main server'
-          : 'WebRTC failed — switched to the WebSocket transport',
-        'error'
-      );
-    }
-  }, [transport, setTransport, onToast]);
+  const handleLiveFallback = useCallback(
+    (reason) => {
+      const next = transport === 'livekit' ? 'webrtc' : 'ws';
+      setTransport?.(next);
+      const toast = onToastRef.current;
+      if (toast) {
+        const detail = reason ? ` (${reason})` : '';
+        toast(
+          next === 'webrtc'
+            ? `LiveKit failed${detail} — switched to WebRTC via the main server`
+            : `WebRTC failed${detail} — switched to the WebSocket transport`,
+          'error'
+        );
+      }
+    },
+    [transport, setTransport]
+  );
 
   // Cycle progress stages smoothly during generation
   useEffect(() => {

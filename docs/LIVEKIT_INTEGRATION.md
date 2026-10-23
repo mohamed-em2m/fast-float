@@ -273,6 +273,28 @@ When LiveKit cannot be reached the Studio now falls back to this raw WebRTC
 transport first (main-server signalling + STUN); the WebSocket transport is
 only the last resort.
 
+STUN only discovers addresses; it does not relay media. If the browser reaches
+the API through a **TCP-only edge proxy** (RunPod/Cloudflare tunnels, many
+corporate NATs), WebRTC cannot open a UDP path and will never reach
+`connected`. Configure a TURN relay in `[webrtc]` for those deployments:
+
+```toml
+turn_urls = ["turn:turn.example.com:3478?transport=tcp"]
+# Static credential:
+turn_username = "..."
+turn_credential = "..."
+# Or, for coturn `use-auth-secret`, put only this in secerts.toml:
+# turn_secret = "..."
+```
+
+`GET /livekit/status` returns the complete `ice_servers` list (STUN + TURN,
+with short-lived coturn REST credentials when `turn_secret` is set); the same
+list feeds aiortc's `RTCConfiguration`. `POST /offer` returns a `peer_id`, and
+browsers trickle late candidates to `POST /offer/candidate`, so a slow TURN/TCP
+allocation is not lost when the initial SDP was already sent. The Studio gives
+ICE 12 seconds to connect and then falls back to WebSocket with an explanatory
+toast, so a TCP-only deployment no longer hangs on "Connecting…".
+
 ## 11. The transport decision still to settle: SDK publisher vs RTMP ingest
 
 The worker has to get H.264 (or raw frames) into the room, and there are two

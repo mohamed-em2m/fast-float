@@ -57,6 +57,29 @@ def test_unconfigured_settings_say_so(monkeypatch):
     assert settings.source == "none"
 
 
+def test_status_reports_stun_and_turn_ice_servers(client, monkeypatch):
+    # Keep the test independent of any operator secerts.toml in the checkout.
+    monkeypatch.setattr("fast_float.livekit.settings.load_settings", lambda: {})
+    monkeypatch.setattr("fast_float.livekit.settings.load_secrets", lambda: {})
+    monkeypatch.setenv("WEBRTC_STUN_URLS", "stun:stun.example:3478")
+    monkeypatch.setenv("WEBRTC_TURN_URLS", "turn:turn.example:3478?transport=tcp")
+    monkeypatch.setenv("WEBRTC_TURN_USERNAME", "viewer")
+    monkeypatch.setenv("WEBRTC_TURN_CREDENTIAL", "s3cret")
+
+    data = client.get("/livekit/status").json()
+    assert data["stun_urls"] == ["stun:stun.example:3478"]
+    assert data["turn_urls"] == ["turn:turn.example:3478?transport=tcp"]
+    assert data["ice_servers"] == [
+        {"urls": "stun:stun.example:3478"},
+        {
+            "urls": "turn:turn.example:3478?transport=tcp",
+            "username": "viewer",
+            "credential": "s3cret",
+        },
+    ]
+    assert data["ws_fallback"] is True
+
+
 def test_room_names_are_validated():
     assert valid_room_name("float-abc123") is True
     assert valid_room_name("has space") is False

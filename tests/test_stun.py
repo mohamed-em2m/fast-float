@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import ipaddress
 import struct
 
@@ -100,3 +103,54 @@ def test_explicit_stun_list_wins_over_the_builtin_responder(monkeypatch):
 
     settings = LiveKitSettings.from_env()
     assert settings.resolved_stun_urls("192.0.2.10") == ("stun:coturn.example:3478",)
+
+
+def test_ice_servers_include_stun_and_static_turn(monkeypatch):
+    monkeypatch.setattr(
+        "fast_float.livekit.settings.load_settings",
+        lambda: {
+            "webrtc": {
+                "stun_urls": ["stun:stun.example:3478"],
+                "turn_urls": ["turn:turn.example:3478?transport=tcp"],
+                "turn_username": "viewer",
+                "turn_credential": "secret",
+            }
+        },
+    )
+    monkeypatch.setattr("fast_float.livekit.settings.load_secrets", lambda: {})
+    for name in ("WEBRTC_STUN_URLS", "WEBRTC_TURN_URLS", "WEBRTC_TURN_USERNAME",
+                 "WEBRTC_TURN_CREDENTIAL", "WEBRTC_TURN_SECRET"):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = LiveKitSettings.from_env()
+    assert settings.resolved_ice_servers() == (
+        {"urls": "stun:stun.example:3478"},
+        {
+            "urls": "turn:turn.example:3478?transport=tcp",
+            "username": "viewer",
+            "credential": "secret",
+        },
+    )
+
+
+def test_turn_rest_credentials_are_derived_from_the_shared_secret(monkeypatch):
+    monkeypatch.setenv("WEBRTC_TURN_SECRET", "turn-shared-secret")
+    monkeypatch.setenv("WEBRTC_TURN_URLS", "turn:turn.example:3478")
+    monkeypatch.setattr("fast_float.livekit.settings.load_settings", lambda: {})
+    monkeypatch.setattr("fast_float.livekit.settings.load_secrets", lambda: {})
+
+    settings = LiveKitSettings.from_env()
+    username, credential = settings.turn_credentials(ttl_s=600)
+    expected = base64.b64encode(
+        hmac.new(b"turn-shared-secret", username.encode(), hashlib.sha1).digest()
+    ).decode("ascii")
+    assert username.split(":", 1)[1]
+    assert credential == expected
+
+    servers = settings.resolved_ice_servers()
+    entry = servers[0]
+    assert entry["urls"] == "turn:turn.example:3478"
+    assert entry["username"].split(":", 1)[1]
+    assert entry["credential"] == base64.b64encode(
+        hmac.new(b"turn-shared-secret", entry["username"].encode(), hashlib.sha1).digest()
+    ).decode("ascii")

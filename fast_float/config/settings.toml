@@ -43,3 +43,22 @@ stun_host = ""
 # Env override: WEBRTC_STUN_URLS="stun:a:3478,stun:b:3478".
 # Empty = use the API's built-in responder (the default for this deployment).
 stun_urls = []
+
+# TURN relay for browsers that cannot reach this server over UDP (RunPod /
+# Cloudflare / other TCP-only proxies, strict corporate NAT). STUN alone is
+# enough on a LAN, but not through a TCP-only edge proxy.
+# Supported schemes: turn:, turns:, turn:...?transport=tcp.
+# Static credentials can live here; put real credentials in secerts.toml:
+#   [webrtc]
+#   turn_urls = ["turn:turn.example.com:3478?transport=tcp"]
+#   turn_username = "..."
+#   turn_credential = "..."
+# For coturn `use-auth-secret`, set only turn_secret in secerts.toml; the API
+# then returns short-lived credentials instead of the shared secret.
+# Env overrides: WEBRTC_TURN_URLS, WEBRTC_TURN_USERNAME,
+# WEBRTC_TURN_CREDENTIAL, WEBRTC_TURN_SECRET, WEBRTC_TURN_TTL_S.
+turn_urls = []
+turn_username = ""
+turn_credential = ""
+turn_secret = ""
+turn_ttl_s = 3600

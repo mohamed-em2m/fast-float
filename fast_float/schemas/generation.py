@@ -131,6 +131,22 @@ class WebRTCOfferRequest(BaseModel):
     live: bool = Field(False, description="Attach the in-flight live stream instead of a finished file")
 
 
+class WebRTCIceCandidateRequest(BaseModel):
+    """A browser ICE candidate to add to an existing peer connection."""
+
+    peer_id: str = Field(..., min_length=1)
+    candidate: str | None = Field(
+        None,
+        description="Candidate attribute string (omit or null for end-of-candidates)",
+    )
+    sdp_mid: str | None = Field(None, description="Media section id from the offer")
+    sdp_mline_index: int | None = Field(None, ge=0, description="Media section index from the offer")
+
+
 class WebRTCOfferResponse(BaseModel):
     sdp: str
     type: str
+    peer_id: str | None = Field(
+        None,
+        description="Opaque id used to POST later ICE candidates to /offer/candidate",
+    )

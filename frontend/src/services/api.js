@@ -444,16 +444,16 @@ export async function generateVideo(payload) {
 let serverIceServers = null;
 
 /**
- * Rewrite a `stun:` URL whose host is loopback to the host the browser
- * actually uses for the API. The backend advertises itself (e.g.
- * `stun:localhost:3478`) but a remote browser cannot gather candidates from
- * its own machine — and when the API sits behind the Vite/prod proxy the
- * request Host header is often loopback. Explicit operator hosts (coturn,
- * a public DNS name) are left untouched.
+ * Rewrite an ICE URL whose host is loopback to the host the browser actually
+ * uses for the API. The backend advertises itself (e.g. `stun:localhost:3478`)
+ * but a remote browser cannot gather candidates from its own machine — and
+ * when the API sits behind the Vite/prod proxy the request Host header is
+ * often loopback. Explicit operator hosts (coturn, a public DNS name) are left
+ * untouched. Both STUN and TURN schemes are supported.
  */
-function alignStunUrl(url) {
+function alignIceUrl(url) {
   const value = String(url || '').trim();
-  const match = /^(stuns?):(\[[^\]]+\]|[^:]+)(?::(\d+))?/i.exec(value);
+  const match = /^(stuns?|turns?):(\[[^\]]+\]|[^:?]+)(?::(\d+))?([^ ]*)$/i.exec(value);
   if (!match) return value;
   const scheme = match[1].toLowerCase();
   let host = match[2].replace(/^\[|\]$/g, '');
@@ -466,12 +466,30 @@ function alignStunUrl(url) {
     }
   }
   const port = match[3] ? `:${match[3]}` : '';
-  return `${scheme}:${host.includes(':') ? `[${host}]` : host}${port}`;
+  return `${scheme}:${host.includes(':') ? `[${host}]` : host}${port}${match[4] || ''}`;
 }
 
-export function setIceServers(stunUrls) {
-  if (Array.isArray(stunUrls) && stunUrls.length > 0) {
-    serverIceServers = stunUrls.map((url) => ({ urls: alignStunUrl(url) }));
+function normalizeIceServer(entry) {
+  if (typeof entry === 'string') return { urls: alignIceUrl(entry) };
+  if (!entry || typeof entry !== 'object') return null;
+  const rawUrls = Array.isArray(entry.urls) ? entry.urls : [entry.urls];
+  const urls = rawUrls.filter(Boolean).map(alignIceUrl);
+  if (!urls.length) return null;
+  const server = { urls: urls.length === 1 ? urls[0] : urls };
+  if (entry.username) server.username = entry.username;
+  if (entry.credential) server.credential = entry.credential;
+  return server;
+}
+
+/**
+ * Feed the raw WebRTC transport an ICE list from `/livekit/status`.
+ * Accepts either `ice_servers` objects (`{urls, username, credential}`) or a
+ * plain STUN URL list for compatibility. An explicit empty list is kept as
+ * empty so a deployment that disabled ICE can opt out of the Google default.
+ */
+export function setIceServers(servers) {
+  if (Array.isArray(servers)) {
+    serverIceServers = servers.map(normalizeIceServer).filter(Boolean);
   } else {
     serverIceServers = null;
   }
@@ -512,8 +530,8 @@ export function attachRemoteTrack(videoEl, event) {
 export async function createWebRtcSession(streamId, onTrackCallback, onStateCallback, options = {}) {
   const { live = false } = options;
   const pc = new RTCPeerConnection({
-    // Server-provided STUN list (see /livekit/status -> stun_urls, ideally the
-    // self-hosted coturn) replaces the public Google default when present.
+    // Server-provided STUN/TURN list (see /livekit/status -> ice_servers)
+    // replaces the public Google default when present.
     iceServers: getIceServers(),
   });
 
@@ -529,14 +547,71 @@ export async function createWebRtcSession(streamId, onTrackCallback, onStateCall
   if (onStateCallback) {
     pc.onconnectionstatechange = () => onStateCallback(pc.connectionState);
   }
+  // Surface STUN/TURN failures in the browser console; a TCP-only proxy
+  // produces candidate errors here even though SDP negotiation succeeds.
+  pc.onicecandidateerror = (event) => {
+    console.warn(
+      `[webrtc] ICE candidate error ${event.errorCode ?? '?'}: ${event.errorText || 'unknown'} (${event.url || 'no url'})`
+    );
+  };
+
+  // Trickle ICE. `/offer` only carries the initial SDP; candidates discovered
+  // afterwards (especially TURN/TCP allocations) are POSTed to
+  // /offer/candidate using the peer id returned with the answer.
+  let peerId = null;
+  let closed = false;
+  let endOfCandidatesPending = false;
+  const pendingCandidates = [];
+  let candidateChain = Promise.resolve();
+  const postCandidate = (candidate) => {
+    if (closed) return;
+    const payload = {
+      peer_id: peerId,
+      candidate: candidate ? candidate.candidate : null,
+      sdp_mid: candidate ? candidate.sdpMid : null,
+      sdp_mline_index: candidate ? candidate.sdpMLineIndex : null,
+    };
+    candidateChain = candidateChain
+      .then(() =>
+        fetch(`${currentApiUrl}/offer/candidate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        })
+      )
+      .then((candidateRes) => {
+        if (!candidateRes.ok) {
+          console.warn(`[webrtc] candidate rejected (HTTP ${candidateRes.status})`);
+        }
+      })
+      .catch((err) => {
+        if (!closed) console.warn('[webrtc] candidate post failed:', err);
+      });
+  };
+  pc.onicecandidate = (event) => {
+    if (closed) return;
+    if (event.candidate) {
+      if (peerId) postCandidate(event.candidate);
+      else pendingCandidates.push(event.candidate);
+    } else if (peerId) {
+      postCandidate(null);
+    } else {
+      // Gathering finished before /offer returned; flush after peer_id.
+      endOfCandidatesPending = true;
+    }
+  };
 
   // Create local offer
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
 
+  // The browser appends `a=end-of-candidates` once gathering completes. If
+  // that line is in the offer, aioice closes its remote-candidate list before
+  // later TURN candidates arrive. Omit it and send an explicit null candidate
+  // via /offer/candidate instead (after peer_id is known).
   const offerBody = () =>
     JSON.stringify({
-      sdp: pc.localDescription.sdp,
+      sdp: pc.localDescription.sdp.replace(/^a=end-of-candidates\r?\n/gm, ''),
       type: pc.localDescription.type,
       stream_id: streamId,
       live,
@@ -556,11 +631,13 @@ export async function createWebRtcSession(streamId, onTrackCallback, onStateCall
       body: offerBody(),
     });
   }).catch((err2) => {
+    closed = true;
     pc.close();
     throw new Error(`Cannot reach backend at ${currentApiUrl} — is it running? (${err2.message})`);
   });
 
   if (!res.ok) {
+    closed = true;
     pc.close();
     const errorData = await res.json().catch(() => ({}));
     const detail = errorData.detail || res.statusText;
@@ -569,7 +646,22 @@ export async function createWebRtcSession(streamId, onTrackCallback, onStateCall
   }
 
   const answer = await res.json();
-  await pc.setRemoteDescription(new RTCSessionDescription(answer));
+  peerId = answer.peer_id || null;
+  if (peerId) {
+    // Flush candidates that were gathered while /offer was in flight.
+    for (const candidate of pendingCandidates.splice(0)) postCandidate(candidate);
+    if (endOfCandidatesPending) postCandidate(null);
+  } else {
+    console.warn('[webrtc] backend did not return a peer_id; late ICE candidates are dropped');
+  }
+
+  try {
+    await pc.setRemoteDescription(new RTCSessionDescription(answer));
+  } catch (err) {
+    closed = true;
+    pc.close();
+    throw err;
+  }
 
   return pc;
 }
