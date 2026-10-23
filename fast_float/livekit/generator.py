@@ -20,7 +20,10 @@ import contextlib
 import logging
 import os
 import tempfile
-from collections.abc import AsyncIterator
+import time
+import wave
+from collections.abc import AsyncIterator, Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -50,60 +53,66 @@ BYTES_PER_FRAME = SAMPLES_PER_FRAME * 2  # 16-bit mono = 1280 bytes
 _QUEUE_SENTINEL = object()
 
 
-class _LiveKitDispatcherBridge(FrameDispatcher):
-    """Bridge FrameDispatcher events to an asyncio.Queue on the event loop.
+# Scratch dir for the temp WAVs: RAM-backed when available, so no disk I/O per chunk.
+_TMP_DIR = "/dev/shm" if os.path.isdir("/dev/shm") else None
 
-    Every frame leaves the producer already paired with its exact
-    ``BYTES_PER_FRAME`` audio slice, so a frame dropped here takes its own
-    audio with it. (Reading the audio from shared state on the consumer side
-    desynced A/V by one slice per dropped frame.)
+
+class _Cancelled(Exception):
+    """Raised inside the inference thread when the chunk's generation is stale."""
+
+
+class _LiveKitDispatcherBridge(FrameDispatcher):
+    """Runs on the inference thread. Pairs each frame with its own 40 ms audio slice.
+
+    Real-time changes vs. the old version:
+      * `valid_samples`: the chunk is zero-padded to 2 s, but only frames that
+        cover real audio are emitted (no dead silent frames at the tail).
+      * `is_current(gen)`: after clear_buffer()/stop(), the next dispatch raises
+        _Cancelled so the GPU stops working on audio nobody will hear.
     """
 
     def __init__(
         self,
-        queue: asyncio.Queue,
         loop: asyncio.AbstractEventLoop,
+        push: Callable[[int, tuple], None],
         audio_pcm: bytes,
+        valid_samples: int,
+        gen: int,
+        is_current: Callable[[int], bool],
     ) -> None:
         super().__init__()
-        self._queue = queue
         self._loop = loop
+        self._push = push
         self._audio_pcm = audio_pcm
-        self._audio_cursor = 0
+        self._valid_samples = valid_samples
+        self._gen = gen
+        self._is_current = is_current
+        self._cursor = 0  # in samples; only touched from the inference thread
 
     def dispatch(self, idx: int, frames: np.ndarray, pts_ms: float) -> None:
         if self._loop.is_closed():
             return
+        if not self._is_current(self._gen):
+            raise _Cancelled
         if frames.ndim == 3:
-            items = [(idx, frames, pts_ms)]
-        else:
-            items = [(idx + i, frames[i], pts_ms + (i * (1000.0 / TARGET_FPS))) for i in range(len(frames))]
-        for item in items:
-            self._loop.call_soon_threadsafe(self._push_sync, (*item, self._next_audio_slice()))
-
-    def _next_audio_slice(self) -> bytes | None:
-        """The next BYTES_PER_FRAME slice of the chunk's PCM, or None past the end."""
-        start = self._audio_cursor
-        end = start + BYTES_PER_FRAME
-        self._audio_cursor = end
-        data = self._audio_pcm[start:end]
-        return data if len(data) == BYTES_PER_FRAME else None
-
-    def _push_sync(self, item: tuple[int, np.ndarray, float, bytes | None]) -> None:
-        with contextlib.suppress(asyncio.QueueFull):
-            self._queue.put_nowait(item)
+            frames = frames[None]
+        for i in range(len(frames)):
+            if self._cursor >= self._valid_samples:
+                return  # padded tail: drop
+            s = self._cursor * 2
+            audio = self._audio_pcm[s : s + BYTES_PER_FRAME]
+            if len(audio) < BYTES_PER_FRAME:
+                audio = audio + bytes(BYTES_PER_FRAME - len(audio))
+            self._cursor += SAMPLES_PER_FRAME
+            item = (idx + i, frames[i], pts_ms + i * (1000.0 / TARGET_FPS), audio)
+            self._loop.call_soon_threadsafe(self._push, self._gen, item)
 
     def close(self) -> None:
-        if not self._loop.is_closed():
-            self._loop.call_soon_threadsafe(self._close_sync)
-
-    def _close_sync(self) -> None:
-        with contextlib.suppress(asyncio.QueueFull):
-            self._queue.put_nowait(_QUEUE_SENTINEL)
+        pass  # the generator owns the sentinel; a per-chunk close must not end the stream
 
 
 class FloatVideoGenerator:
-    """Consumes audio chunks and yields synchronized (rtc.VideoFrame, rtc.AudioFrame) tuples."""
+    """Audio in -> synchronized (rtc.VideoFrame, rtc.AudioFrame) out, tuned for low latency."""
 
     def __init__(
         self,
@@ -116,12 +125,13 @@ class FloatVideoGenerator:
         fps: float = TARGET_FPS,
         sample_rate: int = SAMPLE_RATE,
         semaphore: asyncio.Semaphore | None = None,
+        first_chunk_sec: float = 1.0,
+        idle_flush_sec: float | None = 0.25,
+        max_queue_frames: int = 128,
+        executor: ThreadPoolExecutor | None = None,
     ) -> None:
         self.agent = agent
         self.image_path = image_path
-        # The inference task is scheduled on a *running* loop: without one the
-        # task would be created on a loop that never runs and audio pushes
-        # would silently produce zero frames. Fail loudly instead.
         self.loop = loop or asyncio.get_running_loop()
         self.width = width
         self.height = height
@@ -129,126 +139,236 @@ class FloatVideoGenerator:
         self.sample_rate = sample_rate
         self.semaphore = semaphore
 
+        # Start a segment after `first_chunk_sec` of audio instead of waiting for a full 2 s.
+        self._first_chunk_samples = int(sample_rate * min(first_chunk_sec, MIN_AUDIO_SAMPLES / sample_rate))
+        self.idle_flush_sec = idle_flush_sec
+
+        # One dedicated worker: serialises GPU work and doesn't compete with the
+        # default executor (DNS, file I/O, ...) used by the rest of the agent.
+        self._owns_executor = executor is None
+        self._executor = executor or ThreadPoolExecutor(max_workers=1, thread_name_prefix="float-infer")
+
         self._audio_pcm = bytearray()
-        self._frame_queue: asyncio.Queue = asyncio.Queue(maxsize=128)
+        self._frame_queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue_frames)
         self._stopped = False
         self._inference_running = False
+        self._segment_started = False
+        self._flush_requested = False
+        self._gen = 0  # bumped by clear_buffer(); stale work is dropped
+        self._idle_handle: asyncio.TimerHandle | None = None
         self._frame_count = 0
         self._first_frame_emitted = False
+        self._dropped_frames = 0
         self._bg_tasks: set[asyncio.Task[Any]] = set()
         self.on_first_frame: Any | None = None
+        self.last_chunk_rtf: float | None = None  # inference_time / audio_time; must stay < 1
+
+    # ------------------------------------------------------------------ input
+
+    def _to_pcm16_mono(self, audio: Any) -> bytes:
+        if RTC_AVAILABLE and isinstance(audio, rtc.AudioFrame):
+            samples = np.frombuffer(audio.data, dtype=np.int16)
+            ch, sr = audio.num_channels, audio.sample_rate
+            if ch > 1:
+                samples = samples.reshape(-1, ch).mean(axis=1)
+            if sr != self.sample_rate:
+                samples = self._resample(samples.astype(np.float32), sr)
+            return np.asarray(samples).astype(np.int16).tobytes()
+        if isinstance(audio, (bytes, bytearray, memoryview)):
+            return bytes(audio)
+        if isinstance(audio, np.ndarray):
+            if audio.dtype in (np.float32, np.float64):
+                return (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+            return audio.astype(np.int16).tobytes()
+        raise TypeError(f"Unsupported audio type: {type(audio)}")
+
+    def _resample(self, x: np.ndarray, src_sr: int) -> np.ndarray:
+        # Cheap path. Integer ratios (48k/24k -> 16k) use box-filter decimation,
+        # which also low-passes; otherwise fall back to linear interpolation.
+        if src_sr % self.sample_rate == 0:
+            r = src_sr // self.sample_rate
+            n = len(x) // r * r
+            return x[:n].reshape(-1, r).mean(axis=1)
+        n_out = int(len(x) * self.sample_rate / src_sr)
+        return np.interp(np.linspace(0, len(x) - 1, n_out), np.arange(len(x)), x)
 
     def push_audio(self, audio: Any) -> None:
-        """Accumulate incoming audio (rtc.AudioFrame, raw bytes, or numpy array)."""
+        """Call from the event-loop thread."""
         if self._stopped:
             return
+        self._audio_pcm.extend(self._to_pcm16_mono(audio))
+        self._pump()
+        self._arm_idle_flush()
 
-        if RTC_AVAILABLE and isinstance(audio, rtc.AudioFrame):
-            data = bytes(audio.data)
-        elif isinstance(audio, (bytes, bytearray, memoryview)):
-            data = bytes(audio)
-        elif isinstance(audio, np.ndarray):
-            if audio.dtype in (np.float32, np.float64):
-                data = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-            else:
-                data = audio.astype(np.int16).tobytes()
-        else:
-            raise TypeError(f"Unsupported audio type: {type(audio)}")
+    def _arm_idle_flush(self) -> None:
+        if self.idle_flush_sec is None:
+            return
+        if self._idle_handle:
+            self._idle_handle.cancel()
+        self._idle_handle = self.loop.call_later(self.idle_flush_sec, self.flush)
 
-        self._audio_pcm.extend(data)
+    # ------------------------------------------------------------- scheduling
 
-        # Trigger chunk inference if we have >= 2.0 s of audio
-        total_samples = len(self._audio_pcm) // 2
-        if total_samples >= MIN_AUDIO_SAMPLES and not self._inference_running:
-            self._schedule_chunk()
-
-    def _schedule_chunk(self) -> None:
+    def _pump(self) -> None:
+        """Start the next chunk if there is enough audio (or a flush is pending)."""
         if self._stopped or self._inference_running:
             return
-        self._inference_running = True
-        chunk_bytes = bytes(self._audio_pcm[: MIN_AUDIO_SAMPLES * 2])
-        del self._audio_pcm[: MIN_AUDIO_SAMPLES * 2]
+        n = len(self._audio_pcm) // 2
+        if n == 0:
+            self._flush_requested = False
+            self._segment_started = False
+            return
+        need = MIN_AUDIO_SAMPLES if self._segment_started else self._first_chunk_samples
+        if n >= need or self._flush_requested:
+            self._launch_chunk()
 
-        task = self.loop.create_task(self._run_chunk_inference(chunk_bytes))
+    def _launch_chunk(self) -> None:
+        self._inference_running = True
+        self._segment_started = True
+
+        take = min(len(self._audio_pcm), MIN_AUDIO_SAMPLES * 2)
+        pcm = bytes(self._audio_pcm[:take])
+        del self._audio_pcm[:take]
+        valid_samples = take // 2
+        pcm += bytes(MIN_AUDIO_SAMPLES * 2 - len(pcm))  # FLOAT wants exactly 2 s
+
+        if not self._audio_pcm and self._flush_requested:  # tail consumed: segment over
+            self._flush_requested = False
+            self._segment_started = False
+
+        task = self.loop.create_task(self._run_chunk_inference(pcm, valid_samples, self._gen))
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
 
-    async def _run_chunk_inference(self, pcm_bytes: bytes) -> None:
-        """Run FLOAT inference in a background thread and deliver frames."""
+    def flush(self) -> None:
+        """Generate whatever audio is buffered (end of utterance / idle). Also fine to
+        call from an AudioSegmentEnd handler."""
+        self._idle_handle = None
+        if self._audio_pcm:
+            self._flush_requested = True
+            self._pump()  # if inference is running, _run_chunk_inference's finally picks it up
+
+    def clear_buffer(self) -> None:
+        """Barge-in / interrupt: drop buffered audio, queued frames and in-flight inference."""
+        self._gen += 1
+        self._audio_pcm.clear()
+        self._flush_requested = False
+        self._segment_started = False
+        if self._idle_handle:
+            self._idle_handle.cancel()
+            self._idle_handle = None
+        while True:
+            try:
+                self._frame_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    # -------------------------------------------------------------- inference
+
+    def _push(self, gen: int, item: tuple) -> None:
+        """Loop thread. Drops *stale* frames; on overflow drops the OLDEST pair so we
+        stay near live instead of playing old frames late."""
+        if gen != self._gen or self._stopped:
+            return
+        if self._frame_queue.full():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._frame_queue.get_nowait()
+            self._dropped_frames += 1
+            if self._dropped_frames % 25 == 1:
+                logger.warning(f"[livekit-gen] consumer behind; dropped {self._dropped_frames} frames total")
+        self._frame_queue.put_nowait(item)
+
+    def _write_wav(self, pcm: bytes) -> str:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=_TMP_DIR) as f:
+            path = f.name
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(self.sample_rate)
+            w.writeframes(pcm)
+        return path
+
+    async def _run_chunk_inference(self, pcm: bytes, valid_samples: int, gen: int) -> None:
+        wav_path = None
         try:
+            wav_path = self._write_wav(pcm)  # before the semaphore: don't hold the GPU slot for I/O
             if self.semaphore:
                 await self.semaphore.acquire()
             try:
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_audio:
-                    tmp_audio_path = tmp_audio.name
-                    import wave
+                if gen != self._gen:
+                    return
+                t0 = time.perf_counter()
+                if self.agent is not None and self.image_path:
+                    from fast_float.core.service import run_inference_blocking
 
-                    with wave.open(tmp_audio_path, "wb") as wav_file:
-                        wav_file.setnchannels(1)
-                        wav_file.setsampwidth(2)
-                        wav_file.setframerate(self.sample_rate)
-                        wav_file.writeframes(pcm_bytes)
+                    bridge = _LiveKitDispatcherBridge(
+                        self.loop, self._push, pcm, valid_samples, gen, lambda g: g == self._gen and not self._stopped
+                    )
+                    req_data = {
+                        "a_cfg_scale": 2.0,
+                        "r_cfg_scale": 1.0,
+                        "e_cfg_scale": 1.0,
+                        "emotion": "S2E",
+                        "nfe": 10,
+                        "no_crop": False,
+                        "seed": 25,
+                    }
+                    await self.loop.run_in_executor(
+                        self._executor,
+                        run_inference_blocking,
+                        self.agent,
+                        None,
+                        self.image_path,
+                        wav_path,
+                        req_data,
+                        bridge,
+                    )
+                else:  # test pattern, one frame per 40 ms of real audio
+                    n_frames = -(-valid_samples // SAMPLES_PER_FRAME)
+                    for i in range(n_frames):
+                        pattern = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+                        pattern[:, :, 0] = (i * 5) % 255
+                        pattern[:, :, 1] = 120
+                        pattern[:, :, 2] = 180
+                        s = i * BYTES_PER_FRAME
+                        audio = pcm[s : s + BYTES_PER_FRAME].ljust(BYTES_PER_FRAME, b"\0")
+                        self._push(gen, (i, pattern, i * 1000.0 / self.fps, audio))
 
-                try:
-                    bridge = _LiveKitDispatcherBridge(self._frame_queue, self.loop, pcm_bytes)
-                    if self.agent is not None and self.image_path:
-                        from fast_float.core.service import run_inference_blocking
-
-                        req_data = {
-                            "a_cfg_scale": 2.0,
-                            "r_cfg_scale": 1.0,
-                            "e_cfg_scale": 1.0,
-                            "emotion": "S2E",
-                            "nfe": 10,
-                            "no_crop": False,
-                            "seed": 25,
-                        }
-                        await self.loop.run_in_executor(
-                            None,
-                            run_inference_blocking,
-                            self.agent,
-                            None,
-                            self.image_path,
-                            tmp_audio_path,
-                            req_data,
-                            bridge,
-                        )
-                    else:
-                        # Fallback test pattern: 50 frames, no audio attached
-                        for i in range(50):
-                            pts_ms = (self._frame_count + i) * (1000.0 / self.fps)
-                            pattern = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-                            pattern[:, :, 0] = (i * 5) % 255
-                            pattern[:, :, 1] = 120
-                            pattern[:, :, 2] = 180
-                            await self._frame_queue.put((self._frame_count + i, pattern, pts_ms, None))
-                finally:
-                    if os.path.exists(tmp_audio_path):
-                        with contextlib.suppress(OSError):
-                            os.remove(tmp_audio_path)
+                audio_s = valid_samples / self.sample_rate
+                self.last_chunk_rtf = (time.perf_counter() - t0) / audio_s
+                if self.last_chunk_rtf >= 1.0:
+                    logger.warning(
+                        f"[livekit-gen] slower than real time: RTF={self.last_chunk_rtf:.2f} "
+                        f"(consider lower nfe / smaller chunks)"
+                    )
             finally:
                 if self.semaphore:
                     self.semaphore.release()
+        except _Cancelled:
+            logger.debug("[livekit-gen] chunk cancelled")
         except Exception as exc:
             logger.warning(f"[livekit-gen] inference error: {exc}")
         finally:
+            if wav_path:
+                with contextlib.suppress(OSError):
+                    os.remove(wav_path)
             self._inference_running = False
-            if len(self._audio_pcm) // 2 >= MIN_AUDIO_SAMPLES:
-                self._schedule_chunk()
+            self._pump()  # next full chunk, or a flush that arrived while we were busy
 
-    def flush(self) -> None:
-        """Trigger generation on remaining audio in buffer."""
-        if len(self._audio_pcm) > 0 and not self._inference_running:
-            remaining_samples = len(self._audio_pcm) // 2
-            if remaining_samples < MIN_AUDIO_SAMPLES:
-                padding = bytes(MIN_AUDIO_SAMPLES * 2 - len(self._audio_pcm))
-                self._audio_pcm.extend(padding)
-            self._schedule_chunk()
+    # ----------------------------------------------------------------- output
 
     def stop(self) -> None:
         self._stopped = True
-        with contextlib.suppress(asyncio.QueueFull):
-            self._frame_queue.put_nowait(_QUEUE_SENTINEL)
+        self._gen += 1
+        if self._idle_handle:
+            self._idle_handle.cancel()
+        if self._owns_executor:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        # make room for the sentinel so the consumer always wakes up
+        while self._frame_queue.full():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._frame_queue.get_nowait()
+        self._frame_queue.put_nowait(_QUEUE_SENTINEL)
 
     async def __aiter__(self) -> AsyncIterator[Any]:
         while True:
@@ -274,14 +394,14 @@ class FloatVideoGenerator:
                 h, w, c = frame_array.shape
                 if c == 4:
                     frame_array = frame_array[:, :, :3]
-                data = np.ascontiguousarray(frame_array).tobytes()
-                video_frame = rtc.VideoFrame(w, h, rtc.VideoBufferType.RGB24, data)
-
-                audio_frame = None
+                video_frame = rtc.VideoFrame(
+                    w, h, rtc.VideoBufferType.RGB24, np.ascontiguousarray(frame_array).tobytes()
+                )
                 if audio_data:
                     audio_frame = rtc.AudioFrame(audio_data, self.sample_rate, 1, SAMPLES_PER_FRAME)
-
-                yield (video_frame, audio_frame) if audio_frame else video_frame
+                    yield (video_frame, audio_frame)
+                else:
+                    yield video_frame
             else:
                 yield (idx, frame_array, pts_ms)
 
