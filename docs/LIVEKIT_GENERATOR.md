@@ -137,11 +137,21 @@ BYTES_PER_FRAME     = 1_280        # 640 * int16
 MIN_AUDIO_SAMPLES   = 32_000       # 2 s
 ```
 
-`_LiveKitDispatcherBridge` walks the chunk's PCM with a cursor:
+`_LiveKitDispatcherBridge` derives each frame's audio position from its frame
+index:
 
-- a frame is emitted only while `cursor < valid_samples`;
+```
+start_sample = (idx - first_idx) * SAMPLES_PER_FRAME
+```
+
+- a frame is emitted only while `start_sample < valid_samples`;
 - the last partial frame is zero-padded with silence;
 - frames that would cover only the padded tail of the 2 s window are dropped.
+
+Because the position comes from the frame index, a frame dropped by the
+dispatcher ahead of the bridge (a `gap`) does not shift every later frame's
+audio. The dropped frame's 40 ms slice is skipped with it, so A/V remain
+aligned instead of replaying old audio against new video.
 
 Example: a 1.3 s chunk is padded to 2 s for inference, but emits
 `ceil(1.3 / 0.04) = 33` frames, not 50. The first 32 frames carry real audio;
@@ -160,8 +170,9 @@ generator.clear_buffer()
 - increments the internal generation counter;
 - clears buffered PCM and every queued frame;
 - marks in-flight inference stale: the next `dispatch()` raises the internal
-  `_Cancelled` exception, and the worker thread stops producing frames nobody
-  will hear;
+  `_Cancelled` exception. The bridge sets `abort_on_error`, so the dispatcher
+  signals the pipeline's stop event and generation aborts instead of running
+  to completion for audio nobody will hear;
 - leaves the generator running and ready for the next utterance.
 
 An in-flight GPU call is not killed mid-kernel; it stops at the next frame
@@ -199,8 +210,14 @@ and RPC cleanup. A stopped generator is not restarted; create a new one.
   semaphore, so file I/O does not hold the GPU slot.
 - Temp WAVs go to `/dev/shm` when available (no disk I/O per chunk), otherwise
   the system temp directory. They are deleted after each chunk.
-- `FrameDispatcher.dispatch()` runs on the worker thread; results cross back
-  to asyncio through `loop.call_soon_threadsafe`.
+- `FrameDispatcher.dispatch()` runs on the dispatcher's dedicated delivery
+  thread; results cross back to asyncio through `loop.call_soon_threadsafe`.
+- Each chunk's bridge is shut down when inference returns, so the delivery
+  thread does not leak for the lifetime of the session.
+- The bridge disables the dispatcher's lag-drop policy (`max_lag_ms = 0`) and
+  allows a full 2 s burst (`max_queue_frames = 128`). The generator's own
+  bounded queue is the single backpressure point; otherwise the dispatcher
+  could discard half of a 50-frame burst before delivery.
 - An optional `semaphore` lets the whole application share one GPU slot with
   the HTTP `/generate` path. Passing an `executor` transfers ownership to the
   caller: `stop()` will **not** shut it down.
@@ -341,11 +358,16 @@ constructor parameters. Private internals changed:
 - `_LiveKitDispatcherBridge` no longer takes `(queue, loop, audio_pcm)`. It now
   takes `(loop, push, audio_pcm, valid_samples, gen, is_current)`.
 - `_LiveKitDispatcherBridge.close()` is a **no-op**. The generator owns the
-  stream sentinel; a per-chunk `close()` must not end the stream.
+  stream sentinel; a per-chunk `close()` must not end the stream. The bridge is
+  still explicitly `shutdown()` after each chunk to stop its delivery thread.
 - Emitted items always carry an audio slice when audio exists; the consumer
   receives `(video_frame, audio_frame)` tuples rather than video-only frames.
-- `FrameDispatcher.dispatch()` can raise `_Cancelled` on stale work. Inference
-  callers that catch broad exceptions should not treat it as an error.
+- `FrameDispatcher.dispatch()` can raise `_Cancelled` on stale work. The bridge
+  sets `abort_on_error`, so the dispatcher's error path trips the pipeline's
+  stop event. `_Cancelled` is logged at debug level, not as an error.
+- Audio position is computed from the frame index, not a running sample
+  counter. This keeps later frames aligned after a dispatcher-level gap and
+  avoids colliding with `FrameDispatcher`'s private frame cursor.
 - A dedicated inference executor replaces the default executor.
 
 ---
@@ -362,8 +384,10 @@ The targeted suite:
   tests/test_webrtc_trickle.py -q
 ```
 
-Current result: **39 passed** (14 token, 13 worker/generator, 9 STUN,
-3 trickle-ICE).
+Current result: **43 passed** (14 token, 17 worker/generator, 9 STUN,
+3 trickle-ICE). The generator tests cover the frame-index audio pairing, a
+dispatcher gap, per-chunk dispatcher shutdown, and cancellation aborting the
+pipeline.
 
 The generator was also exercised against a real LiveKit Cloud room: a
 `FloatVideoGenerator` in test-pattern mode was published through `AvatarRunner`

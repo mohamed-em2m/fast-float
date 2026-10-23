@@ -38,6 +38,7 @@ except ImportError:  # pragma: no cover
 
 from fast_float.streaming.dispatcher import FrameDispatcher
 from fast_float.streaming.live import CLOSE, LiveStream
+from fast_float.streaming.types import StreamMeta
 
 logger = logging.getLogger(__name__)
 
@@ -54,22 +55,34 @@ _QUEUE_SENTINEL = object()
 
 
 # Scratch dir for the temp WAVs: RAM-backed when available, so no disk I/O per chunk.
-_TMP_DIR = "/dev/shm" if os.path.isdir("/dev/shm") else None
+_TMP_DIR = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
 
 
 class _Cancelled(Exception):
-    """Raised inside the inference thread when the chunk's generation is stale."""
+    """Raised on the dispatch thread when the chunk's generation is stale."""
 
 
 class _LiveKitDispatcherBridge(FrameDispatcher):
-    """Runs on the inference thread. Pairs each frame with its own 40 ms audio slice.
+    """Runs on the dispatcher delivery thread. Pairs each frame with its own 40 ms audio slice.
 
     Real-time changes vs. the old version:
       * `valid_samples`: the chunk is zero-padded to 2 s, but only frames that
         cover real audio are emitted (no dead silent frames at the tail).
       * `is_current(gen)`: after clear_buffer()/stop(), the next dispatch raises
-        _Cancelled so the GPU stops working on audio nobody will hear.
+        _Cancelled so the pipeline's stop event aborts the chunk.
+      * The audio position comes from the frame index, so frames dropped by the
+        dispatcher (a ``gap``) do not shift every later frame's audio.
     """
+
+    # A stale/cancelled chunk must stop the inference pipeline, not keep
+    # generating frames nobody will hear.
+    abort_on_error = True
+    # A 2 s chunk is submitted as bursts of up to 50 frames. The default
+    # FrameDispatcher live policy (50 frames / 1000 ms lag) drops the oldest
+    # half of such a burst before the delivery thread can drain it, so disable
+    # lag drops and let the generator's own bounded queue handle backpressure.
+    max_queue_frames = 128
+    max_lag_ms = 0.0
 
     def __init__(
         self,
@@ -87,7 +100,14 @@ class _LiveKitDispatcherBridge(FrameDispatcher):
         self._valid_samples = valid_samples
         self._gen = gen
         self._is_current = is_current
-        self._cursor = 0  # in samples; only touched from the inference thread
+        self._first_idx = 0
+        self._fps = TARGET_FPS
+
+    def open(self, meta: StreamMeta) -> None:
+        # ``idx`` is relative to the stream's first frame; each chunk has its
+        # own dispatcher, so the audio chunk starts at the stream's first frame.
+        self._first_idx = int(meta.first_idx)
+        self._fps = float(meta.fps or TARGET_FPS)
 
     def dispatch(self, idx: int, frames: np.ndarray, pts_ms: float) -> None:
         if self._loop.is_closed():
@@ -96,16 +116,29 @@ class _LiveKitDispatcherBridge(FrameDispatcher):
             raise _Cancelled
         if frames.ndim == 3:
             frames = frames[None]
+        first = int(idx) - self._first_idx
+        frame_ms = 1000.0 / self._fps
         for i in range(len(frames)):
-            if self._cursor >= self._valid_samples:
+            frame_idx = first + i
+            if frame_idx < 0:
+                continue
+            start_sample = frame_idx * SAMPLES_PER_FRAME
+            if start_sample >= self._valid_samples:
                 return  # padded tail: drop
-            s = self._cursor * 2
+            s = start_sample * 2
             audio = self._audio_pcm[s : s + BYTES_PER_FRAME]
             if len(audio) < BYTES_PER_FRAME:
                 audio = audio + bytes(BYTES_PER_FRAME - len(audio))
-            self._cursor += SAMPLES_PER_FRAME
-            item = (idx + i, frames[i], pts_ms + i * (1000.0 / TARGET_FPS), audio)
+            item = (frame_idx, frames[i], pts_ms + i * frame_ms, audio)
             self._loop.call_soon_threadsafe(self._push, self._gen, item)
+
+    def error(self, exc: BaseException) -> None:
+        # FrameDispatcher reports a dispatch exception through error(); a stale
+        # chunk is a normal barge-in, not an error.
+        if isinstance(exc, _Cancelled):
+            logger.debug("[livekit-gen] chunk cancelled")
+            return
+        super().error(exc)
 
     def close(self) -> None:
         pass  # the generator owns the sentinel; a per-chunk close must not end the stream
@@ -201,10 +234,11 @@ class FloatVideoGenerator:
         self._arm_idle_flush()
 
     def _arm_idle_flush(self) -> None:
-        if self.idle_flush_sec is None:
-            return
         if self._idle_handle:
             self._idle_handle.cancel()
+            self._idle_handle = None
+        if self.idle_flush_sec is None:
+            return
         self._idle_handle = self.loop.call_later(self.idle_flush_sec, self.flush)
 
     # ------------------------------------------------------------- scheduling
@@ -226,7 +260,10 @@ class FloatVideoGenerator:
         self._inference_running = True
         self._segment_started = True
 
-        take = min(len(self._audio_pcm), MIN_AUDIO_SAMPLES * 2)
+        take = min(len(self._audio_pcm), MIN_AUDIO_SAMPLES * 2) & ~1  # whole int16 samples only
+        if take <= 0:
+            self._inference_running = False
+            return
         pcm = bytes(self._audio_pcm[:take])
         del self._audio_pcm[:take]
         valid_samples = take // 2
@@ -243,7 +280,11 @@ class FloatVideoGenerator:
     def flush(self) -> None:
         """Generate whatever audio is buffered (end of utterance / idle). Also fine to
         call from an AudioSegmentEnd handler."""
-        self._idle_handle = None
+        # Also cancels a still-pending idle timer: an explicit flush replaces it,
+        # otherwise the old timer could fire into the next utterance's audio.
+        if self._idle_handle:
+            self._idle_handle.cancel()
+            self._idle_handle = None
         if self._audio_pcm:
             self._flush_requested = True
             self._pump()  # if inference is running, _run_chunk_inference's finally picks it up
@@ -281,11 +322,16 @@ class FloatVideoGenerator:
     def _write_wav(self, pcm: bytes) -> str:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=_TMP_DIR) as f:
             path = f.name
-        with wave.open(path, "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(self.sample_rate)
-            w.writeframes(pcm)
+        try:
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(self.sample_rate)
+                w.writeframes(pcm)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.remove(path)
+            raise
         return path
 
     async def _run_chunk_inference(self, pcm: bytes, valid_samples: int, gen: int) -> None:
@@ -313,16 +359,25 @@ class FloatVideoGenerator:
                         "no_crop": False,
                         "seed": 25,
                     }
-                    await self.loop.run_in_executor(
-                        self._executor,
-                        run_inference_blocking,
-                        self.agent,
-                        None,
-                        self.image_path,
-                        wav_path,
-                        req_data,
-                        bridge,
-                    )
+
+                    def _infer_and_close() -> str:
+                        # The bridge owns a dispatcher delivery thread (started by
+                        # bind() inside run_inference). It must be shut down per
+                        # chunk or every chunk leaks a thread for the whole session.
+                        try:
+                            return run_inference_blocking(
+                                self.agent,
+                                None,
+                                self.image_path,
+                                wav_path,
+                                req_data,
+                                bridge,
+                            )
+                        finally:
+                            with contextlib.suppress(Exception):
+                                bridge.shutdown()
+
+                    await self.loop.run_in_executor(self._executor, _infer_and_close)
                 else:  # test pattern, one frame per 40 ms of real audio
                     n_frames = -(-valid_samples // SAMPLES_PER_FRAME)
                     for i in range(n_frames):
@@ -334,6 +389,8 @@ class FloatVideoGenerator:
                         audio = pcm[s : s + BYTES_PER_FRAME].ljust(BYTES_PER_FRAME, b"\0")
                         self._push(gen, (i, pattern, i * 1000.0 / self.fps, audio))
 
+                if gen != self._gen:  # barge-in/stop: the chunk was discarded
+                    return
                 audio_s = valid_samples / self.sample_rate
                 self.last_chunk_rtf = (time.perf_counter() - t0) / audio_s
                 if self.last_chunk_rtf >= 1.0:
@@ -358,10 +415,13 @@ class FloatVideoGenerator:
     # ----------------------------------------------------------------- output
 
     def stop(self) -> None:
+        if self._stopped:
+            return
         self._stopped = True
         self._gen += 1
         if self._idle_handle:
             self._idle_handle.cancel()
+            self._idle_handle = None
         if self._owns_executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
         # make room for the sentinel so the consumer always wakes up

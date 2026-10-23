@@ -364,7 +364,7 @@ The plan is fully implemented and tested across backend and frontend:
 
 - **Automated Verification**:
   - `tests/test_livekit_tokens.py`: 14 tests covering settings, grants and endpoints.
-  - `tests/test_livekit_worker.py`: 13 tests covering the generator, worker, synchronizer, agent, media-file playback and publish endpoints.
+  - `tests/test_livekit_worker.py`: 17 tests covering the generator, worker, synchronizer, agent, media-file playback and publish endpoints.
   - `tests/test_stun.py`: 9 tests for the built-in STUN responder and static/secret-based TURN credentials.
   - `tests/test_webrtc_trickle.py`: 3 tests for trickle ICE and graceful degradation.
-  - All 39 tests passing cleanly.
+  - All 43 tests passing cleanly.

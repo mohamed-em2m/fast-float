@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
@@ -14,9 +15,11 @@ from fastapi.testclient import TestClient
 from fast_float.core.state import app_state
 from fast_float.livekit.agent import ConversationalAgent
 from fast_float.livekit.generator import (
+    BYTES_PER_FRAME,
     FloatVideoGenerator,
     LiveStreamVideoGenerator,
     MediaFileVideoGenerator,
+    _LiveKitDispatcherBridge,
 )
 from fast_float.livekit.worker import (
     AvatarOptions,
@@ -79,6 +82,116 @@ def test_float_video_generator_accumulates_and_yields():
             else:
                 assert isinstance(first, rtc.VideoFrame)
                 assert first.width == 512
+
+    asyncio.run(_test())
+
+
+def test_generator_bridge_keeps_dispatcher_cursor_and_audio_position():
+    async def _test():
+        loop = asyncio.get_running_loop()
+        pcm = np.arange(32000, dtype=np.int16).tobytes()
+        pushed = []
+        bridge = _LiveKitDispatcherBridge(loop, lambda gen, item: pushed.append(item), pcm, 32000, 0, lambda gen: True)
+        bridge.bind(StreamMeta(fps=25.0, width=8, height=8, channels=3))
+
+        frames = np.zeros((10, 8, 8, 3), dtype=np.uint8)
+        bridge.submit(frames)
+        await asyncio.sleep(0.1)
+        # idx=None must use the dispatcher's frame cursor (10), not the audio
+        # position; otherwise the next batch is submitted at a huge index and
+        # stalls until shutdown.
+        bridge.submit(frames)
+        await asyncio.to_thread(bridge.shutdown, 1.0)
+        await asyncio.sleep(0.05)
+
+        assert [item[0] for item in pushed] == list(range(20))
+        for item in pushed:
+            idx = item[0]
+            expected = pcm[idx * BYTES_PER_FRAME : (idx + 1) * BYTES_PER_FRAME]
+            assert item[3] == expected
+
+    asyncio.run(_test())
+
+
+def test_generator_bridge_pairs_audio_after_dispatcher_gap():
+    async def _test():
+        loop = asyncio.get_running_loop()
+        pcm = np.arange(32000, dtype=np.int16).tobytes()
+        pushed = []
+        bridge = _LiveKitDispatcherBridge(loop, lambda gen, item: pushed.append(item), pcm, 32000, 0, lambda gen: True)
+        bridge.bind(StreamMeta(fps=25.0, width=8, height=8, channels=3))
+
+        bridge.submit(np.zeros((2, 8, 8, 3), dtype=np.uint8))  # frames 0, 1
+        bridge.submit(np.zeros((2, 8, 8, 3), dtype=np.uint8), idx=10)  # frames 2-9 lost
+        await asyncio.to_thread(bridge.shutdown, 1.0)
+        await asyncio.sleep(0.05)
+
+        assert [item[0] for item in pushed] == [0, 1, 10, 11]
+        for item in pushed:
+            idx = item[0]
+            expected = pcm[idx * BYTES_PER_FRAME : (idx + 1) * BYTES_PER_FRAME]
+            assert item[3] == expected
+
+    asyncio.run(_test())
+
+
+def test_float_generator_shuts_down_bridge_per_chunk(monkeypatch):
+    async def _test():
+        loop = asyncio.get_running_loop()
+        captured = {}
+
+        def fake_inference(agent, video, image, wav_path, request, bridge):
+            captured["bridge"] = bridge
+            bridge.bind(StreamMeta(fps=25.0, width=8, height=8, channels=3))
+            bridge.submit(np.zeros((25, 8, 8, 3), dtype=np.uint8))
+            bridge.submit(np.zeros((25, 8, 8, 3), dtype=np.uint8))
+            return "ok"
+
+        monkeypatch.setattr("fast_float.core.service.run_inference_blocking", fake_inference)
+        gen = FloatVideoGenerator(agent=object(), image_path="fake.jpg", loop=loop, width=8, height=8)
+        gen.push_audio(np.zeros(32000, dtype=np.int16).tobytes())
+
+        for _ in range(200):
+            if captured.get("bridge") is not None and not gen._inference_running:
+                break
+            await asyncio.sleep(0.01)
+
+        bridge = captured["bridge"]
+        assert bridge._cursor == 50  # dispatcher frame cursor, not an audio cursor
+        assert bridge._thread is not None
+        assert not bridge._thread.is_alive()
+
+        gen.stop()
+        frames = [frame async for frame in gen]
+        assert len(frames) == 50
+
+    asyncio.run(_test())
+
+
+def test_generator_bridge_cancelled_aborts_dispatcher():
+    async def _test():
+        loop = asyncio.get_running_loop()
+        stop = threading.Event()
+        pushed = []
+        bridge = _LiveKitDispatcherBridge(
+            loop,
+            lambda gen, item: pushed.append(item),
+            np.zeros(32000, dtype=np.int16).tobytes(),
+            32000,
+            0,
+            lambda gen: False,
+        )
+        bridge.bind(StreamMeta(fps=25.0, width=8, height=8, channels=3), stop_event=stop)
+        bridge.submit(np.zeros((4, 8, 8, 3), dtype=np.uint8))
+
+        for _ in range(100):
+            if stop.is_set():
+                break
+            await asyncio.sleep(0.01)
+
+        assert stop.is_set()
+        assert pushed == []
+        await asyncio.to_thread(bridge.shutdown, 1.0)
 
     asyncio.run(_test())
 
