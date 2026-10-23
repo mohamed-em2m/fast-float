@@ -22,4 +22,9 @@ results/
 .mypy_cache
 .ruff_cache
 # Machine-local secrets (key material); settings.toml is committed.
-fast_float/config/secerts.toml
+# Covers the historical "secerts.toml" typo as well as the correct spelling.
+**/secerts*.toml
+**/secrets*.toml
+.env
+.env.*
+!.env.example

@@ -167,6 +167,41 @@ def test_conversational_agent_turn():
     asyncio.run(_test())
 
 
+def test_agent_registers_rpc_handlers_after_connect():
+    class FakeLocalParticipant:
+        def __init__(self):
+            self.methods = []
+
+        def register_rpc_method(self, name, handler):
+            self.methods.append(name)
+
+    class FakeRoom:
+        def __init__(self):
+            self.connected = False
+            self.local = FakeLocalParticipant()
+
+        @property
+        def local_participant(self):
+            # The RTC SDK raises this until the room is connected.
+            if not self.connected:
+                raise Exception("cannot access local participant before connecting")
+            return self.local
+
+        async def connect(self, url, token):
+            self.connected = True
+
+    room = FakeRoom()
+    agent = ConversationalAgent(room_name="room-test")
+    with (
+        patch("fast_float.livekit.agent.rtc.Room", return_value=room),
+        patch("fast_float.livekit.agent.issue_token", return_value=MagicMock(token="tok")),
+    ):
+        asyncio.run(agent.connect())
+
+    assert room.connected is True
+    assert room.local.methods == ["lk.playback_started", "lk.playback_finished"]
+
+
 def test_media_file_video_generator_lifecycle():
     gen = MediaFileVideoGenerator("dummy.mp4")
     assert gen.file_path == "dummy.mp4"

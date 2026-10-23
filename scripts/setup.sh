@@ -202,6 +202,13 @@ fi
 if ! uv pip install --python .venv/bin/python --no-deps "livekit==1.1.21"; then
     echo "Warning: livekit RTC SDK install failed -- LiveKit live-transport publishing will be unavailable."
 fi
+# `--no-deps` skips two *declared* deps: numpy>=2 (which would break onnx) and
+# aiofiles>=24 (gradio pins <24, and the RTC SDK never imports it). The real
+# runtime imports are protobuf + livekit-protocol; install them explicitly so
+# a partial/failed `livekit-api` sync cannot leave `import livekit.rtc` broken.
+if ! uv pip install --python .venv/bin/python "livekit-protocol>=1.1.27,<2" "protobuf>=5" "types-protobuf>=5"; then
+    echo "Warning: livekit runtime deps install failed -- check 'uv pip list | grep livekit'."
+fi
 if ! uv pip install --python .venv/bin/python "numpy==1.24.4"; then
     echo "Warning: numpy re-pin failed — check 'uv pip list | grep numpy'."
 fi

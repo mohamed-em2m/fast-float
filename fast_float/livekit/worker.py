@@ -17,13 +17,15 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+RTC_IMPORT_ERROR = ""
 try:
     from livekit import rtc
 
     RTC_AVAILABLE = True
-except ImportError:  # pragma: no cover
+except ImportError as exc:  # pragma: no cover - depends on the environment
     rtc = None  # type: ignore[assignment]
     RTC_AVAILABLE = False
+    RTC_IMPORT_ERROR = str(exc)
 
 from fast_float.livekit.generator import (
     FloatVideoGenerator,
@@ -35,6 +37,15 @@ from fast_float.livekit.tokens import issue_token
 from fast_float.streaming.live import LiveStream
 
 logger = logging.getLogger(__name__)
+
+if not RTC_AVAILABLE:
+    logger.warning(f"LiveKit RTC SDK unavailable: {RTC_IMPORT_ERROR}")
+
+
+def rtc_unavailable_message() -> str:
+    """Human-readable reason the RTC SDK could not be imported."""
+    base = "LiveKit RTC SDK is not installed; run the setup script to install the 'livekit' SDK."
+    return f"{base} ({RTC_IMPORT_ERROR})" if RTC_IMPORT_ERROR else base
 
 # Publisher registries. Double-publishing the same request into the same room
 # joins two participants with the *same* worker identity (deriving from

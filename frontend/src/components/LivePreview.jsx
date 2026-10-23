@@ -19,9 +19,9 @@ const STATUS_LABEL = {
  * transport === 'livekit' frames streamed via LiveKit SFU into <video>
  *
  * When the LiveKit SFU cannot be reached (not configured, dead cloud project,
- * blocked WebRTC/UDP) the studio automatically falls back to the pure
- * WebSocket transport — zero external services: `onFallback` switches the
- * transport to 'ws' upstream.
+ * blocked WebRTC/UDP) the studio first falls back to the raw WebRTC transport
+ * (signalled by this API host, ICE via its built-in STUN responder); only if
+ * that also fails does it degrade to the WebSocket transport.
  */
 export default function LivePreview({ requestId, transport, onStatus, onFallback }) {
   const canvasRef = useRef(null);
@@ -166,8 +166,12 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
       },
       (state) => {
         if (state === 'connected') report('live');
-        else if (state === 'failed') report('error');
-        else if (state === 'disconnected' || state === 'closed') report('done');
+        else if (state === 'failed') {
+          report('error');
+          // Raw WebRTC (main-server signalling + STUN) also failed; the
+          // parent may now use the WebSocket transport as the last resort.
+          if (onFallback) onFallback();
+        } else if (state === 'disconnected' || state === 'closed') report('done');
       },
       { live: true }
     )
@@ -181,6 +185,9 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
       .catch((err) => {
         report('error');
         onStatusRef.current?.(err.message);
+        // Negotiation itself failed (not just a dropped peer): let the parent
+        // degrade to the WebSocket transport.
+        if (onFallback) onFallback();
       });
 
     return () => {

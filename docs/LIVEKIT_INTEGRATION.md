@@ -250,6 +250,29 @@ curl -s -X POST localhost:8000/livekit/token -H 'content-type: application/json'
      -d '{"room": "float-demo"}'
 ```
 
+### ICE without a LiveKit/coturn dependency
+
+The API process runs a small RFC 5389 **STUN binding responder** on UDP 3478
+(`fast_float/utils/stun.py`, started in the FastAPI lifespan). Both sides of
+the raw WebRTC transport use it:
+
+- the browser gets `stun_urls` from `GET /livekit/status` and passes them to
+  the raw WebRTC `RTCPeerConnection` (the LiveKit client keeps the ICE/TURN
+  list its own SFU returns);
+- aiortc builds its `RTCConfiguration` from the same list, so it gathers a
+  public reflexive candidate instead of host candidates only.
+
+The advertised host is the one the browser used for the API (or an explicit
+`[webrtc].stun_host`); a loopback host is rewritten client-side to the API
+host. Configure `[webrtc].stun_enabled` / `stun_port`, or point `stun_urls`
+at an external coturn — an explicit list wins and disables the built-in
+responder. `run_all.sh` exports `WEBRTC_STUN_URLS` when it starts the
+compose `stun` profile.
+
+When LiveKit cannot be reached the Studio now falls back to this raw WebRTC
+transport first (main-server signalling + STUN); the WebSocket transport is
+only the last resort.
+
 ## 11. The transport decision still to settle: SDK publisher vs RTMP ingest
 
 The worker has to get H.264 (or raw frames) into the room, and there are two

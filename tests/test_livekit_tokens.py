@@ -174,6 +174,12 @@ def test_token_endpoint_rejects_a_bad_room(client):
 def test_token_endpoint_reports_an_unconfigured_server(monkeypatch):
     for name in ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"):
         monkeypatch.delenv(name, raising=False)
+    # secerts.toml may configure this machine; force the unconfigured branch
+    # instead of depending on the developer's local secret file.
+    monkeypatch.setattr(
+        "fast_float.routers.livekit.LiveKitSettings.from_env",
+        classmethod(lambda cls: LiveKitSettings()),
+    )
     app = FastAPI()
     app.include_router(livekit_router.router)
     with TestClient(app) as test_client:

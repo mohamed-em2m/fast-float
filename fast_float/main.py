@@ -11,12 +11,14 @@ import soundfile as sf
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# Ensure current directory and repository root are in sys.path
+# Only the repository root belongs on sys.path. Adding fast_float/ itself makes
+# its subpackages importable as top-level modules, which shadows real pip
+# packages: `fast_float/livekit` would be imported as `livekit` and break the
+# LiveKit RTC SDK (`from livekit import rtc`) with a circular import.
 CURRENT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CURRENT_DIR.parent
-for path in (str(CURRENT_DIR), str(REPO_ROOT)):
-    if path not in sys.path:
-        sys.path.insert(0, path)
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from fast_float.initialize_env import initialize_environment, initialize_onnx_lib_paths
 
@@ -32,6 +34,7 @@ from fast_float.core.service import (
     run_inference_blocking,
 )
 from fast_float.core.state import app_state
+from fast_float.livekit.settings import LiveKitSettings
 from fast_float.routers import api_router
 from fast_float.utils.gpu import print_gpu_status
 from fast_float.utils.logger import logger
@@ -40,6 +43,7 @@ from fast_float.utils.media import (
     TARGET_IMAGE_SIZE,
     ensure_default_image,
 )
+from fast_float.utils.stun import StunServer
 from fast_float.utils.video_optimizer import VideoSaveOptimizer
 
 # Keep strong references to fire-and-forget tasks so they are not garbage
@@ -178,6 +182,17 @@ async def lifespan(app: FastAPI):
     app_state.initialize_runtime()
     app_state.max_concurrent_requests = MAX_CONCURRENT_REQUESTS
 
+    # Built-in STUN responder for ICE gathering on the raw WebRTC transport.
+    # The API host itself is the STUN endpoint (instead of requiring LiveKit's
+    # coturn or a public Google server); an explicit [webrtc].stun_urls list
+    # disables it. Best effort: a busy UDP port never blocks startup.
+    stun_server: StunServer | None = None
+    ice_settings = LiveKitSettings.from_env()
+    if ice_settings.stun_enabled and not ice_settings.stun_urls:
+        stun_server = StunServer(port=ice_settings.stun_port)
+        if await stun_server.start():
+            app_state.stun_port = ice_settings.stun_port
+
     logger.info("=" * 70)
     logger.info("🚀 Starting FLOAT Fast API - NVENC Optimized v5.1.0")
     logger.info(f"⚡ Optimization: {OPTIMIZATION_MODE} | FP16: {USE_FP16}")
@@ -246,6 +261,10 @@ async def lifespan(app: FastAPI):
     # Shutdown logic
     logger.info("🛑 Shutting down server...")
     from fast_float.routers.webrtc import _cleanup_peer
+
+    if stun_server is not None:
+        await stun_server.stop()
+        app_state.stun_port = None
 
     for pc in list(app_state.pcs):
         try:

@@ -38,15 +38,36 @@ export NGPUS="${NGPUS:-1}"
 export PYTHONUNBUFFERED=1
 
 # --- LiveKit SFU (live-transport preview) -------------------------------------
-# The backend reads LIVEKIT_URL/KEY/SECRET (LiveKitSettings.from_env) and the
-# docker-compose.livekit.yml server uses the same keys as its tokens, so both
-# halves must agree: export one source of truth here. Defaults are the dev
-# credentials the compose file also falls back to.
-LIVEKIT_API_KEY="${LIVEKIT_API_KEY:-devkey}"
-LIVEKIT_API_SECRET="${LIVEKIT_API_SECRET:-secret}"
-LIVEKIT_URL="${LIVEKIT_URL:-ws://127.0.0.1:7880}"
-export LIVEKIT_API_KEY LIVEKIT_API_SECRET LIVEKIT_URL
+# The backend reads LIVEKIT_URL/KEY/SECRET (LiveKitSettings.from_env) from the
+# environment, then secerts.toml, then settings.toml. Do NOT export the local
+# dev defaults unconditionally: that used to override a configured LiveKit
+# Cloud deployment in settings.toml with ws://127.0.0.1:7880, so the browser
+# tried to join a local SFU that was never started ("LiveKit SFU failed").
 LIVEKIT_START="${LIVEKIT_START:-auto}"
+
+# The endpoint configured in the TOML files (env not exported yet). Uses the
+# project venv once it exists; empty when nothing is configured.
+livekit_configured_url() {
+    local py="${PROJECT_ROOT}/.venv/bin/python"
+    [ -x "${py}" ] || return 0
+    (
+        unset LIVEKIT_URL LIVEKIT_API_KEY LIVEKIT_API_SECRET
+        "${py}" - <<'PY' 2>/dev/null
+from fast_float.livekit.settings import LiveKitSettings
+
+settings = LiveKitSettings.from_env()
+print(settings.url if settings.configured else "")
+PY
+    ) || true
+}
+
+# Local SFU: only export dev credentials when we are actually starting the
+# compose container, so its keys and the backend's token keys agree.
+livekit_export_local_dev() {
+    export LIVEKIT_API_KEY="${LIVEKIT_API_KEY:-devkey}"
+    export LIVEKIT_API_SECRET="${LIVEKIT_API_SECRET:-secret}"
+    export LIVEKIT_URL="${LIVEKIT_URL:-ws://127.0.0.1:7880}"
+}
 
 livekit_server_start() {
     if ! command -v docker >/dev/null 2>&1; then
@@ -60,7 +81,9 @@ livekit_server_start() {
     if docker compose -f "${PROJECT_ROOT}/docker-compose.livekit.yml" up -d; then
         echo "🟢 LiveKit SFU running at ${LIVEKIT_URL} (left running; stop with:"
         echo "   docker compose -f docker-compose.livekit.yml down)"
-        # Optional pure STUN for the raw WebRTC transport (LIVEKIT_STUN=yes)
+        # Optional coturn STUN for the raw WebRTC transport (LIVEKIT_STUN=yes).
+        # The API also has a built-in responder; set [webrtc].stun_urls to use
+        # this container instead.
         if [ "${LIVEKIT_STUN:-no}" = "yes" ]; then
             docker compose -f "${PROJECT_ROOT}/docker-compose.livekit.yml" --profile stun up -d \
                 && echo "🟢 STUN server running on 3478 (set [webrtc].stun_urls in fast_float/config/settings.toml)"
@@ -69,9 +92,6 @@ livekit_server_start() {
         return 1
     fi
 }
-if [ "${LIVEKIT_START}" = "auto" ] || [ "${LIVEKIT_START}" = "yes" ]; then
-    livekit_server_start || { echo "LiveKit start failed — continuing without the live transport."; true; }
-fi
 
 # --- Prerequisites -----------------------------------------------------------
 command -v uv >/dev/null 2>&1 || { echo "❌ 'uv' not found on PATH. Run ./scripts/setup.sh first."; exit 1; }
@@ -83,12 +103,32 @@ if [ ! -x "${PROJECT_ROOT}/.venv/bin/python" ]; then
     echo "📦 .venv missing -> running the full setup first (scripts/setup.sh)..."
     bash "${SCRIPT_DIR}/setup.sh"
 fi
-# Top up the LiveKit RTC SDK when a fresh `uv sync` removed it again (it is
-# installed --no-deps on top of the lock, so uv sync can prune it silently).
-if ! uv run --frozen --no-sync python -c "import livekit.rtc" 2>/dev/null; then
-    echo "📦 LiveKit RTC SDK missing from the venv -> installing (--no-deps)..."
-    uv pip install --python .venv/bin/python --no-deps "livekit>=1.1" \
+# Top up the LiveKit stack when a fresh `uv sync` removed it again (the RTC
+# SDK is installed --no-deps on top of the lock, so uv sync can prune it, and
+# the token API belongs to an optional group that a plain sync skips).
+if ! uv run --frozen --no-sync python -c "import livekit.api, livekit.rtc" 2>/dev/null; then
+    echo "📦 LiveKit SDK missing from the venv -> installing..."
+    uv sync --group livekit --inexact \
+        || echo "⚠️ livekit-api install failed — LiveKit token minting will be unavailable."
+    uv pip install --python .venv/bin/python --no-deps "livekit==1.1.21" \
+        && uv pip install --python .venv/bin/python "livekit-protocol>=1.1.27,<2" "protobuf>=5" "types-protobuf>=5" \
         || echo "⚠️ livekit install failed — the live transport falls back to MP4."
+    # Keep the onnx/numpy pin intact: the RTC SDK metadata asks for numpy>=2.
+    uv pip install --python .venv/bin/python "numpy==1.24.4" >/dev/null 2>&1 || true
+fi
+
+# Resolve LiveKit only after setup/top-up, so the configured endpoint in
+# settings.toml can be read without falling back to the local dev defaults.
+if [ "${LIVEKIT_START}" = "yes" ]; then
+    livekit_export_local_dev
+    livekit_server_start || { echo "LiveKit start failed — continuing without the live transport."; true; }
+elif [ "${LIVEKIT_START}" = "auto" ]; then
+    if [ -n "${LIVEKIT_URL:-}" ] || [ -n "$(livekit_configured_url)" ]; then
+        echo "ℹ️  LiveKit endpoint already configured — not starting the local SFU container."
+    else
+        livekit_export_local_dev
+        livekit_server_start || { echo "LiveKit start failed — continuing without the live transport."; true; }
+    fi
 fi
 
 # Vite 8 / rolldown import `node:util`'s `styleText`, which only exists on Node

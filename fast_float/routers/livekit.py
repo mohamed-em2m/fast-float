@@ -10,16 +10,30 @@ import asyncio
 import os
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from fast_float.core.state import app_state
 from fast_float.livekit.session import get_session, start_session, stop_session
-from fast_float.livekit.settings import LiveKitSettings, valid_room_name
+from fast_float.livekit.settings import LiveKitSettings, host_only, valid_room_name
 from fast_float.livekit.tokens import LiveKitUnavailable, issue_token
-from fast_float.livekit.worker import RTC_AVAILABLE, spawn_live_publish_task, spawn_media_publish_task
+from fast_float.livekit.worker import (
+    RTC_AVAILABLE,
+    rtc_unavailable_message,
+    spawn_live_publish_task,
+    spawn_media_publish_task,
+)
 
 router = APIRouter(tags=["livekit"])
+
+
+def _request_host(request: Request) -> str | None:
+    """Public host the client used, preferring proxy headers over the socket."""
+    return (
+        host_only(request.headers.get("x-forwarded-host"))
+        or host_only(request.headers.get("host"))
+        or request.url.hostname
+    )
 
 
 class LiveKitTokenRequest(BaseModel):
@@ -58,23 +72,34 @@ class ConversationStopRequest(BaseModel):
 
 
 @router.get("/livekit/status")
-async def livekit_status() -> dict[str, Any]:
+async def livekit_status(request: Request) -> dict[str, Any]:
     """Whether LiveKit is configured, and with which settings (and from where).
 
     The frontend uses this to show or hide the LiveKit transport, to feed the
-    browser STUN servers, and to know when to fall back to the pure
-    WebSocket transport (``/ws/stream/{request_id}``, zero external services).
+    browser STUN servers, and to know when to fall back to the raw WebRTC
+    transport (``POST /offer``), which is signalled by this same API.
+
+    ``stun_urls`` prefers an explicit ``[webrtc].stun_urls`` list; otherwise it
+    advertises the API's own built-in STUN responder so ICE gathering does not
+    depend on LiveKit (or a public Google server). The URL host is the one the
+    client used to reach us, which is also the host its ICE candidates must
+    target.
     """
     settings = LiveKitSettings.from_env()
+    stun_urls = list(settings.resolved_stun_urls(_request_host(request)))
+    # Only advertise the built-in responder once its UDP socket actually bound.
+    if stun_urls and not settings.stun_urls and app_state.stun_port is None:
+        stun_urls = []
     return {
         "configured": settings.configured,
         "url": settings.url or None,
         "source": settings.source,
         "room_prefix": settings.room_prefix,
         "token_ttl_s": settings.token_ttl_s,
-        "stun_urls": list(settings.stun_urls),
-        # The WebSocket live transport exists regardless of LiveKit: it is the
-        # automatic fallback whenever the SFU cannot be reached.
+        "stun_urls": stun_urls,
+        "stun_port": app_state.stun_port,
+        # The WebSocket live transport still exists, but it is a last resort:
+        # the frontend falls back from LiveKit to raw WebRTC first.
         "ws_fallback": True,
     }
 
@@ -138,10 +163,7 @@ async def livekit_publish(request_id: str, request: LiveKitPublishRequest | None
     # The publish task runs the RTC SDK in this process; fail loudly here
     # instead of returning 200 "publishing" and failing silently in the task.
     if not RTC_AVAILABLE:
-        raise HTTPException(
-            status_code=503,
-            detail="LiveKit RTC SDK is not installed; run the setup script to install the 'livekit' SDK.",
-        )
+        raise HTTPException(status_code=503, detail=rtc_unavailable_message())
 
     # 1. In-flight LiveStream
     stream = app_state.live_streams.get(request_id)
@@ -169,10 +191,7 @@ def _conversation_guards() -> LiveKitSettings:
     if not settings.configured:
         raise HTTPException(status_code=503, detail="LiveKit is not configured")
     if not RTC_AVAILABLE:
-        raise HTTPException(
-            status_code=503,
-            detail="LiveKit RTC SDK is not installed; run the setup script to install the 'livekit' SDK.",
-        )
+        raise HTTPException(status_code=503, detail=rtc_unavailable_message())
     if app_state.agent is None:
         raise HTTPException(
             status_code=503,

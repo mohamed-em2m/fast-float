@@ -5,10 +5,11 @@ from contextlib import suppress
 from fractions import Fraction
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from fast_float.core.perf_metrics import FrameClock
 from fast_float.core.state import app_state
+from fast_float.livekit.settings import LiveKitSettings, host_only
 from fast_float.schemas.generation import WebRTCOfferRequest, WebRTCOfferResponse
 from fast_float.streaming.live import CLOSE
 from fast_float.utils.logger import logger
@@ -16,7 +17,7 @@ from fast_float.utils.logger import logger
 try:
     import av
     import numpy as np
-    from aiortc import RTCPeerConnection, RTCSessionDescription
+    from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
     from aiortc.contrib.media import MediaPlayer
     from aiortc.mediastreams import MediaStreamError, MediaStreamTrack
 
@@ -33,6 +34,40 @@ _players: dict[int, Any] = {}
 _live_subs: dict[int, Any] = {}
 
 LIVE_META_TIMEOUT_S = 30.0
+
+
+def _peer_configuration(http_request: Request | None) -> "RTCConfiguration | None":
+    """ICE config for aiortc: the API host's own STUN responder.
+
+    aiortc only gathers host candidates by default, which a browser on another
+    network cannot reach. Pointing it at the deployment's STUN endpoint lets it
+    discover the public reflexive candidate as well — no LiveKit/TURN needed.
+    An explicit ``[webrtc].stun_urls`` list overrides the built-in responder.
+    """
+    if not AIORTC_AVAILABLE:
+        return None
+    settings = LiveKitSettings.from_env()
+    if http_request is not None:
+        host = (
+            host_only(http_request.headers.get("x-forwarded-host"))
+            or host_only(http_request.headers.get("host"))
+            or http_request.url.hostname
+        )
+    else:
+        host = None
+    urls = settings.resolved_stun_urls(host)
+    # An empty list is deliberate: it stops aiortc from silently falling back
+    # to its built-in Google/Twilio STUN servers when this deployment disabled
+    # STUN. Host candidates still work on a LAN.
+    return RTCConfiguration(iceServers=[RTCIceServer(url) for url in urls])
+
+
+def _new_peer_connection(http_request: Request | None) -> "RTCPeerConnection":
+    configuration = _peer_configuration(http_request)
+    if configuration is None:
+        return RTCPeerConnection()
+    logger.debug(f"WebRTC ICE servers: {[server.urls for server in configuration.iceServers or []]}")
+    return RTCPeerConnection(configuration)
 
 
 if AIORTC_AVAILABLE:
@@ -119,7 +154,7 @@ def _cleanup_peer(pc) -> None:
     app_state.pcs.discard(pc)
 
 
-async def _live_offer(request: WebRTCOfferRequest) -> WebRTCOfferResponse:
+async def _live_offer(request: WebRTCOfferRequest, http_request: Request) -> WebRTCOfferResponse:
     """Attach the in-flight live stream (video + request audio) to a new peer."""
     if not request.stream_id:
         raise HTTPException(status_code=400, detail="live offers require a stream_id")
@@ -139,7 +174,7 @@ async def _live_offer(request: WebRTCOfferRequest) -> WebRTCOfferResponse:
             )
 
         offer = RTCSessionDescription(sdp=request.sdp, type=request.type)
-        pc = RTCPeerConnection()
+        pc = _new_peer_connection(http_request)
         app_state.pcs.add(pc)
         # Register the subscription before addTrack so any failure below is
         # cleaned up by _cleanup_peer (which unsubscribes it).
@@ -191,7 +226,7 @@ async def _live_offer(request: WebRTCOfferRequest) -> WebRTCOfferResponse:
 
 
 @router.post("/offer", response_model=WebRTCOfferResponse)
-async def webrtc_offer(request: WebRTCOfferRequest):
+async def webrtc_offer(request: WebRTCOfferRequest, http_request: Request):
     """Handle WebRTC SDP offer and establish peer connection for stream playback."""
     if not AIORTC_AVAILABLE:
         raise HTTPException(
@@ -200,7 +235,7 @@ async def webrtc_offer(request: WebRTCOfferRequest):
         )
 
     if request.live:
-        return await _live_offer(request)
+        return await _live_offer(request, http_request)
 
     if request.stream_id is not None and request.stream_id not in app_state.active_streams:
         raise HTTPException(
@@ -209,7 +244,7 @@ async def webrtc_offer(request: WebRTCOfferRequest):
         )
 
     offer = RTCSessionDescription(sdp=request.sdp, type=request.type)
-    pc = RTCPeerConnection()
+    pc = _new_peer_connection(http_request)
     app_state.pcs.add(pc)
 
     @pc.on("connectionstatechange")

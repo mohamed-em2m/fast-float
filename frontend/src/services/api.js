@@ -443,9 +443,35 @@ export async function generateVideo(payload) {
  */
 let serverIceServers = null;
 
+/**
+ * Rewrite a `stun:` URL whose host is loopback to the host the browser
+ * actually uses for the API. The backend advertises itself (e.g.
+ * `stun:localhost:3478`) but a remote browser cannot gather candidates from
+ * its own machine — and when the API sits behind the Vite/prod proxy the
+ * request Host header is often loopback. Explicit operator hosts (coturn,
+ * a public DNS name) are left untouched.
+ */
+function alignStunUrl(url) {
+  const value = String(url || '').trim();
+  const match = /^(stuns?):(\[[^\]]+\]|[^:]+)(?::(\d+))?/i.exec(value);
+  if (!match) return value;
+  const scheme = match[1].toLowerCase();
+  let host = match[2].replace(/^\[|\]$/g, '');
+  if (isLoopbackHost(host)) {
+    try {
+      const apiHost = new URL(currentApiUrl, window.location.origin).hostname;
+      if (apiHost && !isLoopbackHost(apiHost)) host = apiHost;
+    } catch {
+      /* keep the loopback host */
+    }
+  }
+  const port = match[3] ? `:${match[3]}` : '';
+  return `${scheme}:${host.includes(':') ? `[${host}]` : host}${port}`;
+}
+
 export function setIceServers(stunUrls) {
   if (Array.isArray(stunUrls) && stunUrls.length > 0) {
-    serverIceServers = stunUrls.map((urls) => ({ urls }));
+    serverIceServers = stunUrls.map((url) => ({ urls: alignStunUrl(url) }));
   } else {
     serverIceServers = null;
   }

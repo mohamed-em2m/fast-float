@@ -68,21 +68,29 @@ export default function StudioStage({
     return () => window.removeEventListener('float:api_url_changed', checkLiveKit);
   }, []);
 
-  // Automatic transport fallback: both LiveKit (WebRTC SFU) and the pure
-  // WebSocket (/ws/stream, zero external services) stay available side by
-  // side. When the SFU does not work — unconfigured, cloud down, WebRTC/UDP
-  // blocked — the Studio silently switches to WebSocket and keeps streaming.
+  // Automatic transport fallback: LiveKit is the primary SFU. When it is
+  // unconfigured or unreachable, switch to the raw WebRTC transport whose
+  // signalling and STUN live on this API host — not to the WebSocket
+  // transport, which is only the last resort (LiveKit → WebRTC → WebSocket).
   useEffect(() => {
     if (liveKitAvailable === false && transport === 'livekit') {
-      setTransport?.('ws');
-      if (onToast) onToast('LiveKit unavailable — switched to the WebSocket transport', 'error');
+      setTransport?.('webrtc');
+      if (onToast) onToast('LiveKit unavailable — switched to WebRTC via the main server', 'error');
     }
   }, [liveKitAvailable, transport, setTransport, onToast]);
 
-  const handleLiveKitFallback = useCallback(() => {
-    setTransport?.('ws');
-    if (onToast) onToast('LiveKit SFU failed — switched to the WebSocket transport', 'error');
-  }, [setTransport, onToast]);
+  const handleLiveFallback = useCallback(() => {
+    const next = transport === 'livekit' ? 'webrtc' : 'ws';
+    setTransport?.(next);
+    if (onToast) {
+      onToast(
+        next === 'webrtc'
+          ? 'LiveKit SFU failed — switched to WebRTC via the main server'
+          : 'WebRTC failed — switched to the WebSocket transport',
+        'error'
+      );
+    }
+  }, [transport, setTransport, onToast]);
 
   // Cycle progress stages smoothly during generation
   useEffect(() => {
@@ -347,7 +355,7 @@ export default function StudioStage({
             requestId={liveRequestId}
             transport={transport}
             onStatus={(message) => onToast?.(message || 'Live stream ended', 'error')}
-            onFallback={handleLiveKitFallback}
+            onFallback={handleLiveFallback}
           />
         ) : useLiveKit ? (
           <div className="webrtc-player-box">

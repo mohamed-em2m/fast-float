@@ -133,7 +133,9 @@ export async function connectLiveKitSession({
   const livekitUrl = alignLiveKitUrl(overrideUrl || tokenData.url);
   const token = tokenData.token;
 
-  // 2. Create LiveKit Room
+  // 2. Create LiveKit Room. LiveKit keeps the ICE/TURN list its own server
+  // hands back; the main-server STUN responder is used by the raw WebRTC
+  // fallback transport instead.
   const room = new Room({
     adaptiveStream: true,
     dynacast: true,

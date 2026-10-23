@@ -25,6 +25,9 @@ class AppState:
         self.public_backup_url: str | None = None
         self.pcs: set[Any] = set()
         self.active_streams: dict[str, str] = {}
+        # UDP port of the built-in STUN responder, or None when it is disabled
+        # or failed to bind (see fast_float/utils/stun.py).
+        self.stun_port: int | None = None
         # Live (in-flight) streams keyed by request id; consumed by the
         # WebSocket and WebRTC transports.
         self.live_streams: dict[str, Any] = {}

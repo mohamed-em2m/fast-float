@@ -80,17 +80,18 @@ class ConversationalAgent:
 
         self.room = rtc.Room()
 
-        # Register RPC handlers after room is created but before connecting,
-        # so events dispatched synchronously on connect are caught.
-        self._register_rpc_handlers()
-
         await self.room.connect(self.settings.url, token_result.token)
+        # `local_participant` only exists once the room is connected, so RPC
+        # handlers must be registered after connect (before the avatar worker
+        # can send its first playback callback).
+        self._register_rpc_handlers()
         logger.info(f"[agent] connected to {self.room_name} as {self.identity}")
 
     def _register_rpc_handlers(self) -> None:
         """Register lk.playback_started and lk.playback_finished RPC callbacks.
 
-        Must be called after ``self.room`` is instantiated (not before).
+        Must be called after ``self.room`` has connected: the RTC SDK does not
+        expose ``local_participant`` until then.
         """
         if self.room is None:
             raise RuntimeError("_register_rpc_handlers called before room was created")
