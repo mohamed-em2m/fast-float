@@ -190,13 +190,16 @@ if ! uv sync --group livekit --inexact; then
     echo "Warning: livekit-api install failed -- LiveKit token generation will be unavailable."
 fi
 # 2. The RTC SDK (livekit) — needed by the avatar worker / publisher tasks
-#    (fast_float/livekit/worker.py). Its wheel *declares* numpy>=2.0, but uv
-#    would then unpin the project's numpy==1.24.4 (needed by onnx<1.17).
-#    Verified at runtime: the SDK works correctly with numpy 1.24.4, and all
-#    of its real dependencies (protobuf, aiofiles, ...) are already in this
-#    venv — so install it WITHOUT its dependency resolution (--no-deps) and
-#    re-assert numpy afterwards to be safe against a drifted lock.
-if ! uv pip install --python .venv/bin/python --no-deps "livekit>=1.1"; then
+#    (fast_float/livekit/worker.py). Pinned to the version this transport was
+#    verified against (1.1.21): newer 1.x releases change the room-join token
+#    rules and reconnect/DTLS behaviour the worker relies on. Its wheel
+#    *declares* numpy>=2.0, but uv would then unpin the project's numpy==1.24.4
+#    (needed by onnx<1.17). Verified at runtime: the SDK works correctly with
+#    numpy 1.24.4, and all of its real dependencies (protobuf, aiofiles, ...)
+#    are already in this venv — so install it WITHOUT its dependency
+#    resolution (--no-deps) and re-assert numpy afterwards to be safe against a
+#    drifted lock.
+if ! uv pip install --python .venv/bin/python --no-deps "livekit==1.1.21"; then
     echo "Warning: livekit RTC SDK install failed -- LiveKit live-transport publishing will be unavailable."
 fi
 if ! uv pip install --python .venv/bin/python "numpy==1.24.4"; then
@@ -207,11 +210,19 @@ if uv run --frozen --no-sync python - <<'PY'
 from livekit import api as livekit_api
 from livekit import rtc
 
-token = livekit_api.AccessToken("probe-key", "probe-secret").with_grants(
+token = livekit_api.AccessToken(
+    "probe-key", "probe-secret-0123456789abcdef0123456789"
+).with_grants(
     livekit_api.VideoGrants(room_join=True, room="probe")
-).to_jwt()
+).with_identity("probe").to_jwt()
 import numpy  # noqa: F401
-print("  livekit-api ok, rtc ok, numpy", numpy.__version__, "- token minted (len", len(token), ")")
+from importlib.metadata import version
+print(
+    "  livekit-api", version("livekit-api"),
+    "ok, rtc", version("livekit"),
+    "ok, numpy", numpy.__version__,
+    "- token minted (len", len(token), ")",
+)
 PY
 then
     echo "LiveKit SDK installed."
