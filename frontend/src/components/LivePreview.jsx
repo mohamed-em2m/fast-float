@@ -17,8 +17,13 @@ const STATUS_LABEL = {
  * transport === 'ws'      raw frames over WebSocket, drawn to a canvas
  * transport === 'webrtc'  the same frames re-encoded by aiortc into <video>
  * transport === 'livekit' frames streamed via LiveKit SFU into <video>
+ *
+ * When the LiveKit SFU cannot be reached (not configured, dead cloud project,
+ * blocked WebRTC/UDP) the studio automatically falls back to the pure
+ * WebSocket transport — zero external services: `onFallback` switches the
+ * transport to 'ws' upstream.
  */
-export default function LivePreview({ requestId, transport, onStatus }) {
+export default function LivePreview({ requestId, transport, onStatus, onFallback }) {
   const canvasRef = useRef(null);
   const videoRef = useRef(null);
   const [status, setStatus] = useState('connecting');
@@ -101,6 +106,12 @@ export default function LivePreview({ requestId, transport, onStatus }) {
         room: requestId,
         videoElement: videoEl,
         onStatus: (s) => {
+          if (s === 'error') {
+            // SFU unreachable → fall back to the pure WebSocket transport
+            if (onFallback) onFallback();
+            else report('error');
+            return;
+          }
           report(s);
           if (s === 'live' && videoEl) {
             videoEl.play().catch(() => {});
@@ -116,6 +127,10 @@ export default function LivePreview({ requestId, transport, onStatus }) {
         })
         .catch((err) => {
           console.warn('[livekit] connection failed:', err);
+          if (onFallback) {
+            onFallback();
+            return;
+          }
           report('error');
           onStatusRef.current?.(err.message);
         });
@@ -181,7 +196,7 @@ export default function LivePreview({ requestId, transport, onStatus }) {
         /* ignore */
       }
     };
-  }, [requestId, transport]);
+  }, [requestId, transport, onFallback]);
 
   return (
     <div className="live-preview">

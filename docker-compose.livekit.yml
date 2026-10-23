@@ -24,3 +24,21 @@ services:
     environment:
       LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:-secret}"
     restart: unless-stopped
+
+  # Optional pure STUN (no TURN) for the raw aiortc 'webrtc' transport; point
+  # [webrtc].stun_urls in fast_float/config/settings.toml at it. No auth —
+  # STUN only, never run TURN without credentials. Enabled with:
+  #   docker compose -f docker-compose.livekit.yml --profile stun up -d
+  stun-server:
+    image: coturn/coturn:latest
+    command:
+      - --no-cli
+      - --no-auth
+      - --no-tls
+      - --no-dtls
+      - --listening-port=3478
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+    restart: unless-stopped
+    profiles: ["stun"]

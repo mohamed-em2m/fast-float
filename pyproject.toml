@@ -43,6 +43,8 @@ dependencies = [
     "matplotlib==3.7.2",
     "flow-vis==0.1",
     "pyyaml==6.0.1",
+    # Dynamic config (settings.toml / secerts.toml); stdlib tomllib needs 3.11.
+    "tomli>=2.0,<3; python_version < '3.11'",
     "tqdm==4.65.0",
     "gdown==5.2.0",
     "setuptools==80.10.2",

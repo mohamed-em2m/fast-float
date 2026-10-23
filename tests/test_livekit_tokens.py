@@ -48,7 +48,13 @@ def test_settings_are_read_from_the_env(monkeypatch):
 def test_unconfigured_settings_say_so(monkeypatch):
     for name in ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"):
         monkeypatch.delenv(name, raising=False)
-    assert LiveKitSettings.from_env().configured is False
+    # Also neutralize the config files (an operator checkout may carry a
+    # populated secerts.toml); here we test the layered "nothing set" case.
+    monkeypatch.setattr("fast_float.livekit.settings.load_secrets", lambda: {})
+    monkeypatch.setattr("fast_float.livekit.settings.load_settings", lambda: {})
+    settings = LiveKitSettings.from_env()
+    assert settings.configured is False
+    assert settings.source == "none"
 
 
 def test_room_names_are_validated():
@@ -56,6 +62,40 @@ def test_room_names_are_validated():
     assert valid_room_name("has space") is False
     assert valid_room_name("") is False
     assert valid_room_name("a" * 65) is False
+
+
+def test_settings_layering_secrets_beat_files_env_beats_all(monkeypatch):
+    # secerts.toml beats settings.toml; the env beats everything.
+    monkeypatch.setattr(
+        "fast_float.livekit.settings.load_settings",
+        lambda: {"livekit": {"url": "ws://settings-layer:7880", "room_prefix": "set"}},
+    )
+    monkeypatch.setattr(
+        "fast_float.livekit.settings.load_secrets",
+        lambda: {"livekit": {"url": "wss://secrets-layer.livekit.cloud", "api_key": "k", "api_secret": "s"}},
+    )
+    for name in ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "LIVEKIT_ROOM_PREFIX"):
+        monkeypatch.delenv(name, raising=False)
+    s = LiveKitSettings.from_env()
+    assert s.url == "wss://secrets-layer.livekit.cloud"
+    assert s.api_key == "k"
+    assert s.configured is True
+    assert s.source == "secerts.toml"
+    assert s.room_prefix == "set"
+
+    monkeypatch.setenv("LIVEKIT_URL", "ws://env-layer:7880")
+    s = LiveKitSettings.from_env()
+    assert s.url == "ws://env-layer:7880"
+    assert s.source == "env"
+
+
+def test_settings_stun_urls_from_config(monkeypatch):
+    monkeypatch.setattr(
+        "fast_float.livekit.settings.load_settings",
+        lambda: {"webrtc": {"stun_urls": ["stun:127.0.0.1:3478", "stun:stun.example:3478"]}},
+    )
+    s = LiveKitSettings.from_env()
+    assert s.stun_urls == ("stun:127.0.0.1:3478", "stun:stun.example:3478")
 
 
 def test_issued_token_carries_the_room_grant():
