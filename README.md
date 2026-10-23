@@ -41,6 +41,7 @@ FLOAT Fast wraps the FLOAT generator in production-friendly interfaces and perfo
 - **Gradio apps** — a batch UI (`fast_float/legacy/gradio_interface.py`) and a live microphone streaming UI (`fast_float/interfaces/float_live_app.py`).
 - **Batched latent decoding + VRAM auto-sizing** — decodes frames in micro-batches sized to free GPU memory, with a tuner cache to skip re-probing on repeat runs. See [`docs/BATCH_DECODING.md`](docs/BATCH_DECODING.md).
 - **Asynchronous streaming pipeline** — a multi-threaded producer/consumer over multiple CUDA streams and GPUs, overlapping encode, transfer, and disk I/O. See [`docs/STREAMING_PIPELINE.md`](docs/STREAMING_PIPELINE.md).
+- **LiveKit avatar transport** — FLOAT publishes synchronized avatar video + audio into LiveKit rooms for conversational sessions, with raw WebRTC and WebSocket fallbacks. See [`docs/LIVEKIT_INTEGRATION.md`](docs/LIVEKIT_INTEGRATION.md) and [`docs/LIVEKIT_GENERATOR.md`](docs/LIVEKIT_GENERATOR.md).
 - **Per-component ONNX / TensorRT acceleration** — each module can run `eager`, `compile`, or `onnx` (TensorRT → CUDA → CPU), selected from a config generated **on the target box** after parity + benchmark checks. See [Backends](#per-component-backends-onnx--tensorrt).
 
 ---

@@ -9,6 +9,10 @@ the [`AvatarRunner` reference](https://docs.livekit.io/reference/python/livekit/
 the [voice AI quickstart](https://docs.livekit.io/agents/start/voice-ai/) and the
 [custom avatar worker docs](https://docs.livekit.io/agents/models/avatar/#custom-avatar-workers).
 
+For the audio-driven generator internals — chunk timing, A/V pairing,
+backpressure, cancellation and tuning — see
+[`LIVEKIT_GENERATOR.md`](LIVEKIT_GENERATOR.md).
+
 ## 1. The decision
 
 **LiveKit is the transport; FLOAT is the avatar.** We implement FLOAT as a
@@ -116,20 +120,27 @@ API. No model involved.*
 ### Phase 1 — FLOAT as a custom avatar worker (2–3 days)
 
 - `FloatVideoGenerator` implements the provider interface: `push_audio(frame)`
-  accumulates the incoming audio; the async iterator yields `rtc.VideoFrame`s
-  (RGB24, 512×512, 25 fps) built from the frames the pipeline taps.
+  accumulates the incoming audio; the async iterator yields synchronized
+  `(rtc.VideoFrame, rtc.AudioFrame)` pairs (RGB24, 512×512, 25 fps, 40 ms of
+  audio per frame) built from the frames the pipeline taps.
 - It reuses today's pipeline unchanged: the audio buffer is written to a temp
   wav, `agent.run_inference(..., dispatcher=...)` runs, and the existing
-  `FrameDispatcher` delivers `(idx, frames, pts_ms)` — the generator converts
-  each frame and yields it with its pts.
-- `AvatarRunner(room, audio_recv=DataStreamAudioReceiver(room, sender_identity=AGENT_IDENTITY), video_gen=generator, options=AvatarOptions(video_width=512, video_height=512, video_fps=25, audio_sample_rate=16000, audio_channels=1))`.
-  `AvatarRunner` publishes `avatar_video` (SOURCE_CAMERA) and `avatar_audio`
-  (SOURCE_MICROPHONE) and sends the `lk.playback_started` RPC for us.
-- **Thread bridge**: the pipeline runs in a thread pool and the SDK is
-  asyncio — the same `queue.Queue` + `loop.call_soon_threadsafe` pattern as
-  `streaming/dispatcher.py::FrameQueue._push`.
-- The worker takes the same `inference_lock` as the HTTP path: one GPU, one
-  inference at a time.
+  `FrameDispatcher` delivers `(idx, frames, pts_ms)` — the bridge pairs each
+  frame with its own PCM slice and pushes it to the asyncio queue.
+- The first chunk starts after **1 s** of audio instead of 2 s; later chunks
+  wait for 2 s, and an idle flush (0.25 s) drains the tail of an utterance.
+  `clear_buffer()` invalidates in-flight work after a barge-in. See
+  [`LIVEKIT_GENERATOR.md`](LIVEKIT_GENERATOR.md) for the full timing model.
+- `AvatarRunner(room, generator, options=AvatarOptions(video_width=512, video_height=512, video_fps=25, audio_sample_rate=16000, audio_channels=1), agent_identity=AGENT_IDENTITY)`.
+  Audio is not received by the runner: the agent pushes it into the generator
+  with `push_audio()`. `AvatarRunner` publishes `avatar_video` (SOURCE_CAMERA)
+  and `avatar_audio` (SOURCE_MICROPHONE) and sends the `lk.playback_started`
+  RPC for us.
+- **Thread bridge**: the pipeline runs in a dedicated single-worker executor
+  and the SDK is asyncio — results cross back with
+  `loop.call_soon_threadsafe` into an `asyncio.Queue` of paired A/V frames.
+- The worker shares the `_render_lock` semaphore with the HTTP path: one GPU,
+  one inference at a time.
 - `FLOAT_LIVEKIT=1` adds "LiveKit" to the Studio's transport selector; the
   aiortc path stays as the default until this is proven.
 
@@ -338,7 +349,7 @@ The plan is fully implemented and tested across backend and frontend:
   - `docker-compose.livekit.yml`: Containerized self-hosted LiveKit SFU server.
 
 - **Phase 1 (Avatar Worker & Video Generator)**:
-  - `fast_float/livekit/generator.py`: `FloatVideoGenerator` accumulating >= 2.0 s audio and yielding `rtc.VideoFrame`s (512x512, RGB24, 25 fps), with thread-safe bridge to `FrameDispatcher`. Also `LiveStreamVideoGenerator` for direct in-flight stream forwarding.
+  - `fast_float/livekit/generator.py`: `FloatVideoGenerator` with a 1 s first chunk, 2 s steady-state chunks, a 0.25 s idle tail flush, per-frame 40 ms audio pairing, cancellable generations, a bounded output queue and a dedicated inference executor. Also `LiveStreamVideoGenerator` for direct in-flight stream forwarding. See [`LIVEKIT_GENERATOR.md`](LIVEKIT_GENERATOR.md).
   - `fast_float/livekit/worker.py`: `AvatarOptions`, `AvatarRunner` with `rtc.AVSynchronizer` (coordinating `avatar_video` and `avatar_audio` tracks, setting `lk.publish_on_behalf` attribute), and `LiveKitLiveStreamPublisher` with background task spawning.
   - `fast_float/routers/generation.py`: Automatically launches LiveKit publisher task when `live=True` and LiveKit is configured.
 
@@ -352,6 +363,8 @@ The plan is fully implemented and tested across backend and frontend:
   - `fast_float/livekit/agent.py`: `ConversationalAgent` managing conversation turns, streaming audio to worker, and coordinating via `lk.playback_started` and `lk.playback_finished` RPCs.
 
 - **Automated Verification**:
-  - `tests/test_livekit_tokens.py`: 10 tests covering settings, grants, endpoints.
-  - `tests/test_livekit_worker.py`: 8 tests covering generator, worker, synchronizer, agent, media file playback, and publish endpoints.
-  - All 18 tests passing cleanly (10 token tests + 8 worker/generator tests).
+  - `tests/test_livekit_tokens.py`: 14 tests covering settings, grants and endpoints.
+  - `tests/test_livekit_worker.py`: 13 tests covering the generator, worker, synchronizer, agent, media-file playback and publish endpoints.
+  - `tests/test_stun.py`: 9 tests for the built-in STUN responder and static/secret-based TURN credentials.
+  - `tests/test_webrtc_trickle.py`: 3 tests for trickle ICE and graceful degradation.
+  - All 39 tests passing cleanly.
