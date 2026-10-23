@@ -144,11 +144,34 @@ class LiveStreamDispatcher(FrameDispatcher):
         self.request_id = request_id
         self.stream = LiveStream(request_id, loop)
         self._audio_hint: str | None = None
+        self._trim_remaining = 0
 
     def set_audio_path(self, path: str | None) -> None:
         """Provide the full-request audio before bind (chunk paths are partial)."""
         self._audio_hint = path
         self.stream.audio_path = path
+
+    def begin_chunk(self, trim_frames: int = 0) -> None:
+        """Skip the overlapping head of the next chunk.
+
+        ``_generate_chunked`` renders overlapping windows so each chunk has
+        context at its start. The merge trims that head from the MP4; live
+        transports must do the same before publishing, otherwise every chunk
+        repeats half a second of video while the full-request audio keeps
+        moving forward (and later audio slices fall off the end).
+        """
+        self._trim_remaining = max(0, int(trim_frames))
+
+    def submit(self, frames: Any, idx: int | None = None) -> bool:
+        if self._trim_remaining:
+            drop = min(self._trim_remaining, len(frames))
+            self._trim_remaining -= drop
+            frames = frames[drop:]
+            if idx is not None:
+                idx += drop
+            if len(frames) == 0:
+                return True
+        return super().submit(frames, idx=idx)
 
     def open(self, meta: StreamMeta) -> None:
         if self._audio_hint:

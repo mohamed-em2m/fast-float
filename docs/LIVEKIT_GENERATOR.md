@@ -157,6 +157,25 @@ Example: a 1.3 s chunk is padded to 2 s for inference, but emits
 `ceil(1.3 / 0.04) = 33` frames, not 50. The first 32 frames carry real audio;
 the 33rd carries 0.02 s of real audio and 0.02 s of silence.
 
+### Chunked `/generate?live=true` streams
+
+Chunked generation renders overlapping audio windows so each window has
+context at its start. The MP4 merge removes that overlapping head from later
+chunks. The live path must do the same, otherwise the stream repeats the
+overlap and the full-request audio used by `LiveStreamVideoGenerator` falls
+out of sync.
+
+`_generate_chunked()` calls `dispatcher.begin_chunk(trim_frames)` before each
+chunk, where `trim_frames = ceil(overlap_seconds * fps)` for every chunk after
+the first. `LiveStreamDispatcher.submit()` drops those leading frames without
+advancing the dispatcher cursor. Frame indices therefore stay continuous
+across chunks, and `idx * 40 ms` continues to select the correct audio slice.
+
+Example: 7 s of audio in three 3 s chunks with 0.5 s overlap used to publish
+200 frames (175 + 25 duplicated overlap frames) and run past the end of the
+audio. It now publishes 174 frames, matching the merged MP4, with no repeated
+chunk head and with audio pairing aligned through the final frame.
+
 ---
 
 ## 5. Cancellation and backpressure
@@ -381,13 +400,16 @@ The targeted suite:
   tests/test_livekit_tokens.py \
   tests/test_livekit_worker.py \
   tests/test_stun.py \
-  tests/test_webrtc_trickle.py -q
+  tests/test_webrtc_trickle.py \
+  tests/test_live_stream.py \
+  tests/test_frame_dispatcher.py -q
 ```
 
-Current result: **43 passed** (14 token, 17 worker/generator, 9 STUN,
-3 trickle-ICE). The generator tests cover the frame-index audio pairing, a
-dispatcher gap, per-chunk dispatcher shutdown, and cancellation aborting the
-pipeline.
+Current result: **68 passed** (14 token, 17 worker/generator, 9 STUN,
+3 trickle-ICE, 11 live-stream, 14 frame-dispatcher). The generator tests cover
+the frame-index audio pairing, a dispatcher gap, per-chunk dispatcher shutdown,
+and cancellation aborting the pipeline. The live-stream tests cover fan-out,
+frame PTS, and overlap-head trimming for chunked `/generate?live=true`.
 
 The generator was also exercised against a real LiveKit Cloud room: a
 `FloatVideoGenerator` in test-pattern mode was published through `AvatarRunner`

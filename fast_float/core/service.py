@@ -439,6 +439,13 @@ async def _generate_chunked(
             # Same request seed, shifted by the chunk's position in the audio:
             # reproducible, and independent of chunk_batch_size.
             chunk_request = {**request_data, "seed": _chunk_seed(request_data, idx)}
+            if dispatcher is not None:
+                # Live transports publish while we render; skip the overlap
+                # head that the MP4 merge trims so the stream is continuous.
+                trim = math.ceil(overlap_seconds * fps) if idx > 0 else 0
+                begin_chunk = getattr(dispatcher, "begin_chunk", None)
+                if callable(begin_chunk):
+                    begin_chunk(trim)
             await loop.run_in_executor(
                 state.executor,
                 run_inference_blocking,

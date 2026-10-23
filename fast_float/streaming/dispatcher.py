@@ -249,6 +249,14 @@ class FrameDispatcher:
     def set_audio_path(self, path: str | None) -> None:
         """Optional hint for transports that also need the request audio."""
 
+    def begin_chunk(self, trim_frames: int = 0) -> None:
+        """Called before each independently rendered audio chunk.
+
+        Live transports use this to skip the overlapping head of later chunks
+        so the published stream stays continuous instead of replaying frames
+        that the MP4 merge would trim.
+        """
+
     @property
     def disabled(self) -> bool:
         return self._disabled_reason is not None

@@ -87,6 +87,29 @@ def test_live_dispatcher_publishes_frames_with_pts():
     asyncio.run(scenario())
 
 
+def test_live_dispatcher_trims_overlapping_chunk_head():
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        dispatcher = LiveStreamDispatcher("req-trim", loop)
+        dispatcher.bind(StreamMeta(fps=25.0, width=2, height=2, channels=3))
+        q = dispatcher.stream.subscribe()
+
+        dispatcher.begin_chunk(0)
+        dispatcher.submit(np.zeros((4, 2, 2, 3), dtype=np.uint8))
+        # The next chunk overlaps two frames with the previous one; those
+        # frames are already on the wire and must not be published twice.
+        dispatcher.begin_chunk(2)
+        dispatcher.submit(np.zeros((5, 2, 2, 3), dtype=np.uint8))
+
+        items = [await asyncio.wait_for(q.get(), 2.0) for _ in range(7)]
+        assert [item[1] for item in items] == [0, 1, 2, 3, 4, 5, 6]
+        assert dispatcher.stats()["submitted"] == 7
+
+        dispatcher.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_live_dispatcher_configuration():
     async def scenario():
         loop = asyncio.get_running_loop()

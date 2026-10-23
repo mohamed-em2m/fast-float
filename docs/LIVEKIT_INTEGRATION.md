@@ -352,6 +352,7 @@ The plan is fully implemented and tested across backend and frontend:
   - `fast_float/livekit/generator.py`: `FloatVideoGenerator` with a 1 s first chunk, 2 s steady-state chunks, a 0.25 s idle tail flush, per-frame 40 ms audio pairing, cancellable generations, a bounded output queue and a dedicated inference executor. Also `LiveStreamVideoGenerator` for direct in-flight stream forwarding. See [`LIVEKIT_GENERATOR.md`](LIVEKIT_GENERATOR.md).
   - `fast_float/livekit/worker.py`: `AvatarOptions`, `AvatarRunner` with `rtc.AVSynchronizer` (coordinating `avatar_video` and `avatar_audio` tracks, setting `lk.publish_on_behalf` attribute), and `LiveKitLiveStreamPublisher` with background task spawning.
   - `fast_float/routers/generation.py`: Automatically launches LiveKit publisher task when `live=True` and LiveKit is configured.
+  - `fast_float/streaming/live.py`: `LiveStreamDispatcher.begin_chunk()` trims the overlapping head of later audio chunks before publishing, so chunked live streams stay continuous and frame-index audio pairing does not fall behind the full-request audio.
 
 - **Phase 2 (Browser UI)**:
   - `frontend/src/services/livekit.js`: `livekit-client` room connection, token fetching, track subscription, track attachment to `<video>`.
@@ -367,4 +368,6 @@ The plan is fully implemented and tested across backend and frontend:
   - `tests/test_livekit_worker.py`: 17 tests covering the generator, worker, synchronizer, agent, media-file playback and publish endpoints.
   - `tests/test_stun.py`: 9 tests for the built-in STUN responder and static/secret-based TURN credentials.
   - `tests/test_webrtc_trickle.py`: 3 tests for trickle ICE and graceful degradation.
-  - All 43 tests passing cleanly.
+  - `tests/test_live_stream.py`: 11 tests for live fan-out, PTS, and overlap-head trimming in chunked live generation.
+  - `tests/test_frame_dispatcher.py`: 14 tests for ordered delivery, gaps, and backpressure policy.
+  - All 68 tests passing cleanly.
