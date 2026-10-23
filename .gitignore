@@ -21,3 +21,5 @@ results/
 .ipynb_checkpoints
 .mypy_cache
 .ruff_cache
+# Machine-local secrets (key material); settings.toml is committed.
+fast_float/config/secerts.toml

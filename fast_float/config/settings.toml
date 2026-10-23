@@ -1,0 +1,33 @@
+# Operator-tunable defaults, committed. Secrets live in secerts.toml next to
+# this file (NOT committed — machine-local). Every value here can be
+# overridden by an environment variable, and every env value wins over these
+# files. The frontend can in turn override the SFU URL at runtime (config
+# settings -> LiveKit SFU URL); the recommended lookup order is therefore:
+#
+#   frontend user override  >  env var  >  secerts.toml  >  settings.toml
+#
+# The Studio always keeps the pure WebSocket transport (MP4 fallback) as the
+# zero-external-services option: when the LiveKit SFU is unreachable the UI
+# automatically falls back to WebSocket (/ws/stream/{request_id}).
+
+[livekit]
+# LiveKit SFU endpoint. Leave empty to disable the WebRTC live transport
+# (the Studio then uses Wi-Fi-profile WebSocket/MP4 paths). ws:// for a local
+# deployment (docker-compose.livekit.yml serves it on ws://127.0.0.1:7880),
+# wss:// in production (LiveKit Cloud or a TLS-terminated host).
+url = ""
+
+# Prefix for auto-generated room names ("float-<hex12>").
+room_prefix = "float"
+
+# Room-token lifetime for the browser, seconds (clamped 60..86400).
+token_ttl_s = 3600
+
+[webrtc]
+# STUN servers the browser probes ICE candidates against (strings like
+# "stun:host:3478"). Empty = the Studio keeps its built-in Google STUN.
+# The self-hosted compose file (docker-compose.livekit.yml) also embeds a
+# coturn STUN server on port 3478, so deployments behind restrictive NATs
+# point this at their own host instead of relying on Google:
+#   stun_urls = ["stun:<your-public-host>:3478"]
+stun_urls = []

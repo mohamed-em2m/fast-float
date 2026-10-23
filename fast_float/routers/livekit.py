@@ -59,16 +59,23 @@ class ConversationStopRequest(BaseModel):
 
 @router.get("/livekit/status")
 async def livekit_status() -> dict[str, Any]:
-    """Whether LiveKit is configured, and with which settings.
+    """Whether LiveKit is configured, and with which settings (and from where).
 
-    The frontend uses this to show or hide the LiveKit transport.
+    The frontend uses this to show or hide the LiveKit transport, to feed the
+    browser STUN servers, and to know when to fall back to the pure
+    WebSocket transport (``/ws/stream/{request_id}``, zero external services).
     """
     settings = LiveKitSettings.from_env()
     return {
         "configured": settings.configured,
         "url": settings.url or None,
+        "source": settings.source,
         "room_prefix": settings.room_prefix,
         "token_ttl_s": settings.token_ttl_s,
+        "stun_urls": list(settings.stun_urls),
+        # The WebSocket live transport exists regardless of LiveKit: it is the
+        # automatic fallback whenever the SFU cannot be reached.
+        "ws_fallback": True,
     }
 
 

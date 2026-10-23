@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useCallback, useState, useRef, useEffect } from 'react';
 import {
   Sparkles,
   Download,
@@ -8,7 +8,7 @@ import {
   Zap,
   Gauge
 } from 'lucide-react';
-import { attachRemoteTrack, createWebRtcSession, getApiUrl } from '../services/api';
+import { attachRemoteTrack, createWebRtcSession, getApiUrl, setIceServers } from '../services/api';
 import { connectLiveKitSession, fetchLiveKitStatus, triggerLiveKitPublish } from '../services/livekit';
 import LivePreview from './LivePreview';
 
@@ -55,13 +55,34 @@ export default function StudioStage({
   useEffect(() => {
     const checkLiveKit = () => {
       fetchLiveKitStatus()
-        .then((status) => setLiveKitAvailable(!!status.configured))
+        .then((status) => {
+          setLiveKitAvailable(!!status.configured);
+          // Feed the deployment's own STUN list (self-hosted coturn or cloud)
+          // to the raw WebRTC transport; empty keeps the Google default.
+          setIceServers(status.stun_urls);
+        })
         .catch(() => setLiveKitAvailable(false));
     };
     checkLiveKit();
     window.addEventListener('float:api_url_changed', checkLiveKit);
     return () => window.removeEventListener('float:api_url_changed', checkLiveKit);
   }, []);
+
+  // Automatic transport fallback: both LiveKit (WebRTC SFU) and the pure
+  // WebSocket (/ws/stream, zero external services) stay available side by
+  // side. When the SFU does not work — unconfigured, cloud down, WebRTC/UDP
+  // blocked — the Studio silently switches to WebSocket and keeps streaming.
+  useEffect(() => {
+    if (liveKitAvailable === false && transport === 'livekit') {
+      setTransport?.('ws');
+      if (onToast) onToast('LiveKit unavailable — switched to the WebSocket transport', 'error');
+    }
+  }, [liveKitAvailable, transport, setTransport, onToast]);
+
+  const handleLiveKitFallback = useCallback(() => {
+    setTransport?.('ws');
+    if (onToast) onToast('LiveKit SFU failed — switched to the WebSocket transport', 'error');
+  }, [setTransport, onToast]);
 
   // Cycle progress stages smoothly during generation
   useEffect(() => {
@@ -326,6 +347,7 @@ export default function StudioStage({
             requestId={liveRequestId}
             transport={transport}
             onStatus={(message) => onToast?.(message || 'Live stream ended', 'error')}
+            onFallback={handleLiveKitFallback}
           />
         ) : useLiveKit ? (
           <div className="webrtc-player-box">

@@ -437,6 +437,28 @@ export async function generateVideo(payload) {
 }
 
 /**
+ * Server-provided STUN servers (fed from /livekit/status -> stun_urls, which
+ * reads fast_float/config/settings.toml [webrtc]). When the deployment ships
+ * no STUN list, the built-in public Google servers keep ICE working.
+ */
+let serverIceServers = null;
+
+export function setIceServers(stunUrls) {
+  if (Array.isArray(stunUrls) && stunUrls.length > 0) {
+    serverIceServers = stunUrls.map((urls) => ({ urls }));
+  } else {
+    serverIceServers = null;
+  }
+}
+
+export function getIceServers() {
+  return serverIceServers ?? [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ];
+}
+
+/**
  * Attach a remote track to a <video>, merging tracks into one MediaStream.
  *
  * aiortc gives every sender its own stream id, so audio and video arrive in
@@ -464,10 +486,9 @@ export function attachRemoteTrack(videoEl, event) {
 export async function createWebRtcSession(streamId, onTrackCallback, onStateCallback, options = {}) {
   const { live = false } = options;
   const pc = new RTCPeerConnection({
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-    ],
+    // Server-provided STUN list (see /livekit/status -> stun_urls, ideally the
+    // self-hosted coturn) replaces the public Google default when present.
+    iceServers: getIceServers(),
   });
 
   // Recv-only viewer: declare the m-lines BEFORE createOffer. Without these

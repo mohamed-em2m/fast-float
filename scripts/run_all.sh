@@ -60,6 +60,11 @@ livekit_server_start() {
     if docker compose -f "${PROJECT_ROOT}/docker-compose.livekit.yml" up -d; then
         echo "🟢 LiveKit SFU running at ${LIVEKIT_URL} (left running; stop with:"
         echo "   docker compose -f docker-compose.livekit.yml down)"
+        # Optional pure STUN for the raw WebRTC transport (LIVEKIT_STUN=yes)
+        if [ "${LIVEKIT_STUN:-no}" = "yes" ]; then
+            docker compose -f "${PROJECT_ROOT}/docker-compose.livekit.yml" --profile stun up -d \
+                && echo "🟢 STUN server running on 3478 (set [webrtc].stun_urls in fast_float/config/settings.toml)"
+        fi
     else
         return 1
     fi
