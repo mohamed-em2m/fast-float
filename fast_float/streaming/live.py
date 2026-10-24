@@ -22,6 +22,31 @@ CLOSE = object()
 # Log a subscriber-overflow warning every this many dropped frames.
 _DROP_WARN_EVERY = 25
 
+# A fast GPU renders far ahead of real time (100+ fps for a 25 fps stream).
+# Transports that play at ``meta.fps`` (LiveKit, WebRTC) must buffer the
+# in-flight render instead of dropping everything that does not fit in a
+# near-live queue; size that buffer by bytes so a long request still has a
+# hard memory ceiling.
+LIVE_BUFFER_BYTES = 1024 * 1024 * 1024  # 1 GiB
+LIVE_QUEUE_MIN_FRAMES = 128
+LIVE_QUEUE_MAX_FRAMES = 4096  # ~164 s at 25 fps, ~3.2 GiB at 512x512
+
+
+def live_queue_size(meta: StreamMeta | None) -> int:
+    """Frames to buffer for a transport that plays the render back at real time.
+
+    Sized from the stream's frame dimensions so the queue holds the whole
+    render for a normal clip (e.g. ~1365 frames / 55 s at 512x512) while a
+    multi-minute render still has a hard memory ceiling.
+    """
+    if meta is None or meta.width <= 0 or meta.height <= 0:
+        return LIVE_QUEUE_MIN_FRAMES
+    frame_bytes = meta.width * meta.height * max(1, meta.channels)
+    return max(
+        LIVE_QUEUE_MIN_FRAMES,
+        min(LIVE_QUEUE_MAX_FRAMES, LIVE_BUFFER_BYTES // frame_bytes),
+    )
+
 
 class LiveQueue(asyncio.Queue):
     """Subscriber queue with drop accounting.
@@ -38,6 +63,14 @@ class LiveQueue(asyncio.Queue):
         self.last_dropped_idx: int | None = None
         # Recent dropped ranges, merged when contiguous (frames only).
         self.dropped_ranges: list[tuple[int, int]] = []
+
+    def resize(self, maxsize: int) -> None:
+        """Change the buffer bound once the stream's frame size is known.
+
+        Transports subscribe before metadata arrives (so no early frame is
+        lost), then grow the queue to hold the whole fast render.
+        """
+        self._maxsize = max(1, int(maxsize))
 
     def note_dropped(self, item: Any) -> None:
         if not isinstance(item, tuple) or not item or item[0] != "frame":

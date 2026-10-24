@@ -653,7 +653,7 @@ def test_livestream_generator_buffers_fast_render_without_dropping():
 
 
 def test_live_queue_size_is_bounded_by_frame_dimensions():
-    from fast_float.livekit.generator import (
+    from fast_float.streaming.live import (
         LIVE_QUEUE_MAX_FRAMES,
         LIVE_QUEUE_MIN_FRAMES,
         live_queue_size,

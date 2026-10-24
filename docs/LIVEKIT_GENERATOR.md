@@ -229,13 +229,15 @@ in sync.
 
 The `/generate?live=true` tap (`LiveStream`) renders much faster than real
 time (100+ fps for a 25 fps stream), so a small per-subscriber queue would
-overflow and skip seconds of the preview. `LiveStreamVideoGenerator` therefore
-subscribes with a queue sized from the stream's frame dimensions
-(`live_queue_size()`): a 1 GiB byte budget, clamped to 128–4096 frames. At
-512×512×3 that is ~1365 frames (≈55 s), so a normal single-pass render is
-buffered completely and played out in order; a multi-minute render still has a
-hard memory ceiling. Only if the render outruns that budget does the queue
-drop the oldest frame, which is counted and logged
+overflow and skip seconds of the preview. Every real-time transport
+(`LiveStreamVideoGenerator` for LiveKit, the raw WebRTC offer, and the
+WebSocket stream) therefore subscribes with a queue sized from the stream's
+frame dimensions by `live_queue_size()` (in `fast_float/streaming/live.py`):
+a 1 GiB byte budget, clamped to 128–4096 frames. At 512×512×3 that is
+~1365 frames (≈55 s), so a normal single-pass render is buffered completely
+and played out in order; a multi-minute render still has a hard memory
+ceiling. Only if the render outruns that budget does the queue drop the
+oldest frame, which is counted and logged
 (`subscriber_dropped_frames` in `metrics()`).
 
 Note that the publisher's video track must also be configured at the source

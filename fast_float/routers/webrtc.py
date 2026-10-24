@@ -16,7 +16,7 @@ from fast_float.schemas.generation import (
     WebRTCOfferRequest,
     WebRTCOfferResponse,
 )
-from fast_float.streaming.live import CLOSE
+from fast_float.streaming.live import CLOSE, live_queue_size
 from fast_float.utils.logger import logger
 
 try:
@@ -38,6 +38,8 @@ router = APIRouter(tags=["webrtc"])
 _players: dict[int, Any] = {}
 # Live subscriptions keyed by id(pc): (stream, queue).
 _live_subs: dict[int, Any] = {}
+# Watcher that closes a live peer when its stream finishes, keyed by id(pc).
+_live_end_tasks: dict[int, asyncio.Task] = {}
 # Trickle-ICE signalling: the browser gets an opaque peer id with the answer
 # and POSTs candidates discovered after the offer to /offer/candidate.
 _pending_peers: dict[str, Any] = {}
@@ -106,6 +108,10 @@ if AIORTC_AVAILABLE:
             self._fps = max(1.0, float(meta.fps or 25.0))
             self._next_at: float | None = None
             self._stopped = False
+            # Set when the publisher's stream finished (not when the peer is
+            # torn down) so the offer can close the peer connection and the
+            # browser sees a clean end instead of a frozen last frame.
+            self.ended = asyncio.Event()
             # Consumer-side clock: how late each frame reached the WebRTC
             # encoder (TTFF, latency percentiles, pacing jitter, drops).
             started = getattr(meta, "started_at_s", None)
@@ -129,6 +135,7 @@ if AIORTC_AVAILABLE:
                     raise MediaStreamError("track stopped")
                 item = await self._queue.get()
                 if item is CLOSE:
+                    self.ended.set()
                     self.stop()
                     raise MediaStreamError("stream finished")
                 if item[0] != "frame":
@@ -185,6 +192,9 @@ def _cleanup_peer(pc) -> None:
             track.stop()
         with suppress(asyncio.QueueFull):
             queue.put_nowait(CLOSE)
+    end_task = _live_end_tasks.pop(id(pc), None)
+    if end_task is not None and end_task is not asyncio.current_task():
+        end_task.cancel()
     app_state.pcs.discard(pc)
 
 
@@ -198,7 +208,10 @@ async def _live_offer(request: WebRTCOfferRequest, http_request: Request) -> Web
         raise HTTPException(status_code=404, detail="Requested live stream not found")
 
     # Subscribe before waiting for meta so the first decoded frames are queued.
-    queue = stream.subscribe(maxsize=8)
+    # A fast render produces far more frames than real-time playout consumes;
+    # buffer them (bounded by ``live_queue_size``) so the preview plays the
+    # whole clip instead of freezing after the first ~8 frames.
+    queue = stream.subscribe(maxsize=live_queue_size(stream.meta))
     try:
         meta = await stream.wait_meta(LIVE_META_TIMEOUT_S)
         if meta is None:
@@ -206,6 +219,9 @@ async def _live_offer(request: WebRTCOfferRequest, http_request: Request) -> Web
                 status_code=502 if stream.error else 504,
                 detail=stream.error or "Live stream did not start in time",
             )
+        # Meta arrived after the provisional subscription: resize now that the
+        # frame dimensions are known.
+        queue.resize(live_queue_size(meta))
 
         offer = RTCSessionDescription(sdp=request.sdp, type=request.type)
         pc = _new_peer_connection(http_request)
@@ -230,6 +246,18 @@ async def _live_offer(request: WebRTCOfferRequest, http_request: Request) -> Web
 
         try:
             pc.addTrack(track)
+
+            # When the render finishes, the track raises MediaStreamError and
+            # ends; close the peer so the viewer's <video> reports the end
+            # instead of freezing on the last frame forever.
+            async def _close_when_stream_ends() -> None:
+                await track.ended.wait()
+                logger.info(f"Live WebRTC stream {request.stream_id} finished; closing peer")
+                with suppress(Exception):
+                    await pc.close()
+                _cleanup_peer(pc)
+
+            _live_end_tasks[id(pc)] = asyncio.create_task(_close_when_stream_ends())
 
             if stream.audio_path and os.path.exists(stream.audio_path):
                 try:

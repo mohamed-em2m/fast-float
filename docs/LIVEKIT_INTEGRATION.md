@@ -290,6 +290,13 @@ When LiveKit cannot be reached the Studio now falls back to this raw WebRTC
 transport first (main-server signalling + STUN); the WebSocket transport is
 only the last resort.
 
+All three transports consume the same `LiveStream` fan-out and buffer a fast
+render with `live_queue_size()` (1 GiB / 128–4096 frames, see
+`fast_float/streaming/live.py`). The raw WebRTC offer previously kept only 8
+frames, so a 15 s render froze the preview after about one second. When the
+render finishes, the offer closes its peer connection and the viewer hands
+over to the finished MP4 instead of freezing on the last frame.
+
 STUN only discovers addresses; it does not relay media. If the browser reaches
 the API through a **TCP-only edge proxy** (RunPod/Cloudflare tunnels, many
 corporate NATs), WebRTC cannot open a UDP path and will never reach

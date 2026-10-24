@@ -19,7 +19,7 @@ import struct
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from fast_float.core.state import app_state
-from fast_float.streaming.live import CLOSE
+from fast_float.streaming.live import CLOSE, live_queue_size
 from fast_float.utils.logger import logger
 
 router = APIRouter(tags=["streaming"])
@@ -56,14 +56,19 @@ async def live_frames(ws: WebSocket, request_id: str) -> None:
         return
 
     # Subscribe before waiting for meta so the first decoded frames are queued
-    # for this client instead of being published to nobody.
-    q = stream.subscribe(maxsize=64)
+    # for this client instead of being published to nobody. A fast render can
+    # outrun a slow socket; buffer it (bounded by ``live_queue_size``) rather
+    # than dropping most of the clip on the floor.
+    q = stream.subscribe(maxsize=live_queue_size(stream.meta))
     try:
         meta = await stream.wait_meta(META_TIMEOUT_S)
         if meta is None:
             await ws.send_json({"type": "error", "message": stream.error or "stream did not start"})
             await ws.close(code=4408)
             return
+        # Meta arrived after the provisional subscription: size the queue from
+        # the real frame dimensions now that they are known.
+        q.resize(live_queue_size(meta))
 
         await ws.send_json(_meta_payload(meta))
         while True:

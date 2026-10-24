@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from fast_float.core.state import app_state
 from fast_float.routers.streaming import HEADER
 from fast_float.routers.streaming import router as streaming_router
-from fast_float.streaming.live import CLOSE, LiveStream, LiveStreamDispatcher
+from fast_float.streaming.live import CLOSE, LiveQueue, LiveStream, LiveStreamDispatcher
 from fast_float.streaming.types import StreamMeta
 
 
@@ -163,7 +163,7 @@ class _FakeStream:
         return self.meta
 
     def subscribe(self, maxsize: int = 64):
-        queue = asyncio.Queue(maxsize=maxsize)
+        queue = LiveQueue(maxsize=maxsize)
         frame = self._frame
 
         async def produce():
@@ -262,6 +262,21 @@ def test_ws_stream_end_to_end_with_dispatcher():
                 assert done["type"] == "done"
     finally:
         app_state.live_streams.pop("e2e", None)
+
+
+def test_live_queue_resize_grows_buffer_for_fast_renders():
+    """Transports subscribe before meta, then grow the queue to fit the clip."""
+
+    async def scenario():
+        q = LiveQueue(maxsize=8)
+        q.resize(128)
+        assert q.maxsize == 128
+        for i in range(100):
+            q.put_nowait(("frame", i, i * 40.0, None))
+        assert q.qsize() == 100
+        assert q.dropped_frames == 0
+
+    asyncio.run(scenario())
 
 
 def test_slow_subscriber_drops_are_counted_not_silent():
