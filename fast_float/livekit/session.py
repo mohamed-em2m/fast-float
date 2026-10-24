@@ -363,7 +363,7 @@ class ConversationSession:
             raise RuntimeError(
                 f"{exc} The Gemini worker did not join as {self.agent_name!r} "
                 f"(dispatch created: {bool(self.agent_dispatched)}). {dispatch_state} "
-                "Start it with `cd agents && uv run python -m float_agent.agent dev`. The worker reads "
+                "Start it with `cd agents && uv run python -m float_agent.agent start`. The worker reads "
                 "the shared fast_float/config/secerts.toml + settings.toml (the single source of "
                 "truth — put the same LiveKit project's LIVEKIT_URL/API_KEY/API_SECRET there, in "
                 "both processes' FLOAT_CONFIG_DIR; agents/.env is only a fallback and a differing "

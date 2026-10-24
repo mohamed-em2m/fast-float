@@ -3,8 +3,16 @@
 Run from ``agents/``::
 
     uv sync
-    cp .env.example .env   # fill in LiveKit + Google keys
-    uv run python -m float_agent.agent dev
+    uv run python -m float_agent.agent start
+
+The LiveKit + Gemini values come from the FLOAT repo's shared
+``fast_float/config/secerts.toml`` / ``settings.toml`` (the single source of
+truth, also read by the API); ``agents/.env`` is only a fallback for boxes
+without that file, and ``cp .env.example .env`` still works there.
+
+Use ``start`` rather than the deprecated ``dev`` command: livekit-agents
+removed in-process auto-reload, so ``dev`` only prints deprecation warnings
+now.
 
 The worker registers as ``float-gemini``. When the FLOAT API starts a Gemini
 conversation it dispatches this agent into the room; the agent listens to the
@@ -48,7 +56,15 @@ from float_agent.tools import FloatApi
 logger = logging.getLogger("float_gemini")
 
 config = AgentConfig.from_env()
-server = AgentServer()
+# AgentServer reads LIVEKIT_* from os.environ when it registers with the SFU
+# (config.from_env also exports the winners there), but pass them explicitly
+# as well: registration is the one thing that must never depend on import
+# order, and a missing value here is an opaque "ws_url is required" exit.
+server = AgentServer(
+    ws_url=config.livekit_url or None,
+    api_key=config.livekit_api_key or None,
+    api_secret=config.livekit_api_secret or None,
+)
 
 
 class FloatAssistant(Agent):
@@ -169,7 +185,7 @@ async def entrypoint(ctx: JobContext) -> None:
         config.avatar_identity,
     )
     logger.info(
-        "registered as %r — LiveKit credentials present: %s, Gemini API key present: %s, model: %s",
+        "job for agent %r — LiveKit credentials present: %s, Gemini API key present: %s, model: %s",
         config.agent_name,
         bool(config.livekit_url and config.livekit_api_key and config.livekit_api_secret),
         bool(config.google_api_key),
@@ -218,7 +234,33 @@ async def entrypoint(ctx: JobContext) -> None:
 def main() -> None:
     missing = config.missing()
     if missing:
-        raise SystemExit("Missing configuration: " + ", ".join(missing) + ". See agents/.env.example.")
+        raise SystemExit(
+            "Missing configuration: "
+            + ", ".join(missing)
+            + f". Define them in {config.config_dir}/secerts.toml ([livekit] and "
+            "[gemini].api_key) or in agents/.env; see agents/.env.example. The worker and "
+            "the FLOAT API must read the same directory (set FLOAT_CONFIG_DIR on both if "
+            "the checkout lives elsewhere)."
+        )
+    # Startup summary, logged from an SDK event because the CLI installs its
+    # log handlers inside run_app() — a logger.info() before that is dropped.
+    # This is the line to check when the API reports that dispatch found
+    # "NO job": it proves which SFU, agent name and config directory this
+    # process is running with. worker_started fires even when registration
+    # then fails; the SDK's "registered worker" line confirms the handshake.
+    def _log_startup(*_args: object) -> None:
+        logger.info(
+            "worker starting: agent_name=%s url=%s config_dir=%s livekit_credentials=%s "
+            "gemini_key=%s model=%s",
+            config.agent_name,
+            config.livekit_url or "<missing>",
+            config.config_dir,
+            bool(config.livekit_url and config.livekit_api_key and config.livekit_api_secret),
+            bool(config.google_api_key),
+            config.model or "<plugin default>",
+        )
+
+    server.on("worker_started", _log_startup)
     cli.run_app(server)
 
 

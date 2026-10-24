@@ -105,6 +105,22 @@ def _first_set(*candidates: object) -> str:
     return ""
 
 
+def _export_env(name: str, value: str) -> None:
+    """Expose a resolved shared-config value to the libraries that read env.
+
+    ``livekit-agents`` reads ``LIVEKIT_URL`` / ``LIVEKIT_API_KEY`` /
+    ``LIVEKIT_API_SECRET`` straight from ``os.environ`` when the worker starts
+    (``AgentServer`` construction and ``run()``), and google-genai does the
+    same for ``GOOGLE_API_KEY``. Those libraries have no notion of our
+    file-first precedence, so the winner below must be exported here — a key
+    that resolves fine in this config but never reaches the SDK makes the
+    worker exit with "ws_url is required, or set LIVEKIT_URL environment
+    variable" even though secerts.toml has it.
+    """
+    if value and os.environ.get(name) != value:
+        os.environ[name] = value
+
+
 def _shared_first(env_name: str, file_raw: object) -> str:
     """Deployment value where the shared config file wins, env only falls back.
 
@@ -271,15 +287,14 @@ class AgentConfig:
         # SDK in sync with whatever layer won above, so a stale env copy
         # (already warned about in _shared_first) cannot win for the SDK
         # while the config reports the file's key.
-        if api_key and os.getenv("GOOGLE_API_KEY") != api_key:
-            os.environ["GOOGLE_API_KEY"] = api_key
+        _export_env("GOOGLE_API_KEY", api_key)
 
         try:
             timeout = float(os.getenv("FLOAT_API_TIMEOUT_S", "8") or "8")
         except ValueError:
             timeout = 8.0
 
-        return cls(
+        config = cls(
             livekit_url=_shared_first("LIVEKIT_URL", livekit_cfg.get("url")),
             livekit_api_key=_shared_first("LIVEKIT_API_KEY", livekit_cfg.get("api_key")),
             livekit_api_secret=_shared_first("LIVEKIT_API_SECRET", livekit_cfg.get("api_secret")),
@@ -306,6 +321,25 @@ class AgentConfig:
             float_api_timeout_s=max(1.0, min(timeout, 60.0)),
             instructions=os.getenv("FLOAT_AGENT_INSTRUCTIONS", "").strip() or DEFAULT_INSTRUCTIONS,
         )
+        # livekit-agents (AgentServer / run) and google-genai read the
+        # environment, not our config object; export the winners so the
+        # file-first values actually reach the SDKs. Without this the worker
+        # exits with "ws_url is required, or set LIVEKIT_URL environment
+        # variable" even though secerts.toml defines all three.
+        _export_env("LIVEKIT_URL", config.livekit_url)
+        _export_env("LIVEKIT_API_KEY", config.livekit_api_key)
+        _export_env("LIVEKIT_API_SECRET", config.livekit_api_secret)
+        return config
+
+    @property
+    def config_dir(self) -> Path:
+        """Directory the shared ``secerts.toml`` / ``settings.toml`` were read from.
+
+        Surfaced in startup errors: with file-first precedence, a worker
+        pointed at a different directory silently registers on another LiveKit
+        project than the API dispatches into.
+        """
+        return _repo_config_dir()
 
     def missing(self) -> list[str]:
         """Required settings that are absent (for a readable startup error)."""

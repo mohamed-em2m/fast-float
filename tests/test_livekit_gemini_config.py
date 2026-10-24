@@ -134,6 +134,43 @@ def test_agent_shared_falls_back_to_livekit_and_non_secret_defaults(monkeypatch,
     assert "GOOGLE_API_KEY" in config.missing()[0]
 
 
+def test_agent_exports_livekit_triple_to_env_for_the_sdk(monkeypatch, tmp_path):
+    """livekit-agents reads LIVEKIT_* from os.environ, not from our config.
+
+    Regression: file-first resolution made the config correct while the
+    worker still died with "ws_url is required, or set LIVEKIT_URL
+    environment variable" (AgentServer never saw the file's values).
+    """
+    _write_configs(tmp_path)
+    monkeypatch.setenv("FLOAT_CONFIG_DIR", str(tmp_path))
+    for name in ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET"):
+        monkeypatch.delenv(name, raising=False)
+
+    config = AgentConfig.from_env()
+    assert os.environ["LIVEKIT_URL"] == config.livekit_url == "ws://127.0.0.1:7880"
+    assert os.environ["LIVEKIT_API_KEY"] == config.livekit_api_key == "devkey"
+    assert os.environ["LIVEKIT_API_SECRET"] == config.livekit_api_secret
+
+
+def test_agent_exported_livekit_env_follows_the_file_not_a_stale_copy(monkeypatch, tmp_path):
+    """The SDK must see the same winner the config resolves (file > env)."""
+    _write_configs(tmp_path)
+    monkeypatch.setenv("FLOAT_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("LIVEKIT_URL", "ws://stale-project:7880")
+
+    config = AgentConfig.from_env()
+    assert config.livekit_url == "ws://127.0.0.1:7880"
+    assert os.environ["LIVEKIT_URL"] == "ws://127.0.0.1:7880"
+
+
+def test_agent_reports_the_shared_config_dir(monkeypatch, tmp_path):
+    """Startup errors name the directory actually read (config-dir drift)."""
+    _write_configs(tmp_path)
+    monkeypatch.setenv("FLOAT_CONFIG_DIR", str(tmp_path))
+    config = AgentConfig.from_env()
+    assert config.config_dir == tmp_path
+
+
 def test_agent_shared_file_wins_over_env_secret(monkeypatch, tmp_path):
     """secerts.toml is the single source of truth; env is only a fallback."""
     _write_configs(tmp_path, gemini_key="from-file")
@@ -204,13 +241,17 @@ def test_livekit_settings_file_wins_over_env_copy_and_warns(monkeypatch, caplog,
     monkeypatch.setattr("fast_float.livekit.settings.load_settings", lambda: {})
     monkeypatch.setenv("LIVEKIT_URL", "wss://stale-env.livekit.cloud")
     monkeypatch.setenv("LIVEKIT_API_KEY", "APIstale")
+    # config.from_env exports winners into the real environment (that is the
+    # SDK contract), so a secret may be left over from an earlier test.
+    monkeypatch.delenv("LIVEKIT_API_SECRET", raising=False)
 
     with caplog.at_level(logging.WARNING, logger="fast_float.livekit.settings"):
         settings = LiveKitSettings.from_env()
     assert settings.api_key == "APIfile"
     assert settings.source == "secerts.toml"
     drift = [r for r in caplog.records if "different deployments" in r.getMessage()]
-    assert len(drift) == 2  # url and key env copies are stale
+    warned = {r.args[0] for r in drift}
+    assert {"LIVEKIT_URL", "LIVEKIT_API_KEY"} <= warned  # stale env copies flagged
 
 
 def test_livekit_status_reports_gemini_configured_without_the_key(api_client, monkeypatch):
