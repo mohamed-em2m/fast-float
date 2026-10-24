@@ -4,6 +4,7 @@ import {
   CircleStop,
   Mic,
   MicOff,
+  Play,
   Radio,
   ShieldCheck,
   Sparkles,
@@ -49,6 +50,7 @@ function newRoomName() {
 export default function LiveAudioStudio({
   imagePreview,
   imageBase64,
+  imageFormat = 'jpg',
   onToast,
   onOpenStudio,
   portraitPicker,
@@ -60,17 +62,25 @@ export default function LiveAudioStudio({
   const [level, setLevel] = useState(0);
   const [room, setRoom] = useState(null);
   const [elapsed, setElapsed] = useState(0);
+  // Autoplay with sound can be rejected even after a click; offer a retry.
+  const [needsGesture, setNeedsGesture] = useState(false);
 
   const videoRef = useRef(null);
   const roomRef = useRef(null);
   const viewerRef = useRef(null);
   const micRef = useRef(null);
   const mountedRef = useRef(true);
+  // Every start/stop bumps this; a late await from an older start must not
+  // resurrect a session the user already ended.
+  const sessionRef = useRef(0);
+  const stoppingRef = useRef(false);
+  const startingRef = useRef(false);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      sessionRef.current += 1;
       const activeRoom = roomRef.current;
       roomRef.current = null;
       try {
@@ -166,35 +176,72 @@ export default function LiveAudioStudio({
     return () => window.removeEventListener('beforeunload', onUnload);
   }, []);
 
+  const resumePlayback = async () => {
+    const video = videoRef.current;
+    try {
+      await video?.play();
+      setNeedsGesture(false);
+    } catch (err) {
+      console.warn('Playback is still blocked', err);
+      onToast?.('Your browser is still blocking playback. Tap the video to allow sound.', 'error');
+    }
+  };
+
   const endSession = async ({ silent = false } = {}) => {
+    if (stoppingRef.current) return;
+    stoppingRef.current = true;
+    startingRef.current = false;
+    // Invalidate any in-flight start; its late awaits clean themselves up.
+    sessionRef.current += 1;
     const activeRoom = roomRef.current;
+    roomRef.current = null;
     setPhase('stopping');
+    setNeedsGesture(false);
     await teardownLocal({ flush: true });
     if (activeRoom) await stopConversation(activeRoom).catch(() => {});
-    roomRef.current = null;
-    if (!mountedRef.current) return;
+    if (!mountedRef.current) {
+      stoppingRef.current = false;
+      return;
+    }
     setRoom(null);
     setPhase('idle');
     setLevel(0);
     setMuted(false);
     setError(null);
+    setElapsed(0);
+    stoppingRef.current = false;
     if (!silent) onToast?.('Live session ended.', 'info');
   };
 
   const startSession = async () => {
+    if (startingRef.current) return;
+    if (phase === 'starting' || phase === 'stopping' || phase === 'live') return;
     if (!imageBase64) {
       onToast?.('Choose an avatar portrait first.', 'error');
       return;
     }
+
+    startingRef.current = true;
+    const token = ++sessionRef.current;
+    const isActive = () => mountedRef.current && sessionRef.current === token;
+    let startedRoom = null;
     setError(null);
+    setNeedsGesture(false);
     setPhase('starting');
     const targetRoom = newRoomName();
     try {
       const started = await startConversation({
         room: targetRoom,
         imageBase64,
-        imageFormat: 'jpg',
+        imageFormat: imageFormat || 'jpg',
       });
+      startedRoom = started.room;
+
+      // The user may have pressed End while the server was warming up.
+      if (!isActive()) {
+        await stopConversation(startedRoom).catch(() => {});
+        return;
+      }
       roomRef.current = started.room;
       setRoom(started.room);
 
@@ -204,7 +251,7 @@ export default function LiveAudioStudio({
         connectTimeoutMs: 20000,
         trackTimeoutMs: 30000,
         onStatus: (status) => {
-          if (!mountedRef.current) return;
+          if (!isActive()) return;
           if (status === 'error') {
             setPhase((current) => (current === 'live' ? current : 'error'));
             setError('The LiveKit room could not be reached.');
@@ -212,16 +259,18 @@ export default function LiveAudioStudio({
           if (status === 'done' || status === 'error') {
             // Publisher stopped: tear down the local side, but never loop.
             const endedRoom = roomRef.current;
+            roomRef.current = null;
             teardownLocal({ flush: false });
+            setNeedsGesture(false);
             setPhase((current) => {
               if (current === 'starting') return 'error';
               if (current === 'live') return 'idle';
               return current;
             });
             setRoom(null);
-            roomRef.current = null;
             // Release the GPU session even if the publisher died on its own.
             if (endedRoom) stopConversation(endedRoom).catch(() => {});
+            if (status === 'done') onToast?.('The live stream ended.', 'info');
           }
         },
       });
@@ -229,9 +278,14 @@ export default function LiveAudioStudio({
 
       // The room may have ended while we were connecting; do not start a mic
       // against a dead session.
-      if (!mountedRef.current || roomRef.current !== started.room) {
+      if (!isActive() || roomRef.current !== started.room) {
         viewer.disconnect?.();
         await stopConversation(started.room).catch(() => {});
+        // The publisher died before we were live: the phase was flipped to
+        // 'error' by onStatus, so give it something to show.
+        if (isActive() && !roomRef.current) {
+          setError((current) => current || 'The avatar stream ended before the session went live.');
+        }
         return;
       }
 
@@ -243,7 +297,8 @@ export default function LiveAudioStudio({
       await mic.start();
       micRef.current = mic;
 
-      if (!mountedRef.current || roomRef.current !== started.room) {
+      if (!isActive() || roomRef.current !== started.room) {
+        micRef.current = null;
         await mic.stop({ flush: false });
         viewer.disconnect?.();
         await stopConversation(started.room).catch(() => {});
@@ -252,16 +307,25 @@ export default function LiveAudioStudio({
       setPhase('live');
       setElapsed(0);
       onToast?.('Live avatar is on air — start speaking.', 'success');
+      // The audio track may unmute the element after the click that started
+      // the session, so autoplay can still be rejected. Surface a retry.
+      videoRef.current?.play?.().catch(() => setNeedsGesture(true));
     } catch (err) {
       console.error('Live session failed', err);
-      setError(err.message || 'Could not start the live session.');
+      if (startedRoom) await stopConversation(startedRoom).catch(() => {});
+      if (!isActive()) return;
+      const message =
+        err?.name === 'NotAllowedError' || err?.name === 'SecurityError'
+          ? 'Microphone access was blocked. Allow the microphone in your browser and try again.'
+          : (err?.message || 'Could not start the live session.');
+      setError(message);
       setPhase('error');
       await teardownLocal({ flush: false });
-      const activeRoom = roomRef.current;
       roomRef.current = null;
-      if (activeRoom) await stopConversation(activeRoom).catch(() => {});
-      setRoom(null);
-      onToast?.(err.message || 'Could not start the live session.', 'error');
+      if (mountedRef.current) setRoom(null);
+      onToast?.(message, 'error');
+    } finally {
+      if (sessionRef.current === token) startingRef.current = false;
     }
   };
 
@@ -279,6 +343,7 @@ export default function LiveAudioStudio({
   };
 
   const configured = liveKit?.configured;
+  const backendReachable = liveKit?.reachable !== false;
   const busy = phase === 'starting' || phase === 'stopping';
   const isLive = phase === 'live';
   const minutes = String(Math.floor(elapsed / 60)).padStart(2, '0');
@@ -297,7 +362,11 @@ export default function LiveAudioStudio({
               <span className="muted-label">one photo, front-facing</span>
             </div>
             <div className="live-portrait-preview">
-              <img src={imagePreview} alt="Selected avatar portrait" />
+              {imagePreview ? (
+                <img src={imagePreview} alt="Selected avatar portrait" />
+              ) : (
+                <p className="live-portrait-empty">Choose a front-facing portrait to begin.</p>
+              )}
             </div>
           </section>
         )}
@@ -362,7 +431,9 @@ export default function LiveAudioStudio({
           {!configured && liveKit !== null && (
             <p className="inline-warning">
               <TriangleAlert size={14} />
-              LiveKit is not configured. See the setup card on the right.
+              {backendReachable
+                ? 'LiveKit is not configured. Add the project URL, API key and secret on the server.'
+                : 'Cannot reach the backend. Check that the API is running, then reload.'}
             </p>
           )}
           {error && (
@@ -403,7 +474,19 @@ export default function LiveAudioStudio({
         </div>
 
         <div className={`live-video ${isLive ? 'is-live' : ''}`}>
-          <video ref={videoRef} autoPlay playsInline className="live-video-el" />
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            className="live-video-el"
+            onPlaying={() => setNeedsGesture(false)}
+          />
+          {isLive && needsGesture && (
+            <button type="button" className="live-play-overlay" onClick={resumePlayback}>
+              <Play size={18} fill="currentColor" />
+              <span>Tap to start playback with sound</span>
+            </button>
+          )}
           {!isLive && (
             <div className="live-video-placeholder">
               {configured ? (
@@ -427,12 +510,15 @@ export default function LiveAudioStudio({
                   <div className="live-orb is-muted">
                     <Radio size={34} />
                   </div>
-                  <h3>LiveKit needs to be running</h3>
+                  <h3>{backendReachable ? 'LiveKit needs to be configured' : 'Backend unavailable'}</h3>
                   <p>
-                    Live audio uses a LiveKit SFU for the avatar&apos;s video and audio.
-                    Start it once, then this panel comes alive.
+                    {backendReachable
+                      ? 'Live audio uses a LiveKit SFU for the avatar’s video and audio. Add the project URL, API key and secret on the server, then this panel comes alive.'
+                      : 'The Studio cannot reach its API, so a live session cannot start. Check that the backend is running, then reload the page.'}
                   </p>
-                  <code className="live-code">docker compose -f docker-compose.livekit.yml up -d</code>
+                  {backendReachable && (
+                    <code className="live-code">fast_float/config/secerts.toml → [livekit]</code>
+                  )}
                   <button type="button" className="btn-secondary" onClick={onOpenStudio}>
                     Use the studio instead
                   </button>

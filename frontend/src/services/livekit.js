@@ -88,10 +88,14 @@ function withTimeout(promise, ms, message, onTimeout) {
 export async function fetchLiveKitStatus() {
   try {
     const res = await fetch(`${getApiUrl()}/livekit/status`);
-    if (!res.ok) return { configured: false };
-    return await res.json();
-  } catch {
-    return { configured: false };
+    if (!res.ok) return { configured: false, reachable: true };
+    return { ...(await res.json()), reachable: true };
+  } catch (err) {
+    return {
+      configured: false,
+      reachable: false,
+      error: err?.message || 'Cannot reach the backend',
+    };
   }
 }
 

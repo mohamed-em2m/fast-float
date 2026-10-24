@@ -238,11 +238,13 @@ export default function StudioStage({
           <video
             key={videoUrl}
             src={videoUrl}
+            poster={imagePreview || undefined}
             controls
             autoPlay
             loop
             playsInline
             className="stage-video"
+            onError={() => onToast?.('The rendered video could not be loaded. Try downloading the MP4.', 'error')}
           />
         ) : (
           <div className="stage-empty">

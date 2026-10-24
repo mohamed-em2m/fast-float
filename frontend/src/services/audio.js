@@ -78,54 +78,62 @@ export class MicStreamer {
     this.bufferedSamples = 0;
     this.muted = false;
     this.stopped = false;
+    this.failed = false;
     this.sendChain = Promise.resolve();
     this.analyserData = null;
     this.levelTimer = null;
   }
 
   async start() {
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-    });
+    try {
+      this.stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
 
-    const AudioCtx = window.AudioContext || window.webkitAudioContext;
-    this.context = new AudioCtx();
-    // A user gesture started the session; this is a no-op when already running.
-    await this.context.resume?.().catch(() => {});
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      this.context = new AudioCtx();
+      // A user gesture started the session; this is a no-op when already running.
+      await this.context.resume?.().catch(() => {});
 
-    this.source = this.context.createMediaStreamSource(this.stream);
-    this.analyser = this.context.createAnalyser();
-    this.analyser.fftSize = 512;
-    this.analyser.smoothingTimeConstant = 0.75;
-    this.analyserData = new Uint8Array(this.analyser.frequencyBinCount);
-    this.source.connect(this.analyser);
+      this.source = this.context.createMediaStreamSource(this.stream);
+      this.analyser = this.context.createAnalyser();
+      this.analyser.fftSize = 512;
+      this.analyser.smoothingTimeConstant = 0.75;
+      this.analyserData = new Uint8Array(this.analyser.frequencyBinCount);
+      this.source.connect(this.analyser);
 
-    // ScriptProcessor is deprecated but universally available and good enough
-    // for 200 ms PCM batches (this is not an audio-quality path).
-    this.processor = this.context.createScriptProcessor(4096, 1, 1);
-    this.sink = this.context.createGain();
-    this.sink.gain.value = 0; // keep the graph pulled without echoing to speakers
+      // ScriptProcessor is deprecated but universally available and good enough
+      // for 200 ms PCM batches (this is not an audio-quality path).
+      this.processor = this.context.createScriptProcessor(4096, 1, 1);
+      this.sink = this.context.createGain();
+      this.sink.gain.value = 0; // keep the graph pulled without echoing to speakers
 
-    this.processor.onaudioprocess = (event) => {
-      if (this.stopped || this.muted) return;
-      const channel = event.inputBuffer.getChannelData(0);
-      const pcm = floatToPcm16(downsampleTo16k(channel, this.context.sampleRate));
-      this.buffer.push(pcm);
-      this.bufferedSamples += pcm.length;
-      if (this.bufferedSamples >= CHUNK_SAMPLES) this._send();
-    };
+      this.processor.onaudioprocess = (event) => {
+        if (this.stopped || this.muted) return;
+        const channel = event.inputBuffer.getChannelData(0);
+        const pcm = floatToPcm16(downsampleTo16k(channel, this.context.sampleRate));
+        this.buffer.push(pcm);
+        this.bufferedSamples += pcm.length;
+        if (this.bufferedSamples >= CHUNK_SAMPLES) this._send();
+      };
 
-    this.source.connect(this.processor);
-    this.processor.connect(this.sink);
-    this.sink.connect(this.context.destination);
+      this.source.connect(this.processor);
+      this.processor.connect(this.sink);
+      this.sink.connect(this.context.destination);
 
-    if (this.onLevel) {
-      this.levelTimer = setInterval(() => this._emitLevel(), 100);
+      if (this.onLevel) {
+        this.levelTimer = setInterval(() => this._emitLevel(), 100);
+      }
+    } catch (err) {
+      // A permission/device error after getUserMedia succeeded used to leave
+      // the microphone track and AudioContext alive.
+      await this.stop({ flush: false }).catch(() => {});
+      throw err;
     }
   }
 
@@ -144,12 +152,23 @@ export class MicStreamer {
     const pcm = concatPcm16(this.buffer, this.bufferedSamples);
     this.buffer = [];
     this.bufferedSamples = 0;
+    if (this.failed) return;
     const base64 = pcm16ToBase64(pcm);
     // Serialise posts: the renderer owns the ordering, and a slow network must
     // not let two chunks race.
     this.sendChain = this.sendChain
-      .then(() => pushConversationAudio(this.room, base64))
-      .catch((err) => this.onError?.(err.message || 'Live audio upload failed'));
+      .then(() => {
+        if (this.failed) return undefined;
+        return pushConversationAudio(this.room, base64);
+      })
+      .catch((err) => {
+        // A dead room would otherwise produce one toast per 200 ms chunk.
+        if (this.failed) return;
+        this.failed = true;
+        this.buffer = [];
+        this.bufferedSamples = 0;
+        this.onError?.(err?.message || 'Live audio upload failed');
+      });
   }
 
   setMuted(muted) {
@@ -181,7 +200,7 @@ export class MicStreamer {
     }
     if (this.bufferedSamples) this._send();
     await this.sendChain.catch(() => {});
-    if (flush) {
+    if (flush && !this.failed) {
       await pushConversationAudio(this.room, '', { flush: true }).catch(() => {});
     }
     try {

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { Play } from 'lucide-react';
 import { attachRemoteTrack, createWebRtcSession } from '../services/api';
 import { openLiveSocket } from '../services/live';
 import { connectLiveKitSession, fetchLiveKitPublishStatus } from '../services/livekit';
@@ -30,6 +31,7 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
   const [status, setStatus] = useState('connecting');
   const [gaps, setGaps] = useState(0);
   const [size, setSize] = useState(null);
+  const [needsGesture, setNeedsGesture] = useState(false);
   // Kept in a ref so a new callback identity never restarts the socket.
   const onStatusRef = useRef(onStatus);
   const onEndedRef = useRef(onEnded);
@@ -145,7 +147,9 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
           }
           report(s);
           if (s === 'live' && videoEl) {
-            videoEl.play().catch(() => {});
+            videoEl.play().catch(() => {
+              if (!cancelled) setNeedsGesture(true);
+            });
           }
         },
       })
@@ -245,7 +249,9 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
         if (attachRemoteTrack(videoEl, event)) {
           watchTrackEnd();
           clearConnectionTimer();
-          videoEl.play().catch(() => {});
+          videoEl.play().catch(() => {
+            if (!cancelled) setNeedsGesture(true);
+          });
           report('live');
         }
       },
@@ -308,7 +314,31 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
           height={size?.height ?? 512}
         />
       ) : (
-        <video ref={videoRef} className="live-preview-media" autoPlay playsInline controls />
+        <video
+          ref={videoRef}
+          className="live-preview-media"
+          autoPlay
+          playsInline
+          controls
+          onPlaying={() => setNeedsGesture(false)}
+        />
+      )}
+      {needsGesture && transport !== 'ws' && (
+        <button
+          type="button"
+          className="live-preview-play"
+          onClick={async () => {
+            try {
+              await videoRef.current?.play();
+              setNeedsGesture(false);
+            } catch {
+              /* the overlay stays until the browser allows playback */
+            }
+          }}
+        >
+          <Play size={17} fill="currentColor" />
+          Tap to play with sound
+        </button>
       )}
       <div className="live-preview-overlay">
         <span className={`live-preview-status live-preview-status--${status}`}>

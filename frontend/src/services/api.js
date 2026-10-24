@@ -252,17 +252,117 @@ async function ensureBackend() {
   );
 }
 
-/** Convert a Blob or File to a Base64 string (without data URL header) */
+/** Convert a Blob or File to a Base64 string (without the data URL header). */
 export function blobToBase64(blob) {
   return new Promise((resolve, reject) => {
+    if (!blob) {
+      reject(new Error('No file selected.'));
+      return;
+    }
     const reader = new FileReader();
-    reader.onloadend = () => {
-      const base64String = reader.result.split(',')[1];
-      resolve(base64String);
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : '';
+      const comma = result.indexOf(',');
+      if (comma < 0 || comma === result.length - 1) {
+        reject(new Error('Could not read this file.'));
+        return;
+      }
+      resolve(result.slice(comma + 1));
     };
-    reader.onerror = reject;
+    // `onloadend` also fires after `onerror`; using it to resolve would throw
+    // on `null` and leave the caller's promise pending forever.
+    reader.onerror = () => reject(reader.error || new Error('Could not read this file.'));
+    reader.onabort = () => reject(new Error('Reading the file was cancelled.'));
     reader.readAsDataURL(blob);
   });
+}
+
+/** Lower-case, parameter-free MIME type (`audio/webm;codecs=opus` -> `audio/webm`). */
+function baseMime(value) {
+  return String(value || '').split(';')[0].trim().toLowerCase();
+}
+
+function extensionOf(name) {
+  const match = /\.([a-z0-9]+)$/i.exec(String(name || ''));
+  return match ? match[1].toLowerCase() : '';
+}
+
+const IMAGE_MIME_FORMATS = {
+  'image/jpeg': 'jpg',
+  'image/jpg': 'jpg',
+  'image/pjpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+};
+
+const IMAGE_EXTENSION_FORMATS = {
+  jpg: 'jpg',
+  jpeg: 'jpg',
+  png: 'png',
+  webp: 'webp',
+};
+
+// Only the containers the backend can decode. Extensions are mapped to the
+// container name pydub/ffmpeg understands (m4a -> mp4, opus -> ogg).
+const AUDIO_MIME_FORMATS = {
+  'audio/wav': 'wav',
+  'audio/wave': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/vnd.wave': 'wav',
+  'audio/mpeg': 'mp3',
+  'audio/mp3': 'mp3',
+  'audio/mpga': 'mp3',
+  'audio/mp4': 'mp4',
+  'audio/x-m4a': 'mp4',
+  'audio/m4a': 'mp4',
+  'audio/ogg': 'ogg',
+  'audio/opus': 'ogg',
+  'audio/webm': 'webm',
+  'audio/flac': 'flac',
+  'audio/x-flac': 'flac',
+  'audio/aac': 'aac',
+};
+
+const AUDIO_EXTENSION_FORMATS = {
+  wav: 'wav',
+  wave: 'wav',
+  mp3: 'mp3',
+  mpga: 'mp3',
+  m4a: 'mp4',
+  mp4: 'mp4',
+  ogg: 'ogg',
+  oga: 'ogg',
+  opus: 'ogg',
+  webm: 'webm',
+  flac: 'flac',
+  aac: 'aac',
+};
+
+/**
+ * Container hint for `image_format` / `image_base64`.
+ *
+ * Derive it from the MIME type first, then from the extension. `null` means
+ * the file is not an image the backend supports (BMP/GIF/SVG/TIFF are not).
+ */
+export function imageFormatFromFile(file) {
+  const mime = baseMime(file?.type);
+  if (IMAGE_MIME_FORMATS[mime]) return IMAGE_MIME_FORMATS[mime];
+  return IMAGE_EXTENSION_FORMATS[extensionOf(file?.name)] || null;
+}
+
+/** Container hint for `audio_format`; `null` when the file is not decodable. */
+export function audioFormatFromFile(file) {
+  const mime = baseMime(file?.type);
+  if (AUDIO_MIME_FORMATS[mime]) return AUDIO_MIME_FORMATS[mime];
+  return AUDIO_EXTENSION_FORMATS[extensionOf(file?.name)] || null;
+}
+
+/** Human-readable size for validation messages. */
+export function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(0)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /** Log API failures so they are visible in the browser console, not silent. */

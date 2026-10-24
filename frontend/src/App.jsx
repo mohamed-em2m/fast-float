@@ -32,6 +32,8 @@ export default function App() {
   // Input State
   const [imagePreview, setImagePreview] = useState(DEFAULT_PORTRAIT);
   const [imageBase64, setImageBase64] = useState(null);
+  // Container hint for image_base64; portrait uploads set the real format.
+  const [imageFormat, setImageFormat] = useState('jpg');
   const [noCrop, setNoCrop] = useState(false);
 
   const [audioBlob, setAudioBlob] = useState(null);
@@ -150,7 +152,7 @@ export default function App() {
         channels: 1,
         sample_width: 2,
         image_base64: imageBase64 || null,
-        image_format: 'jpg',
+        image_format: imageFormat || 'jpg',
         emotion: params.emotion,
         nfe: params.nfe,
         seed: params.seed,
@@ -195,9 +197,11 @@ export default function App() {
       imagePreview={imagePreview}
       setImagePreview={setImagePreview}
       setImageBase64={setImageBase64}
+      setImageFormat={setImageFormat}
       noCrop={noCrop}
       setNoCrop={setNoCrop}
       step={1}
+      onToast={showToast}
     />
   );
 
@@ -230,6 +234,7 @@ export default function App() {
         <LiveAudioStudio
           imagePreview={imagePreview}
           imageBase64={imageBase64}
+          imageFormat={imageFormat}
           onToast={showToast}
           onOpenStudio={() => setMode('studio')}
           portraitPicker={portraitCard}
