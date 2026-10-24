@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 import sys
 from pathlib import Path
 
@@ -28,6 +30,18 @@ try:
     RTC_AVAILABLE = True
 except ImportError:  # pragma: no cover - depends on the environment
     RTC_AVAILABLE = False
+
+
+@pytest.fixture
+def visible_fast_float_logs(monkeypatch):
+    """Let ``fast_float.*`` records reach pytest's caplog.
+
+    fast_float.utils.logger installs its own handler on the ``fast_float``
+    logger with ``propagate = False``, so caplog (a root-logger handler)
+    never sees records from module loggers. Re-enable propagation for the
+    tests that assert on drift warnings.
+    """
+    monkeypatch.setattr(logging.getLogger("fast_float"), "propagate", True)
 
 
 @pytest.fixture
@@ -68,12 +82,30 @@ def test_agent_reads_gemini_key_from_shared_secerts(monkeypatch, tmp_path):
     monkeypatch.setenv("FLOAT_CONFIG_DIR", str(tmp_path))
     for name in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("LIVEKIT_URL", "ws://override:7880")  # env still wins
+    monkeypatch.setenv("LIVEKIT_URL", "ws://override:7880")  # stale env copy
 
     config = AgentConfig.from_env()
     assert config.google_api_key == "AI-secret-from-secerts"
-    # Env beats the shared file for LiveKit; shared file is a fallback.
-    assert config.livekit_url == "ws://override:7880"
+    # The shared file is the single source of truth: a disagreeing env copy
+    # loses (and is logged as stale).
+    assert config.livekit_url == "ws://127.0.0.1:7880"
+
+
+def test_agent_warns_when_env_copy_disagrees_with_shared_file(monkeypatch, tmp_path, caplog):
+    """The stale-env drift that used to register the worker on the wrong SFU."""
+    _write_configs(tmp_path, gemini_key="AI-file-key")
+    monkeypatch.setenv("FLOAT_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("LIVEKIT_URL", "ws://other-project.livekit.cloud")
+    monkeypatch.setenv("GOOGLE_API_KEY", "AI-env-stale")
+
+    with caplog.at_level(logging.WARNING, logger="float_agent.config"):
+        config = AgentConfig.from_env()
+    # File wins, in the config and for the google-genai SDK (env re-export).
+    assert config.livekit_url == "ws://127.0.0.1:7880"
+    assert config.google_api_key == "AI-file-key"
+    assert os.environ["GOOGLE_API_KEY"] == "AI-file-key"
+    drift = [r for r in caplog.records if "shared FLOAT config" in r.getMessage()]
+    assert len(drift) >= 2  # LIVEKIT_URL and GOOGLE_API_KEY copies are stale
 
 
 def test_agent_shared_falls_back_to_livekit_and_non_secret_defaults(monkeypatch, tmp_path):
@@ -101,11 +133,20 @@ def test_agent_shared_falls_back_to_livekit_and_non_secret_defaults(monkeypatch,
     assert "GOOGLE_API_KEY" in config.missing()[0]
 
 
-def test_agent_env_beats_shared_secret(monkeypatch, tmp_path):
+def test_agent_shared_file_wins_over_env_secret(monkeypatch, tmp_path):
+    """secerts.toml is the single source of truth; env is only a fallback."""
     _write_configs(tmp_path, gemini_key="from-file")
     monkeypatch.setenv("FLOAT_CONFIG_DIR", str(tmp_path))
     monkeypatch.setenv("GOOGLE_API_KEY", "from-env")
 
+    config = AgentConfig.from_env()
+    assert config.google_api_key == "from-file"
+
+    # Without the shared config the env keeps working (fallback). The call
+    # above re-exported the winning file key into the real environment
+    # (that is the google-genai contract), so restore the env copy.
+    monkeypatch.setenv("GOOGLE_API_KEY", "from-env")
+    (tmp_path / "secerts.toml").write_text("", encoding="utf-8")
     config = AgentConfig.from_env()
     assert config.google_api_key == "from-env"
 
@@ -142,12 +183,33 @@ def test_livekit_settings_gemini_env_beats_files(monkeypatch):
         lambda: {"gemini": {"api_key": "from-file"}},
     )
     monkeypatch.setattr("fast_float.livekit.settings.load_settings", lambda: {})
-    monkeypatch.setenv("GOOGLE_API_KEY", "from-env")
     monkeypatch.setenv("GEMINI_VOICE", "Aster")
 
     settings = LiveKitSettings.from_env()
-    assert settings.gemini.api_key == "from-env"
+    # The shared file is the source of truth for the key...
+    assert settings.gemini.api_key == "from-file"
+    # ...and env is the fallback where the file does not define the key.
     assert settings.gemini.voice == "Aster"
+
+
+def test_livekit_settings_file_wins_over_env_copy_and_warns(monkeypatch, caplog, visible_fast_float_logs):
+    """A disagreeing env copy must not silently fight the shared file."""
+    monkeypatch.setattr(
+        "fast_float.livekit.settings.load_secrets",
+        lambda: {
+            "livekit": {"url": "wss://demo.livekit.cloud", "api_key": "APIfile", "api_secret": "s" * 44},
+        },
+    )
+    monkeypatch.setattr("fast_float.livekit.settings.load_settings", lambda: {})
+    monkeypatch.setenv("LIVEKIT_URL", "wss://stale-env.livekit.cloud")
+    monkeypatch.setenv("LIVEKIT_API_KEY", "APIstale")
+
+    with caplog.at_level(logging.WARNING, logger="fast_float.livekit.settings"):
+        settings = LiveKitSettings.from_env()
+    assert settings.api_key == "APIfile"
+    assert settings.source == "secerts.toml"
+    drift = [r for r in caplog.records if "different deployments" in r.getMessage()]
+    assert len(drift) == 2  # url and key env copies are stale
 
 
 def test_livekit_status_reports_gemini_configured_without_the_key(api_client, monkeypatch):

@@ -174,18 +174,46 @@ class LiveKitSettings:
         def _s(value: Any) -> str:
             return str(value or "").strip()
 
-        url, url_src = first_value(
-            (os.getenv("LIVEKIT_URL", "").strip(), "env"),
+        # The shared FLOAT config (secerts.toml / settings.toml) is the single
+        # source of truth for the deployment values that must agree between
+        # this API and the agents worker (same LiveKit project, same agent
+        # name): the file wins, and the environment is only a *fallback* for
+        # boxes without the shared config. A disagreeing env copy is stale —
+        # say so loudly instead of letting the copies drift apart silently.
+        def _shared(name: str, env_name: str, *layers: tuple[str, str]) -> tuple[str, str]:
+            env_value = os.getenv(env_name, "").strip()
+            for raw_value, src in layers:
+                value = str(raw_value or "").strip()
+                if value:
+                    if env_value and env_value != value:
+                        logger.warning(
+                            "%s is defined in both the shared FLOAT config and the environment "
+                            "(%s, differing). The shared file (%s) wins — remove or align the env "
+                            "copy, or the Gemini worker and this API will use different deployments.",
+                            name,
+                            env_name,
+                            src,
+                        )
+                    return value, src
+            if env_value:
+                return env_value, "env"
+            return "", "none"
+
+        url, url_src = _shared(
+            "LIVEKIT_URL",
+            "LIVEKIT_URL",
             (_s(secrets.get("url")), "secerts.toml"),
             (_s(config.get("url")), "settings.toml"),
         )
-        api_key, key_src = first_value(
-            (os.getenv("LIVEKIT_API_KEY", "").strip(), "env"),
+        api_key, key_src = _shared(
+            "LIVEKIT_API_KEY",
+            "LIVEKIT_API_KEY",
             (_s(secrets.get("api_key")), "secerts.toml"),
             (_s(config.get("api_key")), "settings.toml"),
         )
-        api_secret, sec_src = first_value(
-            (os.getenv("LIVEKIT_API_SECRET", "").strip(), "env"),
+        api_secret, sec_src = _shared(
+            "LIVEKIT_API_SECRET",
+            "LIVEKIT_API_SECRET",
             (_s(secrets.get("api_secret")), "secerts.toml"),
             (_s(config.get("api_secret")), "settings.toml"),
         )
@@ -195,24 +223,24 @@ class LiveKitSettings:
         gemini_secrets = all_secrets.get("gemini", {})
         gemini_cfg = all_config.get("gemini", {})
         gemini_key, _ = first_value(
+            (_s(gemini_secrets.get("api_key")), "secerts.toml"),
+            (_s(gemini_cfg.get("api_key")), "settings.toml"),
             (
                 os.getenv("GOOGLE_API_KEY", "").strip() or os.getenv("GEMINI_API_KEY", "").strip(),
                 "env",
             ),
-            (_s(gemini_secrets.get("api_key")), "secerts.toml"),
-            (_s(gemini_cfg.get("api_key")), "settings.toml"),
         )
         gemini_model, _ = first_value(
-            (os.getenv("GEMINI_MODEL", "").strip(), "env"),
             (_s(gemini_cfg.get("model")), "settings.toml"),
+            (os.getenv("GEMINI_MODEL", "").strip(), "env"),
         )
         gemini_voice, _ = first_value(
-            (os.getenv("GEMINI_VOICE", "").strip(), "env"),
             (_s(gemini_cfg.get("voice")), "settings.toml"),
+            (os.getenv("GEMINI_VOICE", "").strip(), "env"),
         )
         gemini_lang, _ = first_value(
-            (os.getenv("GEMINI_LANGUAGE", "").strip(), "env"),
             (_s(gemini_cfg.get("language")), "settings.toml"),
+            (os.getenv("GEMINI_LANGUAGE", "").strip(), "env"),
         )
         gemini_vertex_raw = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip()
         gemini_vertex = (
@@ -221,12 +249,12 @@ class LiveKitSettings:
             else _as_bool(gemini_cfg.get("vertexai", False))
         )
         gemini_project, _ = first_value(
-            (os.getenv("GOOGLE_CLOUD_PROJECT", "").strip(), "env"),
             (_s(gemini_cfg.get("project")), "settings.toml"),
+            (os.getenv("GOOGLE_CLOUD_PROJECT", "").strip(), "env"),
         )
         gemini_location, _ = first_value(
-            (os.getenv("GOOGLE_CLOUD_LOCATION", "").strip(), "env"),
             (_s(gemini_cfg.get("location")), "settings.toml"),
+            (os.getenv("GOOGLE_CLOUD_LOCATION", "").strip(), "env"),
         )
 
         ttl_raw, _ttl_src = first_value(
@@ -338,14 +366,12 @@ class LiveKitSettings:
             )
 
         avatar_identity, _ = first_value(
+            (_s(gemini_cfg.get("avatar_identity")) or _s(config.get("avatar_identity")), "settings.toml"),
             (os.getenv("FLOAT_AVATAR_IDENTITY", "").strip(), "env"),
-            (_s(gemini_cfg.get("avatar_identity")), "settings.toml"),
-            (_s(config.get("avatar_identity")), "settings.toml"),
         )
         agent_name, _ = first_value(
+            (_s(gemini_cfg.get("agent_name")) or _s(config.get("agent_name")), "settings.toml"),
             (os.getenv("FLOAT_GEMINI_AGENT_NAME", "").strip(), "env"),
-            (_s(gemini_cfg.get("agent_name")), "settings.toml"),
-            (_s(config.get("agent_name")), "settings.toml"),
         )
         autodispatch_raw = os.getenv("FLOAT_GEMINI_AUTODISPATCH", "").strip()
         autodispatch = (

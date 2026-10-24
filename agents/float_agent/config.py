@@ -105,6 +105,31 @@ def _first_set(*candidates: object) -> str:
     return ""
 
 
+def _shared_first(env_name: str, file_raw: object) -> str:
+    """Deployment value where the shared config file wins, env only falls back.
+
+    ``fast_float/config/secerts.toml`` (and ``settings.toml``) is read by both
+    the FLOAT API and this worker, so its copy is guaranteed to agree on both
+    sides. An env copy in ``agents/.env`` is only a fallback for boxes without
+    the shared config: when both exist and differ, the file wins and the stale
+    env copy is flagged — a silent mismatch here meant registering the worker
+    on a different LiveKit project than the API dispatches into (the "NO job"
+    dispatch symptom).
+    """
+    env_value = os.getenv(env_name, "").strip()
+    file_value = _first_set(file_raw)
+    if file_value:
+        if env_value and env_value != file_value:
+            logger.warning(
+                "%s is set both in agents/.env and in the shared FLOAT config (secerts.toml/"
+                "settings.toml), with different values. The shared file wins — remove or align "
+                "the .env copy, or this worker and the FLOAT API will use different deployments.",
+                env_name,
+            )
+        return file_value
+    return env_value
+
+
 def dispatch_config(metadata: str) -> dict[str, str]:
     """Per-session overrides sent by the FLOAT API in the dispatch metadata.
 
@@ -239,11 +264,14 @@ class AgentConfig:
         gemini_cfg = sections["gemini"]
         livekit_cfg = sections["livekit"]
 
-        api_key = os.getenv("GOOGLE_API_KEY", "").strip() or os.getenv("GEMINI_API_KEY", "").strip()
+        api_key = _shared_first("GOOGLE_API_KEY", gemini_cfg.get("api_key"))
         if not api_key:
-            api_key = str(gemini_cfg.get("api_key") or "").strip()
-        # google-genai reads GOOGLE_API_KEY; accept GEMINI_* / shared config.
-        if api_key and not os.getenv("GOOGLE_API_KEY"):
+            api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        # google-genai reads GOOGLE_API_KEY from the environment; keep the
+        # SDK in sync with whatever layer won above, so a stale env copy
+        # (already warned about in _shared_first) cannot win for the SDK
+        # while the config reports the file's key.
+        if api_key and os.getenv("GOOGLE_API_KEY") != api_key:
             os.environ["GOOGLE_API_KEY"] = api_key
 
         try:
@@ -252,25 +280,25 @@ class AgentConfig:
             timeout = 8.0
 
         return cls(
-            livekit_url=_first_set(os.getenv("LIVEKIT_URL"), livekit_cfg.get("url")),
-            livekit_api_key=_first_set(os.getenv("LIVEKIT_API_KEY"), livekit_cfg.get("api_key")),
-            livekit_api_secret=_first_set(os.getenv("LIVEKIT_API_SECRET"), livekit_cfg.get("api_secret")),
+            livekit_url=_shared_first("LIVEKIT_URL", livekit_cfg.get("url")),
+            livekit_api_key=_shared_first("LIVEKIT_API_KEY", livekit_cfg.get("api_key")),
+            livekit_api_secret=_shared_first("LIVEKIT_API_SECRET", livekit_cfg.get("api_secret")),
             google_api_key=api_key,
-            vertexai=_flag("GOOGLE_GENAI_USE_VERTEXAI") or _as_bool(gemini_cfg.get("vertexai")),
-            google_cloud_project=_first_set(os.getenv("GOOGLE_CLOUD_PROJECT"), gemini_cfg.get("project")),
-            google_cloud_location=_first_set(os.getenv("GOOGLE_CLOUD_LOCATION"), gemini_cfg.get("location")),
-            model=_first_set(os.getenv("GEMINI_MODEL"), gemini_cfg.get("model")),
-            voice=_first_set(os.getenv("GEMINI_VOICE"), gemini_cfg.get("voice")) or "Puck",
-            language=_first_set(os.getenv("GEMINI_LANGUAGE"), gemini_cfg.get("language")),
-            avatar_identity=_first_set(
-                os.getenv("FLOAT_AVATAR_IDENTITY"),
-                gemini_cfg.get("avatar_identity"),
-                livekit_cfg.get("avatar_identity"),
-            )
+            # `vertexai = false` is the file's placeholder default, so only a
+            # *set* file value wins; the env flag stays the enabling fallback.
+            vertexai=(
+                True
+                if _as_bool(gemini_cfg.get("vertexai"))
+                else _flag("GOOGLE_GENAI_USE_VERTEXAI")
+            ),
+            google_cloud_project=_shared_first("GOOGLE_CLOUD_PROJECT", gemini_cfg.get("project")),
+            google_cloud_location=_shared_first("GOOGLE_CLOUD_LOCATION", gemini_cfg.get("location")),
+            model=_shared_first("GEMINI_MODEL", gemini_cfg.get("model")),
+            voice=_shared_first("GEMINI_VOICE", gemini_cfg.get("voice")) or "Puck",
+            language=_shared_first("GEMINI_LANGUAGE", gemini_cfg.get("language")),
+            avatar_identity=_shared_first("FLOAT_AVATAR_IDENTITY", gemini_cfg.get("avatar_identity"))
             or "float-avatar",
-            agent_name=_first_set(
-                os.getenv("FLOAT_GEMINI_AGENT_NAME"), gemini_cfg.get("agent_name"), livekit_cfg.get("agent_name")
-            )
+            agent_name=_shared_first("FLOAT_GEMINI_AGENT_NAME", gemini_cfg.get("agent_name"))
             or "float-gemini",
             float_api_url=(
                 os.getenv("FLOAT_API_URL", "http://127.0.0.1:8000").strip() or "http://127.0.0.1:8000"

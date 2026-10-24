@@ -20,6 +20,11 @@ API_SECRET = "devsecretdevsecretdevsecretdevsecret"
 
 @pytest.fixture
 def client(monkeypatch):
+    # Neutralize any operator secerts.toml / settings.toml in the checkout:
+    # for the LiveKit (url/key/secret) those shared files now win over env,
+    # and these tests test the purely env-configured deployment.
+    monkeypatch.setattr("fast_float.livekit.settings.load_secrets", lambda: {})
+    monkeypatch.setattr("fast_float.livekit.settings.load_settings", lambda: {})
     monkeypatch.setenv("LIVEKIT_URL", "ws://127.0.0.1:7880")
     monkeypatch.setenv("LIVEKIT_API_KEY", API_KEY)
     monkeypatch.setenv("LIVEKIT_API_SECRET", API_SECRET)
@@ -30,6 +35,8 @@ def client(monkeypatch):
 
 
 def test_settings_are_read_from_the_env(monkeypatch):
+    monkeypatch.setattr("fast_float.livekit.settings.load_secrets", lambda: {})
+    monkeypatch.setattr("fast_float.livekit.settings.load_settings", lambda: {})
     monkeypatch.setenv("LIVEKIT_URL", "ws://localhost:7880")
     monkeypatch.setenv("LIVEKIT_API_KEY", "k")
     monkeypatch.setenv("LIVEKIT_API_SECRET", "s")
@@ -87,8 +94,10 @@ def test_room_names_are_validated():
     assert valid_room_name("a" * 65) is False
 
 
-def test_settings_layering_secrets_beat_files_env_beats_all(monkeypatch):
-    # secerts.toml beats settings.toml; the env beats everything.
+def test_settings_layering_files_beat_env(monkeypatch):
+    # secerts.toml beats settings.toml; the shared file also beats the env for
+    # the LiveKit credentials, which must match the agents worker's
+    # deployment (the env is only a fallback for boxes without the file).
     monkeypatch.setattr(
         "fast_float.livekit.settings.load_settings",
         lambda: {"livekit": {"url": "ws://settings-layer:7880", "room_prefix": "set"}},
@@ -106,7 +115,14 @@ def test_settings_layering_secrets_beat_files_env_beats_all(monkeypatch):
     assert s.source == "secerts.toml"
     assert s.room_prefix == "set"
 
+    # A disagreeing env copy loses to the shared file (and is warned about).
     monkeypatch.setenv("LIVEKIT_URL", "ws://env-layer:7880")
+    s = LiveKitSettings.from_env()
+    assert s.url == "wss://secrets-layer.livekit.cloud"
+
+    # Where the shared files are silent, the env remains the fallback.
+    monkeypatch.setattr("fast_float.livekit.settings.load_secrets", lambda: {})
+    monkeypatch.setattr("fast_float.livekit.settings.load_settings", lambda: {})
     s = LiveKitSettings.from_env()
     assert s.url == "ws://env-layer:7880"
     assert s.source == "env"

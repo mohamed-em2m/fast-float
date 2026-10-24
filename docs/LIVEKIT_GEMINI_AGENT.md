@@ -95,7 +95,12 @@ env vars.
 Worker-side (see [`agents/.env.example`](../agents/.env.example)):
 `LIVEKIT_URL` + `LIVEKIT_API_KEY` + `LIVEKIT_API_SECRET`, `GOOGLE_API_KEY`
 (or Vertex AI flags), and optional `GEMINI_MODEL` / `GEMINI_VOICE` /
-`GEMINI_LANGUAGE`.
+`GEMINI_LANGUAGE`. The shared FLOAT config is the **single source of truth**:
+both processes read the same `secerts.toml` / `settings.toml` sections and a
+file value wins over the env; a disagreeing env copy is ignored and logged
+as stale. Only set these in `agents/.env` when the box has no shared config
+— a copy here that drifts is exactly why a worker can register on a
+different LiveKit project than the API dispatches into.
 
 ## Run it
 
@@ -105,8 +110,8 @@ Worker-side (see [`agents/.env.example`](../agents/.env.example)):
 # 3. the Gemini worker
 cd agents
 uv sync
-cp .env.example .env    # optional — the worker also reads the repo's
-                        # secerts.toml ([gemini].api_key) + settings.toml
+cp .env.example .env    # optional — the shared secerts.toml/settings.toml
+                        # is preferred; agents/.env is only the fallback
 uv run python -m float_agent.agent dev
 ```
 

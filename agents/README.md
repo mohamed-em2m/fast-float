@@ -64,14 +64,18 @@ The system prompt is in `float_agent/config.py`; override it with
 
 ## Configuration
 
-Values are read from the environment (or `agents/.env`) first; the Gemini
-model/voice and the LiveKit credentials fall back to the *shared* FLOAT
-config files, so the operator can keep everything in one place:
+`fast_float/config/secerts.toml` (secrets) and `settings.toml` (defaults) are
+the **single source of truth**: both the FLOAT API and this worker read the
+same file sections, and a file value wins over `agents/.env` / plain env. An
+env copy that *disagrees* with the file is ignored and logged as stale — a
+mismatch there is what makes the worker register on a different LiveKit
+project than the API dispatches into. Env values are only the fallback for
+boxes without the shared config:
 
 | shared place | keys |
 | --- | --- |
 | `fast_float/config/secerts.toml` `[gemini]` | `api_key` (and `[livekit]` url/key/secret) |
-| `fast_float/config/settings.toml` `[gemini]` | `model`, `voice`, `language`, `vertexai`, `project`, `location` |
+| `fast_float/config/settings.toml` `[gemini]` | `model`, `voice`, `language`, `vertexai`, `project`, `location`, `avatar_identity`, `agent_name`, `autodispatch` |
 
 Override the config directory with `FLOAT_CONFIG_DIR` (defaults to the
 sibling `fast_float/config` of this repo).

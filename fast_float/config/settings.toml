@@ -81,7 +81,7 @@ turn_ttl_s = 3600
 # FLOAT_GEMINI_AGENT_NAME, FLOAT_GEMINI_AUTODISPATCH.
 #
 # Leave model empty to use the plugin's current stable Gemini Live model.
-model = ""
+model = "google/gemini-3.8-live"
 voice = "Puck"
 language = ""
 # Vertex AI instead of the Gemini Developer API:
@@ -92,3 +92,4 @@ location = ""
 avatar_identity = "float-avatar"
 agent_name = "float-gemini"
 autodispatch = true
+
