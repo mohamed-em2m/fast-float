@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -146,6 +145,11 @@ def _build_realtime_model(api_key: str | None = None, model: str | None = None) 
             kwargs["project"] = config.google_cloud_project
         if config.google_cloud_location:
             kwargs["location"] = config.google_cloud_location
+        if api_key:
+            logger.info(
+                "vertexai mode: the per-session Gemini API key has no effect "
+                "(Vertex AI authenticates with project credentials, not API keys)"
+            )
     elif api_key or config.google_api_key:
         kwargs["api_key"] = api_key or config.google_api_key
     return google.realtime.RealtimeModel(**kwargs)  # type: ignore[arg-type]
@@ -172,16 +176,18 @@ async def entrypoint(ctx: JobContext) -> None:
         config.model or "<plugin default>",
     )
 
-    # The FLOAT API forwards Studio-supplied overrides (Gemini key + model)
-    # in the dispatch metadata; prefer them over the box config this session.
+    # Per-session overrides from the Studio (Config panel) rank *above* the
+    # deployment config this session — that is their purpose — but they are
+    # passed straight to RealtimeModel and never written into the process
+    # environment, where a concurrent job could inherit them (os.environ is
+    # global to the worker process; only config.from_env, at import time,
+    # keeps env in sync with secerts.toml). The model name is still
+    # format-validated inside _build_realtime_model before it is used.
     dispatch = dispatch_config(getattr(getattr(ctx, "job", None), "metadata", "") or "")
     session_api_key = dispatch.get("gemini_api_key", "")
     session_model = dispatch.get("gemini_model", "")
     if session_api_key:
         logger.info("using a per-session Gemini API key supplied by the FLOAT API")
-        # google-genai reads GOOGLE_API_KEY from the environment too.
-        if not os.getenv("GOOGLE_API_KEY"):
-            os.environ["GOOGLE_API_KEY"] = session_api_key
     if session_model:
         logger.info("using a per-session Gemini model supplied by the FLOAT API (%s)", session_model)
 
