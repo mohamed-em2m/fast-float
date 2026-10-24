@@ -652,6 +652,38 @@ def test_livestream_generator_buffers_fast_render_without_dropping():
     asyncio.run(_test())
 
 
+def test_livestream_generator_spills_a_long_render_without_dropping():
+    """A render far larger than the in-memory window must still play in order.
+
+    Regression guard for the 8676-frame (≈347 s) preview that dropped ~6000
+    frames because it outran the 1 GiB subscriber buffer.
+    """
+
+    async def _test():
+        loop = asyncio.get_running_loop()
+        stream = LiveStream("req-long", loop)
+        stream.start(StreamMeta(fps=25.0, width=8, height=8, channels=3, request_id="req-long"))
+        gen = LiveStreamVideoGenerator(stream)
+        # Force the overflow path without publishing thousands of frames.
+        gen._queue.resize(4)
+
+        frame = np.full((8, 8, 3), 7, dtype=np.uint8)
+        for idx in range(50):
+            stream.publish(("frame", idx, idx * 40.0, frame))
+        stream.finish()
+
+        out = [item async for item in gen]
+        assert len(out) == 50
+        assert gen._queue.dropped_frames == 0
+        assert gen._queue.spilled_frames == 46
+        # The iterator releases the disk spool when it finishes.
+        assert gen._queue._spool is None
+        if not RTC_AVAILABLE:
+            assert [item[0] for item in out] == list(range(50))
+
+    asyncio.run(_test())
+
+
 def test_live_queue_size_is_bounded_by_frame_dimensions():
     from fast_float.streaming.live import (
         LIVE_QUEUE_MAX_FRAMES,

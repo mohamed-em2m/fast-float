@@ -14,6 +14,7 @@ backpressures the GPU.
 
 from __future__ import annotations
 
+import asyncio
 import struct
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -71,6 +72,16 @@ async def live_frames(ws: WebSocket, request_id: str) -> None:
         q.resize(live_queue_size(meta))
 
         await ws.send_json(_meta_payload(meta))
+        # Play the preview at the stream's own rate.  A fast render is buffered
+        # in ``q`` (spilling to disk if needed), so without this the sender
+        # would push the whole clip as fast as the socket accepts it.  Those
+        # bursts are synchronous (768 KiB message + permessage-deflate), which
+        # starved the event loop for hundreds of ms and made a LiveKit
+        # publisher on the same loop fall behind by tens of seconds.
+        fps = float(meta.fps or 25.0)
+        interval = 1.0 / fps if fps > 0 else 0.04
+        loop = asyncio.get_running_loop()
+        next_frame_at = loop.time()
         while True:
             item = await q.get()
             if item is CLOSE:
@@ -79,6 +90,10 @@ async def live_frames(ws: WebSocket, request_id: str) -> None:
             if kind == "frame":
                 _, idx, pts_ms, frame = item
                 await ws.send_bytes(HEADER.pack(int(idx), 1, int(pts_ms)) + frame.tobytes())
+                next_frame_at = max(next_frame_at + interval, loop.time())
+                delay = next_frame_at - loop.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
             elif kind == "gap":
                 _, start, end, reason = item
                 await ws.send_json({"type": "gap", "start": start, "end": end, "reason": reason})
@@ -88,6 +103,7 @@ async def live_frames(ws: WebSocket, request_id: str) -> None:
         logger.debug("[ws %s] stream closed: %s", request_id, exc)
     finally:
         stream.unsubscribe(q)
+        q.dispose()
 
     try:
         if stream.error:

@@ -260,11 +260,26 @@ overflow and skip seconds of the preview. Every real-time transport
 WebSocket stream) therefore subscribes with a queue sized from the stream's
 frame dimensions by `live_queue_size()` (in `fast_float/streaming/live.py`):
 a 1 GiB byte budget, clamped to 128–4096 frames. At 512×512×3 that is
-~1365 frames (≈55 s), so a normal single-pass render is buffered completely
-and played out in order; a multi-minute render still has a hard memory
-ceiling. Only if the render outruns that budget does the queue drop the
-oldest frame, which is counted and logged
-(`subscriber_dropped_frames` in `metrics()`).
+~1365 frames (≈55 s) of **in-memory** near-live window.
+
+Anything beyond that window is not dropped: `LiveQueue` appends it, in order,
+to a temporary disk spool (`tempfile.TemporaryFile`, so it disappears on
+close even after a crash). RGB frames are stored as JPEG (~50–90 KiB per
+512×512 frame instead of 768 KiB), so a five-minute render costs a few
+hundred MiB on disk while RAM stays at the 1 GiB window. Reads drain the
+in-memory window first and then the spool, so playback is continuous and
+frame/audio indices are unchanged. A 4 GiB spool cap (≈45 min at 25 fps) is
+the only remaining bound; if it is ever hit, the transport logs a warning and
+falls back to the old drop-oldest behaviour, which is counted in
+`subscriber_dropped_frames`. `metrics()` also reports
+`subscriber_spilled_frames`.
+
+The spool is written on the event-loop thread: a 512×512 JPEG encode takes
+about 0.5–0.9 ms, i.e. ~7–13 % of the loop at the ~150 fps a fast render
+produces, and it happens only once the in-memory window is full. Consumers
+call `dispose()` when they stop reading (the WebSocket handler, the WebRTC
+peer cleanup, and `LiveStreamVideoGenerator`'s iterator all do), which
+releases the spool immediately.
 
 `AvatarRunner` paces its forward loop at `options.video_fps` **before** pushing
 a frame's video and audio into `AVSynchronizer`. The synchronizer queues video

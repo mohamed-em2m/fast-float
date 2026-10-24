@@ -555,6 +555,13 @@ class LiveStreamVideoGenerator:
                 self.stream.request_id,
                 dropped,
             )
+        spilled = getattr(self._queue, "spilled_frames", 0)
+        if spilled:
+            logger.info(
+                "[livekit-gen] %s: buffered %d frame(s) on disk for real-time playback",
+                self.stream.request_id,
+                spilled,
+            )
         # Unsubscribe first so no new frames arrive, then queue the sentinel:
         # frames already queued are real audio/video and must be played out
         # before the publisher disconnects.
@@ -570,42 +577,47 @@ class LiveStreamVideoGenerator:
         if self.stream.meta is not None:
             self._fps = float(self.stream.meta.fps or TARGET_FPS)
             self._queue.resize(live_queue_size(self.stream.meta))
-        while True:
-            if self._stop_pending and self._queue.empty():
-                break
-            item = await self._queue.get()
-            if item is CLOSE:
-                break
-            if item[0] != "frame":
-                continue
+        try:
+            while True:
+                if self._stop_pending and self._queue.empty():
+                    break
+                item = await self._queue.get()
+                if item is CLOSE:
+                    break
+                if item[0] != "frame":
+                    continue
 
-            _, idx, pts_ms, frame_array = item
+                _, idx, pts_ms, frame_array = item
 
-            if not self._first_emitted:
-                self._first_emitted = True
-                if callable(self.on_first_frame):
-                    try:
-                        res = self.on_first_frame()
-                        if asyncio.iscoroutine(res):
-                            await res
-                    except Exception as exc:
-                        logger.warning(f"[livekit-gen] on_first_frame error: {exc}")
+                if not self._first_emitted:
+                    self._first_emitted = True
+                    if callable(self.on_first_frame):
+                        try:
+                            res = self.on_first_frame()
+                            if asyncio.iscoroutine(res):
+                                await res
+                        except Exception as exc:
+                            logger.warning(f"[livekit-gen] on_first_frame error: {exc}")
 
-            if RTC_AVAILABLE:
-                h, w, c = frame_array.shape
-                if c == 4:
-                    frame_array = frame_array[:, :, :3]
-                data = np.ascontiguousarray(frame_array).tobytes()
-                video_frame = rtc.VideoFrame(w, h, rtc.VideoBufferType.RGB24, data)
+                if RTC_AVAILABLE:
+                    h, w, c = frame_array.shape
+                    if c == 4:
+                        frame_array = frame_array[:, :, :3]
+                    data = np.ascontiguousarray(frame_array).tobytes()
+                    video_frame = rtc.VideoFrame(w, h, rtc.VideoBufferType.RGB24, data)
 
-                audio_frame = None
-                if self._audio_data is not None:
-                    chunk, samples = slice_audio_for_frame(self._audio_data, idx, self._fps, SAMPLE_RATE)
-                    audio_frame = rtc.AudioFrame(chunk, SAMPLE_RATE, 1, samples)
+                    audio_frame = None
+                    if self._audio_data is not None:
+                        chunk, samples = slice_audio_for_frame(self._audio_data, idx, self._fps, SAMPLE_RATE)
+                        audio_frame = rtc.AudioFrame(chunk, SAMPLE_RATE, 1, samples)
 
-                yield (video_frame, audio_frame) if audio_frame else video_frame
-            else:
-                yield (idx, frame_array, pts_ms)
+                    yield (video_frame, audio_frame) if audio_frame else video_frame
+                else:
+                    yield (idx, frame_array, pts_ms)
+        finally:
+            # Release the overflow spool as soon as the consumer is done
+            # (including cancellation / early teardown).
+            self._queue.dispose()
 
 
 class MediaFileVideoGenerator:

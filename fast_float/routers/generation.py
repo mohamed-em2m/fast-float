@@ -47,9 +47,16 @@ def _close_live(dispatcher, request_id: str, message: str) -> None:
     """Retire a live stream so watchers stop waiting for frames."""
     if dispatcher is None:
         return
-    if app_state.live_streams.get(request_id) is dispatcher.stream:
+    stream = dispatcher.stream
+    if app_state.live_streams.get(request_id) is stream:
         app_state.live_streams.pop(request_id, None)
-    dispatcher.stream.finish(error=message)
+    # Keep the delivery metrics readable after the stream is retired: a client
+    # that polls /progress once the request is done should still see how many
+    # frames were buffered on disk or dropped.
+    metrics = stream.metrics()
+    if metrics:
+        app_state.set_progress(request_id, delivery_metrics=metrics)
+    stream.finish(error=message)
 
 
 @router.post("/generate", response_model=GenerationResponse)

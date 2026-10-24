@@ -291,11 +291,23 @@ transport first (main-server signalling + STUN); the WebSocket transport is
 only the last resort.
 
 All three transports consume the same `LiveStream` fan-out and buffer a fast
-render with `live_queue_size()` (1 GiB / 128–4096 frames, see
-`fast_float/streaming/live.py`). The raw WebRTC offer previously kept only 8
-frames, so a 15 s render froze the preview after about one second. When the
-render finishes, the offer closes its peer connection and the viewer hands
-over to the finished MP4 instead of freezing on the last frame.
+render with `live_queue_size()` (1 GiB / 128–4096 frames in RAM, see
+`fast_float/streaming/live.py`). Frames beyond that window are appended, in
+order, to a compressed temporary disk spool instead of being dropped, so a
+multi-minute preview plays every frame at `meta.fps` with no gaps. The raw
+WebRTC offer previously kept only 8 frames, so a 15 s render froze the preview
+after about one second. When the render finishes, the offer closes its peer
+connection and the viewer hands over to the finished MP4 instead of freezing
+on the last frame.
+
+The WebSocket sender also paces itself at `meta.fps`. It used to push the
+buffered render as fast as the socket accepted it; each 512×512 frame is a
+768 KiB message that the ASGI server compresses and writes synchronously, so a
+long render arrived in multi-hundred-millisecond bursts. That starved the
+event loop and made a LiveKit publisher on the same process fall behind by
+tens of seconds (its audio/video capture ran at ~17 fps instead of 25). Pacing
+the fallback transport keeps the loop responsive and makes the preview play at
+the same rate as the other transports.
 
 STUN only discovers addresses; it does not relay media. If the browser reaches
 the API through a **TCP-only edge proxy** (RunPod/Cloudflare tunnels, many

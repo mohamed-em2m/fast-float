@@ -279,8 +279,8 @@ def _cleanup_peer(pc) -> None:
             track.stop()
         if audio_feed is not None:
             audio_feed.close()
-        with suppress(asyncio.QueueFull):
-            queue.put_nowait(CLOSE)
+        # Wake a recv() blocked on the queue and release its overflow spool.
+        queue.dispose()
     end_task = _live_end_tasks.pop(id(pc), None)
     if end_task is not None and end_task is not asyncio.current_task():
         end_task.cancel()
