@@ -19,6 +19,8 @@ from fast_float.livekit.settings import LiveKitSettings, host_only, valid_room_n
 from fast_float.livekit.tokens import LiveKitUnavailable, issue_token
 from fast_float.livekit.worker import (
     RTC_AVAILABLE,
+    live_publish_active,
+    publish_error,
     rtc_unavailable_message,
     spawn_live_publish_task,
     spawn_media_publish_task,
@@ -195,6 +197,22 @@ async def livekit_publish(request_id: str, request: LiveKitPublishRequest | None
         return _publishing_response("live", target_room, request_id, task)
 
     raise HTTPException(status_code=404, detail=f"Request {request_id} not found in live or active streams")
+
+
+@router.get("/livekit/publish/{request_id}")
+async def livekit_publish_status(request_id: str) -> dict[str, Any]:
+    """Whether a publisher is running for this request, and its last error.
+
+    Publishing is asynchronous: ``POST /livekit/publish/{id}`` returns as soon
+    as the task is spawned, so the browser polls this to find out *why* the
+    room never received tracks (bad credentials, SFU unreachable, ...) instead
+    of waiting forever and silently falling back.
+    """
+    return {
+        "request_id": request_id,
+        "publishing": live_publish_active(request_id),
+        "error": publish_error(request_id),
+    }
 
 
 def _conversation_guards() -> LiveKitSettings:

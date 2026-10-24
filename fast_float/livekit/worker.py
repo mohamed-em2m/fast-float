@@ -54,12 +54,20 @@ def rtc_unavailable_message() -> str:
 # through `spawn_*_publish_task`, which refuses a second task for the same key.
 _live_publish_jobs: dict[str, asyncio.Task[None]] = {}
 _media_publish_jobs: dict[tuple[str, str], asyncio.Task[None]] = {}
+# Last publisher error per request, so the browser can report *why* the SFU
+# stream never appeared instead of silently waiting for tracks.
+_publish_errors: dict[str, str] = {}
 
 
 def _track_job(registry: dict, key: Any, task: asyncio.Task[None]) -> asyncio.Task[None]:
     registry[key] = task
     task.add_done_callback(lambda _t: registry.pop(key, None))
     return task
+
+
+def publish_error(request_id: str) -> str | None:
+    """The last error raised by a LiveKit publisher for ``request_id``."""
+    return _publish_errors.get(request_id)
 
 
 def live_publish_active(request_id: str) -> bool:
@@ -131,6 +139,10 @@ class AvatarOptions:
 
 class AvatarRunner:
     """Worker that publishes synchronized avatar video + audio into a LiveKit room."""
+
+    # How long ``stop()`` lets already-generated frames play out before it
+    # tears the tracks down. Bounded so a wedged consumer cannot block shutdown.
+    DRAIN_TIMEOUT_S = 2.0
 
     def __init__(
         self,
@@ -211,9 +223,10 @@ class AvatarRunner:
         first_frame = True
         try:
             async for item in self.video_gen:
-                if self._stopped or not self._running:
-                    break
-
+                # Deliberately do NOT abort on ``stop()`` here: the generator
+                # queues the tail of the stream before ending, and dropping it
+                # cut the last words off. The iterator ends by itself; stop()
+                # bounds the drain with a timeout.
                 if first_frame:
                     first_frame = False
                     if self.agent_identity:
@@ -260,22 +273,36 @@ class AvatarRunner:
             self._running = False
 
     async def stop(self) -> None:
-        """Stop forwarding, wait for tasks, unpublish tracks and clean up."""
+        """Stop forwarding, play out queued frames, unpublish tracks and clean up."""
         if self._stopped:
             return
         self._stopped = True
         self._running = False
 
+        # End the generator first: it queues the frames it already rendered and
+        # then signals end-of-stream, so the forward loop can play the tail out
+        # instead of cutting mid-sentence.
         if hasattr(self.video_gen, "stop"):
             self.video_gen.stop()
 
-        if self._forward_task and not self._forward_task.done():
-            self._forward_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._forward_task
+        task = self._forward_task
+        self._forward_task = None
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=self.DRAIN_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            except asyncio.CancelledError:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                raise
 
         if self._av_sync:
-            await self._av_sync.aclose()
+            with contextlib.suppress(Exception):
+                await self._av_sync.aclose()
             self._av_sync = None
 
         if self.room and self.room.local_participant:
@@ -334,10 +361,25 @@ class LiveKitLiveStreamPublisher:
 
         try:
             meta = await self.stream.wait_meta(timeout=15.0)
+            if meta is None:
+                logger.warning(
+                    f"[livekit-pub] {self.room_name}: no stream metadata after 15s; "
+                    "publishing with default 25fps (audio may be missing)"
+                )
             fps = float(meta.fps) if meta and meta.fps else 25.0
+            # Match the source to the frames the pipeline actually renders: a
+            # 512x512 VideoSource fed different-sized frames corrupts or scales
+            # the preview, and the browser then sees a stuttering/misaligned
+            # picture instead of the avatar.
+            width = int(meta.width) if meta and meta.width else 512
+            height = int(meta.height) if meta and meta.height else 512
+            # H.264 needs even dimensions; round down instead of letting the
+            # encoder reject the track.
+            width -= width % 2
+            height -= height % 2
             options = AvatarOptions(
-                video_width=512,
-                video_height=512,
+                video_width=max(2, width),
+                video_height=max(2, height),
                 video_fps=fps,
                 audio_sample_rate=16000,
                 audio_channels=1,
@@ -413,7 +455,14 @@ class LiveKitMediaFilePublisher:
 
         try:
             video_gen = MediaFileVideoGenerator(self.file_path, loop=self.loop)
-            self.runner = AvatarRunner(self.room, video_gen)
+            # Publish at the file's own size/rate: the default 25 fps would
+            # stretch a 30 fps render and drift against its audio.
+            width, height, fps = video_gen.probe()
+            self.runner = AvatarRunner(
+                self.room,
+                video_gen,
+                options=AvatarOptions(video_width=width, video_height=height, video_fps=fps),
+            )
             await self.runner.start()
 
             if self.runner._forward_task:
@@ -443,8 +492,13 @@ async def publish_live_stream_task(
     publisher = LiveKitLiveStreamPublisher(stream, room_name=room_name, settings=settings)
     try:
         await publisher.run()
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
+        _publish_errors[stream.request_id] = str(exc)
         logger.warning(f"[livekit-pub] live publishing failed for {room_name}: {exc}")
+    else:
+        _publish_errors.pop(stream.request_id, None)
     finally:
         await publisher.close()
 
@@ -459,8 +513,13 @@ async def publish_media_file_task(
     publisher = LiveKitMediaFilePublisher(file_path, room_name=room_name, settings=settings, loop=loop)
     try:
         await publisher.run()
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
+        _publish_errors[room_name] = str(exc)
         logger.warning(f"[livekit-pub] file publishing failed for {room_name}: {exc}")
+    else:
+        _publish_errors.pop(room_name, None)
     finally:
         await publisher.close()
 
@@ -473,6 +532,7 @@ __all__ = [
     "LiveKitLiveStreamPublisher",
     "LiveKitMediaFilePublisher",
     "live_publish_active",
+    "publish_error",
     "publish_live_stream_task",
     "publish_media_file_task",
     "spawn_live_publish_task",

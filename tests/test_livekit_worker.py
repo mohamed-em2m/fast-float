@@ -515,3 +515,102 @@ def test_conversation_endpoints_flow(api_client, monkeypatch):
     res = api_client.post("/livekit/conversation/stop", json={"room": "room-conv"})
     assert res.status_code == 200
     assert res.json() == {"room": "room-conv", "status": "stopped", "had_session": True}
+
+
+def test_float_generator_paces_production_without_dropping_frames():
+    """A long utterance must not be cut in the middle by queue overflow.
+
+    Production is faster than playout; without backpressure the frame queue
+    fills and drops the oldest frames, so the listener hears a jump cut. The
+    generator must wait for the consumer instead.
+    """
+
+    async def _test():
+        loop = asyncio.get_running_loop()
+        gen = FloatVideoGenerator(loop=loop, width=8, height=8)
+
+        # 10 s of audio = 250 frames at 25 fps, twice the queue capacity.
+        gen.push_audio(np.zeros(16000 * 10, dtype=np.int16).tobytes())
+        gen.flush()
+
+        seen = []
+        for _ in range(10000):
+            try:
+                item = await asyncio.wait_for(gen._frame_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                break
+            seen.append(item[0])
+            await asyncio.sleep(0.001)  # consumer slower than inference
+            if len(seen) == 250:
+                break
+
+        gen.stop()
+        # Every frame of the utterance arrives (none was dropped to catch up)
+        # and the counters agree; frame indices restart per chunk by design.
+        assert len(seen) == 250
+        assert gen._dropped_frames == 0
+
+    asyncio.run(_test())
+
+
+def test_float_generator_stop_plays_out_the_queued_tail():
+    async def _test():
+        loop = asyncio.get_running_loop()
+        gen = FloatVideoGenerator(loop=loop, width=8, height=8)
+        gen.push_audio(np.zeros(16000 * 2, dtype=np.int16).tobytes())
+
+        for _ in range(300):
+            if gen._frame_queue.qsize() >= 50:
+                break
+            await asyncio.sleep(0.01)
+        assert gen._frame_queue.qsize() == 50
+
+        # stop() must not throw the already-generated frames away.
+        gen.stop()
+        frames = [frame async for frame in gen]
+        assert len(frames) == 50
+
+    asyncio.run(_test())
+
+
+def test_livestream_generator_stop_plays_out_the_queued_tail():
+    async def _test():
+        loop = asyncio.get_running_loop()
+        stream = LiveStream("req-tail", loop)
+        stream.start(StreamMeta(fps=25.0, width=8, height=8, channels=3, request_id="req-tail"))
+        gen = LiveStreamVideoGenerator(stream)
+
+        frame = np.zeros((8, 8, 3), dtype=np.uint8)
+        for idx in range(5):
+            gen._queue.put_nowait(("frame", idx, idx * 40.0, frame))
+
+        gen.stop()
+        collected = [item async for item in gen]
+        assert len(collected) == 5
+
+    asyncio.run(_test())
+
+
+def test_media_file_probe_falls_back_to_defaults_for_unreadable_file():
+    from fast_float.livekit.generator import TARGET_FPS, TARGET_HEIGHT, TARGET_WIDTH
+
+    gen = MediaFileVideoGenerator("does-not-exist.mp4")
+    assert gen.probe() == (TARGET_WIDTH, TARGET_HEIGHT, TARGET_FPS)
+
+
+def test_publish_status_endpoint_reports_publisher_error(api_client, monkeypatch):
+    import fast_float.livekit.worker as worker
+
+    monkeypatch.setattr(worker, "_publish_errors", {"req-status": "SFU unreachable"})
+
+    res = api_client.get("/livekit/publish/req-status")
+    assert res.status_code == 200
+    assert res.json() == {
+        "request_id": "req-status",
+        "publishing": False,
+        "error": "SFU unreachable",
+    }
+
+    ok = api_client.get("/livekit/publish/req-ok")
+    assert ok.status_code == 200
+    assert ok.json() == {"request_id": "req-ok", "publishing": False, "error": None}

@@ -183,7 +183,15 @@ class FloatVideoGenerator:
 
         self._audio_pcm = bytearray()
         self._frame_queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue_frames)
+        # Largest burst one chunk can add: a full 2 s window rendered at
+        # ``TARGET_FPS``. Production is paced so that a new chunk only starts
+        # when this many slots are free, i.e. the queue never has to drop the
+        # oldest frames of the utterance being played.
+        self._max_chunk_frames = int(np.ceil(MIN_AUDIO_SAMPLES / SAMPLES_PER_FRAME))
+        self._pump_retry: asyncio.TimerHandle | None = None
+        self._queue_retry_s = 0.1
         self._stopped = False
+        self._stop_pending = False
         self._inference_running = False
         self._segment_started = False
         self._flush_requested = False
@@ -253,8 +261,33 @@ class FloatVideoGenerator:
             self._segment_started = False
             return
         need = MIN_AUDIO_SAMPLES if self._segment_started else self._first_chunk_samples
-        if n >= need or self._flush_requested:
-            self._launch_chunk()
+        if n < need and not self._flush_requested:
+            return
+        # Backpressure: don't let production outrun playout. Queuing the whole
+        # utterance at inference speed overflows the frame queue, which then
+        # drops the *oldest* frames — the viewer hears a jump cut in the middle
+        # of the sentence. Wait for the consumer instead; inference is faster
+        # than real time, so the backlog still drains before playback needs it.
+        # One extra chunk of headroom covers the frames this chunk already
+        # handed to the loop via call_soon_threadsafe but that have not landed
+        # in the queue yet. A queue smaller than a single chunk cannot be paced
+        # (waiting would deadlock), so it keeps the old drop-oldest behaviour.
+        maxsize = self._frame_queue.maxsize
+        if maxsize >= self._max_chunk_frames:
+            margin = self._max_chunk_frames if maxsize >= 2 * self._max_chunk_frames else 0
+            if self._frame_queue.qsize() + self._max_chunk_frames + margin > maxsize:
+                self._schedule_pump_retry()
+                return
+        self._launch_chunk()
+
+    def _schedule_pump_retry(self) -> None:
+        if self._pump_retry is not None or self._stopped:
+            return
+        self._pump_retry = self.loop.call_later(self._queue_retry_s, self._on_pump_retry)
+
+    def _on_pump_retry(self) -> None:
+        self._pump_retry = None
+        self._pump()
 
     def _launch_chunk(self) -> None:
         self._inference_running = True
@@ -298,6 +331,9 @@ class FloatVideoGenerator:
         if self._idle_handle:
             self._idle_handle.cancel()
             self._idle_handle = None
+        if self._pump_retry:
+            self._pump_retry.cancel()
+            self._pump_retry = None
         while True:
             try:
                 self._frame_queue.get_nowait()
@@ -422,16 +458,24 @@ class FloatVideoGenerator:
         if self._idle_handle:
             self._idle_handle.cancel()
             self._idle_handle = None
+        if self._pump_retry:
+            self._pump_retry.cancel()
+            self._pump_retry = None
         if self._owns_executor:
             self._executor.shutdown(wait=False, cancel_futures=True)
-        # make room for the sentinel so the consumer always wakes up
-        while self._frame_queue.full():
-            with contextlib.suppress(asyncio.QueueEmpty):
-                self._frame_queue.get_nowait()
-        self._frame_queue.put_nowait(_QUEUE_SENTINEL)
+        # Do NOT flush the queue here: frames already generated are real audio
+        # and the consumer must play them out (dropping them cut the tail of
+        # the last sentence). If the queue is full the sentinel can't be
+        # enqueued; ``_stop_pending`` makes the consumer exit as soon as it has
+        # drained what is queued.
+        self._stop_pending = True
+        with contextlib.suppress(asyncio.QueueFull):
+            self._frame_queue.put_nowait(_QUEUE_SENTINEL)
 
     async def __aiter__(self) -> AsyncIterator[Any]:
         while True:
+            if self._stop_pending and self._frame_queue.empty():
+                break
             item = await self._frame_queue.get()
             if item is _QUEUE_SENTINEL or item is CLOSE:
                 break
@@ -473,6 +517,7 @@ class LiveStreamVideoGenerator:
         self.stream = stream
         self._queue = stream.subscribe(maxsize=128)
         self._stopped = False
+        self._stop_pending = False
         self._audio_data: np.ndarray | None = None
         self._audio_loaded = False
         self._first_emitted = False
@@ -500,14 +545,29 @@ class LiveStreamVideoGenerator:
                 logger.warning(f"[livekit-gen] failed to load audio from {audio_path}: {exc}")
 
     def stop(self) -> None:
+        if self._stopped:
+            return
         self._stopped = True
+        dropped = getattr(self._queue, "dropped_frames", 0)
+        if dropped:
+            logger.warning(
+                "[livekit-gen] %s: live preview fell %d frame(s) behind and skipped them",
+                self.stream.request_id,
+                dropped,
+            )
+        # Unsubscribe first so no new frames arrive, then queue the sentinel:
+        # frames already queued are real audio/video and must be played out
+        # before the publisher disconnects.
         self.stream.unsubscribe(self._queue)
+        self._stop_pending = True
         with contextlib.suppress(asyncio.QueueFull):
             self._queue.put_nowait(CLOSE)
 
     async def __aiter__(self) -> AsyncIterator[Any]:
         self._ensure_audio_loaded()
-        while not self._stopped:
+        while True:
+            if self._stop_pending and self._queue.empty():
+                break
             item = await self._queue.get()
             if item is CLOSE:
                 break
@@ -560,6 +620,32 @@ class MediaFileVideoGenerator:
         self.file_path = file_path
         self.loop = loop
         self._stopped = False
+        # Filled in by probe(): a file rendered at 30 fps published at the
+        # default 25 fps would play slow and drift against its own audio.
+        self.fps: float = TARGET_FPS
+        self.width: int = TARGET_WIDTH
+        self.height: int = TARGET_HEIGHT
+        self._probed = False
+
+    def probe(self) -> tuple[int, int, float]:
+        """Read the container's frame size and rate (defaults if unreadable)."""
+        if self._probed:
+            return self.width, self.height, self.fps
+        self._probed = True
+        try:
+            import av
+
+            with av.open(self.file_path) as container:
+                stream = container.streams.video[0] if container.streams.video else None
+                if stream is not None:
+                    self.width = int(stream.codec_context.width or self.width)
+                    self.height = int(stream.codec_context.height or self.height)
+                    rate = stream.average_rate or stream.guessed_rate
+                    if rate:
+                        self.fps = float(rate)
+        except Exception as exc:
+            logger.warning(f"[livekit-gen] could not probe {self.file_path}: {exc}")
+        return self.width, self.height, self.fps
 
     def stop(self) -> None:
         self._stopped = True
@@ -580,6 +666,10 @@ class MediaFileVideoGenerator:
                 if audio_stream:
                     resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
 
+                # One audio slice per video frame, sized by the file's own
+                # frame rate so audio and video stay the same length.
+                samples_per_frame = max(1, round(SAMPLE_RATE / max(self.fps, 1e-6)))
+                bytes_per_frame = samples_per_frame * 2
                 audio_samples_buf = bytearray()
 
                 for packet in container.demux():
@@ -598,10 +688,10 @@ class MediaFileVideoGenerator:
                             video_frame = rtc.VideoFrame(w, h, rtc.VideoBufferType.RGB24, arr.tobytes())
 
                             audio_frame = None
-                            if len(audio_samples_buf) >= BYTES_PER_FRAME:
-                                chunk = bytes(audio_samples_buf[:BYTES_PER_FRAME])
-                                del audio_samples_buf[:BYTES_PER_FRAME]
-                                audio_frame = rtc.AudioFrame(chunk, SAMPLE_RATE, 1, SAMPLES_PER_FRAME)
+                            if len(audio_samples_buf) >= bytes_per_frame:
+                                chunk = bytes(audio_samples_buf[:bytes_per_frame])
+                                del audio_samples_buf[:bytes_per_frame]
+                                audio_frame = rtc.AudioFrame(chunk, SAMPLE_RATE, 1, samples_per_frame)
 
                             yield (video_frame, audio_frame) if audio_frame else video_frame
                             await asyncio.sleep(0.001)  # Cooperate with event loop

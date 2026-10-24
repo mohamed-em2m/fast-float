@@ -57,6 +57,31 @@ export function alignLiveKitUrl(url) {
   }
 }
 
+const CONNECT_TIMEOUT_MS = 15000;
+const FIRST_TRACK_TIMEOUT_MS = 25000;
+
+/**
+ * Resolve/reject `promise` within `ms`, running `onTimeout` on expiry.
+ *
+ * livekit-client's connect can wait forever when signalling succeeds but the
+ * media path never comes up (blocked UDP/TCP, dead SFU). Without a bound the
+ * studio sits on "Connecting…" and never falls back.
+ */
+function withTimeout(promise, ms, message, onTimeout) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      try {
+        onTimeout?.();
+      } catch {
+        /* ignore cleanup errors */
+      }
+      reject(new Error(message));
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 /**
  * Fetch current LiveKit server configuration status.
  */
@@ -107,6 +132,20 @@ export async function triggerLiveKitPublish(requestId, room = null) {
 }
 
 /**
+ * Whether the backend publisher for a request is running, and its last error.
+ * Publishing is async, so this explains why a room never received tracks.
+ */
+export async function fetchLiveKitPublishStatus(requestId) {
+  try {
+    const res = await fetch(`${getApiUrl()}/livekit/publish/${encodeURIComponent(requestId)}`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Connect to a LiveKit room and stream avatar tracks to the video element.
  *
  * Video track is attached directly to `videoElement`.
@@ -117,13 +156,17 @@ export async function triggerLiveKitPublish(requestId, room = null) {
  * @param {Object} options
  * @param {string} options.room - Room name to join
  * @param {HTMLMediaElement} options.videoElement - <video> element to attach the video track to
- * @param {function} [options.onStatus] - Callback for status updates ('connecting', 'live', 'done', 'error')
+ * @param {function} [options.onStatus] - Callback for status updates ('connecting', 'reconnecting', 'live', 'done', 'error')
+ * @param {number} [options.connectTimeoutMs] - Bound on the SFU handshake
+ * @param {number} [options.trackTimeoutMs] - Bound on waiting for the first track
  * @returns {Promise<{ room: Room, disconnect: function }>}
  */
 export async function connectLiveKitSession({
   room: roomName,
   videoElement,
   onStatus,
+  connectTimeoutMs = CONNECT_TIMEOUT_MS,
+  trackTimeoutMs = FIRST_TRACK_TIMEOUT_MS,
 }) {
   onStatus?.('connecting');
 
@@ -142,6 +185,14 @@ export async function connectLiveKitSession({
   });
 
   const attachedTracks = new Set();
+  // One live track per kind: a publisher reconnect republishes the track, and
+  // attaching both would leave the old (frozen) video behind the new one.
+  const tracksByKind = new Map();
+  let failed = false;
+  let resolveFirstTrack;
+  const firstTrack = new Promise((resolve) => {
+    resolveFirstTrack = resolve;
+  });
 
   // Hidden <audio> element for the avatar audio track.
   // Kept separate from <video> to avoid double-playback (video element
@@ -157,18 +208,42 @@ export async function connectLiveKitSession({
     return audioEl;
   };
 
-  const attachTrack = (track) => {
-    if (attachedTracks.has(track)) return;
-
-    if (track.kind === Track.Kind.Video && videoElement) {
-      track.attach(videoElement);
-      attachedTracks.add(track);
-      onStatus?.('live');
-    } else if (track.kind === Track.Kind.Audio) {
-      track.attach(getAudioEl());
-      attachedTracks.add(track);
-      onStatus?.('live');
+  const detachTrack = (track) => {
+    try {
+      track.detach();
+    } catch {
+      /* already detached */
     }
+    attachedTracks.delete(track);
+    if (tracksByKind.get(track.kind) === track) {
+      tracksByKind.delete(track.kind);
+    }
+  };
+
+  const attachTrack = (track) => {
+    if (!track || attachedTracks.has(track)) return;
+
+    const previous = tracksByKind.get(track.kind);
+    if (previous && previous !== track) detachTrack(previous);
+
+    if (track.kind === Track.Kind.Video) {
+      if (!videoElement) return;
+      track.attach(videoElement);
+      // Autoplay can be rejected before the first user gesture; retry quietly
+      // instead of leaving a black <video> that "has" a track.
+      videoElement.play?.().catch(() => {});
+    } else if (track.kind === Track.Kind.Audio) {
+      const el = getAudioEl();
+      track.attach(el);
+      el.play?.().catch(() => {});
+    } else {
+      return;
+    }
+
+    attachedTracks.add(track);
+    tracksByKind.set(track.kind, track);
+    resolveFirstTrack?.();
+    if (!failed) onStatus?.('live');
   };
 
   room.on(RoomEvent.TrackSubscribed, (track) => {
@@ -176,25 +251,44 @@ export async function connectLiveKitSession({
   });
 
   room.on(RoomEvent.TrackUnsubscribed, (track) => {
-    track.detach();
-    attachedTracks.delete(track);
-    if (attachedTracks.size === 0) {
+    detachTrack(track);
+    if (attachedTracks.size === 0 && !failed) {
       onStatus?.('done');
     }
   });
 
+  // A transient signal drop must not look like a finished stream: report it
+  // so the UI can show "Reconnecting…" and keep the last frame on screen.
+  room.on(RoomEvent.Reconnecting, () => {
+    if (!failed) onStatus?.('reconnecting');
+  });
+  room.on(RoomEvent.Reconnected, () => {
+    if (!failed) onStatus?.(attachedTracks.size ? 'live' : 'connecting');
+  });
+
   room.on(RoomEvent.ConnectionStateChanged, (state) => {
-    if (state === 'disconnected') {
+    if (state === 'disconnected' && !failed) {
       onStatus?.('done');
     }
   });
 
   room.on(RoomEvent.Disconnected, () => {
-    onStatus?.('done');
+    if (!failed) onStatus?.('done');
   });
 
   try {
-    await room.connect(livekitUrl, token);
+    await withTimeout(
+      room.connect(livekitUrl, token),
+      connectTimeoutMs,
+      `no answer from ${livekitUrl} within ${Math.round(connectTimeoutMs / 1000)}s`,
+      () => {
+        try {
+          room.disconnect();
+        } catch {
+          /* ignore */
+        }
+      }
+    );
 
     // Check for tracks that were already published before/during connect
     for (const participant of room.remoteParticipants.values()) {
@@ -204,16 +298,51 @@ export async function connectLiveKitSession({
         }
       }
     }
+
+    // Connected to the SFU but nobody published: the backend publisher either
+    // failed or has not started. Wait a bounded time, then surface an error so
+    // the caller can fall back instead of showing an empty player forever.
+    if (attachedTracks.size === 0) {
+      await withTimeout(
+        firstTrack,
+        trackTimeoutMs,
+        `connected to ${livekitUrl} but the publisher sent no media within ${Math.round(trackTimeoutMs / 1000)}s`,
+        () => {
+          try {
+            room.disconnect();
+          } catch {
+            /* ignore */
+          }
+        }
+      );
+    }
   } catch (err) {
+    failed = true;
     onStatus?.('error');
-    throw err;
+    for (const track of Array.from(attachedTracks)) {
+      detachTrack(track);
+    }
+    if (audioEl) {
+      audioEl.remove();
+      audioEl = null;
+    }
+    try {
+      room.disconnect();
+    } catch {
+      /* ignore */
+    }
+    throw new Error(err?.message || String(err));
   }
 
   const disconnect = () => {
-    for (const track of attachedTracks) {
-      track.detach();
+    // Intentional teardown: suppress the 'done'/'error' callbacks that the
+    // SDK may still emit while disconnecting.
+    failed = true;
+    for (const track of Array.from(attachedTracks)) {
+      detachTrack(track);
     }
     attachedTracks.clear();
+    tracksByKind.clear();
     // Remove injected audio element
     if (audioEl) {
       audioEl.remove();

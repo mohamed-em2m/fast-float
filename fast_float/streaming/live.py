@@ -19,6 +19,40 @@ logger = logging.getLogger(__name__)
 
 CLOSE = object()
 
+# Log a subscriber-overflow warning every this many dropped frames.
+_DROP_WARN_EVERY = 25
+
+
+class LiveQueue(asyncio.Queue):
+    """Subscriber queue with drop accounting.
+
+    :class:`LiveStream` is a lossy fan-out by design: when a transport cannot
+    keep up, the *oldest* item is dropped so playback stays near-live. The
+    counters below let a transport (and the logs) explain a jump in the
+    stream instead of silently skipping frames.
+    """
+
+    def __init__(self, maxsize: int = 64) -> None:
+        super().__init__(maxsize=maxsize)
+        self.dropped_frames = 0
+        self.last_dropped_idx: int | None = None
+        # Recent dropped ranges, merged when contiguous (frames only).
+        self.dropped_ranges: list[tuple[int, int]] = []
+
+    def note_dropped(self, item: Any) -> None:
+        if not isinstance(item, tuple) or not item or item[0] != "frame":
+            return
+        idx = int(item[1])
+        self.dropped_frames += 1
+        self.last_dropped_idx = idx
+        if self.dropped_ranges and self.dropped_ranges[-1][1] == idx:
+            start, _ = self.dropped_ranges[-1]
+            self.dropped_ranges[-1] = (start, idx + 1)
+        else:
+            self.dropped_ranges.append((idx, idx + 1))
+        if len(self.dropped_ranges) > 64:  # keep the bookkeeping bounded
+            del self.dropped_ranges[:-64]
+
 
 class LiveStream:
     """A finished-or-running request that any number of transports can consume.
@@ -42,6 +76,7 @@ class LiveStream:
         self._loop = loop
         self._subs: set[asyncio.Queue] = set()
         self._meta_event = asyncio.Event()
+        self._drop_warn_total = 0
         # Delivery-side clock: how late each frame reached the transport, plus
         # the dropped-frame count (see fast_float.core.perf_metrics).
         self.clock: FrameClock | None = None
@@ -92,7 +127,7 @@ class LiveStream:
 
     # ---- fan-out ------------------------------------------------------ #
     def subscribe(self, maxsize: int = 64) -> asyncio.Queue:
-        q: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
+        q: LiveQueue = LiveQueue(maxsize=maxsize)
         self._subs.add(q)
         if self.done:
             self._push(q, CLOSE)
@@ -113,10 +148,27 @@ class LiveStream:
             self.clock.on_frame(item[1], item[2], time.monotonic())
         for q in list(self._subs):
             self._push(q, item)
+        self._warn_drops()
+
+    def dropped_frames(self) -> int:
+        """Frames this stream dropped across all slow subscribers."""
+        return sum(getattr(q, "dropped_frames", 0) for q in self._subs)
+
+    def _warn_drops(self) -> None:
+        total = self.dropped_frames()
+        if total >= self._drop_warn_total + _DROP_WARN_EVERY:
+            self._drop_warn_total = total
+            logger.warning(
+                "[live] %s: a subscriber fell behind; %d frame(s) dropped (playback jumps)",
+                self.request_id,
+                total,
+            )
 
     def metrics(self) -> dict[str, Any]:
         """Delivery metrics of this stream (TTFF, latency percentiles, drops)."""
-        return self.clock.to_dict() if self.clock is not None else {}
+        data = self.clock.to_dict() if self.clock is not None else {}
+        data["subscriber_dropped_frames"] = self.dropped_frames()
+        return data
 
     def publish_threadsafe(self, item: tuple) -> None:
         with suppress(RuntimeError):  # loop already closed (shutdown)
@@ -126,7 +178,9 @@ class LiveStream:
     def _push(q: asyncio.Queue, item: Any) -> None:
         if q.full():
             with suppress(asyncio.QueueEmpty):
-                q.get_nowait()
+                dropped = q.get_nowait()
+                if isinstance(q, LiveQueue):
+                    q.note_dropped(dropped)
         with suppress(asyncio.QueueFull):
             q.put_nowait(item)
 

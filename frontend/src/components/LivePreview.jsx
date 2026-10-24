@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { attachRemoteTrack, createWebRtcSession } from '../services/api';
 import { openLiveSocket } from '../services/live';
-import { connectLiveKitSession } from '../services/livekit';
+import { connectLiveKitSession, fetchLiveKitPublishStatus } from '../services/livekit';
 
 const STATUS_LABEL = {
   idle: 'Idle',
   connecting: 'Connecting…',
+  reconnecting: 'Reconnecting…',
   live: 'Live',
   done: 'Finished',
   error: 'Error',
@@ -100,7 +101,28 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
 
     if (transport === 'livekit') {
       let livekitSession = null;
+      let fellBack = false;
       const videoEl = videoRef.current;
+
+      // The SFU can fail in two places: the handshake (thrown) or after the
+      // room connected but the publisher never sent tracks (onStatus 'error').
+      // Both must degrade exactly once, with the server's publisher error when
+      // there is one, so the toast says *why* LiveKit failed.
+      const failOver = async (reason) => {
+        if (cancelled || fellBack) return;
+        fellBack = true;
+        let detail = reason || 'LiveKit connection failed';
+        try {
+          const status = await fetchLiveKitPublishStatus(requestId);
+          if (status?.error) detail = status.error;
+        } catch {
+          /* best effort */
+        }
+        if (cancelled) return;
+        report('error');
+        if (onFallback) onFallback(detail);
+        else onStatusRef.current?.(detail);
+      };
 
       connectLiveKitSession({
         room: requestId,
@@ -108,8 +130,7 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
         onStatus: (s) => {
           if (s === 'error') {
             // SFU unreachable → try the raw WebRTC transport next.
-            if (onFallback) onFallback('LiveKit connection failed');
-            else report('error');
+            failOver('LiveKit connection failed');
             return;
           }
           report(s);
@@ -119,7 +140,7 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
         },
       })
         .then((session) => {
-          if (cancelled) {
+          if (cancelled || fellBack) {
             session.disconnect();
             return;
           }
@@ -127,12 +148,7 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
         })
         .catch((err) => {
           console.warn('[livekit] connection failed:', err);
-          if (onFallback) {
-            onFallback(err.message || 'LiveKit connection failed');
-            return;
-          }
-          report('error');
-          onStatusRef.current?.(err.message);
+          failOver(err?.message || 'LiveKit connection failed');
         });
 
       return () => {

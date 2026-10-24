@@ -262,3 +262,24 @@ def test_ws_stream_end_to_end_with_dispatcher():
                 assert done["type"] == "done"
     finally:
         app_state.live_streams.pop("e2e", None)
+
+
+def test_slow_subscriber_drops_are_counted_not_silent():
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        stream = LiveStream("req-drops", loop)
+        stream.start(StreamMeta(fps=25.0, width=2, height=2, channels=3, request_id="req-drops"))
+        q = stream.subscribe(maxsize=2)
+
+        for i in range(6):
+            stream.publish(("frame", i, i * 40.0, np.zeros((2, 2, 3), np.uint8)))
+
+        # The queue keeps the newest two frames; the four older ones are
+        # accounted for so a transport can explain the jump instead of hiding it.
+        assert q.dropped_frames == 4
+        assert q.last_dropped_idx == 3
+        assert stream.metrics()["subscriber_dropped_frames"] == 4
+        assert (await asyncio.wait_for(q.get(), 1.0))[1] == 4
+        assert (await asyncio.wait_for(q.get(), 1.0))[1] == 5
+
+    asyncio.run(scenario())
