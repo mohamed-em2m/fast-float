@@ -339,9 +339,11 @@ def test_publish_endpoint_starts_live_publisher(api_client):
     app_state.live_streams["req-active"] = stream
 
     spawn_calls = {"count": 0}
+    started = threading.Event()
 
     async def _never_finish(*args, **kwargs):
         spawn_calls["count"] += 1
+        started.set()
         await asyncio.sleep(3600)
 
     with patch("fast_float.livekit.worker.publish_live_stream_task", _never_finish):
@@ -352,6 +354,11 @@ def test_publish_endpoint_starts_live_publisher(api_client):
         assert data["type"] == "live"
         assert data["room"] == "custom-room"
         assert data["request_id"] == "req-active"
+        # The endpoint schedules the publisher on the app's loop and returns
+        # without awaiting it, so the coroutine's first step runs after the
+        # response. Waiting on the event removes the race that made this
+        # assertion fail intermittently (count still 0 right after the POST).
+        assert started.wait(2.0), "publisher task was scheduled but never started"
         assert spawn_calls["count"] == 1
 
         # A second publish trigger for the same request must not spawn another
