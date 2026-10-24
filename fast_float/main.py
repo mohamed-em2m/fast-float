@@ -188,6 +188,13 @@ async def lifespan(app: FastAPI):
     # disables it. Best effort: a busy UDP port never blocks startup.
     stun_server: StunServer | None = None
     ice_settings = LiveKitSettings.from_env()
+    if ice_settings.configured:
+        logger.info(
+            f"🔑 LiveKit: {ice_settings.url} "
+            f"(key {ice_settings.api_key[:6]}…, config: {ice_settings.source})"
+        )
+    else:
+        logger.info("🔑 LiveKit: not configured — the SFU live transport is disabled")
     if ice_settings.stun_enabled and not ice_settings.stun_urls:
         stun_server = StunServer(port=ice_settings.stun_port)
         if await stun_server.start():

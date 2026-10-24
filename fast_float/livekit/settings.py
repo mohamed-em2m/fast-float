@@ -17,6 +17,7 @@ import base64
 import hashlib
 import hmac
 import ipaddress
+import logging
 import os
 import re
 import time
@@ -30,6 +31,8 @@ DEFAULT_TTL_S = 3600
 DEFAULT_ROOM_PREFIX = "float"
 DEFAULT_STUN_PORT = 3478
 DEFAULT_TURN_TTL_S = 3600
+
+logger = logging.getLogger(__name__)
 
 # LiveKit room names: letters, digits, dash and underscore.
 _ROOM_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -222,6 +225,26 @@ class LiveKitSettings:
             if "settings.toml" in sources
             else "none"
         )
+
+        # Mixing layers is the classic way to end up with a key that does not
+        # match its secret (LiveKit answers every such token with
+        # "401 invalid API key"). Say so once instead of debugging it live.
+        if api_key and api_secret and key_src != sec_src:
+            logger.warning(
+                "LiveKit API key comes from %s but the API secret from %s. "
+                "A pair taken from different layers is rejected as 'invalid API key'; "
+                "set both from the same LiveKit project.",
+                key_src,
+                sec_src,
+            )
+        url_host = str(url or "").split("://", 1)[-1].split("/", 1)[0]
+        if api_key and ".livekit.cloud" in url_host and not str(api_key).startswith("API"):
+            logger.warning(
+                "LiveKit Cloud URL %s is paired with an API key that does not start with 'API' "
+                "(got %r...). Check that LIVEKIT_API_KEY and LIVEKIT_API_SECRET are not swapped.",
+                url,
+                str(api_key)[:4],
+            )
 
         return cls(
             url=url,

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import logging
 import os
 from typing import Any
 
@@ -28,7 +29,42 @@ from fast_float.livekit.worker import (
     spawn_media_publish_task,
 )
 
+try:  # the RTC SDK is optional; importing this module must not require it
+    from livekit.rtc import ConnectError as _RtcConnectError
+except Exception:  # pragma: no cover - depends on the installed SDK
+    _RtcConnectError = None  # type: ignore[assignment,misc]
+
+# Empty tuple = "catch nothing" when the SDK is absent, so the handler below
+# can stay a plain `except` clause.
+_RTC_CONNECT_ERRORS: tuple[type[BaseException], ...] = (_RtcConnectError,) if _RtcConnectError else ()
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter(tags=["livekit"])
+
+
+def _connect_error_detail(settings: LiveKitSettings, exc: BaseException) -> str:
+    """Turn an RTC ``ConnectError`` into an actionable message for the operator.
+
+    The LiveKit server deliberately reports *every* JWT rejection as
+    ``401 ... invalid API key`` (it does not reveal whether the key id or the
+    signature was wrong), so the message always points at the credential pair.
+    """
+    message = str(exc) or type(exc).__name__
+    lowered = message.lower()
+    if "invalid api key" not in lowered and "unauthorized" not in lowered:
+        return f"LiveKit connection to {settings.url or '(unconfigured)'} failed: {message}"
+
+    host = str(settings.url or "").split("://", 1)[-1].split("/", 1)[0]
+    where = f" ({host})" if host else ""
+    return (
+        f"LiveKit rejected the API key for {settings.url or '(unconfigured)'}{where}: {message}. "
+        "The key/secret pair is not valid for this project — they were revoked, copied from a "
+        "different project, or the URL points at another deployment. Copy the WebSocket URL, "
+        "API key and secret together from LiveKit Cloud -> your project -> Settings -> Keys "
+        f"(current values come from {settings.source}), then retry."
+    )
+
 
 
 def _request_host(request: Request) -> str | None:
@@ -270,6 +306,12 @@ async def conversation_start(request: ConversationStartRequest) -> dict[str, Any
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except _RTC_CONNECT_ERRORS as exc:
+        # A rejected API key is the most common failure here. Returning a
+        # readable 502 lets the Studio show the real reason instead of an ASGI
+        # traceback and a bare "Internal Server Error".
+        logger.warning(f"[livekit] conversation start rejected by {settings.url}: {exc}")
+        raise HTTPException(status_code=502, detail=_connect_error_detail(settings, exc)) from exc
 
     return {
         "status": "ready",
