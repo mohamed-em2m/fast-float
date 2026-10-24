@@ -129,17 +129,22 @@ function withTimeout(promise, ms, message, onTimeout) {
 
 /**
  * Fetch current LiveKit server configuration status.
+ *
+ * `verify: true` dials the SFU once (mint a token + connect) and refreshes
+ * the connectivity check, so the Config panel can prove credentials work
+ * before a session is started.
  */
-export async function fetchLiveKitStatus() {
+export async function fetchLiveKitStatus({ verify = false } = {}) {
   try {
-    const res = await fetch(`${getApiUrl()}/livekit/status`);
-    if (!res.ok) return { configured: false, reachable: true };
+    const suffix = verify ? '?verify=1' : '';
+    const res = await fetch(`${getApiUrl()}/livekit/status${suffix}`);
+    if (!res.ok) return { configured: false, reachable: true, warnings: ['LiveKit status request failed.'] };
     return { ...(await res.json()), reachable: true };
   } catch (err) {
     return {
       configured: false,
       reachable: false,
-      error: err?.message || 'Cannot reach the backend',
+      warnings: [err?.message || 'Cannot reach the backend'],
     };
   }
 }

@@ -117,6 +117,13 @@ When the agent joins and streams its first audio, the API reports
 
 ## Notes
 
+- `GET /livekit/status` returns a `checks`/`warnings` readiness list (LiveKit
+  credentials, gemini key, agent name, auto-dispatch) the Studio shows in the
+  Config panel and Live Audio tab. `GET /livekit/status?verify=1` probes the
+  SFU for real (mint a token + dial it) so the operator can prove the
+  credentials work before a session starts; the API also runs this probe once
+  in the background at startup.
+
 - The worker needs **no GPU**; it negotiates Gemini Live and forwards audio.
 - Keep the built-in engine as the default: `agent` defaults to `"builtin"`,
   so existing clients and tests are unchanged.

@@ -404,6 +404,66 @@
   margin: -4px 0 10px;
 }
 
+.settings-checks {
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-card-inner);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  margin-top: 8px;
+}
+
+.settings-checks-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 6px;
+}
+
+.settings-checks-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.settings-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+
+.settings-check svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.settings-check strong {
+  text-transform: capitalize;
+  color: var(--text-main);
+}
+
+.settings-check--ok {
+  color: var(--success);
+}
+
+.settings-check--warn {
+  color: var(--warning);
+}
+
+.settings-check--fail {
+  color: var(--danger);
+}
+
+.settings-check--skip {
+  color: var(--text-faint);
+}
+
 .settings-buttons {
   display: flex;
   justify-content: flex-end;
@@ -2485,6 +2545,12 @@
   color: var(--danger);
   background: rgba(255, 93, 122, 0.07);
   border-color: rgba(255, 93, 122, 0.22);
+}
+
+.live-checks {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 /* Live stage */

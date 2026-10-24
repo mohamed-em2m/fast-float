@@ -3,6 +3,8 @@ import {
   AudioLines,
   Clapperboard,
   Radio,
+  ShieldCheck,
+  TriangleAlert,
   Trash2,
   Settings,
   Cpu,
@@ -139,6 +141,27 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
     setGeminiModelInput(getGeminiModel());
     setConfigError(null);
     setShowSettings(true);
+  };
+
+  const handleVerifyConnection = async () => {
+    setIsSaving(true);
+    try {
+      const lk = await fetchLiveKitStatus({ verify: true });
+      setLiveKitStatus(lk);
+      const bad = (lk?.warnings || []).length;
+      if (onToast) {
+        onToast(
+          bad === 0
+            ? 'Connection checks passed — LiveKit + Gemini ready.'
+            : `Connection check found ${bad} issue${bad === 1 ? '' : 's'} — see the list below.`,
+          bad === 0 ? 'success' : 'error'
+        );
+      }
+    } catch (err) {
+      setConfigError(err?.message || 'Verification failed.');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   const handleResetApiUrl = () => {
@@ -447,6 +470,37 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
               Pins the Live API model for <strong>Gemini Live</strong> sessions. Empty uses the worker's
               default (server <code>[gemini] &rarr; model</code> or <code>GEMINI_MODEL</code>).
             </p>
+
+            {/* Connection / readiness checks */}
+            <div className="settings-checks">
+              <div className="settings-checks-head">
+                <span className="settings-label">Connection Checks</span>
+                <button
+                  type="button"
+                  className="btn-secondary btn-xs"
+                  onClick={handleVerifyConnection}
+                  disabled={isSaving}
+                  title="Probe the LiveKit SFU and re-run every readiness check"
+                >
+                  {isSaving ? 'Verifying…' : 'Verify'}
+                </button>
+              </div>
+              {liveKitStatus?.checks?.length ? (
+                <ul className="settings-checks-list">
+                  {liveKitStatus.checks.map((check) => (
+                    <li key={check.name} className={`settings-check settings-check--${check.status || 'skip'}`}>
+                      {check.status === 'ok' ? <ShieldCheck size={13} /> : <TriangleAlert size={13} />}
+                      <span>
+                        <strong>{check.name.replace(/_/g, ' ')}</strong>
+                        {check.message}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="settings-warning">Not available — is the backend reachable?</p>
+              )}
+            </div>
 
             {configError && <p className="settings-error">{configError}</p>}
 

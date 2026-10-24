@@ -34,6 +34,7 @@ from fast_float.core.service import (
     run_inference_blocking,
 )
 from fast_float.core.state import app_state
+from fast_float.livekit import selftest
 from fast_float.livekit.settings import LiveKitSettings
 from fast_float.routers import api_router
 from fast_float.utils.gpu import print_gpu_status
@@ -189,16 +190,18 @@ async def lifespan(app: FastAPI):
     stun_server: StunServer | None = None
     ice_settings = LiveKitSettings.from_env()
     if ice_settings.configured:
-        logger.info(
-            f"🔑 LiveKit: {ice_settings.url} "
-            f"(key {ice_settings.api_key[:6]}…, config: {ice_settings.source})"
-        )
+        logger.info(f"🔑 LiveKit: {ice_settings.url} (key {ice_settings.api_key[:6]}…, config: {ice_settings.source})")
     else:
         logger.info("🔑 LiveKit: not configured — the SFU live transport is disabled")
     if ice_settings.stun_enabled and not ice_settings.stun_urls:
         stun_server = StunServer(port=ice_settings.stun_port)
         if await stun_server.start():
             app_state.stun_port = ice_settings.stun_port
+
+    # Probe the SFU in the background so /health and /livekit/status answer
+    # immediately; the result populates the Config checklist's connectivity
+    # row. Best effort — a failure only shows as a warning, never blocks boot.
+    selftest.start_probe(ice_settings)
 
     logger.info("=" * 70)
     logger.info("🚀 Starting FLOAT Fast API - NVENC Optimized v5.1.0")

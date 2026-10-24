@@ -486,19 +486,15 @@ export default function LiveAudioStudio({
               </button>
             ))}
           </div>
-          {engine === 'gemini' && liveKit?.gemini_autodispatch === false && (
-            <p className="inline-warning">
-              <TriangleAlert size={14} />
-              Auto-dispatch is off. Start the Gemini worker with an explicit dispatch for this room.
-            </p>
-          )}
-          {engine === 'gemini' && liveKit?.gemini_configured === false && !getGeminiApiKey() && (
-            <p className="inline-warning">
-              <TriangleAlert size={14} />
-              No Gemini API key on the server. Add it under <code>[gemini] &rarr; api_key</code> in{' '}
-              <code>fast_float/config/secerts.toml</code> or export <code>GOOGLE_API_KEY</code> — or paste one
-              in the header <strong>Config</strong> panel.
-            </p>
+          {engine === 'gemini' && (liveKit?.warnings?.length || 0) > 0 && (
+            <div className="live-checks">
+              {liveKit.warnings.map((message, index) => (
+                <p key={index} className="inline-warning">
+                  <TriangleAlert size={14} />
+                  {message}
+                </p>
+              ))}
+            </div>
           )}
 
           <div className={`live-level ${isLive && !muted ? 'is-active' : ''}`} aria-hidden="true">

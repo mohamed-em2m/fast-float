@@ -11,12 +11,14 @@ import base64
 import binascii
 import logging
 import os
+from dataclasses import asdict
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from fast_float.core.state import app_state
+from fast_float.livekit import selftest
 from fast_float.livekit.session import get_session, start_session, stop_session
 from fast_float.livekit.settings import LiveKitSettings, host_only, valid_room_name
 from fast_float.livekit.tokens import LiveKitUnavailable, issue_token
@@ -164,6 +166,10 @@ async def livekit_status(request: Request) -> dict[str, Any]:
     depend on LiveKit (or a public Google server). The URL host is the one the
     client used to reach us, which is also the host its ICE candidates must
     target.
+
+    ``checks``/``warnings`` report the LiveKit + Gemini readiness that the
+    Studio shows in the Config panel and Live Audio tab; ``?verify=1`` dials
+    the SFU once (cached afterwards) to prove the credentials actually connect.
     """
     settings = LiveKitSettings.from_env()
     stun_urls = list(settings.resolved_stun_urls(_request_host(request)))
@@ -179,6 +185,15 @@ async def livekit_status(request: Request) -> dict[str, Any]:
             stun_available=bool(stun_urls),
         )
     ]
+
+    checks = selftest.run_checks(settings)
+    verify = str(request.query_params.get("verify", "")).lower() in {"1", "true", "yes", "on"}
+    for index, check in enumerate(checks):
+        if check.name != "livekit_connectivity":
+            continue
+        checks[index] = await selftest.run_verify(settings) if verify else await selftest.cached_check()
+        break
+
     return {
         "configured": settings.configured,
         "url": settings.url or None,
@@ -194,6 +209,9 @@ async def livekit_status(request: Request) -> dict[str, Any]:
         "gemini_autodispatch": settings.autodispatch,
         # Presence only — the key itself never leaves the server.
         "gemini_configured": settings.gemini_configured,
+        # Readiness checklist the Studio surfaces to the user.
+        "checks": [asdict(check) for check in checks],
+        "warnings": selftest.warning_messages(checks),
         # The WebSocket live transport still exists, but it is a last resort:
         # the frontend falls back from LiveKit to raw WebRTC first.
         "ws_fallback": True,
