@@ -209,9 +209,10 @@ class DataStreamAudioReceiver:
         try:
             await asyncio.wait_for(self._agent_ready.wait(), timeout=self._agent_wait_timeout_s)
         except asyncio.TimeoutError as exc:
+            room = str(getattr(self._room, "name", "") or "")
+            where = f" in room {room!r}" if room else ""
             raise TimeoutError(
-                "No LiveKit agent participant joined the room. Start the Gemini worker "
-                "(agents/) and make sure its agent_name matches FLOAT_GEMINI_AGENT_NAME."
+                f"No LiveKit agent participant joined the room{where} within {self._agent_wait_timeout_s:g}s."
             ) from exc
         finally:
             if self.agent_identity:

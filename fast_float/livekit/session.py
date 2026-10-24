@@ -272,7 +272,11 @@ class ConversationSession:
 
         self.agent_dispatched = await self._dispatch_external_agent()
 
-        self.receiver = DataStreamAudioReceiver(self.worker_room)
+        # Give a cold-started worker time to boot, register and join. First
+        # runs compile/import livekit-agents + google-genai, which can exceed
+        # the old 30s window; override with FLOAT_GEMINI_AGENT_WAIT_S.
+        wait_s = max(10, int(float(os.getenv("FLOAT_GEMINI_AGENT_WAIT_S", "45") or "45")))
+        self.receiver = DataStreamAudioReceiver(self.worker_room, agent_wait_timeout_s=wait_s)
         self.runner = AgentAvatarRunner(
             self.worker_room,
             video_gen=self.generator,
@@ -282,7 +286,13 @@ class ConversationSession:
         try:
             await self.runner.start()
         except TimeoutError as exc:
-            raise RuntimeError(str(exc)) from exc
+            raise RuntimeError(
+                f"{exc} The Gemini worker did not join as {self.agent_name!r} "
+                f"(dispatch created: {bool(self.agent_dispatched)}). Start it with "
+                "`cd agents && uv run python -m float_agent.agent dev`, make sure agents/.env "
+                "has LIVEKIT_URL/API_KEY/API_SECRET + GOOGLE_API_KEY, and that its "
+                "FLOAT_GEMINI_AGENT_NAME matches the API's.",
+            ) from exc
         self.identity = self.receiver.agent_identity or self.identity
         logger.info(
             f"[session] Gemini Live conversation ready in {self.room_name} ({self.identity} -> {self.avatar_identity})"

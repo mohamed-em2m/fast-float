@@ -124,6 +124,30 @@ def test_generator_wait_until_idle_after_frames_are_consumed():
     asyncio.run(_test())
 
 
+@pytest.mark.skipif(not RTC_AVAILABLE, reason="LiveKit RTC SDK not installed")
+def test_receiver_wait_error_mentions_room_and_timeout():
+    """The agent-wait timeout names the room and window for a readable 503."""
+
+    class _EmptyRoom:
+        def __init__(self) -> None:
+            self.name = "float-noworker"
+            self.remote_participants: dict = {}
+
+        def on(self, *_args, **_kwargs):
+            pass
+
+        def off(self, *_args, **_kwargs):
+            pass
+
+    receiver = DataStreamAudioReceiver(_EmptyRoom(), agent_wait_timeout_s=0.05)
+    with pytest.raises(TimeoutError) as excinfo:
+        asyncio.run(receiver._wait_for_agent())
+    message = str(excinfo.value)
+    assert "float-noworker" in message
+    assert "0.05" in message
+    assert "agent" in message.lower()
+
+
 def test_avatar_token_is_agent_kind_for_room_io_isolation():
     issued = issue_token(
         url="ws://127.0.0.1:7880",
