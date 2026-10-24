@@ -7,6 +7,8 @@ room-scoped token and joins the room with it.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import os
 from typing import Any
 
@@ -58,6 +60,25 @@ class ConversationStartRequest(BaseModel):
 
     room: str | None = Field(default=None, description="Room to run the conversation in (generated when omitted)")
     image_path: str | None = Field(default=None, description="Reference face image (default placeholder when omitted)")
+    image_base64: str | None = Field(
+        default=None,
+        max_length=24_000_000,
+        description="Reference face image as base64 (browser upload); image_path wins when both are set",
+    )
+    image_format: str = Field(default="jpg", description="Image container hint: jpg, png, webp or bmp")
+
+
+class ConversationAudioRequest(BaseModel):
+    """One live-microphone chunk for a running conversation session.
+
+    The browser captures mono int16 PCM at 16 kHz and posts ~200 ms batches.
+    ``flush`` renders whatever is still buffered (end of an utterance).
+    """
+
+    room: str = Field(description="The conversation room")
+    audio_base64: str = Field(default="", max_length=4_000_000, description="Base64 mono int16 PCM")
+    sample_rate: int = Field(default=16000, ge=8000, le=48000)
+    flush: bool = Field(default=False, description="Render the buffered tail immediately")
 
 
 class ConversationSpeakRequest(BaseModel):
@@ -238,7 +259,15 @@ async def conversation_start(request: ConversationStartRequest) -> dict[str, Any
         raise HTTPException(status_code=400, detail="Invalid room name")
 
     try:
-        session = await start_session(room, settings=settings, image_path=request.image_path)
+        session = await start_session(
+            room,
+            settings=settings,
+            image_path=request.image_path,
+            image_base64=request.image_base64,
+            image_format=request.image_format,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -249,6 +278,61 @@ async def conversation_start(request: ConversationStartRequest) -> dict[str, Any
         "avatar_identity": session.avatar_identity,
         "tts": session.tts_fn is not None,
     }
+
+
+@router.post("/livekit/conversation/audio")
+async def conversation_audio(request: ConversationAudioRequest) -> dict[str, Any]:
+    """Stream a live microphone chunk into the avatar renderer.
+
+    This is the browser counterpart of ``ConversationalAgent.send_speech``:
+    it feeds PCM directly to ``FloatVideoGenerator``, whose 2 s window and
+    idle-flush timer decide when to launch a render. Audio must be mono int16
+    at 16 kHz; the browser downsamples before posting.
+    """
+    session = get_session(request.room)
+    if session is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No live session in room {request.room} — start one at /livekit/conversation/start",
+        )
+    if request.sample_rate != 16000:
+        raise HTTPException(
+            status_code=400,
+            detail="Live audio must be 16 kHz mono int16; downsample in the browser.",
+        )
+
+    accepted = 0
+    if request.audio_base64:
+        try:
+            pcm = base64.b64decode(request.audio_base64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="audio_base64 is not valid base64") from exc
+        # Whole int16 samples only; a dangling byte would shift every later sample.
+        if len(pcm) % 2:
+            pcm = pcm[:-1]
+        if pcm:
+            session.push_audio(pcm)
+            accepted = len(pcm)
+
+    if request.flush:
+        session.flush_audio()
+
+    return {
+        "room": request.room,
+        "status": "ok",
+        "accepted_bytes": accepted,
+        "flushed": request.flush,
+    }
+
+
+@router.post("/livekit/conversation/interrupt")
+async def conversation_interrupt(request: ConversationStopRequest) -> dict[str, Any]:
+    """Barge-in: drop buffered and queued audio so the avatar stops immediately."""
+    session = get_session(request.room)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"No live session in room {request.room}")
+    session.interrupt()
+    return {"room": request.room, "status": "interrupted"}
 
 
 @router.post("/livekit/conversation/speak")
@@ -278,6 +362,7 @@ async def conversation_stop(request: ConversationStopRequest) -> dict[str, Any]:
 
 
 __all__ = [
+    "ConversationAudioRequest",
     "ConversationSpeakRequest",
     "ConversationStartRequest",
     "ConversationStopRequest",

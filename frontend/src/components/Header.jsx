@@ -1,11 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  Sparkles,
+  AudioLines,
+  Clapperboard,
   Radio,
   Trash2,
   Settings,
   Cpu,
-  RefreshCw
+  RefreshCw,
+  Sparkles,
 } from 'lucide-react';
 import { fetchLiveKitStatus, getLiveKitUrlOverride, setLiveKitUrlOverride } from '../services/livekit';
 import { fetchHealth, fetchGpuMetrics, clearGpuMemory, getApiUrl, setApiUrl, resetApiUrl, isDefaultApiUrl, testApiUrl, isLoopbackUrl, isPageOnLoopback, DEFAULT_API_URL } from '../services/api';
@@ -15,7 +17,7 @@ import { fetchHealth, fetchGpuMetrics, clearGpuMemory, getApiUrl, setApiUrl, res
 // flight) must not flap the UI offline.
 const OFFLINE_AFTER_FAILURES = 3;
 
-export default function Header({ onToast }) {
+export default function Header({ onToast, mode = 'studio', onModeChange }) {
   const [health, setHealth] = useState(null);
   const [gpu, setGpu] = useState(null);
   const [isOnline, setIsOnline] = useState(false);
@@ -143,46 +145,73 @@ export default function Header({ onToast }) {
   };
 
   return (
-    <header className="header-container glass-panel">
+    <header className="app-header glass-panel">
       <div className="header-brand">
         <div className="brand-logo">
-          <Sparkles className="brand-icon" size={22} />
+          <Sparkles className="brand-icon" size={20} />
         </div>
         <div>
           <div className="brand-title-wrap">
             <h1 className="brand-title">FLOAT <span className="gradient-text">Studio</span></h1>
-            <span className="version-badge">v5.1 NVENC</span>
+            <span className="version-badge">v5.2</span>
           </div>
-          <p className="brand-subtitle">Fast Flow Matching Talking Portrait Generator</p>
+          <p className="brand-subtitle">Audio-driven talking portraits</p>
         </div>
       </div>
 
+      <nav className="mode-switch" role="tablist" aria-label="Workspace mode">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={mode === 'studio'}
+          className={`mode-tab ${mode === 'studio' ? 'is-active' : ''}`}
+          onClick={() => onModeChange?.('studio')}
+        >
+          <Clapperboard size={15} />
+          <span>Studio</span>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={mode === 'live'}
+          className={`mode-tab ${mode === 'live' ? 'is-active' : ''}`}
+          onClick={() => onModeChange?.('live')}
+        >
+          <AudioLines size={15} />
+          <span>Live Audio</span>
+          <span className="mode-live-dot" />
+        </button>
+      </nav>
+
       <div className="header-actions">
         {/* Connection Status Pill */}
-        <div className={`status-pill ${isOnline ? 'status-online' : 'status-offline'}`}>
+        <div
+          className={`status-pill ${isOnline ? 'status-online' : 'status-offline'}`}
+          title={isOnline ? `Backend: ${getApiUrl()}` : 'Backend unreachable'}
+        >
           <span className={isOnline ? 'live-dot' : 'offline-dot'} />
           <span className="status-label">
             {isOnline
-              ? (health?.model_loaded ? 'Model Ready' : 'Server Online')
+              ? (health?.model_loaded ? 'Model ready' : 'Server online')
               : 'Disconnected'}
           </span>
         </div>
 
         {/* LiveKit SFU Status Pill */}
         <div
-          className={`status-pill ${liveKitStatus?.configured ? 'status-online' : 'status-offline'}`}
-          title={liveKitStatus?.configured ? `LiveKit SFU Active (${liveKitStatus.url})` : 'LiveKit SFU Standby (run docker-compose.livekit.yml)'}
+          className={`status-pill ${liveKitStatus?.configured ? 'status-online' : 'status-standby'}`}
+          title={liveKitStatus?.configured ? `LiveKit SFU active (${liveKitStatus.url})` : 'LiveKit SFU standby (run docker-compose.livekit.yml)'}
         >
-          <Radio size={13} style={{ marginRight: '5px' }} />
+          <Radio size={13} />
           <span className="status-label">
-            {liveKitStatus?.configured ? 'LiveKit Ready' : 'LiveKit Standby'}
+            {liveKitStatus?.configured ? 'LiveKit' : 'LiveKit off'}
           </span>
         </div>
 
         {/* GPU Memory Widget */}
         {gpu?.memory && (
           <div className="gpu-widget" title={`GPU: ${gpu.info?.name || 'NVIDIA GPU'}`}>
-            <Cpu size={16} className="gpu-icon" />
+            <Cpu size={15} className="gpu-icon" />
             <div className="gpu-text">
               <span className="gpu-val">
                 {gpu.memory.allocated_gb} / {gpu.memory.total_gb} GB
@@ -195,10 +224,11 @@ export default function Header({ onToast }) {
               </div>
             </div>
             <button
-              className="btn-icon"
+              className="btn-icon-subtle"
               onClick={handleClearGpu}
               disabled={isClearing}
               title="Clear GPU VRAM cache"
+              aria-label="Clear GPU VRAM cache"
             >
               <Trash2 size={14} className={isClearing ? 'animate-spin' : ''} />
             </button>
@@ -206,18 +236,18 @@ export default function Header({ onToast }) {
         )}
 
         {/* Refresh Status */}
-        <button className="btn-icon" onClick={checkStatus} title="Refresh Server Status">
+        <button className="btn-icon" onClick={checkStatus} title="Refresh server status" aria-label="Refresh server status">
           <RefreshCw size={16} />
         </button>
 
         {/* Settings Toggle */}
         <button
-          className="btn-secondary btn-sm"
+          className="btn-icon"
           onClick={openSettings}
-          title="Configure API Endpoint"
+          title="Server & network settings"
+          aria-label="Server and network settings"
         >
-          <Settings size={15} />
-          <span>Config</span>
+          <Settings size={16} />
         </button>
       </div>
 

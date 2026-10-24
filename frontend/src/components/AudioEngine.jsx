@@ -18,7 +18,9 @@ export default function AudioEngine({
   setAudioBlob,
   audioBase64,
   setAudioBase64,
-  setAudioFormat
+  setAudioFormat,
+  step = 2,
+  onToast,
 }) {
   const [activeTab, setActiveTab] = useState('mic'); // 'mic' | 'upload' | 'samples'
   const [isRecording, setIsRecording] = useState(false);
@@ -26,6 +28,8 @@ export default function AudioEngine({
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackTime, setPlaybackTime] = useState(0);
   const [audioDuration, setAudioDuration] = useState(0);
+  const [sourceLabel, setSourceLabel] = useState('');
+  const [isDragging, setIsDragging] = useState(false);
 
   const mediaRecorderRef = useRef(null);
   const audioContextRef = useRef(null);
@@ -114,6 +118,7 @@ export default function AudioEngine({
       mediaRecorder.onstop = async () => {
         const recordedBlob = new Blob(chunks, { type: mimeType });
         setAudioBlob(recordedBlob);
+        setSourceLabel(`Microphone take · ${formatSeconds((Date.now() - startTime) / 1000)}`);
         // Send the REAL container format — the backend transcodes it.
         // Labeling webm/opus as 'wav' used to silently produce garbage audio.
         setAudioFormat(mimeToFormat(mimeType));
@@ -143,7 +148,10 @@ export default function AudioEngine({
       drawLiveWaveform();
     } catch (err) {
       console.error('Microphone access denied or failed:', err);
-      alert('Microphone permission is required to record speech.');
+      onToast?.(
+        'Microphone permission is required. Allow it in your browser, or upload an audio file instead.',
+        'error'
+      );
     }
   };
 
@@ -198,6 +206,7 @@ export default function AudioEngine({
   const handleFileUpload = async (file) => {
     if (!file) return;
     setAudioBlob(file);
+    setSourceLabel(file.name);
     // Prefer the real MIME container over the filename; fall back to ext.
     const mimeExt = file.type.includes('mp4') || file.type.includes('m4a')
       ? 'mp4'
@@ -225,6 +234,7 @@ export default function AudioEngine({
       if (!res.ok) throw new Error(`Sample fetch failed: ${res.status}`);
       const blob = await res.blob();
       setAudioBlob(blob);
+      setSourceLabel('Sample speech clip');
       setAudioFormat(url.split('.').pop().toLowerCase() || 'wav');
       const base64 = await blobToBase64(blob);
       setAudioBase64(base64);
@@ -273,13 +283,14 @@ export default function AudioEngine({
 
       <div className="section-header">
         <div className="section-title-wrap">
+          <span className="step-index">{step}</span>
           <Volume2 size={18} className="section-icon text-cyan" />
-          <h2 className="section-title">Driving Speech Audio</h2>
+          <h2 className="section-title">Voice</h2>
         </div>
         {audioBase64 && (
           <span className="badge-ready">
             <CheckCircle2 size={13} />
-            <span>Audio Ready</span>
+            <span>Audio ready</span>
           </span>
         )}
       </div>
@@ -319,10 +330,12 @@ export default function AudioEngine({
               width={420}
               height={90}
               className="waveform-canvas"
+              aria-hidden="true"
             />
             {!isRecording && !audioBlob && (
               <div className="waveform-idle-overlay">
-                <p>Press Record and speak clearly into your mic</p>
+                <p>Tap record and speak naturally</p>
+                <span>16 kHz mono · up to 60 s recommended</span>
               </div>
             )}
           </div>
@@ -362,11 +375,16 @@ export default function AudioEngine({
       {/* TAB 2: UPLOAD AUDIO */}
       {activeTab === 'upload' && (
         <div
-          className="audio-dropzone"
+          className={`audio-dropzone ${isDragging ? 'is-dragging' : ''}`}
           onClick={() => fileInputRef.current?.click()}
-          onDragOver={(e) => e.preventDefault()}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setIsDragging(true);
+          }}
+          onDragLeave={() => setIsDragging(false)}
           onDrop={(e) => {
             e.preventDefault();
+            setIsDragging(false);
             if (e.dataTransfer.files[0]) handleFileUpload(e.dataTransfer.files[0]);
           }}
         >
@@ -378,8 +396,8 @@ export default function AudioEngine({
             style={{ display: 'none' }}
           />
           <FileAudio size={28} className="upload-audio-icon" />
-          <p className="upload-hint-main">Click or drop audio file here</p>
-          <p className="upload-hint-sub">WAV, MP3, AAC, PCM (16kHz recommended)</p>
+          <p className="upload-hint-main">Click or drop an audio file here</p>
+          <p className="upload-hint-sub">WAV, MP3, M4A, OGG · 16 kHz mono works best</p>
         </div>
       )}
 
@@ -388,15 +406,16 @@ export default function AudioEngine({
         <div className="sample-audio-list">
           <div className="sample-audio-card">
             <div className="sample-audio-info">
-              <span className="sample-audio-name">Sample Speech Clip 1</span>
-              <span className="sample-audio-desc">Natural English conversation clip (0.5s - 4s)</span>
+              <span className="sample-audio-name">Studio sample · English</span>
+              <span className="sample-audio-desc">A short natural speech clip to try the pipeline</span>
             </div>
             <button
               type="button"
               className="btn-secondary btn-sm"
               onClick={() => handleSelectSample('/samples/speech1.wav')}
             >
-              Use Sample
+              <Play size={13} />
+              Use sample
             </button>
           </div>
         </div>
@@ -409,10 +428,15 @@ export default function AudioEngine({
             type="button"
             className="btn-play-toggle"
             onClick={togglePlayAudio}
+            aria-label={isPlaying ? 'Pause audio preview' : 'Play audio preview'}
           >
             {isPlaying ? <Pause size={16} /> : <Play size={16} />}
           </button>
           <div className="audio-timeline-wrap">
+            <div className="audio-preview-meta">
+              <span className="audio-source-label">{sourceLabel || 'Audio ready'}</span>
+              <span>{formatSeconds(playbackTime)} / {formatSeconds(audioDuration || recordDuration)}</span>
+            </div>
             <div className="audio-progress-bar">
               <div
                 className="audio-progress-fill"
@@ -421,19 +445,17 @@ export default function AudioEngine({
                 }}
               />
             </div>
-            <div className="audio-time-labels">
-              <span>{formatSeconds(playbackTime)}</span>
-              <span>{formatSeconds(audioDuration || recordDuration)}</span>
-            </div>
           </div>
           <button
             type="button"
             className="btn-icon-subtle"
-            title="Re-record / Clear"
+            title="Clear audio"
+            aria-label="Clear audio"
             onClick={() => {
               setAudioBlob(null);
               setAudioBase64(null);
               setIsPlaying(false);
+              setSourceLabel('');
               setPreviewSrc(null);
             }}
           >

@@ -146,6 +146,61 @@ export async function fetchLiveKitPublishStatus(requestId) {
 }
 
 /**
+ * Start the in-process live-audio session (agent + renderer + avatar worker).
+ *
+ * The browser only receives a room name; media is published by the server and
+ * watched through the normal LiveKit viewer token.
+ */
+export async function startConversation({ room = null, imageBase64 = null, imageFormat = 'jpg' } = {}) {
+  const res = await fetch(`${getApiUrl()}/livekit/conversation/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ room, image_base64: imageBase64, image_format: imageFormat }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Could not start the live session (${res.status})`);
+  }
+  return await res.json();
+}
+
+/** Push one ~200 ms chunk of mono int16 PCM (16 kHz) to the avatar renderer. */
+export async function pushConversationAudio(room, audioBase64, { flush = false } = {}) {
+  const res = await fetch(`${getApiUrl()}/livekit/conversation/audio`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ room, audio_base64: audioBase64, sample_rate: 16000, flush }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Live audio rejected (${res.status})`);
+  }
+  return await res.json();
+}
+
+/** Barge-in: stop the avatar's current utterance immediately. */
+export async function interruptConversation(room) {
+  const res = await fetch(`${getApiUrl()}/livekit/conversation/interrupt`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ room }),
+  });
+  if (!res.ok) return null;
+  return await res.json().catch(() => null);
+}
+
+/** End the live session and stop its renderer/worker. */
+export async function stopConversation(room) {
+  const res = await fetch(`${getApiUrl()}/livekit/conversation/stop`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ room }),
+  });
+  if (!res.ok) return null;
+  return await res.json().catch(() => null);
+}
+
+/**
  * Connect to a LiveKit room and stream avatar tracks to the video element.
  *
  * Video *and* audio are attached to `videoElement`, so the browser renders

@@ -12,7 +12,8 @@ export default function PortraitCanvas({
   setImagePreview,
   setImageBase64,
   noCrop,
-  setNoCrop
+  setNoCrop,
+  step = 1,
 }) {
   const fileInputRef = useRef(null);
   // Tracks blob: preview URLs we created so we can revoke them (static
@@ -76,11 +77,12 @@ export default function PortraitCanvas({
     <div className="card-section glass-panel">
       <div className="section-header">
         <div className="section-title-wrap">
+          <span className="step-index">{step}</span>
           <ImageIcon size={18} className="section-icon text-indigo" />
-          <h2 className="section-title">Reference Portrait</h2>
+          <h2 className="section-title">Portrait</h2>
         </div>
         {imagePreview && (
-          <button className="btn-icon-subtle" onClick={handleClearImage} title="Clear Image">
+          <button className="btn-icon-subtle" onClick={handleClearImage} title="Clear image" aria-label="Clear portrait">
             <X size={16} />
           </button>
         )}

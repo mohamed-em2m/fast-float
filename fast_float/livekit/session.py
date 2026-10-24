@@ -15,8 +15,11 @@ in :data:`_sessions`; manage through the ``/livekit/conversation/*`` endpoints.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import logging
+import os
+import tempfile
 from collections.abc import Callable
 from typing import Any
 
@@ -45,6 +48,31 @@ _render_lock = asyncio.Semaphore(1)
 # room -> running session
 _sessions: dict[str, ConversationSession] = {}
 
+# Only raster formats the loader understands; anything else falls back to jpg.
+_ALLOWED_IMAGE_FORMATS = {"jpg", "jpeg", "png", "webp", "bmp"}
+
+
+def _safe_image_format(value: str | None) -> str:
+    """Normalise an upload's container hint to a whitelisted extension."""
+    ext = str(value or "jpg").strip().lower().lstrip(".")
+    if ext == "jpeg":
+        return "jpg"
+    return ext if ext in _ALLOWED_IMAGE_FORMATS else "jpg"
+
+
+def _materialize_image(image_base64: str, image_format: str) -> str:
+    """Decode a browser-uploaded portrait into a temp file for the renderer."""
+    try:
+        raw = base64.b64decode(image_base64, validate=True)
+    except Exception as exc:
+        raise ValueError("image_base64 is not valid base64") from exc
+    if not raw:
+        raise ValueError("image_base64 is empty")
+    fd, path = tempfile.mkstemp(prefix="float-live-", suffix=f".{_safe_image_format(image_format)}")
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(raw)
+    return path
+
 
 class ConversationSession:
     """One conversational avatar session in a LiveKit room."""
@@ -56,6 +84,8 @@ class ConversationSession:
         settings: LiveKitSettings | None = None,
         identity: str | None = None,
         image_path: str | None = None,
+        image_base64: str | None = None,
+        image_format: str = "jpg",
         tts_fn: Callable[[str], bytes] | None = None,
     ) -> None:
         self.room_name = room_name
@@ -63,7 +93,13 @@ class ConversationSession:
         self.identity = identity or DEFAULT_AGENT_IDENTITY
         self.avatar_identity = f"avatar-{room_name[:24]}"
         self.image_path = image_path
+        self.image_base64 = image_base64
+        self.image_format = _safe_image_format(image_format)
         self.tts_fn = tts_fn
+        # Written from ``image_base64`` on start and removed on stop, so a
+        # browser-uploaded portrait can drive a live session without exposing
+        # a server path.
+        self._temp_image: str | None = None
 
         self.agent: ConversationalAgent | None = None
         self.generator: FloatVideoGenerator | None = None
@@ -85,6 +121,11 @@ class ConversationSession:
         engine = app_state.agent
         if engine is None:
             raise RuntimeError("The FLOAT model is not loaded yet (still warming up)")
+
+        if self.image_path is None and self.image_base64:
+            self._temp_image = _materialize_image(self.image_base64, self.image_format)
+            self.image_path = self._temp_image
+            self.image_base64 = None
 
         if self.image_path is None:
             self.image_path = ensure_default_image()
@@ -134,6 +175,29 @@ class ConversationSession:
             raise RuntimeError("No TTS engine attached to this session")
         await self.agent.send_speech(text)
 
+    def push_audio(self, pcm16_mono: bytes) -> None:
+        """Feed live microphone PCM (16 kHz, mono, int16) to the avatar.
+
+        The browser posts short chunks; :class:`FloatVideoGenerator` buffers
+        them and starts a 2 s render window as soon as enough audio arrives.
+        Call this from the event-loop thread.
+        """
+        if self.generator is None:
+            raise RuntimeError("Session not started")
+        self.generator.push_audio(pcm16_mono)
+
+    def flush_audio(self) -> None:
+        """Render the tail of the current utterance immediately."""
+        if self.generator is None:
+            return
+        self.generator.flush()
+
+    def interrupt(self) -> None:
+        """Barge-in: drop buffered audio and any queued/in-flight render."""
+        if self.generator is None:
+            return
+        self.generator.clear_buffer()
+
     async def stop(self) -> None:
         if self._stopped:
             return
@@ -152,6 +216,10 @@ class ConversationSession:
             with contextlib.suppress(Exception):
                 await self.agent.disconnect()
             self.agent = None
+        if self._temp_image:
+            with contextlib.suppress(OSError):
+                os.unlink(self._temp_image)
+            self._temp_image = None
         logger.info(f"[session] conversation stopped in {self.room_name}")
 
 
@@ -171,6 +239,8 @@ async def start_session(
     settings: LiveKitSettings | None = None,
     identity: str | None = None,
     image_path: str | None = None,
+    image_base64: str | None = None,
+    image_format: str = "jpg",
     tts_fn: Callable[[str], bytes] | None = None,
 ) -> ConversationSession:
     """Start (or reuse) the conversation session for ``room_name``."""
@@ -178,8 +248,21 @@ async def start_session(
     if existing is not None:
         logger.info(f"[session] reusing existing conversation session in {room_name}")
         return existing
-    session = ConversationSession(room_name, settings=settings, identity=identity, image_path=image_path, tts_fn=tts_fn)
-    await session.start()
+    session = ConversationSession(
+        room_name,
+        settings=settings,
+        identity=identity,
+        image_path=image_path,
+        image_base64=image_base64,
+        image_format=image_format,
+        tts_fn=tts_fn,
+    )
+    try:
+        await session.start()
+    except Exception:
+        # A failed start must not leak a temp portrait or a half-open room.
+        await session.stop()
+        raise
     _sessions[room_name] = session
     return session
 
