@@ -189,6 +189,7 @@ export async function connectLiveKitSession({
   // attaching both would leave the old (frozen) video behind the new one.
   const tracksByKind = new Map();
   let failed = false;
+  let reconnecting = false;
   let resolveFirstTrack;
   const firstTrack = new Promise((resolve) => {
     resolveFirstTrack = resolve;
@@ -252,7 +253,9 @@ export async function connectLiveKitSession({
 
   room.on(RoomEvent.TrackUnsubscribed, (track) => {
     detachTrack(track);
-    if (attachedTracks.size === 0 && !failed) {
+    // A reconnect unsubscribes then resubscribes the publisher's tracks; that
+    // is not the end of the stream, so do not flash "Finished" mid-session.
+    if (attachedTracks.size === 0 && !failed && !reconnecting) {
       onStatus?.('done');
     }
   });
@@ -260,9 +263,11 @@ export async function connectLiveKitSession({
   // A transient signal drop must not look like a finished stream: report it
   // so the UI can show "Reconnecting…" and keep the last frame on screen.
   room.on(RoomEvent.Reconnecting, () => {
+    reconnecting = true;
     if (!failed) onStatus?.('reconnecting');
   });
   room.on(RoomEvent.Reconnected, () => {
+    reconnecting = false;
     if (!failed) onStatus?.(attachedTracks.size ? 'live' : 'connecting');
   });
 

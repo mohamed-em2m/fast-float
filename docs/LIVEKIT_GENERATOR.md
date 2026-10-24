@@ -31,7 +31,7 @@ agent TTS / microphone
   _LiveKitDispatcherBridge        ← pairs each frame with its 40 ms PCM slice
         │  loop.call_soon_threadsafe(_push)
         ▼
-  asyncio.Queue[(video, audio)]   ← bounded, drops oldest on lag
+  asyncio.Queue[(video, audio)]   ← bounded; production paced to playout
         │  async iteration
         ▼
   AvatarRunner → rtc.AVSynchronizer → LiveKit room
@@ -197,12 +197,28 @@ generator.clear_buffer()
 An in-flight GPU call is not killed mid-kernel; it stops at the next frame
 dispatch and releases the semaphore/executor slot.
 
-### Bounded output queue
+### Bounded output queue and production pacing
 
 The output queue holds at most `max_queue_frames` pairs (default **128**,
-about 5.1 s at 25 fps). When it is full, the **oldest** pair is discarded so
-the stream stays near live rather than playing old frames late. Dropped pairs
-are counted and logged every 25 drops:
+about 5.1 s at 25 fps). Inference is much faster than real time, so without
+pacing a whole utterance is queued in a burst and the oldest frames are
+discarded — audible as a jump cut in the middle of a sentence.
+
+`_pump()` therefore only starts a chunk when the queue has room for the full
+burst a chunk can produce (a 2 s window = 50 frames, plus one chunk of
+headroom for frames already scheduled on the loop). Production waits for the
+consumer instead of dropping, so normal playback delivers every frame in
+order:
+
+```
+queue:  ... 28 frames  → start chunk → ... 78 frames → drain to 28 → next
+```
+
+A queue configured smaller than one chunk cannot be paced (waiting would
+deadlock), so it keeps the old drop-oldest behaviour. If the consumer still
+falls more than a whole queue behind (or the loop stalls), the oldest pair is
+discarded so the stream stays near live; drops are counted and logged every
+25:
 
 ```
 [livekit-gen] consumer behind; dropped 25 frames total
@@ -211,12 +227,21 @@ are counted and logged every 25 drops:
 Because video and audio are discarded together, the surviving frames remain
 in sync.
 
+The `/generate?live=true` tap (`LiveStream`) is lossy by design as well: its
+per-subscriber queue drops the oldest frame when a transport cannot keep up,
+but now counts and logs it (`subscriber_dropped_frames` in `metrics()`,
+`LiveStreamVideoGenerator.stop()` logs the total). That is how a jump in the
+preview is explained rather than silently hidden.
+
 ### `stop()` — terminal
 
 `stop()` invalidates the current generation, cancels the idle timer, shuts
-down the owned executor, makes room in the queue, and inserts the sentinel.
-The async iterator then ends and `AvatarRunner` performs its normal playout
-and RPC cleanup. A stopped generator is not restarted; create a new one.
+down the owned executor, and signals end-of-stream. It deliberately **does not
+flush the queue**: frames already generated are real audio and are played out
+by the consumer before the iterator ends (if the queue is full, the sentinel
+is not enqueued; `_stop_pending` makes the iterator exit once the queue is
+drained). `AvatarRunner.stop()` bounds that drain with `DRAIN_TIMEOUT_S` before
+unpublishing the tracks. A stopped generator is not restarted; create a new one.
 
 ---
 
@@ -236,7 +261,8 @@ and RPC cleanup. A stopped generator is not restarted; create a new one.
 - The bridge disables the dispatcher's lag-drop policy (`max_lag_ms = 0`) and
   allows a full 2 s burst (`max_queue_frames = 128`). The generator's own
   bounded queue is the single backpressure point; otherwise the dispatcher
-  could discard half of a 50-frame burst before delivery.
+  could discard half of a 50-frame burst before delivery. `_pump()` paces
+  production so the queue never overflows under normal playout.
 - An optional `semaphore` lets the whole application share one GPU slot with
   the HTTP `/generate` path. Passing an `executor` transfers ownership to the
   caller: `stop()` will **not** shut it down.
@@ -267,7 +293,7 @@ Runtime attributes:
 | --- | --- |
 | `on_first_frame` | optional callback (sync or async) fired once, before the first frame is yielded |
 | `last_chunk_rtf` | last chunk's `inference_time / audio_time`; must stay below `1.0` |
-| `_dropped_frames` | diagnostics: pairs dropped because the consumer lagged |
+| `_dropped_frames` | diagnostics: pairs dropped because the consumer fell more than a whole queue behind |
 
 When `last_chunk_rtf >= 1.0`, the generator logs:
 
@@ -276,8 +302,9 @@ When `last_chunk_rtf >= 1.0`, the generator logs:
 ```
 
 Sustained RTF ≥ 1 means the GPU cannot keep up with the incoming audio. Options
-are fewer `nfe` steps, a smaller model/backend, or accepting a growing latency
-(the bounded queue will start dropping oldest frames).
+are fewer `nfe` steps or a smaller model/backend; otherwise the queue drains
+and playback starves (silence between chunks), because production is paced to
+playout rather than dropping frames.
 
 ---
 

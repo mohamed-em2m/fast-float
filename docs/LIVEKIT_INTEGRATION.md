@@ -236,8 +236,10 @@ Implemented and verified:
 - `fast_float/livekit/tokens.py` — mints the room grant with the official
   `livekit-api` (`AccessToken` + `VideoGrants`). The API secret never leaves
   the server; a viewer token has `can_publish=False` by default.
-- `fast_float/routers/livekit.py` — `GET /livekit/status` (is it configured?)
-  and `POST /livekit/token` (mint a room-scoped token).
+- `fast_float/routers/livekit.py` — `GET /livekit/status` (is it configured?),
+  `POST /livekit/token` (mint a room-scoped token) and
+  `GET /livekit/publish/{id}` (is the background publisher still running, and
+  its last error, so the client can explain a fallback).
 - `docker-compose.livekit.yml` — the self-hosted server.
 - `tests/test_livekit_tokens.py` — 10 tests: the settings, the room-name
   validation, the claim shape, the publish flag, and the endpoint's
