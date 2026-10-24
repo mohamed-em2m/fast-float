@@ -90,12 +90,13 @@ def host_only(value: str | None) -> str:
 
 @dataclass(frozen=True)
 class GeminiSettings:
-    """Configuration for the external Gemini Live voice agent (``agents/``).
+    """Configuration for the Gemini Live voice worker.
 
-    Read with the usual precedence: environment variables first, then
-    ``secerts.toml`` for the API key and ``settings.toml`` for non-secret
-    defaults. The key is consumed by the ``agents/`` worker; the API only
-    reports whether it is configured and never exposes the secret over HTTP.
+    Read with the usual precedence: the shared ``secerts.toml`` /
+    ``settings.toml`` files first, then environment variables, then built-in
+    defaults. The key is consumed by
+    :mod:`fast_float.livekit.gemini.agent`; the API only reports whether it is
+    configured and never exposes the secret over HTTP.
     """
 
     #: Google Gemini API key: env ``GOOGLE_API_KEY``/``GEMINI_API_KEY``, else
@@ -176,7 +177,7 @@ class LiveKitSettings:
 
         # The shared FLOAT config (secerts.toml / settings.toml) is the single
         # source of truth for the deployment values that must agree between
-        # this API and the agents worker (same LiveKit project, same agent
+        # this API and the Gemini worker (same LiveKit project, same agent
         # name): the file wins, and the environment is only a *fallback* for
         # boxes without the shared config. A disagreeing env copy is stale —
         # say so loudly instead of letting the copies drift apart silently.
@@ -218,8 +219,8 @@ class LiveKitSettings:
             (_s(config.get("api_secret")), "settings.toml"),
         )
 
-        # Gemini Live voice agent. The worker (agents/) consumes the key; the
-        # API only stores it for the configured/status checks.
+        # Gemini Live voice worker (fast_float/livekit/gemini). The worker
+        # consumes the key; the API only stores it for the status checks.
         gemini_secrets = all_secrets.get("gemini", {})
         gemini_cfg = all_config.get("gemini", {})
         gemini_key, _ = first_value(

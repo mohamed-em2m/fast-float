@@ -11,9 +11,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-# Variables that float_agent.config.AgentConfig.from_env() exports into the
-# real process environment, because livekit-agents (LIVEKIT_*) and google-genai
-# (GOOGLE_API_KEY) read os.environ directly instead of our config object.
+# Variables that fast_float.livekit.gemini.config.AgentConfig.from_env() exports
+# into the real process environment, because livekit-agents (LIVEKIT_*) and
+# google-genai (GOOGLE_API_KEY) read os.environ directly instead of our config
+# object.
 # Tests must not inherit whichever value ran before them.
 _SDK_ENV = ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET", "GOOGLE_API_KEY", "GEMINI_API_KEY")
 

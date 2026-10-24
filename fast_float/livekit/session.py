@@ -4,9 +4,11 @@ Two backends are supported:
 
 * ``builtin`` — :class:`ConversationalAgent` (mic PCM posted by the browser) +
   :class:`FloatVideoGenerator` + :class:`AvatarRunner`, all in this process.
-* ``gemini`` — a separate ``livekit-agents`` worker (Gemini Live
-  speech-to-speech) streams TTS audio over LiveKit DataStream;
-  :class:`AgentAvatarRunner` renders it and publishes synchronized A/V.
+* ``gemini`` — the ``livekit-agents`` worker in
+  :mod:`fast_float.livekit.gemini` (Gemini Live speech-to-speech) streams TTS
+  audio over LiveKit DataStream; :class:`AgentAvatarRunner` renders it and
+  publishes synchronized A/V. The worker shares this venv/lockfile but runs
+  as its own process, as LiveKit's dispatch model expects.
 
 The browser joins the same room with a viewer token (POST /livekit/token) and
 attaches the tracks published by the avatar worker. One session per room, kept
@@ -133,7 +135,7 @@ def _dispatch_payload(
     key = (gemini_api_key or "").strip()
     # Only metadata-shaped names are forwarded. Authoritative validation
     # (known Live-API ids, lowercase, plugin list) happens in the worker
-    # (float_agent.config.sanitize_gemini_model); this is the cheap filter the
+    # (fast_float.livekit.gemini.config.sanitize_gemini_model); this is the cheap filter the
     # API can apply before the name ever enters the SFU's dispatch payload.
     model = (gemini_model or "").strip()
     if _MODEL_NAME_RE.fullmatch(model) is None:
@@ -363,10 +365,11 @@ class ConversationSession:
             raise RuntimeError(
                 f"{exc} The Gemini worker did not join as {self.agent_name!r} "
                 f"(dispatch created: {bool(self.agent_dispatched)}). {dispatch_state} "
-                "Start it with `cd agents && uv run python -m float_agent.agent start`. The worker reads "
-                "the shared fast_float/config/secerts.toml + settings.toml (the single source of "
-                "truth — put the same LiveKit project's LIVEKIT_URL/API_KEY/API_SECRET there, in "
-                "both processes' FLOAT_CONFIG_DIR; agents/.env is only a fallback and a differing "
+                "Start it with `./scripts/run_gemini_agent.sh` (or "
+                "`uv run python -m fast_float.livekit.gemini.agent start`). The worker reads the "
+                "shared fast_float/config/secerts.toml + settings.toml (the single source of truth "
+                "— put the same LiveKit project's LIVEKIT_URL/API_KEY/API_SECRET there, in both "
+                "processes' FLOAT_CONFIG_DIR; the repo-root .env is only a fallback and a differing "
                 "copy is ignored with a warning). Its agent name must match the API's.",
             ) from exc
         self.identity = self.receiver.agent_identity or self.identity
@@ -441,7 +444,7 @@ class ConversationSession:
         if not self.dispatch_id:
             return
         try:
-            from livekit.api import DeleteAgentDispatchRequest, LiveKitAPI
+            from livekit.api import LiveKitAPI
 
             async with LiveKitAPI(
                 url=self.settings.url,

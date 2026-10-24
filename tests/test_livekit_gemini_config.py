@@ -6,21 +6,16 @@ import asyncio
 import json
 import logging
 import os
-import sys
 from pathlib import Path
 from types import SimpleNamespace
-
-import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agents"))
-
 from unittest.mock import MagicMock
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from float_agent.config import AgentConfig, dispatch_config
 
 from fast_float.core.state import app_state
+from fast_float.livekit.gemini.config import AgentConfig, dispatch_config
 from fast_float.livekit.session import _dispatch_payload, dispatch_agent
 from fast_float.livekit.settings import LiveKitSettings
 from fast_float.routers.livekit import router as livekit_router
@@ -61,6 +56,16 @@ def api_client(monkeypatch):
         yield client
 
 
+def test_dynamic_config_dir_honors_float_config_dir(monkeypatch, tmp_path):
+    """The API and the worker must be able to share one config directory."""
+    from fast_float.config import dynamic
+
+    monkeypatch.setenv("FLOAT_CONFIG_DIR", str(tmp_path))
+    assert dynamic.config_dir() == tmp_path
+    assert dynamic.settings_path() == tmp_path / "settings.toml"
+    assert dynamic.secrets_path() == tmp_path / "secerts.toml"
+
+
 def _write_configs(
     tmp_path: Path,
     *,
@@ -98,14 +103,14 @@ def test_agent_reads_gemini_key_from_shared_secerts(monkeypatch, tmp_path):
     assert config.livekit_url == "ws://127.0.0.1:7880"
 
 
-def test_agent_warns_when_env_copy_disagrees_with_shared_file(monkeypatch, tmp_path, caplog):
+def test_agent_warns_when_env_copy_disagrees_with_shared_file(monkeypatch, tmp_path, caplog, visible_fast_float_logs):
     """The stale-env drift that used to register the worker on the wrong SFU."""
     _write_configs(tmp_path, gemini_key="AI-file-key")
     monkeypatch.setenv("FLOAT_CONFIG_DIR", str(tmp_path))
     monkeypatch.setenv("LIVEKIT_URL", "ws://other-project.livekit.cloud")
     monkeypatch.setenv("GOOGLE_API_KEY", "AI-env-stale")
 
-    with caplog.at_level(logging.WARNING, logger="float_agent.config"):
+    with caplog.at_level(logging.WARNING, logger="fast_float.livekit"):
         config = AgentConfig.from_env()
     # File wins, in the config and for the google-genai SDK (env re-export).
     assert config.livekit_url == "ws://127.0.0.1:7880"
@@ -462,7 +467,7 @@ def test_worker_parses_dispatch_metadata_overrides():
 
 
 def test_sanitize_gemini_model_passes_known_and_wellformed_ids(caplog):
-    from float_agent.config import known_live_models, sanitize_gemini_model
+    from fast_float.livekit.gemini.config import known_live_models, sanitize_gemini_model
 
     known = known_live_models()
     assert known  # a fallback snapshot is always available
@@ -471,9 +476,7 @@ def test_sanitize_gemini_model_passes_known_and_wellformed_ids(caplog):
     assert sanitize_gemini_model('  "Gemini-3.8-LIVE"  ') == "gemini-3.8-live"
     # Unknown but well-formedpreview ids are forwarded (with a warning), not
     # dropped: Google ships ids the plugin's list may lag behind.
-    assert (
-        sanitize_gemini_model("gemini-9.9-flash-live-future-preview").startswith("gemini-9.9-flash-live")
-    )
+    assert sanitize_gemini_model("gemini-9.9-flash-live-future-preview").startswith("gemini-9.9-flash-live")
     # models/ prefix is stripped: the plugin adds it itself.
     assert sanitize_gemini_model("models/gemini-3.8-live") == "gemini-3.8-live"
     # Provider-qualified names from a Studio/gateway paste are normalized.
@@ -501,7 +504,7 @@ def test_configured_model_is_normalized_too(monkeypatch, tmp_path):
 
 
 def test_sanitize_gemini_model_drops_free_text():
-    from float_agent.config import sanitize_gemini_model
+    from fast_float.livekit.gemini.config import sanitize_gemini_model
 
     for bad in (
         None,

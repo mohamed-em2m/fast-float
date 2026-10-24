@@ -1,13 +1,14 @@
-"""Avatar runner for an external conversational agent (Gemini Live).
+"""Avatar runner for the Gemini Live worker.
 
 The built-in :class:`fast_float.livekit.worker.AvatarRunner` is push-based: an
 in-process agent calls ``generator.push_audio()``. This runner is pull-based:
-it consumes :class:`DataStreamAudioReceiver` segments streamed by a remote
-``livekit-agents`` worker, renders them with FLOAT, and publishes synchronized
-``avatar_video`` + ``avatar_audio`` tracks.
+it consumes :class:`DataStreamAudioReceiver` segments streamed by the
+``livekit-agents`` worker in :mod:`fast_float.livekit.gemini`, renders them
+with FLOAT, and publishes synchronized ``avatar_video`` + ``avatar_audio``
+tracks.
 
 It mirrors ``livekit.agents.voice.avatar.AvatarRunner`` but uses only the RTC
-SDK, so it can live in FLOAT's pinned environment.
+SDK, so the avatar side does not depend on the worker's agent stack.
 """
 
 from __future__ import annotations

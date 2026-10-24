@@ -1,18 +1,20 @@
-"""Environment-driven configuration for the Gemini Live worker.
+"""Configuration for the Gemini Live worker.
 
-The worker prefers environment variables (including ``agents/.env``), but the
-Gemini API key and model defaults can also live in the FLOAT repo's shared
-config files, so one key serves both processes:
+The worker shares FLOAT's config layer: :class:`fast_float.livekit.settings.LiveKitSettings`
+is the single source of truth for the LiveKit deployment and the Gemini
+defaults, so the API and the worker cannot drift apart. This module only adds
+the worker-specific values (FLOAT API URL/timeout, instructions) and the
+process-level exports the SDKs require.
 
-* ``fast_float/config/secerts.toml`` → ``[gemini].api_key`` (secret)
-* ``fast_float/config/settings.toml`` → ``[gemini].model/voice/language``
+Precedence (highest first), inherited from ``LiveKitSettings``:
 
-Finally, the FLOAT API can hand a per-session key through the dispatch
-``metadata`` (``{"gemini_api_key": "..."}``) when the Studio supplied one —
-see :func:`dispatch_api_key`.
+1. the shared ``secerts.toml`` / ``settings.toml`` files (single source of truth)
+2. environment variables (``LIVEKIT_*``, ``GOOGLE_API_KEY``, ``GEMINI_*``)
+3. built-in defaults
 
-Override the config directory with ``FLOAT_CONFIG_DIR`` (defaults to the
-sibling ``fast_float/config`` of this repository).
+Override the config directory with ``FLOAT_CONFIG_DIR``. Both processes must
+read the same directory; the worker surfaces the effective one in its startup
+log and errors.
 """
 
 from __future__ import annotations
@@ -24,6 +26,9 @@ import re
 import typing
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from fast_float.config.dynamic import config_dir as resolve_config_dir
+from fast_float.livekit.settings import LiveKitSettings
 
 logger = logging.getLogger(__name__)
 
@@ -44,106 +49,18 @@ internal implementation details out loud.
 """
 
 
-def _flag(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name, "").strip().lower()
-    if not raw:
-        return default
-    return raw not in {"0", "false", "no", "off"}
-
-
-def _repo_config_dir() -> Path:
-    """Directory holding settings.toml / secerts.toml for the main repo."""
-    override = os.getenv("FLOAT_CONFIG_DIR", "").strip()
-    if override:
-        return Path(override).expanduser()
-    # agents/float_agent/config.py -> agents -> repository root.
-    return Path(__file__).resolve().parents[2] / "fast_float" / "config"
-
-
-def _read_toml(path: Path) -> dict[str, object]:
-    """Parse one TOML file; returns {} when absent, unreadable or invalid."""
-    try:
-        import tomllib  # Python 3.11+
-    except ImportError:  # pragma: no cover - 3.10 fallback
-        try:
-            import tomli as tomllib  # type: ignore[no-redef]
-        except ImportError:
-            return {}
-    try:
-        with open(path, "rb") as f:
-            data = tomllib.load(f)
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _shared_sections(*names: str) -> dict[str, dict[str, object]]:
-    """Read the requested sections of settings.toml / secerts.toml.
-
-    Returns one mapping per section; secerts.toml (per-machine) wins over
-    settings.toml (defaults) per key.
-    """
-    out: dict[str, dict[str, object]] = {name: {} for name in names}
-    config_dir = _repo_config_dir()
-    for filename in ("secerts.toml", "settings.toml"):
-        data = _read_toml(config_dir / filename)
-        for name in names:
-            section = data.get(name, {})
-            if not isinstance(section, dict):
-                continue
-            for key, value in section.items():
-                if key not in out[name] and value not in (None, ""):
-                    out[name][key] = value
-    return out
-
-
-def _first_set(*candidates: object) -> str:
-    """First candidate that is a non-empty string, stripped."""
-    for value in candidates:
-        if value is not None and str(value).strip():
-            return str(value).strip()
-    return ""
-
-
 def _export_env(name: str, value: str) -> None:
-    """Expose a resolved shared-config value to the libraries that read env.
+    """Expose a resolved value to libraries that read ``os.environ`` directly.
 
     ``livekit-agents`` reads ``LIVEKIT_URL`` / ``LIVEKIT_API_KEY`` /
-    ``LIVEKIT_API_SECRET`` straight from ``os.environ`` when the worker starts
-    (``AgentServer`` construction and ``run()``), and google-genai does the
-    same for ``GOOGLE_API_KEY``. Those libraries have no notion of our
-    file-first precedence, so the winner below must be exported here — a key
-    that resolves fine in this config but never reaches the SDK makes the
-    worker exit with "ws_url is required, or set LIVEKIT_URL environment
-    variable" even though secerts.toml has it.
+    ``LIVEKIT_API_SECRET`` when the worker registers, and google-genai reads
+    ``GOOGLE_API_KEY``. They have no notion of the file-first precedence, so
+    the winner must be exported here. Without this the worker exits with
+    "ws_url is required, or set LIVEKIT_URL environment variable" even though
+    secerts.toml defines it.
     """
     if value and os.environ.get(name) != value:
         os.environ[name] = value
-
-
-def _shared_first(env_name: str, file_raw: object) -> str:
-    """Deployment value where the shared config file wins, env only falls back.
-
-    ``fast_float/config/secerts.toml`` (and ``settings.toml``) is read by both
-    the FLOAT API and this worker, so its copy is guaranteed to agree on both
-    sides. An env copy in ``agents/.env`` is only a fallback for boxes without
-    the shared config: when both exist and differ, the file wins and the stale
-    env copy is flagged — a silent mismatch here meant registering the worker
-    on a different LiveKit project than the API dispatches into (the "NO job"
-    dispatch symptom).
-    """
-    env_value = os.getenv(env_name, "").strip()
-    file_value = _first_set(file_raw)
-    if file_value:
-        if env_value and env_value != file_value:
-            logger.warning(
-                "%s is set both in agents/.env and in the shared FLOAT config (secerts.toml/"
-                "settings.toml), with different values. The shared file wins — remove or align "
-                "the .env copy, or this worker and the FLOAT API will use different deployments.",
-                env_name,
-            )
-        return file_value
-    return env_value
 
 
 def dispatch_config(metadata: str) -> dict[str, str]:
@@ -261,8 +178,7 @@ def sanitize_gemini_model(value: str | None) -> str:
         )
         return cleaned
     logger.warning(
-        f"[config] gemini_model {value!r} does not look like a model id; ignoring it "
-        "and keeping the configured default"
+        f"[config] gemini_model {value!r} does not look like a model id; ignoring it and keeping the configured default"
     )
     return ""
 
@@ -271,8 +187,8 @@ def sanitize_gemini_model(value: str | None) -> str:
 class AgentConfig:
     """Everything the worker reads from the environment at startup.
 
-    Precedence: environment variable → shared ``secerts.toml`` /
-    ``settings.toml`` → built-in default.
+    Deployment values come from :class:`LiveKitSettings` (shared files first,
+    env fallback); only worker-specific knobs are read here.
     """
 
     livekit_url: str = ""
@@ -290,20 +206,26 @@ class AgentConfig:
     float_api_url: str = "http://127.0.0.1:8000"
     float_api_timeout_s: float = 8.0
     instructions: str = field(default=DEFAULT_INSTRUCTIONS)
+    config_dir: Path = field(default_factory=resolve_config_dir)
 
     @classmethod
     def from_env(cls) -> AgentConfig:
-        sections = _shared_sections("gemini", "livekit")
-        gemini_cfg = sections["gemini"]
-        livekit_cfg = sections["livekit"]
+        settings = LiveKitSettings.from_env()
 
-        api_key = _shared_first("GOOGLE_API_KEY", gemini_cfg.get("api_key"))
-        if not api_key:
-            api_key = os.getenv("GEMINI_API_KEY", "").strip()
-        # google-genai reads GOOGLE_API_KEY from the environment; keep the
-        # SDK in sync with whatever layer won above, so a stale env copy
-        # (already warned about in _shared_first) cannot win for the SDK
-        # while the config reports the file's key.
+        api_key = settings.gemini.api_key
+        # LiveKitSettings warns about LIVEKIT_* env copies that disagree with
+        # the shared file. Do the same for the Gemini key: google-genai reads
+        # GOOGLE_API_KEY from the environment, so a stale copy is otherwise
+        # silently ignored by our config but still used by the SDK.
+        for env_name in ("GOOGLE_API_KEY", "GEMINI_API_KEY"):
+            env_value = os.getenv(env_name, "").strip()
+            if env_value and api_key and env_value != api_key:
+                logger.warning(
+                    "%s is defined in both the shared FLOAT config and the environment "
+                    "(differing). The shared file wins — remove or align the env copy, "
+                    "or the Gemini worker and the FLOAT API will use different keys.",
+                    env_name,
+                )
         _export_env("GOOGLE_API_KEY", api_key)
 
         try:
@@ -312,51 +234,32 @@ class AgentConfig:
             timeout = 8.0
 
         config = cls(
-            livekit_url=_shared_first("LIVEKIT_URL", livekit_cfg.get("url")),
-            livekit_api_key=_shared_first("LIVEKIT_API_KEY", livekit_cfg.get("api_key")),
-            livekit_api_secret=_shared_first("LIVEKIT_API_SECRET", livekit_cfg.get("api_secret")),
+            livekit_url=settings.url,
+            livekit_api_key=settings.api_key,
+            livekit_api_secret=settings.api_secret,
             google_api_key=api_key,
-            # `vertexai = false` is the file's placeholder default, so only a
-            # *set* file value wins; the env flag stays the enabling fallback.
-            vertexai=(
-                True
-                if _as_bool(gemini_cfg.get("vertexai"))
-                else _flag("GOOGLE_GENAI_USE_VERTEXAI")
-            ),
-            google_cloud_project=_shared_first("GOOGLE_CLOUD_PROJECT", gemini_cfg.get("project")),
-            google_cloud_location=_shared_first("GOOGLE_CLOUD_LOCATION", gemini_cfg.get("location")),
-            model=sanitize_gemini_model(_shared_first("GEMINI_MODEL", gemini_cfg.get("model"))),
-            voice=_shared_first("GEMINI_VOICE", gemini_cfg.get("voice")) or "Puck",
-            language=_shared_first("GEMINI_LANGUAGE", gemini_cfg.get("language")),
-            avatar_identity=_shared_first("FLOAT_AVATAR_IDENTITY", gemini_cfg.get("avatar_identity"))
-            or "float-avatar",
-            agent_name=_shared_first("FLOAT_GEMINI_AGENT_NAME", gemini_cfg.get("agent_name"))
-            or "float-gemini",
+            vertexai=settings.gemini.vertexai,
+            google_cloud_project=settings.gemini.project,
+            google_cloud_location=settings.gemini.location,
+            model=sanitize_gemini_model(settings.gemini.model),
+            voice=settings.gemini.voice or "Puck",
+            language=settings.gemini.language,
+            avatar_identity=settings.avatar_identity or "float-avatar",
+            agent_name=settings.agent_name or "float-gemini",
             float_api_url=(
                 os.getenv("FLOAT_API_URL", "http://127.0.0.1:8000").strip() or "http://127.0.0.1:8000"
             ).rstrip("/"),
             float_api_timeout_s=max(1.0, min(timeout, 60.0)),
             instructions=os.getenv("FLOAT_AGENT_INSTRUCTIONS", "").strip() or DEFAULT_INSTRUCTIONS,
+            config_dir=resolve_config_dir(),
         )
         # livekit-agents (AgentServer / run) and google-genai read the
         # environment, not our config object; export the winners so the
-        # file-first values actually reach the SDKs. Without this the worker
-        # exits with "ws_url is required, or set LIVEKIT_URL environment
-        # variable" even though secerts.toml defines all three.
+        # file-first values actually reach the SDKs.
         _export_env("LIVEKIT_URL", config.livekit_url)
         _export_env("LIVEKIT_API_KEY", config.livekit_api_key)
         _export_env("LIVEKIT_API_SECRET", config.livekit_api_secret)
         return config
-
-    @property
-    def config_dir(self) -> Path:
-        """Directory the shared ``secerts.toml`` / ``settings.toml`` were read from.
-
-        Surfaced in startup errors: with file-first precedence, a worker
-        pointed at a different directory silently registers on another LiveKit
-        project than the API dispatches into.
-        """
-        return _repo_config_dir()
 
     def missing(self) -> list[str]:
         """Required settings that are absent (for a readable startup error)."""
@@ -372,15 +275,6 @@ class AgentConfig:
         if not self.vertexai and not self.google_api_key:
             missing.append("GOOGLE_API_KEY (or [gemini].api_key in fast_float/config/secerts.toml)")
         return missing
-
-
-def _as_bool(value: object, default: bool = False) -> bool:
-    """Coerce a shared-config value to bool (strings included)."""
-    if isinstance(value, str):
-        return value.strip().lower() not in {"0", "false", "no", "off"}
-    if isinstance(value, bool):
-        return value
-    return bool(value) if value is not None else default
 
 
 __all__ = [

@@ -72,8 +72,6 @@ except ImportError:
             logging.getLogger().setLevel(level)
 
 
-import contextlib
-
 import gradio as gr
 import numpy as np
 import soundfile as sf
@@ -351,8 +349,55 @@ class LiveSession:
         self.buffered_seconds = 0.0
 
 
+def _cleanup_live_session(session: LiveSession | None) -> None:
+    """Stop a live session and remove its temp dir.
+
+    Used by both the Stop button and the per-session ``gr.State`` delete
+    callback (Gradio 6 removed ``unload(inputs=..., outputs=...)``).
+    """
+    if session is None:
+        return
+    session.running = False
+    if session.session_dir and os.path.isdir(session.session_dir):
+        shutil.rmtree(session.session_dir, ignore_errors=True)
+
+
+#: Scratch dirs older than this are assumed orphaned (crashed tab/process).
+STALE_LIVE_DIR_AGE_S = 12 * 3600
+
+
+def _sweep_stale_live_dirs(live_dir: str, max_age_s: float = STALE_LIVE_DIR_AGE_S) -> None:
+    """Remove leftover ``float_live_*`` dirs from sessions that never stopped.
+
+    Gradio 6's ``gr.State(delete_callback=...)`` only runs when the session
+    state expires, which can be long after a tab is closed. The Stop button
+    and that callback handle the normal path; this bounds the damage from
+    crashed/closed tabs so the disk cannot fill up with orphaned chunk files.
+    """
+    cutoff = time.time() - max_age_s
+    try:
+        entries = os.listdir(live_dir)
+    except OSError:
+        return
+    for name in entries:
+        if not name.startswith("float_live_"):
+            continue
+        path = os.path.join(live_dir, name)
+        try:
+            if os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
+
+
 CHUNK_SECONDS = 1.5  # how much audio to accumulate before generating a clip
 MAX_LIVE_CLIPS_KEPT = 20  # rotate old temp files so disk doesn't fill up
+
+# Gradio 6 moved `css` from the Blocks constructor to launch().
+CUSTOM_CSS = """
+.gradio-container { font-family: 'Arial', sans-serif; }
+.live-status { font-weight: 600; }
+"""
 
 
 def _to_mono_float(chunk_sr_data):
@@ -387,14 +432,9 @@ def build_interface(
         wav2vec_model_path=wav2vec_model_path,
         ngpus=ngpus,
     )
+    _sweep_stale_live_dirs(model.live_dir)
 
-    # ---------- custom CSS ----------
-    custom_css = """
-    .gradio-container { font-family: 'Arial', sans-serif; }
-    .live-status { font-weight: 600; }
-    """
-
-    with gr.Blocks(css=custom_css, title="FLOAT - Talking Face Generation") as demo:
+    with gr.Blocks(title="FLOAT - Talking Face Generation") as demo:
         gr.Markdown(
             """
             # 🎭 FLOAT: Audio-Driven Talking Face Generation
@@ -503,7 +543,7 @@ def build_interface(
                 # None = no session yet; a fresh LiveSession is created on Start.
                 # (Never put a mutable LiveSession() instance here — it would be
                 # shared across users.)
-                session_state = gr.State(value=None)
+                session_state = gr.State(value=None, delete_callback=_cleanup_live_session)
 
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -601,9 +641,7 @@ def build_interface(
                 def stop_live(session: LiveSession | None):
                     if session is None:
                         return None, gr.update(active=False), "⏹️ Stopped."
-                    session.running = False
-                    if session.session_dir and os.path.isdir(session.session_dir):
-                        shutil.rmtree(session.session_dir, ignore_errors=True)
+                    _cleanup_live_session(session)
                     return session, gr.update(active=False), "⏹️ Stopped."
 
                 l_start_btn.click(
@@ -740,14 +778,6 @@ def build_interface(
                     outputs=[l_video_out, session_state, l_status],
                 )
 
-                # Best-effort temp cleanup if the user closes the tab without Stop.
-                with contextlib.suppress(Exception):
-                    demo.unload(
-                        fn=stop_live,
-                        inputs=[session_state],
-                        outputs=[session_state, l_timer, l_status],
-                    )
-
         with gr.Accordion("ℹ️ Help & Information", open=False):
             gr.Markdown(
                 """
@@ -859,6 +889,8 @@ if __name__ == "__main__":
         "prevent_thread_lock": args.prevent_thread_lock,
         "allowed_paths": [os.path.abspath(args.res_dir)],
         "blocked_paths": blocked_paths,
+        # Gradio 6 moved these from the Blocks constructor to launch().
+        "css": CUSTOM_CSS,
     }
     if auth_tuple:
         launch_kwargs["auth"] = auth_tuple

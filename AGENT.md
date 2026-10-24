@@ -64,6 +64,7 @@ float-fast/
     │   ├── generation.py           # POST /generate, GET /download/{id}, GET /stream/{id}
     │   ├── health.py               # GET /health, GET /gpu, POST /gpu/clear
     │   ├── streaming.py            # WS /ws/stream/{request_id} (live raw frames)
+    │   ├── livekit.py              # /livekit/token, /status, conversation start/stop
     │   └── webrtc.py               # POST /offer (WebRTC SDP signaling & media player)
     ├── streaming/                  # Per-request frame tap feeding live transports
     │   ├── types.py                # StreamMeta (fps/size/channels/first_idx/pts_ms)
@@ -101,6 +102,17 @@ float-fast/
     │   ├── gradio_interface.py     # Batch UI for image + audio upload
     │   ├── float_live_app.py       # Live mic streaming UI
     │   └── test_gradio.py          # Testing UI with WebRTC player integration
+    ├── livekit/                    # LiveKit transport + Gemini Live worker
+    │   ├── settings.py             # LiveKit/Gemini config (shared files first)
+    │   ├── tokens.py               # room JWT grants
+    │   ├── generator.py            # audio -> rtc.VideoFrame renderer
+    │   ├── worker.py               # avatar worker (in-process agent)
+    │   ├── receiver.py             # DataStream TTS -> PCM segments
+    │   ├── agent_runner.py         # avatar runner for the Gemini worker
+    │   └── gemini/                 # livekit-agents worker (separate process)
+    │       ├── agent.py            # entrypoint + voice tools
+    │       ├── config.py           # AgentConfig over LiveKitSettings
+    │       └── tools.py            # FloatApi HTTP client
     └── options/                    # Backward-compatibility shims for legacy imports
         ├── __init__.py
         └── base_options.py
@@ -177,6 +189,28 @@ Two constraints decide the version and the CUDA major:
   `libcusolver.so.11` / `libcusparse.so.12` **collide** with the cu12 files
   (same filenames, same `nvidia/<pkg>/lib` dir), so whichever installs last
   wins and one of the two stacks breaks.
+
+### LiveKit / Gemini version window
+
+The LiveKit transport and the Gemini Live worker share this environment, which
+makes a few pins load-bearing. Do not bump them casually:
+
+- **`numpy==1.26.4`** — LiveKit's floor (`>=1.26`) while staying on numpy 1.x
+  (`onnx<1.17`, opencv 4.8 wheels).
+- **`gradio==6.10.0`** — the only window that allows `aiofiles>=24` (LiveKit),
+  `pydantic>=2.12.5` + `websockets>=13` (google-genai) and `starlette 0.50`
+  (FastAPI 0.122). Gradio 5.x pins `pydantic<2.12`; Gradio ≥6.20 needs
+  `starlette≥1.0.1`.
+- **`uvicorn==0.54.0`** — 0.24 imported `websockets.legacy`, removed in 14+.
+
+The Gemini worker lives in `fast_float/livekit/gemini/` and runs as its own
+process (`scripts/run_gemini_agent.sh`), sharing the venv, lockfile and config
+with the API. See `docs/LIVEKIT_GEMINI_AGENT.md`.
+
+The ONNX **export** layer is still installed on top of the lock by
+`scripts/_onnx_env.sh` (onnx 1.18 + onnxruntime-gpu + onnxscript 0.7.2); a
+plain `uv sync` reverts it, so re-run the script after syncing if you export
+models.
 
 ---
 

@@ -4,9 +4,9 @@ The conversational agent (``livekit-agents`` + Gemini Live) does not publish
 its voice to the room: it streams the PCM to the FLOAT avatar worker over the
 ``lk.audio_stream`` byte-stream topic, using
 ``livekit.agents.voice.avatar.DataStreamAudioOutput``. This module is the
-receiver side of that protocol, implemented with the RTC SDK only so the
-FLOAT environment keeps its pinned ``numpy``/``pydantic``/``websockets``
-versions (``livekit-agents`` requires newer ones and cannot live here).
+receiver side of that protocol, implemented with the RTC SDK only: the avatar
+process does not need to import the full agents/STT/LLM stack to consume the
+worker's PCM.
 
 Wire protocol (mirrors livekit-agents 1.x):
 

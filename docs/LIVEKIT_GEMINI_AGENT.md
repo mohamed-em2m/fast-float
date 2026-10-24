@@ -4,24 +4,29 @@ FLOAT can run its live avatar conversation with **Gemini Live** — Google's
 real-time speech-to-speech model — instead of the in-process agent. A
 [LiveKit Agents](https://docs.livekit.io/agents/) worker owns the
 conversation, Gemini answers in its own voice, and FLOAT keeps rendering the
-lip-synced avatar. This doc covers the FLOAT side; the worker itself lives in
-[`agents/`](../agents/README.md) as a separate uv project.
+lip-synced avatar. The worker is part of this project
+([`fast_float/livekit/gemini/`](../fast_float/livekit/gemini/)) and shares its
+venv, lockfile and config.
 
 ## Why a separate process
 
-`livekit-agents[google]` resolves to `numpy 2.x`, `pydantic 2.14` and
-`websockets 16`, which would break FLOAT's pinned inference stack
-(`numpy==1.24.4`, `pydantic==2.7.0`, `websockets<12`). The worker therefore
-runs in its own venv and talks to FLOAT over LiveKit only:
+LiveKit's dispatch model requires a long-lived worker that registers with the
+SFU and receives jobs; the API cannot host it. The worker therefore runs as its
+own process, but from the same project — one `uv sync`, one lockfile:
 
 ```
-Browser mic ──WebRTC──▶ LiveKit SFU ──▶ Gemini Live worker (agents/)
+Browser mic ──WebRTC──▶ LiveKit SFU ──▶ Gemini Live worker (fast_float/livekit/gemini)
                         │                     │  TTS PCM over DataStream
                         │                     ▼
-                        │            FLOAT avatar worker (main repo)
+                        │            FLOAT avatar worker (same project)
                         │            FLOAT renderer → avatar_video + avatar_audio
                         └─────────────────▶ Browser playback
 ```
+
+`livekit-agents[google]` used to conflict with FLOAT's inference stack; the
+dependency matrix now resolves both (see
+[`docs/LIVEKIT_INTEGRATION.md`](LIVEKIT_INTEGRATION.md#dependency-matrix)),
+so the worker needs no separate environment.
 
 ## How a Gemini conversation starts
 
@@ -59,7 +64,7 @@ that protocol from `fast_float/livekit/receiver.py` with no dependency on
 ## Voice tools
 
 Gemini can call FLOAT's API and control the room through
-[`function_tool`s](../agents/float_agent/agent.py): `float_health`,
+[`function_tool`s](../fast_float/livekit/gemini/agent.py): `float_health`,
 `float_gpu`, `generation_progress`, `conversation_status` and
 `end_conversation`. The `FloatApi` client hits the FLOAT API configured by
 `FLOAT_API_URL`.
@@ -92,14 +97,14 @@ convenience for quick sessions — for persistent values keep using
 `secerts.toml` / `settings.toml` or the `GOOGLE_API_KEY` / `GEMINI_MODEL`
 env vars.
 
-Worker-side (see [`agents/.env.example`](../agents/.env.example)):
+Worker-side (see [`.env.example`](../.env.example)):
 `LIVEKIT_URL` + `LIVEKIT_API_KEY` + `LIVEKIT_API_SECRET`, `GOOGLE_API_KEY`
 (or Vertex AI flags), and optional `GEMINI_MODEL` / `GEMINI_VOICE` /
 `GEMINI_LANGUAGE`. The shared FLOAT config is the **single source of truth**:
 both processes read the same `secerts.toml` / `settings.toml` sections and a
 file value wins over the env; a disagreeing env copy is ignored and logged
-as stale. Only set these in `agents/.env` when the box has no shared config
-— a copy here that drifts is exactly why a worker can register on a
+as stale. Only set these in the repo-root `.env` when the box has no shared
+config — a copy here that drifts is exactly why a worker can register on a
 different LiveKit project than the API dispatches into.
 
 ## Run it
@@ -108,12 +113,13 @@ different LiveKit project than the API dispatches into.
 # 1. LiveKit SFU (see docker-compose.livekit.yml)
 # 2. FLOAT API (this repo)
 # 3. the Gemini worker
-cd agents
-uv sync
-cp .env.example .env    # optional — the shared secerts.toml/settings.toml
-                        # is preferred; agents/.env is only the fallback
-uv run python -m float_agent.agent start
+./scripts/run_gemini_agent.sh
+# or: uv run python -m fast_float.livekit.gemini.agent start
 ```
+
+`run_all.sh` starts the worker too when LiveKit and Gemini are both configured
+(`FLOAT_GEMINI_WORKER=auto|yes|no`, default `auto`). Set `FLOAT_CONFIG_DIR` on
+both processes if the checkout is not the default location.
 
 `start` replaces the deprecated `dev` command (livekit-agents removed
 in-process auto-reload, so `dev` only warns). A healthy worker logs
@@ -140,9 +146,9 @@ When the agent joins and streams its first audio, the API reports
 ## How the agent works inside FLOAT (end to end)
 
 A Gemini session involves four parties: the browser (mic + preview), the
-LiveKit SFU, the Gemini worker (`agents/`) and the FLOAT avatar worker (this
-repo). The sequence below is what happens between *Go Live* and the first
-frame on screen:
+LiveKit SFU, the Gemini worker (`fast_float/livekit/gemini/`) and the FLOAT
+avatar worker (same project, separate task). The sequence below is what happens
+between *Go Live* and the first frame on screen:
 
 ```
 Studio → POST /livekit/conversation/start?agent=gemini
@@ -168,7 +174,7 @@ layers identically:
 | --- | --- | --- |
 | Studio dispatch metadata | everything | this session only (`gemini_api_key`, `gemini_model`) |
 | `secerts.toml` / `settings.toml` `[livekit]` `[gemini]` | env | deployment: both processes must agree |
-| `GOOGLE_API_KEY`, `LIVEKIT_*` env / `agents/.env` | defaults | fallback for boxes without the shared config |
+| `GOOGLE_API_KEY`, `LIVEKIT_*` env / root `.env` | defaults | fallback for boxes without the shared config |
 
 Rules that keep the stack honest:
 

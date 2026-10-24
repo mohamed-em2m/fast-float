@@ -14,7 +14,9 @@ dependencies = [
     "torchvision==0.22.1",
     "torchaudio==2.7.1",
     # Core Dependencies
-    "numpy==1.24.4",
+    # numpy 1.26.4 is LiveKit's floor (>=1.26) while staying on numpy 1.x:
+    # onnx<1.17 and the opencv 4.8 wheels are built against the 1.x ABI.
+    "numpy==1.26.4",
     # Transformers & NLP
     "transformers==4.30.2",
     # Computer Vision
@@ -42,27 +44,33 @@ dependencies = [
     "hf_transfer>=0.1.9",
     "matplotlib==3.7.2",
     "flow-vis==0.1",
-    "pyyaml==6.0.1",
+    # livekit-agents requires pyyaml>=6.0.3.
+    "pyyaml==6.0.3",
     # Dynamic config (settings.toml / secerts.toml); stdlib tomllib needs 3.11.
     "tomli>=2.0,<3; python_version < '3.11'",
     "tqdm==4.65.0",
     "gdown==5.2.0",
     "setuptools==80.10.2",
-    # Web Interface - Gradio (float_live_app.py needs >=4.40 for gr.Timer + streaming mic)
-    "gradio==4.44.1",
+    # Web Interface - Gradio (gr.Timer + streaming mic).
+    # 6.10 is the compatibility window: it allows aiofiles 24 (livekit) and
+    # pydantic 2.12.5 (google-genai) while staying on starlette 0.50 (FastAPI
+    # 0.122). Gradio 5.x pins pydantic<2.12; Gradio >=6.20 needs starlette>=1.0.
+    "gradio==6.10.0",
     "soundfile>=0.12.1",
     # Web API
     "fastapi==0.122.0",
     "hypercorn==0.15.0",
-    "uvicorn==0.24.0",
+    # uvicorn 0.24 imports websockets.legacy, removed in websockets 14+.
+    "uvicorn==0.54.0",
     # Async performance (no Windows wheels)
     "uvloop==0.19.0; sys_platform != 'win32'",
-    # WebSocket support
-    "websockets>=10.0,<12.0",
-    # HTTP client
-    "httpx==0.25.1",
-    # Pydantic for data validation
-    "pydantic==2.7.0",
+    # WebSocket support: google-genai requires >=13,<18; gradio-client 2.4
+    # has no upper cap; uvicorn 0.54 supports 13+.
+    "websockets==16.1.1",
+    # HTTP client: google-genai requires httpx>=0.28.1.
+    "httpx==0.28.1",
+    # Pydantic for data validation: google-genai requires pydantic>=2.12.5.
+    "pydantic==2.12.5",
     "pydantic-settings==2.1.0",
     "matplotlib-inline==0.1.7",
     "ipython==8.36.0",
@@ -83,20 +91,19 @@ dependencies = [
     # `tensorrt-cu12==10.9.*` on CUDA-12 boxes and keep the two pins in lockstep.
     "onnx>=1.16.0,<1.17",
     "onnxruntime>=1.19.0,<1.24",
+    # LiveKit transport + Gemini Live worker. The worker still runs as its own
+    # process (LiveKit's dispatch model), but it shares this venv and lockfile.
+    "livekit==1.1.21",
+    "livekit-api>=1.2",
+    "livekit-agents[google]>=1.8,<2",
+    # The worker loads the repo-root .env as a fallback for boxes without the
+    # shared fast_float/config/{settings,secerts}.toml files.
+    "python-dotenv>=1.0,<2",
     "pre-commit>=4.6.2",
 ]
 
 [dependency-groups]
 dev = ["pytest>=8.0,<9"]
-# LiveKit transport (optional).
-#   uv sync --group livekit
-# Token generation needs only livekit-api, which is numpy-free and installs
-# cleanly here. The avatar worker additionally uses the RTC SDK (`livekit`):
-# its wheels *declare* numpy>=2, but at runtime they work fine with this
-# project's numpy==1.24.4 pin (onnx<1.17 compatibility) — scripts/setup.sh
-# therefore installs the SDK with `uv pip install --no-deps livekit` after the
-# group sync, never letting uv bump numpy. See docs/LIVEKIT_INTEGRATION.md.
-livekit = ["livekit-api>=1.2"]
 
 # Flat scripts layout (no installable package) — manage the env only.
 [tool.uv]

@@ -1,14 +1,15 @@
 """LiveKit Agents worker: Gemini Live speech-to-speech + FLOAT voice tools.
 
-Run from ``agents/``::
+Run from the project root::
 
-    uv sync
-    uv run python -m float_agent.agent start
+    ./scripts/run_gemini_agent.sh
+    # or: uv run python -m fast_float.livekit.gemini.agent start
 
-The LiveKit + Gemini values come from the FLOAT repo's shared
-``fast_float/config/secerts.toml`` / ``settings.toml`` (the single source of
-truth, also read by the API); ``agents/.env`` is only a fallback for boxes
-without that file, and ``cp .env.example .env`` still works there.
+The worker is part of this project (one venv/lockfile), but runs as a separate
+process so LiveKit can dispatch jobs to it. The LiveKit + Gemini values come
+from the shared ``fast_float/config/secerts.toml`` / ``settings.toml`` (the
+single source of truth, also read by the API); the repo-root ``.env`` is only
+a fallback for boxes without those files (``cp .env.example .env``).
 
 Use ``start`` rather than the deprecated ``dev`` command: livekit-agents
 removed in-process auto-reload, so ``dev`` only prints deprecation warnings
@@ -26,13 +27,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
-# Load agents/.env by its real path (not CWD-relative) so the worker picks up
-# its project env even when launched from another directory; a CWD .env can
-# still override afterwards (python-dotenv never overwrites existing vars).
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+# Load the repo-root .env by its real path (not CWD-relative) so the worker
+# picks it up even when launched from another directory; a CWD .env can still
+# override afterwards (python-dotenv never overwrites existing vars).
+load_dotenv(Path(__file__).resolve().parents[3] / ".env")
 load_dotenv()
 
 from google.genai import types as genai_types
@@ -51,8 +53,8 @@ from livekit.agents import (
 from livekit.agents.voice.avatar import DataStreamAudioOutput
 from livekit.plugins import google
 
-from float_agent.config import AgentConfig, dispatch_config, sanitize_gemini_model
-from float_agent.tools import FloatApi
+from fast_float.livekit.gemini.config import AgentConfig, dispatch_config, sanitize_gemini_model
+from fast_float.livekit.gemini.tools import FloatApi
 
 logger = logging.getLogger("float_gemini")
 
@@ -74,6 +76,14 @@ class FloatAssistant(Agent):
     def __init__(self) -> None:
         super().__init__(instructions=config.instructions)
         self.api = FloatApi(config.float_api_url, timeout_s=config.float_api_timeout_s)
+        # Strong refs to fire-and-forget tasks: the event loop only holds weak
+        # ones, so a bare create_task() can be garbage-collected mid-flight.
+        self._background: set[asyncio.Task[None]] = set()
+
+    def _spawn(self, coro: Any) -> None:
+        task = asyncio.create_task(coro)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
 
     async def _room_name(self) -> str:
         job = get_job_context()
@@ -127,7 +137,7 @@ class FloatAssistant(Agent):
                 logger.warning("stop_conversation failed: %s", exc)
                 message = "I could not reach the avatar service, but I am ending the call."
         # Let the spoken reply finish before the session closes.
-        asyncio.create_task(self._shutdown_after_reply(context))
+        self._spawn(self._shutdown_after_reply(context))
         return message
 
     async def _shutdown_after_reply(self, context: RunContext) -> None:
@@ -176,7 +186,9 @@ def _build_realtime_model(api_key: str | None = None, model: str | None = None) 
 async def entrypoint(ctx: JobContext) -> None:
     missing = config.missing()
     if missing:
-        raise RuntimeError("Missing configuration: " + ", ".join(missing) + ". See agents/.env.example.")
+        raise RuntimeError(
+            "Missing configuration: " + ", ".join(missing) + ". See .env.example or fast_float/config/secerts.toml."
+        )
 
     await ctx.connect()
     logger.info(
@@ -216,9 +228,7 @@ async def entrypoint(ctx: JobContext) -> None:
         # resume_false_interruption by default and warns on every session that
         # the output cannot honour it, so disable it explicitly instead of
         # letting a resumed "false interruption" silently do nothing.
-        turn_handling=TurnHandlingOptions(
-            interruption={"resume_false_interruption": False}
-        ),
+        turn_handling=TurnHandlingOptions(interruption={"resume_false_interruption": False}),
     )
 
     # The agent's voice is not published directly: it is streamed to FLOAT,
@@ -250,10 +260,12 @@ def main() -> None:
             "Missing configuration: "
             + ", ".join(missing)
             + f". Define them in {config.config_dir}/secerts.toml ([livekit] and "
-            "[gemini].api_key) or in agents/.env; see agents/.env.example. The worker and "
-            "the FLOAT API must read the same directory (set FLOAT_CONFIG_DIR on both if "
-            "the checkout lives elsewhere)."
+            "[gemini].api_key) or in the repo-root .env; see .env.example. Start the "
+            "worker with ./scripts/run_gemini_agent.sh. The worker and the FLOAT API must "
+            "read the same directory (set FLOAT_CONFIG_DIR on both if the checkout lives "
+            "elsewhere)."
         )
+
     # Startup summary, logged from an SDK event because the CLI installs its
     # log handlers inside run_app() — a logger.info() before that is dropped.
     # This is the line to check when the API reports that dispatch found
@@ -262,8 +274,7 @@ def main() -> None:
     # then fails; the SDK's "registered worker" line confirms the handshake.
     def _log_startup(*_args: object) -> None:
         logger.info(
-            "worker starting: agent_name=%s url=%s config_dir=%s livekit_credentials=%s "
-            "gemini_key=%s model=%s",
+            "worker starting: agent_name=%s url=%s config_dir=%s livekit_credentials=%s gemini_key=%s model=%s",
             config.agent_name,
             config.livekit_url or "<missing>",
             config.config_dir,

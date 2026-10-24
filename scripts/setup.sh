@@ -181,60 +181,38 @@ source .venv/bin/activate
 # failure this script has to survive on a 50 GiB disk.
 uv sync --inexact
 
-echo "=== Installing LiveKit SDK (token API + RTC SDK) ==="
-# 1. The token API (livekit-api) is numpy-free and a normal dependency group.
-#    --inexact: preserve the ONNX / TensorRT layers that a plain uv sync
-#    --group would prune (it treats any unlisted package as an orphan and
-#    removes them).
-if ! uv sync --group livekit --inexact; then
-    echo "Warning: livekit-api install failed -- LiveKit token generation will be unavailable."
-fi
-# 2. The RTC SDK (livekit) — needed by the avatar worker / publisher tasks
-#    (fast_float/livekit/worker.py). Pinned to the version this transport was
-#    verified against (1.1.21): newer 1.x releases change the room-join token
-#    rules and reconnect/DTLS behaviour the worker relies on. Its wheel
-#    *declares* numpy>=2.0, but uv would then unpin the project's numpy==1.24.4
-#    (needed by onnx<1.17). Verified at runtime: the SDK works correctly with
-#    numpy 1.24.4, and all of its real dependencies (protobuf, aiofiles, ...)
-#    are already in this venv — so install it WITHOUT its dependency
-#    resolution (--no-deps) and re-assert numpy afterwards to be safe against a
-#    drifted lock.
-if ! uv pip install --python .venv/bin/python --no-deps "livekit==1.1.21"; then
-    echo "Warning: livekit RTC SDK install failed -- LiveKit live-transport publishing will be unavailable."
-fi
-# `--no-deps` skips two *declared* deps: numpy>=2 (which would break onnx) and
-# aiofiles>=24 (gradio pins <24, and the RTC SDK never imports it). The real
-# runtime imports are protobuf + livekit-protocol; install them explicitly so
-# a partial/failed `livekit-api` sync cannot leave `import livekit.rtc` broken.
-if ! uv pip install --python .venv/bin/python "livekit-protocol>=1.1.27,<2" "protobuf>=5" "types-protobuf>=5"; then
-    echo "Warning: livekit runtime deps install failed -- check 'uv pip list | grep livekit'."
-fi
-if ! uv pip install --python .venv/bin/python "numpy==1.24.4"; then
-    echo "Warning: numpy re-pin failed — check 'uv pip list | grep numpy'."
-fi
-# Probe: both halves of the LiveKit stack must import (with the pinned numpy).
+echo "=== Verifying LiveKit + Gemini worker stack ==="
+# `uv sync --inexact` above already installed the normal dependencies. This
+# probe fails loudly if the resolved matrix no longer imports (the previous
+# split existed only because these versions used to conflict).
 if uv run --frozen --no-sync python - <<'PY'
+from importlib.metadata import version
+
+import numpy
 from livekit import api as livekit_api
-from livekit import rtc
+from livekit import rtc  # noqa: F401
+from livekit.agents import AgentServer  # noqa: F401
+from livekit.plugins import google  # noqa: F401
+
+from fast_float.livekit.gemini import config as gemini_config  # noqa: F401
 
 token = livekit_api.AccessToken(
     "probe-key", "probe-secret-0123456789abcdef0123456789"
 ).with_grants(
     livekit_api.VideoGrants(room_join=True, room="probe")
 ).with_identity("probe").to_jwt()
-import numpy  # noqa: F401
-from importlib.metadata import version
 print(
     "  livekit-api", version("livekit-api"),
     "ok, rtc", version("livekit"),
+    "ok, agents", version("livekit-agents"),
     "ok, numpy", numpy.__version__,
     "- token minted (len", len(token), ")",
 )
 PY
 then
-    echo "LiveKit SDK installed."
+    echo "LiveKit + Gemini worker stack installed."
 else
-    echo "⚠️ LiveKit SDK probe failed — LiveKit transport will be unavailable."
+    echo "⚠️ LiveKit/Gemini probe failed — live transport or Gemini worker will be unavailable."
 fi
 
 echo "=== Starting the LiveKit SFU server container (best effort) ==="

@@ -96,7 +96,7 @@ def test_room_names_are_validated():
 
 def test_settings_layering_files_beat_env(monkeypatch):
     # secerts.toml beats settings.toml; the shared file also beats the env for
-    # the LiveKit credentials, which must match the agents worker's
+    # the LiveKit credentials, which must match the Gemini worker's
     # deployment (the env is only a fallback for boxes without the file).
     monkeypatch.setattr(
         "fast_float.livekit.settings.load_settings",

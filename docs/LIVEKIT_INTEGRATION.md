@@ -84,22 +84,26 @@ place of today's "equals TTFF" placeholder.
 New files:
 
 ```
-fast_float/livekit/__init__.py
-fast_float/livekit/settings.py      # url, api key/secret, token TTL
-fast_float/livekit/tokens.py        # JWT room grants for the browser
-fast_float/livekit/generator.py     # FloatVideoGenerator: audio in -> rtc.VideoFrame out
-fast_float/livekit/worker.py        # the avatar worker (AvatarRunner)
-fast_float/livekit/agent.py         # the conversational agent (Phase 3)
-fast_float/routers/livekit.py       # POST /livekit/token
+fast_float/livekit/__init__.py     # lazy public names (no torch import)
+fast_float/livekit/settings.py     # url, api key/secret, token TTL, [gemini]
+fast_float/livekit/tokens.py       # JWT room grants for the browser
+fast_float/livekit/generator.py    # FloatVideoGenerator: audio in -> rtc.VideoFrame out
+fast_float/livekit/worker.py       # the avatar worker (AvatarRunner)
+fast_float/livekit/agent.py        # the built-in conversational agent
+fast_float/livekit/receiver.py     # DataStream TTS audio -> PCM segments
+fast_float/livekit/agent_runner.py # avatar runner for the Gemini worker
+fast_float/livekit/gemini/         # the LiveKit Agents Gemini Live worker
+fast_float/routers/livekit.py      # /livekit/token, /livekit/status, conversation
 ```
 
-`livekit` and `livekit-agents` go into an **optional extra**
-(`pyproject.toml: [project.optional-dependencies] livekit = [...]`) so the
-default install (and CI) stays as it is. Phase 1 needs only the RTC SDK plus
-the `livekit.agents.voice.avatar` helpers; if that import drags in the whole
-STT/LLM/TTS/VAD stack and fights our pinned `numpy==1.24.4` / `torch 2.7.1`,
-we vendor the ~150-line `AvatarRunner` pattern (MIT) into `fast_float/livekit/`
-and depend on the RTC SDK alone.
+`livekit`, `livekit-agents` and the Google plugin are **normal dependencies**
+now: the dependency conflict that once forced a separate environment is
+resolved (§9), so one `uv sync` installs the API, the avatar and the worker.
+
+The avatar side deliberately uses the **RTC SDK only** (it does not import the
+agents stack): `receiver.py` re-implements the ~150-line
+`livekit.agents.voice.avatar` protocol so the renderer's dependency surface
+stays small.
 
 ## 5. Phases
 
@@ -211,24 +215,51 @@ browser shows it, with the frames in sync with the audio.*
 
 ## 9. The dependency finding that shapes the worker
 
-`livekit` (the RTC SDK) requires **`numpy>=1.26`**; this repository pins
-`numpy==1.24.4` because `onnx<1.17` needs numpy 1.x. They cannot coexist in
-one environment:
+The first spike hit a genuine three-way conflict between the inference stack,
+Gradio and LiveKit/Gemini:
 
-```
-uv pip install --dry-run "livekit>=1.1"
- - numpy==1.24.4
- + numpy==2.2.6      # <- would break the onnx/onnxruntime stack
-```
+- `livekit` (RTC SDK) required **`numpy>=1.26`**, while the repo pinned
+  `numpy==1.24.4` for `onnx<1.17`;
+- `livekit` also required **`aiofiles>=24`**, which `gradio 4.44` pinned to
+  `<24`;
+- `google-genai` (behind `livekit-agents[google]`) required
+  **`pydantic>=2.12.5`** and **`websockets>=13`**, while `gradio 4.44`'s
+  `gradio-client` capped `websockets<13` and Gradio 5.x still pinned
+  `pydantic<2.12`.
 
-So the split is:
+Two things resolved it without hacks:
 
-- the **API process** stays as it is (numpy 1.24.4, onnx<1.17) and only needs
-  `livekit-api` — the *token* API, which is numpy-free and installs cleanly
-  (it is an optional dependency group: `uv sync --group livekit`);
-- the **avatar worker**, if it needs the RTC SDK, gets its **own uv project**
-  (its own lockfile, numpy 2 + torch + onnxruntime) — or avoids the SDK
-  altogether by publishing over RTMP (below).
+1. **`numpy==1.26.4`** satisfies LiveKit's floor while staying on numpy 1.x,
+   which `onnx<1.17` and the opencv 4.8 wheels need. No `--no-deps` install.
+2. **Gradio 6.10** is the compatibility window: it allows `aiofiles 24`,
+   `pydantic 2.12.5` and a `gradio-client` with no `websockets<13` cap, while
+   staying on `starlette 0.50` (FastAPI 0.122). Gradio 5.x pins
+   `pydantic<2.12`; Gradio ≥6.20 requires `starlette≥1.0.1`.
+
+The result is **one project, one venv, one lockfile**. The worker still runs
+as a separate *process* — LiveKit dispatches jobs to registered workers — but
+it shares the environment and the config layer with the API.
+
+### Dependency matrix
+
+| package | version | why this exact line |
+| --- | --- | --- |
+| `numpy` | `1.26.4` | LiveKit's floor, still numpy 1.x for `onnx<1.17` / opencv 4.8 |
+| `pydantic` | `2.12.5` | `google-genai` floor; Gradio 6 allows it |
+| `pydantic-settings` | `2.1.0` | unchanged from before |
+| `websockets` | `16.1.1` | `google-genai` needs `>=13,<18`; uvicorn 0.54 supports it |
+| `httpx` | `0.28.1` | `google-genai` floor |
+| `aiofiles` | `24.1.0` | `livekit` floor; Gradio 6 allows it |
+| `gradio` | `6.10.0` | the window described above |
+| `uvicorn` | `0.54.0` | 0.24 imported `websockets.legacy`, removed in 14+ |
+| `livekit` | `1.1.21` | the RTC SDK the transport was verified against |
+| `livekit-agents[google]` | `1.8.x` | the worker runtime + Gemini Live plugin |
+| `onnx` | `1.18.0` (export layer) | `onnxscript` needs `>=1.17`; ORT 1.23 accepts IR ≤ 11 |
+
+The ONNX export layer is still installed on top of the lock by
+`scripts/_onnx_env.sh` (onnx 1.18 + onnxruntime-gpu 1.23.2 + onnxscript
+0.7.2). A plain `uv sync` reverts that layer; re-run the script if you export
+models.
 
 ## 10. Phase 0 — done: the server side of the transport
 
@@ -261,7 +292,7 @@ docker compose -f docker-compose.livekit.yml up -d
 export LIVEKIT_URL=ws://127.0.0.1:7880
 export LIVEKIT_API_KEY=devkey
 export LIVEKIT_API_SECRET=devsecretdevsecretdevsecretdevsecret
-uv sync --group livekit          # livekit-api (numpy-free)
+uv sync                          # livekit-api + livekit + livekit-agents
 curl -s localhost:8000/livekit/status
 curl -s -X POST localhost:8000/livekit/token -H 'content-type: application/json' \
      -d '{"room": "float-demo"}'
@@ -331,7 +362,7 @@ allocation is not lost when the initial SDP was already sent. The Studio gives
 ICE 12 seconds to connect and then falls back to WebSocket with an explanatory
 toast, so a TCP-only deployment no longer hangs on "Connecting…".
 
-## 11. The transport decision still to settle: SDK publisher vs RTMP ingest
+## 11. The transport decision: SDK publisher vs RTMP ingest
 
 The worker has to get H.264 (or raw frames) into the room, and there are two
 ways:
@@ -339,7 +370,7 @@ ways:
 | | SDK publisher (`AvatarRunner`) | RTMP ingest |
 | --- | --- | --- |
 | encode | libwebrtc **software** (VP8/VP9) — our NVENC path is bypassed | **NVENC**, unchanged: the pipeline's H.264 goes straight out |
-| dependencies | needs the RTC SDK → numpy 2 → a **separate uv project** for the worker | the **Ingress service** (a separate container) + Redis |
+| dependencies | the RTC SDK — now part of the main project/lockfile | the **Ingress service** (a separate container) + Redis |
 | latency | lowest (~100 ms) | adds the ingest buffer (~1 s) |
 | A/V | the worker publishes synced audio + video | whatever we mux into the file |
 | fit with the avatar-worker model | exact | we are the *publisher*, not a worker |
@@ -351,17 +382,10 @@ version; the only RTMP-related flag is `--ingress.rtmp_base_url`, i.e. RTMP
 ingest belongs to the separate **Ingress service**, which also needs Redis.
 So the RTMP route is two more containers, not a flag.
 
-That splits the two modes cleanly:
-
-- **the live mode** (generate → watch) can publish the NVENC'd H.264 through
-  the **Ingress service** and needs neither the RTC SDK nor a second
-  environment — at the price of the ingress buffer;
-- **the conversational mode** (Phase 3) needs the SDK publisher, because the
-  worker has to react to audio that arrives live — and therefore the separate
-  numpy-2 project.
-
-So the live mode can ship without touching the numpy pin at all, and the
-second environment is only needed when the conversation loop starts.
+**Decision: the SDK publisher.** The dependency conflict that once made this
+expensive (numpy 2 → a second environment) is gone (§9), so the live mode and
+the conversational mode share one implementation and one environment. The
+Ingress service is not deployed.
 
 ## 12. Implementation status: Phases 0–3 completed
 
@@ -387,12 +411,14 @@ The plan is fully implemented and tested across backend and frontend:
 
 - **Phase 3 (Conversational Agent)**:
   - `fast_float/livekit/agent.py`: `ConversationalAgent` managing conversation turns, streaming audio to worker, and coordinating via `lk.playback_started` and `lk.playback_finished` RPCs.
+  - `fast_float/livekit/gemini/`: the optional Gemini Live worker — a `livekit-agents` process that shares this project's venv/lockfile and config. See [`LIVEKIT_GEMINI_AGENT.md`](LIVEKIT_GEMINI_AGENT.md).
+  - `fast_float/livekit/receiver.py` + `agent_runner.py`: the avatar side of the `lk.audio_stream` protocol, implemented with the RTC SDK only.
 
 - **Automated Verification**:
-  - `tests/test_livekit_tokens.py`: 14 tests covering settings, grants and endpoints.
-  - `tests/test_livekit_worker.py`: 17 tests covering the generator, worker, synchronizer, agent, media-file playback and publish endpoints.
-  - `tests/test_stun.py`: 9 tests for the built-in STUN responder and static/secret-based TURN credentials.
-  - `tests/test_webrtc_trickle.py`: 3 tests for trickle ICE and graceful degradation.
-  - `tests/test_live_stream.py`: 11 tests for live fan-out, PTS, and overlap-head trimming in chunked live generation.
-  - `tests/test_frame_dispatcher.py`: 14 tests for ordered delivery, gaps, and backpressure policy.
-  - All 68 tests passing cleanly.
+  - `tests/test_livekit_tokens.py`: settings, grants and endpoints.
+  - `tests/test_livekit_worker.py`: the generator, worker, synchronizer, agent, media-file playback and publish endpoints.
+  - `tests/test_livekit_gemini_config.py` + `test_livekit_gemini_bridge.py`: shared config precedence, model-name sanitising, dispatch metadata and the audio bridge.
+  - `tests/test_stun.py`: the built-in STUN responder and static/secret-based TURN credentials.
+  - `tests/test_webrtc_trickle.py`: trickle ICE and graceful degradation.
+  - `tests/test_live_stream.py`: live fan-out, PTS, and overlap-head trimming in chunked live generation.
+  - `tests/test_frame_dispatcher.py`: ordered delivery, gaps, and backpressure policy.
