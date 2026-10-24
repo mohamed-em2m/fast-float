@@ -18,9 +18,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
+# Load agents/.env by its real path (not CWD-relative) so the worker picks up
+# its project env even when launched from another directory; a CWD .env can
+# still override afterwards (python-dotenv never overwrites existing vars).
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 load_dotenv()
 
 from google.genai import types as genai_types
@@ -155,6 +160,13 @@ async def entrypoint(ctx: JobContext) -> None:
         config.agent_name,
         ctx.room.name,
         config.avatar_identity,
+    )
+    logger.info(
+        "registered as %r — LiveKit credentials present: %s, Gemini API key present: %s, model: %s",
+        config.agent_name,
+        bool(config.livekit_url and config.livekit_api_key and config.livekit_api_secret),
+        bool(config.google_api_key),
+        config.model or "<plugin default>",
     )
 
     # The FLOAT API forwards Studio-supplied overrides (Gemini key + model)

@@ -136,6 +136,58 @@ def _dispatch_payload(
     return payload
 
 
+_JOB_STATUS_NAMES = {0: "pending", 1: "running", 2: "success", 3: "failed", 4: "cancelled"}
+
+
+def _job_status(value: Any) -> str:
+    if isinstance(value, int):
+        return _JOB_STATUS_NAMES.get(value, str(value))
+    return str(value)
+
+
+async def fetch_room_dispatch(settings: LiveKitSettings, room: str) -> str:
+    """Best-effort description of ``room``'s agent dispatch, for error messages.
+
+    Distinguishes the two common failure modes: *no job at all* (no worker is
+    registered and available under the dispatched agent name) vs *a failed
+    job* (the worker's entrypoint raised after dispatch). Never raises.
+    """
+    try:
+        from livekit.api import LiveKitAPI
+
+        async with LiveKitAPI(
+            url=settings.url,
+            api_key=settings.api_key,
+            api_secret=settings.api_secret,
+        ) as lk:
+            dispatches = await lk.agent_dispatch.list_dispatch(room)
+    except Exception as exc:
+        return f"Could not query the SFU for dispatch state: {exc}"
+    if not dispatches:
+        return f"The SFU reports no dispatch for room {room!r}."
+
+    parts: list[str] = []
+    for dispatch in dispatches:
+        name = str(getattr(dispatch, "agent_name", "") or "")
+        jobs = getattr(getattr(dispatch, "state", None), "jobs", None) or []
+        if not jobs:
+            parts.append(
+                f"dispatch {name!r} has NO job — no worker is registered/available "
+                "under that agent name (is the worker process running?)"
+            )
+            continue
+        for job in jobs:
+            state = getattr(job, "state", None)
+            status = _job_status(getattr(state, "status", ""))
+            error = str(getattr(state, "error", "") or "").strip()
+            job_id = str(getattr(job, "id", ""))[:8]
+            if error:
+                parts.append(f"dispatch {name!r} job {job_id} status={status}: {error[:200]}")
+            else:
+                parts.append(f"dispatch {name!r} job {job_id} status={status}")
+    return " ".join(parts)
+
+
 class ConversationSession:
     """One conversational avatar session in a LiveKit room."""
 
@@ -286,11 +338,12 @@ class ConversationSession:
         try:
             await self.runner.start()
         except TimeoutError as exc:
+            dispatch_state = await fetch_room_dispatch(self.settings, self.room_name)
             raise RuntimeError(
                 f"{exc} The Gemini worker did not join as {self.agent_name!r} "
-                f"(dispatch created: {bool(self.agent_dispatched)}). Start it with "
-                "`cd agents && uv run python -m float_agent.agent dev`, make sure agents/.env "
-                "has LIVEKIT_URL/API_KEY/API_SECRET + GOOGLE_API_KEY, and that its "
+                f"(dispatch created: {bool(self.agent_dispatched)}). {dispatch_state} "
+                "Start it with `cd agents && uv run python -m float_agent.agent dev`, make sure "
+                "agents/.env has LIVEKIT_URL/API_KEY/API_SECRET + GOOGLE_API_KEY, and that its "
                 "FLOAT_GEMINI_AGENT_NAME matches the API's.",
             ) from exc
         self.identity = self.receiver.agent_identity or self.identity

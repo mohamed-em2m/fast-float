@@ -281,6 +281,75 @@ def test_worker_parses_dispatch_metadata_overrides():
     assert dispatch_config(json.dumps({"gemini_api_key": "", "other": "x"})) == {}
 
 
+class _FakeJob:
+    def __init__(self, status: int, error: str = "", job_id: str = "JOB_12345678") -> None:
+        self.id = job_id
+        self.state = type("State", (), {"status": status, "error": error})()
+
+
+class _FakeDispatch:
+    def __init__(self, agent_name: str, jobs) -> None:
+        self.agent_name = agent_name
+        self.state = type("State", (), {"jobs": jobs})()
+
+
+def test_fetch_room_dispatch_reports_pending_dispatch_when_worker_is_missing(monkeypatch):
+    """No job on the dispatch == no worker registered under the agent name."""
+    from fast_float.livekit.session import fetch_room_dispatch
+
+    class _FakeAgentDispatch:
+        async def list_dispatch(self, room_name):
+            return [_FakeDispatch("float-gemini", [])]
+
+    class _FakeLiveKitAPI:
+        def __init__(self, **_kwargs):
+            self.agent_dispatch = _FakeAgentDispatch()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr("livekit.api.LiveKitAPI", _FakeLiveKitAPI)
+
+    async def _run():
+        settings = LiveKitSettings(url="ws://127.0.0.1:7880", api_key="k", api_secret="s" * 32)
+        return await fetch_room_dispatch(settings, "float-r")
+
+    message = asyncio.run(_run())
+    assert "NO job" in message
+    assert "no worker is registered/available" in message
+
+
+def test_fetch_room_dispatch_surfaces_a_failed_job_error(monkeypatch):
+    from fast_float.livekit.session import fetch_room_dispatch
+
+    class _FakeAgentDispatch:
+        async def list_dispatch(self, room_name):
+            return [_FakeDispatch("float-gemini", [_FakeJob(3, error="invalid api key (gemini)")])]
+
+    class _FakeLiveKitAPI:
+        def __init__(self, **_kwargs):
+            self.agent_dispatch = _FakeAgentDispatch()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr("livekit.api.LiveKitAPI", _FakeLiveKitAPI)
+
+    async def _run():
+        settings = LiveKitSettings(url="ws://127.0.0.1:7880", api_key="k", api_secret="s" * 32)
+        return await fetch_room_dispatch(settings, "float-r")
+
+    message = asyncio.run(_run())
+    assert "status=failed" in message
+    assert "invalid api key (gemini)" in message
+
+
 def test_session_wires_dispatch_with_keyword_only_args(monkeypatch):
     """Regression: _start_external_agent used to pass agent_name positionally,
     which dispatch_agent() rejects (keyword-only after settings, room)."""
