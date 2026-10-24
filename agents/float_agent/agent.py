@@ -43,7 +43,7 @@ from livekit.agents import (
 from livekit.agents.voice.avatar import DataStreamAudioOutput
 from livekit.plugins import google
 
-from float_agent.config import AgentConfig, dispatch_config
+from float_agent.config import AgentConfig, dispatch_config, sanitize_gemini_model
 from float_agent.tools import FloatApi
 
 logger = logging.getLogger("float_gemini")
@@ -132,7 +132,10 @@ def _build_realtime_model(api_key: str | None = None, model: str | None = None) 
         "input_audio_transcription": genai_types.AudioTranscriptionConfig(),
         "output_audio_transcription": genai_types.AudioTranscriptionConfig(),
     }
-    resolved_model = (model or "").strip() or config.model
+    # The dispatch model name is free text from a Studio box; keep a bad value
+    # from setting up the whole session, then falling over on the Gemini
+    # websocket. Falls back to the box's configured model.
+    resolved_model = sanitize_gemini_model((model or "").strip()) or config.model
     if resolved_model:
         kwargs["model"] = resolved_model
     if config.language:

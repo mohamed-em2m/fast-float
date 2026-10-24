@@ -21,6 +21,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import tempfile
 from collections.abc import Callable
 from typing import Any
@@ -54,6 +55,10 @@ _sessions: dict[str, ConversationSession] = {}
 
 # Only raster formats the loader understands; anything else falls back to jpg.
 _ALLOWED_IMAGE_FORMATS = {"jpg", "jpeg", "png", "webp", "bmp"}
+
+# Google model-id charset, case preserved (the worker lowercases): keeps
+# free-text Studio values out of the dispatch metadata.
+_MODEL_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._/-]{0,98}", re.IGNORECASE)
 
 
 def _safe_image_format(value: str | None) -> str:
@@ -125,7 +130,15 @@ def _dispatch_payload(
     """``CreateAgentDispatchRequest`` kwargs, adding metadata only when needed."""
     payload: dict[str, Any] = {"room": room, "agent_name": agent_name}
     key = (gemini_api_key or "").strip()
+    # Only metadata-shaped names are forwarded. Authoritative validation
+    # (known Live-API ids, lowercase, plugin list) happens in the worker
+    # (float_agent.config.sanitize_gemini_model); this is the cheap filter the
+    # API can apply before the name ever enters the SFU's dispatch payload.
     model = (gemini_model or "").strip()
+    if _MODEL_NAME_RE.fullmatch(model) is None:
+        if model:
+            logger.warning(f"[session] gemini_model {model[:64]!r} is not a model id; not forwarding it")
+        model = ""
     metadata: dict[str, str] = {}
     if key:
         metadata["gemini_api_key"] = key

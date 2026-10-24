@@ -281,6 +281,54 @@ def test_worker_parses_dispatch_metadata_overrides():
     assert dispatch_config(json.dumps({"gemini_api_key": "", "other": "x"})) == {}
 
 
+# ---------------------------------------------------------------------------
+# Model-name validation: free-text Studio values must not silently break the
+# Gemini session (the google plugin only fails on the websocket, late).
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_gemini_model_passes_known_and_wellformed_ids(caplog):
+    from float_agent.config import known_live_models, sanitize_gemini_model
+
+    known = known_live_models()
+    assert known  # a fallback snapshot is always available
+    assert sanitize_gemini_model(next(iter(known))) in known
+    # Whitespace, surrounding quotes and case are normalised; ids are lowercase.
+    assert sanitize_gemini_model('  "Gemini-3.8-LIVE"  ') == "gemini-3.8-live"
+    # Unknown but well-formedpreview ids are forwarded (with a warning), not
+    # dropped: Google ships ids the plugin's list may lag behind.
+    assert (
+        sanitize_gemini_model("gemini-9.9-flash-live-future-preview").startswith("gemini-9.9-flash-live")
+    )
+    # models/ prefix is accepted.
+    assert sanitize_gemini_model("models/gemini-3.8-live") == "models/gemini-3.8-live"
+
+
+def test_sanitize_gemini_model_drops_free_text():
+    from float_agent.config import sanitize_gemini_model
+
+    for bad in (
+        None,
+        "",
+        "   ",
+        "gemini flash live please",
+        "explain the GPU status",
+        "gemini-3.8-live!!",
+        "gemini-3.8-live; rm -rf",
+        "x" * 200,
+    ):
+        assert sanitize_gemini_model(bad) == ""
+
+
+def test_dispatch_payload_drops_free_text_model_names():
+    payload = _dispatch_payload("float-r", "float-gemini", gemini_model="explain the GPU status")
+    assert "metadata" not in payload
+    # Model-id-shaped values still pass through untouched (authoritative
+    # validation happens in the worker).
+    payload = _dispatch_payload("float-r", "float-gemini", gemini_model="gemini-9.9-flash-live-future")
+    assert json.loads(payload["metadata"]) == {"gemini_model": "gemini-9.9-flash-live-future"}
+
+
 class _FakeJob:
     def __init__(self, status: int, error: str = "", job_id: str = "JOB_12345678") -> None:
         self.id = job_id

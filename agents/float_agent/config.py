@@ -18,9 +18,14 @@ sibling ``fast_float/config`` of this repository).
 from __future__ import annotations
 
 import json
+import logging
 import os
+import re
+import typing
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_INSTRUCTIONS = """\
 You are the voice interface of FLOAT, a real-time talking-avatar system.
@@ -126,6 +131,84 @@ def dispatch_config(metadata: str) -> dict[str, str]:
     return overrides
 
 
+# --------------------------------------------------------------- model name
+# ``gemini_model`` arrives from a free-text Studio field and reaches
+# ``RealtimeModel(model=...)`` unfiltered: the google plugin accepts *any*
+# string and defers rejection to the session's Gemini websocket — i.e. after
+# the dispatch and the avatar session are already up, where the operator sees
+# the opaque "worker did not join / no audio" failure. The name also silently
+# changes plugin heuristics keyed on substrings (reply placeholder, tool
+# behavior). Validate the format at this boundary so the worst case is
+# "fall back to the box default", never a broken session.
+
+# Live-API model ids known to current plugin snapshots; the *installed*
+# plugin's list is preferred at runtime (see :func:`known_live_models`).
+_KNOWN_LIVE_MODELS_FALLBACK = frozenset(
+    {
+        "gemini-3.8-live",
+        "gemini-live-2.5-flash-native-audio",
+        "gemini-3.8-live-extended-thinking",
+        "gemini-3.1-flash-live-preview",
+        "gemini-2.5-flash-native-audio-preview-12-2025",
+        "gemini-2.0-flash-live-001",
+    }
+)
+
+# Google's model-id charset: lowercase alnum with `.`/`-`/`_`, optionally
+# prefixed with ``models/``. Longer than any real id, so it cannot hide
+# free-text explanations in the metadata field.
+_MODEL_ID_RE = re.compile(r"^(?:models/)?[a-z0-9][a-z0-9._-]{0,98}$")
+
+
+def known_live_models() -> frozenset[str]:
+    """Live-API model ids the *installed* google plugin knows.
+
+    Falls back to a bundled snapshot when ``livekit-agents`` is not
+    importable (e.g. unit tests of the shared config in the main repo).
+    """
+    try:
+        from livekit.plugins.google.realtime.api_proto import LiveAPIModels
+    except Exception:
+        return _KNOWN_LIVE_MODELS_FALLBACK
+    names = typing.get_args(LiveAPIModels)
+    return frozenset(names) if names else _KNOWN_LIVE_MODELS_FALLBACK
+
+
+def sanitize_gemini_model(value: str | None) -> str:
+    """Validate a browser/Studio-supplied ``gemini_model`` for ``RealtimeModel``.
+
+    The installed plugin never rejects unknown ids locally, so:
+
+    * a known Live-API model id is returned as-is;
+    * an unknown but well-formed id (``models/`` prefix allowed) is returned
+      with a warning — Google ships preview ids the plugin's list lags
+      behind, so names must not be hard-restricted;
+    * anything else (typos, prose, wrong charset) yields ``""`` so the caller
+      keeps its configured default.
+
+    Returned ids are lowercase; Google model ids are.
+    """
+    cleaned = (value or "").strip().strip("\"'").strip()
+    if not cleaned:
+        return ""
+    cleaned = cleaned.lower()
+    if cleaned in known_live_models():
+        return cleaned
+    if _MODEL_ID_RE.match(cleaned):
+        logger.warning(
+            "[config] gemini_model %r is not a known Live-API model for the installed "
+            "google plugin; forwarding it unchecked (the API and not the format will "
+            "be the judge)",
+            cleaned,
+        )
+        return cleaned
+    logger.warning(
+        f"[config] gemini_model {value!r} does not look like a model id; ignoring it "
+        "and keeping the configured default"
+    )
+    return ""
+
+
 @dataclass(frozen=True)
 class AgentConfig:
     """Everything the worker reads from the environment at startup.
@@ -221,4 +304,10 @@ def _as_bool(value: object, default: bool = False) -> bool:
     return bool(value) if value is not None else default
 
 
-__all__ = ["DEFAULT_INSTRUCTIONS", "AgentConfig", "dispatch_config"]
+__all__ = [
+    "DEFAULT_INSTRUCTIONS",
+    "AgentConfig",
+    "dispatch_config",
+    "known_live_models",
+    "sanitize_gemini_model",
+]
