@@ -97,13 +97,14 @@ async def dispatch_agent(
     forwarded to the worker inside the dispatch ``metadata``; the worker reads
     them from ``job.metadata``. The key is never written to any log.
 
-    Returns ``False`` (and logs) when the LiveKit API is unavailable or the
-    request is rejected; the avatar session stays up so an operator can start
-    the worker manually.
+    Returns the created ``AgentDispatch`` (truthy), or ``None`` (and logs) when
+    the LiveKit API is unavailable or the request is rejected; the avatar
+    session stays up so an operator can start the worker manually. The caller
+    keeps the dispatch so a failed/torn-down session can delete it again.
     """
     name = (agent_name or settings.agent_name or "").strip()
     if not name:
-        return False
+        return None
     try:
         from livekit.api import CreateAgentDispatchRequest, LiveKitAPI
 
@@ -113,12 +114,12 @@ async def dispatch_agent(
             api_key=settings.api_key,
             api_secret=settings.api_secret,
         ) as lk:
-            await lk.agent_dispatch.create_dispatch(request)
+            created = await lk.agent_dispatch.create_dispatch(request)
     except Exception as exc:
         logger.warning(f"[session] could not dispatch agent {name!r} into {room}: {exc}")
-        return False
+        return None
     logger.info(f"[session] dispatched agent {name!r} into {room}")
-    return True
+    return created
 
 
 def _dispatch_payload(
@@ -249,6 +250,10 @@ class ConversationSession:
         self.runner: AvatarRunner | AgentAvatarRunner | None = None
         self.receiver: DataStreamAudioReceiver | None = None
         self.agent_dispatched: bool | None = None
+        # The SFU dispatch created for this session, so a torn-down/failed
+        # session deletes it again — otherwise every retry leaks another
+        # queued dispatch that later start failures list as "NO job".
+        self.dispatch_id: str | None = None
         self._stopped = False
 
     @property
@@ -335,7 +340,10 @@ class ConversationSession:
         self.worker_room = rtc.Room()
         await self.worker_room.connect(self.settings.url, token_result.token)
 
-        self.agent_dispatched = await self._dispatch_external_agent()
+        created = await self._dispatch_external_agent()
+        self.agent_dispatched = created is not None
+        # AgentDispatch.id, empty when the dispatch failed/None -> no cleanup.
+        self.dispatch_id = str(getattr(created, "id", "") or "") or None
 
         # Give a cold-started worker time to boot, register and join. First
         # runs compile/import livekit-agents + google-genai, which can exceed
@@ -355,21 +363,23 @@ class ConversationSession:
             raise RuntimeError(
                 f"{exc} The Gemini worker did not join as {self.agent_name!r} "
                 f"(dispatch created: {bool(self.agent_dispatched)}). {dispatch_state} "
-                "Start it with `cd agents && uv run python -m float_agent.agent dev`, make sure "
-                "agents/.env has LIVEKIT_URL/API_KEY/API_SECRET + GOOGLE_API_KEY, and that its "
-                "FLOAT_GEMINI_AGENT_NAME matches the API's.",
+                "Start it with `cd agents && uv run python -m float_agent.agent dev`. The worker reads "
+                "the shared fast_float/config/secerts.toml + settings.toml (the single source of "
+                "truth — put the same LiveKit project's LIVEKIT_URL/API_KEY/API_SECRET there, in "
+                "both processes' FLOAT_CONFIG_DIR; agents/.env is only a fallback and a differing "
+                "copy is ignored with a warning). Its agent name must match the API's.",
             ) from exc
         self.identity = self.receiver.agent_identity or self.identity
         logger.info(
             f"[session] Gemini Live conversation ready in {self.room_name} ({self.identity} -> {self.avatar_identity})"
         )
 
-    async def _dispatch_external_agent(self) -> bool | None:
+    async def _dispatch_external_agent(self):
         """Ask the SFU to run the Gemini worker, forwarding Studio overrides.
 
-        Returns ``False`` when the dispatch failed, or ``None`` when
-        auto-dispatch is disabled or the agent name is unset (the operator
-        starts the worker manually then).
+        Returns the created dispatch (or ``None`` when auto-dispatch is
+        disabled / the agent name is unset / the API call failed — the
+        operator starts the worker manually then).
         """
         if not (self.settings.autodispatch and self.agent_name):
             return None
@@ -426,6 +436,23 @@ class ConversationSession:
             return
         self.generator.clear_buffer()
 
+    async def _delete_dispatch(self) -> None:
+        """Best-effort removal of this session's SFU dispatch (never raises)."""
+        if not self.dispatch_id:
+            return
+        try:
+            from livekit.api import DeleteAgentDispatchRequest, LiveKitAPI
+
+            async with LiveKitAPI(
+                url=self.settings.url,
+                api_key=self.settings.api_key,
+                api_secret=self.settings.api_secret,
+            ) as lk:
+                await lk.agent_dispatch.delete_dispatch(self.dispatch_id, self.room_name)
+            logger.info(f"[session] deleted agent dispatch {self.dispatch_id[:8]} from {self.room_name}")
+        except Exception as exc:
+            logger.warning(f"[session] could not delete agent dispatch {self.dispatch_id[:8]}: {exc}")
+
     async def stop(self) -> None:
         if self._stopped:
             return
@@ -445,6 +472,12 @@ class ConversationSession:
             with contextlib.suppress(Exception):
                 await self.agent.disconnect()
             self.agent = None
+        # Delete the SFU dispatch created for this session: a retry would
+        # otherwise stack another queued dispatch and every later failure
+        # report lists "NO job" for each leak.
+        if self.dispatch_id:
+            await self._delete_dispatch()
+        self.dispatch_id = None
         if self._temp_image:
             with contextlib.suppress(OSError):
                 os.unlink(self._temp_image)

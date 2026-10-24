@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -290,11 +291,12 @@ def test_dispatch_payload_includes_metadata_only_when_needed():
 
 def test_dispatch_agent_forwards_overrides_through_create_dispatch(monkeypatch):
     captured = {}
+    dispatch_obj = SimpleNamespace(id="AD_dispatch1")
 
     class _FakeAgentDispatch:
         async def create_dispatch(self, request):
             captured["request"] = request
-            return None
+            return dispatch_obj
 
     class _FakeLiveKitAPI:
         def __init__(self, **_kwargs):
@@ -324,12 +326,75 @@ def test_dispatch_agent_forwards_overrides_through_create_dispatch(monkeypatch):
         )
         return ok
 
-    assert asyncio.run(_run()) is True
+    # The created dispatch object is returned, so the caller can delete it
+    # again on teardown (dispatch-leak fix).
+    assert asyncio.run(_run()) is dispatch_obj
     assert captured["request"].kwargs["agent_name"] == "float-gemini"
     assert json.loads(captured["request"].kwargs["metadata"]) == {
         "gemini_api_key": "AI-browser",
         "gemini_model": "gemini-3.8-live",
     }
+
+
+def test_session_deletes_its_dispatch_on_teardown(monkeypatch):
+    """Dispatch-leak regression: a torn-down session must not leave its SFU
+    dispatch behind — each leaked dispatch shows up as one more 'NO job' line
+    in every later failure report."""
+    from fast_float.livekit.session import ConversationSession
+
+    captured = {}
+
+    class _FakeAgentDispatch:
+        async def delete_dispatch(self, dispatch_id, room_name):
+            captured["dispatch_id"] = dispatch_id
+            captured["room_name"] = room_name
+            return None
+
+    class _FakeLiveKitAPI:
+        def __init__(self, **_kwargs):
+            self.agent_dispatch = _FakeAgentDispatch()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr("livekit.api.LiveKitAPI", _FakeLiveKitAPI)
+
+    session = ConversationSession.__new__(ConversationSession)
+    session.settings = SimpleNamespace(url="ws://127.0.0.1:7880", api_key="k", api_secret="s" * 32)
+    session.room_name = "float-r"
+    session.dispatch_id = "AD-1234567890abcdef"
+
+    # Happy path first: the right dispatch of the right room is deleted.
+    asyncio.run(session._delete_dispatch())
+    assert captured == {"dispatch_id": "AD-1234567890abcdef", "room_name": "float-r"}
+
+    # Best-effort: even when the SFU rejects the delete, the call never raises.
+    class _RaisingDispatch(_FakeAgentDispatch):
+        async def delete_dispatch(self, dispatch_id, room_name):
+            raise RuntimeError("sfu says no")
+
+    monkeypatch.setattr(
+        "livekit.api.LiveKitAPI",
+        type(
+            "_FakeRaisingAPI",
+            (),
+            {
+                "__init__": _FakeLiveKitAPI.__init__,
+                "__aenter__": _FakeLiveKitAPI.__aenter__,
+                "__aexit__": _FakeLiveKitAPI.__aexit__,
+                "agent_dispatch": property(lambda self: _RaisingDispatch()),
+            },
+        ),
+    )
+    asyncio.run(session._delete_dispatch())  # must not raise
+
+    # No dispatch -> no API call at all.
+    session.dispatch_id = None
+    asyncio.run(session._delete_dispatch())
+    assert captured["dispatch_id"] == "AD-1234567890abcdef"
 
 
 def test_worker_parses_dispatch_metadata_overrides():
@@ -469,11 +534,13 @@ def test_session_wires_dispatch_with_keyword_only_args(monkeypatch):
 
     captured = {}
 
+    fake_created = SimpleNamespace(id="AD_wire1")
+
     async def fake_dispatch(settings, room, **kwargs):
         captured["settings"] = settings
         captured["room"] = room
         captured.update(kwargs)
-        return True
+        return fake_created
 
     monkeypatch.setattr("fast_float.livekit.session.dispatch_agent", fake_dispatch)
     session = ConversationSession.__new__(ConversationSession)
@@ -483,7 +550,7 @@ def test_session_wires_dispatch_with_keyword_only_args(monkeypatch):
     session.gemini_api_key = "AI-wire"
     session.gemini_model = "gemini-3.8-live"
 
-    assert asyncio.run(session._dispatch_external_agent()) is True
+    assert asyncio.run(session._dispatch_external_agent()) is fake_created
     assert captured["room"] == "float-wiring"
     assert captured == {
         "settings": session.settings,
