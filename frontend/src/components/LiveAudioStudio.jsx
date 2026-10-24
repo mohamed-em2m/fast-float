@@ -19,6 +19,7 @@ import {
   connectLiveKitSession,
   createMicrophoneMeter,
   fetchLiveKitStatus,
+  getGeminiApiKey,
   interruptConversation,
   setRoomMicrophoneMuted,
   startConversation,
@@ -285,6 +286,7 @@ export default function LiveAudioStudio({
         imageBase64,
         imageFormat: imageFormat || 'jpg',
         agent: engine,
+        geminiApiKey: engine === 'gemini' ? getGeminiApiKey() : null,
       });
       startedRoom = started.room;
       const mode = started.agent === 'gemini' ? 'gemini' : 'builtin';
@@ -488,11 +490,12 @@ export default function LiveAudioStudio({
               Auto-dispatch is off. Start the Gemini worker with an explicit dispatch for this room.
             </p>
           )}
-          {engine === 'gemini' && liveKit?.gemini_configured === false && (
+          {engine === 'gemini' && liveKit?.gemini_configured === false && !getGeminiApiKey() && (
             <p className="inline-warning">
               <TriangleAlert size={14} />
-              No Gemini API key on the server. Add it to <code>fast_float/config/secerts.toml</code> under{' '}
-              <code>[gemini] &rarr; api_key</code>, or export <code>GOOGLE_API_KEY</code>, then reload.
+              No Gemini API key on the server. Add it under <code>[gemini] &rarr; api_key</code> in{' '}
+              <code>fast_float/config/secerts.toml</code> or export <code>GOOGLE_API_KEY</code> — or paste one
+              in the header <strong>Config</strong> panel.
             </p>
           )}
 

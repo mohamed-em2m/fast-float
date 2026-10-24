@@ -7,12 +7,17 @@ config files, so one key serves both processes:
 * ``fast_float/config/secerts.toml`` → ``[gemini].api_key`` (secret)
 * ``fast_float/config/settings.toml`` → ``[gemini].model/voice/language``
 
+Finally, the FLOAT API can hand a per-session key through the dispatch
+``metadata`` (``{"gemini_api_key": "..."}``) when the Studio supplied one —
+see :func:`dispatch_api_key`.
+
 Override the config directory with ``FLOAT_CONFIG_DIR`` (defaults to the
 sibling ``fast_float/config`` of this repository).
 """
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -93,6 +98,25 @@ def _first_set(*candidates: object) -> str:
         if value is not None and str(value).strip():
             return str(value).strip()
     return ""
+
+
+def dispatch_api_key(metadata: str) -> str:
+    """Extract the per-dispatch Gemini key from job metadata (``""`` when absent).
+
+    The FLOAT API puts ``{"gemini_api_key": "..."}`` into the dispatch
+    metadata when the Studio supplied a key; the worker reads it from
+    ``job.metadata`` and prefers it over its own config for that session.
+    """
+    raw = (metadata or "").strip()
+    if not raw:
+        return ""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("gemini_api_key") or "").strip()
 
 
 @dataclass(frozen=True)
@@ -190,4 +214,4 @@ def _as_bool(value: object, default: bool = False) -> bool:
     return bool(value) if value is not None else default
 
 
-__all__ = ["DEFAULT_INSTRUCTIONS", "AgentConfig"]
+__all__ = ["DEFAULT_INSTRUCTIONS", "AgentConfig", "dispatch_api_key"]

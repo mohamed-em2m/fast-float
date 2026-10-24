@@ -9,7 +9,7 @@ import {
   RefreshCw,
   Sparkles,
 } from 'lucide-react';
-import { fetchLiveKitStatus, getLiveKitUrlOverride, setLiveKitUrlOverride } from '../services/livekit';
+import { fetchLiveKitStatus, getLiveKitUrlOverride, setLiveKitUrlOverride, getGeminiApiKey, setGeminiApiKey } from '../services/livekit';
 import { fetchHealth, fetchGpuMetrics, clearGpuMemory, getApiUrl, setApiUrl, resetApiUrl, isDefaultApiUrl, testApiUrl, isLoopbackUrl, isPageOnLoopback, DEFAULT_API_URL } from '../services/api';
 
 // Consecutive failed polls before the pill flips to Disconnected. A single
@@ -25,6 +25,7 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
   const [showSettings, setShowSettings] = useState(false);
   const [apiUrlInput, setApiUrlInput] = useState(getApiUrl());
   const [liveKitUrlInput, setLiveKitUrlInput] = useState(getLiveKitUrlOverride());
+  const [geminiKeyInput, setGeminiKeyInput] = useState(getGeminiApiKey());
   const [configError, setConfigError] = useState(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
@@ -94,6 +95,7 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
       const hData = await testApiUrl(value);
       setApiUrl(value);
       setLiveKitUrlOverride(liveKitUrlInput);
+      setGeminiApiKey(geminiKeyInput);
       failuresRef.current = 0;
       if (hData && typeof hData === 'object') setHealth(hData);
       setIsOnline(true);
@@ -120,6 +122,7 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
     } catch { /* non-absolute URL — let setApiUrl handle it */ }
     setApiUrl(value);
     setLiveKitUrlOverride(liveKitUrlInput);
+    setGeminiApiKey(geminiKeyInput);
     failuresRef.current = 0;
     setShowSettings(false);
     if (onToast) onToast(`Saved direct endpoint: ${value}`, 'info');
@@ -129,6 +132,7 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
   const openSettings = () => {
     setApiUrlInput(getApiUrl());
     setLiveKitUrlInput(getLiveKitUrlOverride());
+    setGeminiKeyInput(getGeminiApiKey());
     setConfigError(null);
     setShowSettings(true);
   };
@@ -136,8 +140,10 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
   const handleResetApiUrl = () => {
     const base = resetApiUrl();
     setLiveKitUrlOverride('');
+    setGeminiApiKey('');
     setApiUrlInput(base);
     setLiveKitUrlInput('');
+    setGeminiKeyInput('');
     setConfigError(null);
     failuresRef.current = 0;
     if (onToast) onToast('Reset to default endpoint', 'info');
@@ -266,6 +272,11 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
                 LiveKit Override: <code className="settings-active-url">{getLiveKitUrlOverride()}</code>
               </span>
             )}
+            {getGeminiApiKey() && (
+              <span className="settings-label" style={{ marginTop: '4px' }}>
+                Gemini API key: <code className="settings-active-url">••••{getGeminiApiKey().slice(-4)}</code>
+              </span>
+            )}
           </div>
 
           <form onSubmit={handleSaveApiUrl}>
@@ -358,6 +369,40 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
               spellCheck={false}
               autoComplete="off"
             />
+
+            {/* Gemini API Key Section */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px', marginTop: '10px' }}>
+              <label className="settings-label" htmlFor="gemini-key-input" style={{ marginBottom: 0 }}>
+                Gemini API Key
+              </label>
+              {geminiKeyInput && (
+                <button
+                  type="button"
+                  className="btn-secondary btn-xs"
+                  onClick={() => setGeminiKeyInput('')}
+                  title="Clear the stored Gemini API key"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+
+            <input
+              id="gemini-key-input"
+              type="password"
+              value={geminiKeyInput}
+              onChange={(e) => setGeminiKeyInput(e.target.value)}
+              placeholder="AIza… (used by the Gemini Live engine)"
+              className="settings-input"
+              spellCheck={false}
+              autoComplete="off"
+              autoCapitalize="none"
+            />
+            <p className="settings-hint">
+              Sent to the server with each <strong>Gemini Live</strong> session. Stored only in this
+              browser; for a persistent key use <code>[gemini] &rarr; api_key</code> in{' '}
+              <code>fast_float/config/secerts.toml</code> instead.
+            </p>
 
             {configError && <p className="settings-error">{configError}</p>}
 

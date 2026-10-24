@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import logging
 import os
 import tempfile
@@ -77,8 +78,18 @@ def _materialize_image(image_base64: str, image_format: str) -> str:
     return path
 
 
-async def dispatch_agent(settings: LiveKitSettings, room: str, *, agent_name: str | None = None) -> bool:
+async def dispatch_agent(
+    settings: LiveKitSettings,
+    room: str,
+    *,
+    agent_name: str | None = None,
+    gemini_api_key: str | None = None,
+) -> bool:
     """Ask the SFU to dispatch the Gemini worker into ``room``.
+
+    ``gemini_api_key`` (when a browser supplied one) is forwarded to the
+    worker inside the dispatch ``metadata``; the worker reads it from
+    ``job.metadata``. The value is never written to any log.
 
     Returns ``False`` (and logs) when the LiveKit API is unavailable or the
     request is rejected; the avatar session stays up so an operator can start
@@ -90,17 +101,27 @@ async def dispatch_agent(settings: LiveKitSettings, room: str, *, agent_name: st
     try:
         from livekit.api import CreateAgentDispatchRequest, LiveKitAPI
 
+        request = CreateAgentDispatchRequest(**_dispatch_payload(room, name, gemini_api_key))
         async with LiveKitAPI(
             url=settings.url,
             api_key=settings.api_key,
             api_secret=settings.api_secret,
         ) as lk:
-            await lk.agent_dispatch.create_dispatch(CreateAgentDispatchRequest(room=room, agent_name=name))
+            await lk.agent_dispatch.create_dispatch(request)
     except Exception as exc:
         logger.warning(f"[session] could not dispatch agent {name!r} into {room}: {exc}")
         return False
     logger.info(f"[session] dispatched agent {name!r} into {room}")
     return True
+
+
+def _dispatch_payload(room: str, agent_name: str, gemini_api_key: str | None = None) -> dict[str, Any]:
+    """``CreateAgentDispatchRequest`` kwargs, adding metadata only when needed."""
+    payload: dict[str, Any] = {"room": room, "agent_name": agent_name}
+    key = (gemini_api_key or "").strip()
+    if key:
+        payload["metadata"] = json.dumps({"gemini_api_key": key})
+    return payload
 
 
 class ConversationSession:
@@ -118,6 +139,7 @@ class ConversationSession:
         tts_fn: Callable[[str], bytes] | None = None,
         agent_backend: str = "builtin",
         agent_name: str | None = None,
+        gemini_api_key: str | None = None,
     ) -> None:
         self.room_name = room_name
         self.settings = settings or LiveKitSettings.from_env()
@@ -129,6 +151,9 @@ class ConversationSession:
             self.settings.avatar_identity if self.agent_backend == "gemini" else f"avatar-{room_name[:24]}"
         )
         self.agent_name = (agent_name or self.settings.agent_name or "").strip()
+        # Optional per-session API key supplied by the Studio UI. Forwarded to
+        # the Gemini worker in the dispatch metadata; never logged.
+        self.gemini_api_key = (gemini_api_key or "").strip()
         self.image_path = image_path
         self.image_base64 = image_base64
         self.image_format = _safe_image_format(image_format)
@@ -231,7 +256,12 @@ class ConversationSession:
         await self.worker_room.connect(self.settings.url, token_result.token)
 
         if self.settings.autodispatch and self.agent_name:
-            self.agent_dispatched = await dispatch_agent(self.settings, self.room_name, self.agent_name)
+            self.agent_dispatched = await dispatch_agent(
+                self.settings,
+                self.room_name,
+                self.agent_name,
+                gemini_api_key=self.gemini_api_key or None,
+            )
 
         self.receiver = DataStreamAudioReceiver(self.worker_room)
         self.runner = AgentAvatarRunner(
@@ -341,6 +371,7 @@ async def start_session(
     tts_fn: Callable[[str], bytes] | None = None,
     agent_backend: str = "builtin",
     agent_name: str | None = None,
+    gemini_api_key: str | None = None,
 ) -> ConversationSession:
     """Start (or reuse) the conversation session for ``room_name``."""
     existing = get_session(room_name)
@@ -357,6 +388,7 @@ async def start_session(
         tts_fn=tts_fn,
         agent_backend=agent_backend,
         agent_name=agent_name,
+        gemini_api_key=gemini_api_key,
     )
     try:
         await session.start()

@@ -76,6 +76,11 @@ config files, so the operator can keep everything in one place:
 Override the config directory with `FLOAT_CONFIG_DIR` (defaults to the
 sibling `fast_float/config` of this repo).
 
+A key typed into the Studio's header **Config** panel travels in the
+dispatch `metadata` (`{"gemini_api_key": "..."}`) and wins for that session
+(see `dispatch_api_key()` in `float_agent/config.py`); the Studio key never
+appears in any log.
+
 | env | default | meaning |
 | --- | --- | --- |
 | `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | shared `[livekit]` | SFU credentials (required) |

@@ -113,6 +113,11 @@ class ConversationStartRequest(BaseModel):
         default=None,
         description="LiveKit agent name to dispatch for the Gemini backend (defaults to FLOAT_GEMINI_AGENT_NAME)",
     )
+    gemini_api_key: str | None = Field(
+        default=None,
+        max_length=256,
+        description="Per-session Gemini API key from the Studio config; forwarded to the worker via dispatch",
+    )
 
 
 class ConversationAudioRequest(BaseModel):
@@ -325,6 +330,7 @@ async def conversation_start(request: ConversationStartRequest) -> dict[str, Any
             image_format=request.image_format,
             agent_backend=request.agent,
             agent_name=request.agent_name,
+            gemini_api_key=request.gemini_api_key,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

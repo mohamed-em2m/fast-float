@@ -23,6 +23,30 @@ import { getApiUrl } from './api';
  */
 const LIVEKIT_STORAGE_KEY = 'float_livekit_url';
 
+/**
+ * LocalStorage key for the optional Gemini API key the Studio sends per
+ * session. Stored in the browser so the operator does not have to edit
+ * server config to try the Gemini Live engine; the server-side
+ * secerts.toml ``[gemini].api_key`` is still the recommended persistent
+ * location.
+ */
+const GEMINI_API_KEY_STORAGE_KEY = 'float_gemini_api_key';
+
+export function getGeminiApiKey() {
+  if (typeof window === 'undefined') return '';
+  return localStorage.getItem(GEMINI_API_KEY_STORAGE_KEY) || '';
+}
+
+export function setGeminiApiKey(key) {
+  if (typeof window === 'undefined') return;
+  const clean = (key || '').trim();
+  if (clean) {
+    localStorage.setItem(GEMINI_API_KEY_STORAGE_KEY, clean);
+  } else {
+    localStorage.removeItem(GEMINI_API_KEY_STORAGE_KEY);
+  }
+}
+
 export function getLiveKitUrlOverride() {
   if (typeof window === 'undefined') return '';
   return localStorage.getItem(LIVEKIT_STORAGE_KEY) || '';
@@ -166,6 +190,7 @@ export async function startConversation({
   imageFormat = 'jpg',
   agent = 'builtin',
   agentName = null,
+  geminiApiKey = null,
 } = {}) {
   const res = await fetch(`${getApiUrl()}/livekit/conversation/start`, {
     method: 'POST',
@@ -176,6 +201,7 @@ export async function startConversation({
       image_format: imageFormat,
       agent,
       agent_name: agentName,
+      gemini_api_key: geminiApiKey || null,
     }),
   });
   if (!res.ok) {

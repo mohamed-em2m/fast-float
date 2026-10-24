@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -9,10 +11,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "agents"))
 
+from unittest.mock import MagicMock
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from float_agent.config import AgentConfig
+from float_agent.config import AgentConfig, dispatch_api_key
 
+from fast_float.core.state import app_state
+from fast_float.livekit.session import _dispatch_payload, dispatch_agent
 from fast_float.livekit.settings import LiveKitSettings
 from fast_float.routers.livekit import router as livekit_router
 
@@ -162,3 +168,95 @@ def test_livekit_status_reports_gemini_configured_without_the_key(api_client, mo
     assert body["gemini_configured"] is True
     # The key must never be serialized.
     assert "AI-secret" not in res.text
+
+
+# ---------------------------------------------------------------------------
+# Per-session key: browser -> start request -> dispatch metadata -> worker.
+# ---------------------------------------------------------------------------
+
+
+def test_conversation_start_forwards_browser_key_to_session(api_client, monkeypatch):
+    captured = {}
+
+    async def fake_start(room_name, **_kwargs):
+        captured.update(_kwargs)
+        return type(
+            "Session",
+            (),
+            {
+                "agent_backend": "gemini",
+                "room_name": room_name,
+                "resolved_agent_identity": "float-gemini",
+                "avatar_identity": "float-avatar",
+                "agent_dispatched": True,
+                "tts_fn": None,
+            },
+        )()
+
+    monkeypatch.setattr("fast_float.routers.livekit.start_session", fake_start)
+    monkeypatch.setattr("fast_float.routers.livekit.get_session", lambda room: None)
+    monkeypatch.setattr("fast_float.routers.livekit.stop_session", lambda room: None)
+    monkeypatch.setattr(app_state, "agent", MagicMock())
+    # A fresh room so the in-memory registry does not interfere.
+    res = api_client.post(
+        "/livekit/conversation/start",
+        json={
+            "room": "gemini-keysession",
+            "agent": "gemini",
+            "gemini_api_key": "AI-browser-key",
+        },
+    )
+    assert res.status_code == 200
+    assert captured["agent_backend"] == "gemini"
+    assert captured["gemini_api_key"] == "AI-browser-key"
+
+
+def test_dispatch_payload_includes_metadata_only_when_a_key_is_present():
+    assert _dispatch_payload("float-r", "float-gemini") == {"room": "float-r", "agent_name": "float-gemini"}
+    payload = _dispatch_payload("float-r", "float-gemini", "  AI-browser-key  ")
+    assert payload["agent_name"] == "float-gemini"
+    expected = {"gemini_api_key": "AI-browser-key"}
+    assert json.loads(payload["metadata"]) == expected
+
+
+def test_dispatch_agent_forwards_key_through_create_dispatch(monkeypatch):
+    captured = {}
+
+    class _FakeAgentDispatch:
+        async def create_dispatch(self, request):
+            captured["request"] = request
+            return None
+
+    class _FakeLiveKitAPI:
+        def __init__(self, **_kwargs):
+            self.agent_dispatch = _FakeAgentDispatch()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class _FakeCreateRequest:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr("livekit.api.LiveKitAPI", _FakeLiveKitAPI)
+    monkeypatch.setattr("livekit.api.CreateAgentDispatchRequest", _FakeCreateRequest)
+
+    async def _run():
+        settings = LiveKitSettings(url="ws://127.0.0.1:7880", api_key="k", api_secret="s" * 32)
+        ok = await dispatch_agent(settings, "float-r", agent_name="float-gemini", gemini_api_key="AI-browser")
+        return ok
+
+    assert asyncio.run(_run()) is True
+    assert captured["request"].kwargs["agent_name"] == "float-gemini"
+    assert json.loads(captured["request"].kwargs["metadata"]) == {"gemini_api_key": "AI-browser"}
+
+
+def test_worker_parses_dispatch_metadata_key():
+    assert dispatch_api_key("") == ""
+    assert dispatch_api_key("not-json") == ""
+    assert dispatch_api_key('{"foo": 1}') == ""
+    assert dispatch_api_key(json.dumps({"gemini_api_key": "AI-dispatch-key"})) == "AI-dispatch-key"
+    assert dispatch_api_key('{"gemini_api_key": "  AI-padded  "}') == "AI-padded"
