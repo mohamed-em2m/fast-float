@@ -20,6 +20,7 @@ import {
   createMicrophoneMeter,
   fetchLiveKitStatus,
   getGeminiApiKey,
+  getGeminiModel,
   interruptConversation,
   setRoomMicrophoneMuted,
   startConversation,
@@ -287,6 +288,7 @@ export default function LiveAudioStudio({
         imageFormat: imageFormat || 'jpg',
         agent: engine,
         geminiApiKey: engine === 'gemini' ? getGeminiApiKey() : null,
+        geminiModel: engine === 'gemini' ? getGeminiModel() : null,
       });
       startedRoom = started.room;
       const mode = started.agent === 'gemini' ? 'gemini' : 'builtin';

@@ -82,13 +82,15 @@ one place serves both the API and the worker:
 | `fast_float/config/secerts.toml` `[gemini].api_key` | the Gemini API key (git-ignored) |
 | `fast_float/config/settings.toml` `[gemini]` | `model`, `voice`, `language`, `vertexai`… |
 
-The Studio can also supply a **per-session key** from its header
-**Config** panel (stored in the browser only). It travels with the
-`/livekit/conversation/start` request and is forwarded to the worker inside
-the dispatch `metadata` (`{"gemini_api_key": "..."}`); the worker prefers it
-over its own config for that session and never logs it. This is a
-convenience for quick sessions — for a persistent key keep using
-`secerts.toml` or the `GOOGLE_API_KEY` env var.
+The Studio can also supply **per-session overrides** from its header
+**Config** panel (stored in the browser only): a Gemini API key and/or a
+Live model name. They travel with the `/livekit/conversation/start` request
+and are forwarded to the worker inside the dispatch `metadata`
+(`{"gemini_api_key": "...", "gemini_model": "..."}`); the worker prefers
+them over its own config for that session and never logs the key. This is a
+convenience for quick sessions — for persistent values keep using
+`secerts.toml` / `settings.toml` or the `GOOGLE_API_KEY` / `GEMINI_MODEL`
+env vars.
 
 Worker-side (see [`agents/.env.example`](../agents/.env.example)):
 `LIVEKIT_URL` + `LIVEKIT_API_KEY` + `LIVEKIT_API_SECRET`, `GOOGLE_API_KEY`

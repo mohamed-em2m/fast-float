@@ -38,7 +38,7 @@ from livekit.agents import (
 from livekit.agents.voice.avatar import DataStreamAudioOutput
 from livekit.plugins import google
 
-from float_agent.config import AgentConfig, dispatch_api_key
+from float_agent.config import AgentConfig, dispatch_config
 from float_agent.tools import FloatApi
 
 logger = logging.getLogger("float_gemini")
@@ -114,21 +114,22 @@ class FloatAssistant(Agent):
         await context.session.shutdown(drain=False)
 
 
-def _build_realtime_model(api_key: str | None = None) -> google.realtime.RealtimeModel:
+def _build_realtime_model(api_key: str | None = None, model: str | None = None) -> google.realtime.RealtimeModel:
     """Create the Gemini Live model from the environment.
 
-    ``api_key`` wins over the environment/shared config: the FLOAT API passes
-    a per-session key (from the Studio settings) through the dispatch
-    metadata, so one Studio can use a personal key without editing the box.
-    No key is needed in Vertex AI mode.
+    ``api_key`` / ``model`` win over the environment/shared config: the FLOAT
+    API forwards the Studio settings through the dispatch metadata, so one
+    Studio can use its own key and pin its own Live model without editing the
+    box. No key is needed in Vertex AI mode.
     """
     kwargs: dict[str, object] = {
         "voice": config.voice,
         "input_audio_transcription": genai_types.AudioTranscriptionConfig(),
         "output_audio_transcription": genai_types.AudioTranscriptionConfig(),
     }
-    if config.model:
-        kwargs["model"] = config.model
+    resolved_model = (model or "").strip() or config.model
+    if resolved_model:
+        kwargs["model"] = resolved_model
     if config.language:
         kwargs["language"] = config.language
     if config.vertexai:
@@ -156,16 +157,20 @@ async def entrypoint(ctx: JobContext) -> None:
         config.avatar_identity,
     )
 
-    # The FLOAT API forwards a Studio-supplied API key in the dispatch
-    # metadata; prefer it over the box config for this session.
-    session_api_key = dispatch_api_key(getattr(getattr(ctx, "job", None), "metadata", "") or "")
+    # The FLOAT API forwards Studio-supplied overrides (Gemini key + model)
+    # in the dispatch metadata; prefer them over the box config this session.
+    dispatch = dispatch_config(getattr(getattr(ctx, "job", None), "metadata", "") or "")
+    session_api_key = dispatch.get("gemini_api_key", "")
+    session_model = dispatch.get("gemini_model", "")
     if session_api_key:
         logger.info("using a per-session Gemini API key supplied by the FLOAT API")
         # google-genai reads GOOGLE_API_KEY from the environment too.
         if not os.getenv("GOOGLE_API_KEY"):
             os.environ["GOOGLE_API_KEY"] = session_api_key
+    if session_model:
+        logger.info("using a per-session Gemini model supplied by the FLOAT API (%s)", session_model)
 
-    session = AgentSession(llm=_build_realtime_model(session_api_key))
+    session = AgentSession(llm=_build_realtime_model(session_api_key, session_model))
 
     # The agent's voice is not published directly: it is streamed to FLOAT,
     # which renders the avatar and publishes synchronized A/V (and sends back

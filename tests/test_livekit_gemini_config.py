@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from float_agent.config import AgentConfig, dispatch_api_key
+from float_agent.config import AgentConfig, dispatch_config
 
 from fast_float.core.state import app_state
 from fast_float.livekit.session import _dispatch_payload, dispatch_agent
@@ -204,22 +204,29 @@ def test_conversation_start_forwards_browser_key_to_session(api_client, monkeypa
             "room": "gemini-keysession",
             "agent": "gemini",
             "gemini_api_key": "AI-browser-key",
+            "gemini_model": "gemini-3.8-live",
         },
     )
     assert res.status_code == 200
     assert captured["agent_backend"] == "gemini"
     assert captured["gemini_api_key"] == "AI-browser-key"
+    assert captured["gemini_model"] == "gemini-3.8-live"
 
 
-def test_dispatch_payload_includes_metadata_only_when_a_key_is_present():
+def test_dispatch_payload_includes_metadata_only_when_needed():
     assert _dispatch_payload("float-r", "float-gemini") == {"room": "float-r", "agent_name": "float-gemini"}
-    payload = _dispatch_payload("float-r", "float-gemini", "  AI-browser-key  ")
+    payload = _dispatch_payload("float-r", "float-gemini", "  AI-browser-key  ", "  gemini-3.8-live  ")
     assert payload["agent_name"] == "float-gemini"
-    expected = {"gemini_api_key": "AI-browser-key"}
-    assert json.loads(payload["metadata"]) == expected
+    assert json.loads(payload["metadata"]) == {
+        "gemini_api_key": "AI-browser-key",
+        "gemini_model": "gemini-3.8-live",
+    }
+    # A model alone still produces metadata; no value means no metadata key at all.
+    payload_model = _dispatch_payload("float-r", "float-gemini", gemini_model="gemini-3.8-live")
+    assert json.loads(payload_model["metadata"]) == {"gemini_model": "gemini-3.8-live"}
 
 
-def test_dispatch_agent_forwards_key_through_create_dispatch(monkeypatch):
+def test_dispatch_agent_forwards_overrides_through_create_dispatch(monkeypatch):
     captured = {}
 
     class _FakeAgentDispatch:
@@ -246,17 +253,29 @@ def test_dispatch_agent_forwards_key_through_create_dispatch(monkeypatch):
 
     async def _run():
         settings = LiveKitSettings(url="ws://127.0.0.1:7880", api_key="k", api_secret="s" * 32)
-        ok = await dispatch_agent(settings, "float-r", agent_name="float-gemini", gemini_api_key="AI-browser")
+        ok = await dispatch_agent(
+            settings,
+            "float-r",
+            agent_name="float-gemini",
+            gemini_api_key="AI-browser",
+            gemini_model="gemini-3.8-live",
+        )
         return ok
 
     assert asyncio.run(_run()) is True
     assert captured["request"].kwargs["agent_name"] == "float-gemini"
-    assert json.loads(captured["request"].kwargs["metadata"]) == {"gemini_api_key": "AI-browser"}
+    assert json.loads(captured["request"].kwargs["metadata"]) == {
+        "gemini_api_key": "AI-browser",
+        "gemini_model": "gemini-3.8-live",
+    }
 
 
-def test_worker_parses_dispatch_metadata_key():
-    assert dispatch_api_key("") == ""
-    assert dispatch_api_key("not-json") == ""
-    assert dispatch_api_key('{"foo": 1}') == ""
-    assert dispatch_api_key(json.dumps({"gemini_api_key": "AI-dispatch-key"})) == "AI-dispatch-key"
-    assert dispatch_api_key('{"gemini_api_key": "  AI-padded  "}') == "AI-padded"
+def test_worker_parses_dispatch_metadata_overrides():
+    assert dispatch_config("") == {}
+    assert dispatch_config("not-json") == {}
+    assert dispatch_config('{"foo": 1}') == {}
+    assert dispatch_config(json.dumps({"gemini_api_key": "AI-dispatch-key"})) == {"gemini_api_key": "AI-dispatch-key"}
+    full = dispatch_config(json.dumps({"gemini_api_key": "  AI-padded  ", "gemini_model": "  m-audio  "}))
+    assert full == {"gemini_api_key": "AI-padded", "gemini_model": "m-audio"}
+    # Unknown keys and empty values are ignored.
+    assert dispatch_config(json.dumps({"gemini_api_key": "", "other": "x"})) == {}

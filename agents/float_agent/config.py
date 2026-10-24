@@ -100,23 +100,30 @@ def _first_set(*candidates: object) -> str:
     return ""
 
 
-def dispatch_api_key(metadata: str) -> str:
-    """Extract the per-dispatch Gemini key from job metadata (``""`` when absent).
+def dispatch_config(metadata: str) -> dict[str, str]:
+    """Per-session overrides sent by the FLOAT API in the dispatch metadata.
 
-    The FLOAT API puts ``{"gemini_api_key": "..."}`` into the dispatch
-    metadata when the Studio supplied a key; the worker reads it from
-    ``job.metadata`` and prefers it over its own config for that session.
+    The Studio's Config panel forwards a Gemini key and/or model name with the
+    session start; the API puts them into the dispatch ``metadata``
+    (``{"gemini_api_key": "...", "gemini_model": "..."}``) and the worker reads
+    them from ``job.metadata``, preferring them over its own config for that
+    session. Unknown keys are ignored; only non-empty values are returned.
     """
     raw = (metadata or "").strip()
     if not raw:
-        return ""
+        return {}
     try:
         data = json.loads(raw)
     except ValueError:
-        return ""
+        return {}
     if not isinstance(data, dict):
-        return ""
-    return str(data.get("gemini_api_key") or "").strip()
+        return {}
+    overrides: dict[str, str] = {}
+    for key in ("gemini_api_key", "gemini_model"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            overrides[key] = value.strip()
+    return overrides
 
 
 @dataclass(frozen=True)
@@ -214,4 +221,4 @@ def _as_bool(value: object, default: bool = False) -> bool:
     return bool(value) if value is not None else default
 
 
-__all__ = ["DEFAULT_INSTRUCTIONS", "AgentConfig", "dispatch_api_key"]
+__all__ = ["DEFAULT_INSTRUCTIONS", "AgentConfig", "dispatch_config"]

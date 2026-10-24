@@ -32,6 +32,12 @@ const LIVEKIT_STORAGE_KEY = 'float_livekit_url';
  */
 const GEMINI_API_KEY_STORAGE_KEY = 'float_gemini_api_key';
 
+/**
+ * LocalStorage key for the optional Gemini Live model name the Studio sends
+ * per session; empty means "use the server's default (plugin) model".
+ */
+const GEMINI_MODEL_STORAGE_KEY = 'float_gemini_model';
+
 export function getGeminiApiKey() {
   if (typeof window === 'undefined') return '';
   return localStorage.getItem(GEMINI_API_KEY_STORAGE_KEY) || '';
@@ -44,6 +50,21 @@ export function setGeminiApiKey(key) {
     localStorage.setItem(GEMINI_API_KEY_STORAGE_KEY, clean);
   } else {
     localStorage.removeItem(GEMINI_API_KEY_STORAGE_KEY);
+  }
+}
+
+export function getGeminiModel() {
+  if (typeof window === 'undefined') return '';
+  return localStorage.getItem(GEMINI_MODEL_STORAGE_KEY) || '';
+}
+
+export function setGeminiModel(model) {
+  if (typeof window === 'undefined') return;
+  const clean = (model || '').trim();
+  if (clean) {
+    localStorage.setItem(GEMINI_MODEL_STORAGE_KEY, clean);
+  } else {
+    localStorage.removeItem(GEMINI_MODEL_STORAGE_KEY);
   }
 }
 
@@ -191,6 +212,7 @@ export async function startConversation({
   agent = 'builtin',
   agentName = null,
   geminiApiKey = null,
+  geminiModel = null,
 } = {}) {
   const res = await fetch(`${getApiUrl()}/livekit/conversation/start`, {
     method: 'POST',
@@ -202,6 +224,7 @@ export async function startConversation({
       agent,
       agent_name: agentName,
       gemini_api_key: geminiApiKey || null,
+      gemini_model: geminiModel || null,
     }),
   });
   if (!res.ok) {

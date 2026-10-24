@@ -84,12 +84,13 @@ async def dispatch_agent(
     *,
     agent_name: str | None = None,
     gemini_api_key: str | None = None,
+    gemini_model: str | None = None,
 ) -> bool:
     """Ask the SFU to dispatch the Gemini worker into ``room``.
 
-    ``gemini_api_key`` (when a browser supplied one) is forwarded to the
-    worker inside the dispatch ``metadata``; the worker reads it from
-    ``job.metadata``. The value is never written to any log.
+    ``gemini_api_key`` / ``gemini_model`` (when a browser supplied them) are
+    forwarded to the worker inside the dispatch ``metadata``; the worker reads
+    them from ``job.metadata``. The key is never written to any log.
 
     Returns ``False`` (and logs) when the LiveKit API is unavailable or the
     request is rejected; the avatar session stays up so an operator can start
@@ -101,7 +102,7 @@ async def dispatch_agent(
     try:
         from livekit.api import CreateAgentDispatchRequest, LiveKitAPI
 
-        request = CreateAgentDispatchRequest(**_dispatch_payload(room, name, gemini_api_key))
+        request = CreateAgentDispatchRequest(**_dispatch_payload(room, name, gemini_api_key, gemini_model))
         async with LiveKitAPI(
             url=settings.url,
             api_key=settings.api_key,
@@ -115,12 +116,23 @@ async def dispatch_agent(
     return True
 
 
-def _dispatch_payload(room: str, agent_name: str, gemini_api_key: str | None = None) -> dict[str, Any]:
+def _dispatch_payload(
+    room: str,
+    agent_name: str,
+    gemini_api_key: str | None = None,
+    gemini_model: str | None = None,
+) -> dict[str, Any]:
     """``CreateAgentDispatchRequest`` kwargs, adding metadata only when needed."""
     payload: dict[str, Any] = {"room": room, "agent_name": agent_name}
     key = (gemini_api_key or "").strip()
+    model = (gemini_model or "").strip()
+    metadata: dict[str, str] = {}
     if key:
-        payload["metadata"] = json.dumps({"gemini_api_key": key})
+        metadata["gemini_api_key"] = key
+    if model:
+        metadata["gemini_model"] = model
+    if metadata:
+        payload["metadata"] = json.dumps(metadata)
     return payload
 
 
@@ -140,6 +152,7 @@ class ConversationSession:
         agent_backend: str = "builtin",
         agent_name: str | None = None,
         gemini_api_key: str | None = None,
+        gemini_model: str | None = None,
     ) -> None:
         self.room_name = room_name
         self.settings = settings or LiveKitSettings.from_env()
@@ -151,9 +164,11 @@ class ConversationSession:
             self.settings.avatar_identity if self.agent_backend == "gemini" else f"avatar-{room_name[:24]}"
         )
         self.agent_name = (agent_name or self.settings.agent_name or "").strip()
-        # Optional per-session API key supplied by the Studio UI. Forwarded to
-        # the Gemini worker in the dispatch metadata; never logged.
+        # Optional per-session Gemini overrides supplied by the Studio UI
+        # (API key + model name). Forwarded to the worker via the dispatch
+        # metadata; the key is never logged.
         self.gemini_api_key = (gemini_api_key or "").strip()
+        self.gemini_model = (gemini_model or "").strip()
         self.image_path = image_path
         self.image_base64 = image_base64
         self.image_format = _safe_image_format(image_format)
@@ -261,6 +276,7 @@ class ConversationSession:
                 self.room_name,
                 self.agent_name,
                 gemini_api_key=self.gemini_api_key or None,
+                gemini_model=self.gemini_model or None,
             )
 
         self.receiver = DataStreamAudioReceiver(self.worker_room)
@@ -372,6 +388,7 @@ async def start_session(
     agent_backend: str = "builtin",
     agent_name: str | None = None,
     gemini_api_key: str | None = None,
+    gemini_model: str | None = None,
 ) -> ConversationSession:
     """Start (or reuse) the conversation session for ``room_name``."""
     existing = get_session(room_name)
@@ -389,6 +406,7 @@ async def start_session(
         agent_backend=agent_backend,
         agent_name=agent_name,
         gemini_api_key=gemini_api_key,
+        gemini_model=gemini_model,
     )
     try:
         await session.start()
