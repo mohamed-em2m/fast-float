@@ -135,7 +135,11 @@ API. No model involved.*
   Audio is not received by the runner: the agent pushes it into the generator
   with `push_audio()`. `AvatarRunner` publishes `avatar_video` (SOURCE_CAMERA)
   and `avatar_audio` (SOURCE_MICROPHONE) and sends the `lk.playback_started`
-  RPC for us.
+  RPC for us. The video track is published with an explicit
+  `VideoEncoding(max_framerate=video_fps, max_bitrate=w*h*fps*0.15)`:
+  LiveKit's native default caps a track at **20 fps**, which silently drops
+  every fifth frame of a 25 fps avatar at the encoder (the preview stutters
+  and appears to skip ahead). The bitrate term is clamped to 0.4–6 Mbps.
 - **Thread bridge**: the pipeline runs in a dedicated single-worker executor
   and the SDK is asyncio — results cross back with
   `loop.call_soon_threadsafe` into an `asyncio.Queue` of paired A/V frames.

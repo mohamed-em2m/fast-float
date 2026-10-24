@@ -227,11 +227,21 @@ discarded so the stream stays near live; drops are counted and logged every
 Because video and audio are discarded together, the surviving frames remain
 in sync.
 
-The `/generate?live=true` tap (`LiveStream`) is lossy by design as well: its
-per-subscriber queue drops the oldest frame when a transport cannot keep up,
-but now counts and logs it (`subscriber_dropped_frames` in `metrics()`,
-`LiveStreamVideoGenerator.stop()` logs the total). That is how a jump in the
-preview is explained rather than silently hidden.
+The `/generate?live=true` tap (`LiveStream`) renders much faster than real
+time (100+ fps for a 25 fps stream), so a small per-subscriber queue would
+overflow and skip seconds of the preview. `LiveStreamVideoGenerator` therefore
+subscribes with a queue sized from the stream's frame dimensions
+(`live_queue_size()`): a 1 GiB byte budget, clamped to 128–4096 frames. At
+512×512×3 that is ~1365 frames (≈55 s), so a normal single-pass render is
+buffered completely and played out in order; a multi-minute render still has a
+hard memory ceiling. Only if the render outruns that budget does the queue
+drop the oldest frame, which is counted and logged
+(`subscriber_dropped_frames` in `metrics()`).
+
+Note that the publisher's video track must also be configured at the source
+frame rate: LiveKit's native default caps a track at 20 fps, which used to drop
+every fifth frame of a 25 fps stream inside the encoder (before the frames
+ever reached the network). See `LIVEKIT_INTEGRATION.md` §5.
 
 ### `stop()` — terminal
 

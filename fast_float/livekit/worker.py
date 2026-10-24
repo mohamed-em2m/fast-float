@@ -47,6 +47,7 @@ def rtc_unavailable_message() -> str:
     base = "LiveKit RTC SDK is not installed; run the setup script to install the 'livekit' SDK."
     return f"{base} ({RTC_IMPORT_ERROR})" if RTC_IMPORT_ERROR else base
 
+
 # Publisher registries. Double-publishing the same request into the same room
 # joins two participants with the *same* worker identity (deriving from
 # request_id), which LiveKit resolves by disconnecting one of them: both
@@ -196,9 +197,24 @@ class AvatarRunner:
         audio_track = rtc.LocalAudioTrack.create_audio_track("avatar_audio", self._audio_source)
 
         # 3. Publish to room
+        # LiveKit's native default caps a published video track at 20 fps, so a
+        # 25 fps avatar silently lost every fifth frame at the encoder (the
+        # "stream skips/cuts mid-send" symptom). Ask for the source rate and a
+        # bitrate that fits the frame size; ~0.15 bit/pixel/s keeps a moving
+        # face sharp, and the floor/cap keep tiny and huge frames sane.
+        width = self.options.video_width
+        height = self.options.video_height
+        fps = float(self.options.video_fps)
+        video_encoding = rtc.VideoEncoding(
+            max_framerate=fps,
+            max_bitrate=max(400_000, min(6_000_000, int(width * height * fps * 0.15))),
+        )
         self._video_pub = await self.room.local_participant.publish_track(
             video_track,
-            rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA),
+            rtc.TrackPublishOptions(
+                source=rtc.TrackSource.SOURCE_CAMERA,
+                video_encoding=video_encoding,
+            ),
         )
         self._audio_pub = await self.room.local_participant.publish_track(
             audio_track,

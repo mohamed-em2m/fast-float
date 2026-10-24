@@ -247,6 +247,12 @@ def test_avatar_runner_lifecycle():
 
         assert runner._running is True
         assert room.local_participant.publish_track.call_count == 2
+        # The published video track must ask for the source frame rate: the
+        # native default (20 fps) silently drops every fifth frame of a 25 fps
+        # avatar at the encoder.
+        video_options = room.local_participant.publish_track.call_args_list[0].args[1]
+        assert video_options.video_encoding.max_framerate == 25.0
+        assert video_options.video_encoding.max_bitrate >= 400_000
         room.local_participant.set_attributes.assert_called_with({"lk.publish_on_behalf": "agent-1"})
 
         audio_data = np.zeros(320, dtype=np.int16).tobytes()
@@ -614,3 +620,50 @@ def test_publish_status_endpoint_reports_publisher_error(api_client, monkeypatch
     ok = api_client.get("/livekit/publish/req-ok")
     assert ok.status_code == 200
     assert ok.json() == {"request_id": "req-ok", "publishing": False, "error": None}
+
+
+def test_livestream_generator_buffers_fast_render_without_dropping():
+    """A fast GPU render must not overflow the preview queue mid-stream.
+
+    Single-pass generation on an A6000 reaches ~136 fps for a 25 fps stream.
+    The LiveKit publisher plays at 25 fps, so a 128-frame queue dropped 200+
+    frames (8 s of the clip) and the preview jumped. The subscriber queue is
+    now sized from the frame dimensions to hold the in-flight render.
+    """
+
+    async def _test():
+        loop = asyncio.get_running_loop()
+        stream = LiveStream("req-fast", loop)
+        stream.start(StreamMeta(fps=25.0, width=512, height=512, channels=3, request_id="req-fast"))
+        gen = LiveStreamVideoGenerator(stream)
+        assert gen._queue.maxsize >= 376  # one 15 s clip fits
+
+        frame = np.zeros((512, 512, 3), dtype=np.uint8)
+        for idx in range(376):
+            stream.publish(("frame", idx, idx * 40.0, frame))
+
+        assert gen._queue.dropped_frames == 0
+        assert gen._queue.qsize() == 376
+        indices = []
+        while not gen._queue.empty():
+            indices.append(gen._queue.get_nowait()[1])
+        assert indices == list(range(376))
+
+    asyncio.run(_test())
+
+
+def test_live_queue_size_is_bounded_by_frame_dimensions():
+    from fast_float.livekit.generator import (
+        LIVE_QUEUE_MAX_FRAMES,
+        LIVE_QUEUE_MIN_FRAMES,
+        live_queue_size,
+    )
+
+    assert live_queue_size(None) == LIVE_QUEUE_MIN_FRAMES
+    assert live_queue_size(StreamMeta(width=0, height=0)) == LIVE_QUEUE_MIN_FRAMES
+
+    big = live_queue_size(StreamMeta(width=512, height=512, channels=3))
+    assert LIVE_QUEUE_MIN_FRAMES < big <= LIVE_QUEUE_MAX_FRAMES
+
+    # Small frames are bounded by the frame-count cap, not the byte budget.
+    assert live_queue_size(StreamMeta(width=8, height=8, channels=3)) == LIVE_QUEUE_MAX_FRAMES

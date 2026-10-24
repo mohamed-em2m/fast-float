@@ -53,6 +53,30 @@ BYTES_PER_FRAME = SAMPLES_PER_FRAME * 2  # 16-bit mono = 1280 bytes
 
 _QUEUE_SENTINEL = object()
 
+# A fast GPU renders far ahead of real time (100+ fps for a 25 fps stream).
+# The LiveKit publisher plays at ``video_fps``, so a small subscriber queue
+# overflows and skips seconds of the preview. Buffer the in-flight render
+# instead, bounded by bytes so a long request cannot exhaust memory.
+LIVE_BUFFER_BYTES = 1024 * 1024 * 1024  # 1 GiB
+LIVE_QUEUE_MIN_FRAMES = 128
+LIVE_QUEUE_MAX_FRAMES = 4096  # ~164 s at 25 fps, ~3.2 GiB at 512x512
+
+
+def live_queue_size(meta: StreamMeta | None) -> int:
+    """Frames to buffer for a live LiveKit subscriber.
+
+    Sized from the stream's frame dimensions so the queue holds the whole
+    render for a normal clip (e.g. ~1365 frames / 55 s at 512x512) while a
+    multi-minute render still has a hard memory ceiling.
+    """
+    if meta is None or meta.width <= 0 or meta.height <= 0:
+        return LIVE_QUEUE_MIN_FRAMES
+    frame_bytes = meta.width * meta.height * max(1, meta.channels)
+    return max(
+        LIVE_QUEUE_MIN_FRAMES,
+        min(LIVE_QUEUE_MAX_FRAMES, LIVE_BUFFER_BYTES // frame_bytes),
+    )
+
 
 # Scratch dir for the temp WAVs: RAM-backed when available, so no disk I/O per chunk.
 _TMP_DIR = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
@@ -515,7 +539,10 @@ class LiveStreamVideoGenerator:
 
     def __init__(self, stream: LiveStream) -> None:
         self.stream = stream
-        self._queue = stream.subscribe(maxsize=128)
+        # Fast renders produce many more frames than real-time playout can
+        # consume; buffer them (bounded by ``live_queue_size``) so the preview
+        # plays the whole clip instead of skipping the frames that did not fit.
+        self._queue = stream.subscribe(maxsize=live_queue_size(stream.meta))
         self._stopped = False
         self._stop_pending = False
         self._audio_data: np.ndarray | None = None
