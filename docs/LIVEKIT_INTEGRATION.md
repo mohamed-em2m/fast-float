@@ -368,7 +368,7 @@ The plan is fully implemented and tested across backend and frontend:
   - `fast_float/streaming/live.py`: `LiveStreamDispatcher.begin_chunk()` trims the overlapping head of later audio chunks before publishing, so chunked live streams stay continuous and frame-index audio pairing does not fall behind the full-request audio.
 
 - **Phase 2 (Browser UI)**:
-  - `frontend/src/services/livekit.js`: `livekit-client` room connection, token fetching, track subscription, track attachment to `<video>`.
+  - `frontend/src/services/livekit.js`: `livekit-client` room connection, token fetching, track subscription, and attaching **both** the video and audio tracks to the same `<video>` element so they share one `MediaStream` playback clock (a separate hidden `<audio>` is only a fallback when there is no video element).
   - `frontend/src/components/LivePreview.jsx`: Added `livekit` transport rendering live tracks with connection status badges.
   - `frontend/src/components/StudioStage.jsx`: Added `LiveKit` to the `TRANSPORTS` selector.
   - `frontend/package.json`: Added `livekit-client` dependency; verified via `npm run build`.

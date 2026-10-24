@@ -508,20 +508,29 @@ export function getIceServers() {
  * aiortc gives every sender its own stream id, so audio and video arrive in
  * separate MediaStream objects. Assigning `event.streams[0]` on each ontrack
  * would replace the previous one and drop whichever track came first.
+ *
+ * There is at most one track per kind: when a new request reuses the element,
+ * the previous session's track must be replaced, not left alongside the new
+ * one. A MediaStream with two video tracks renders whichever the browser
+ * picks first, which shows up as a frozen preview on the old track.
  */
 export function attachRemoteTrack(videoEl, event) {
   if (!videoEl) return null;
   let media = videoEl.srcObject;
-  // Reuse the element's stream only while it is still live: a stopped stream
-  // keeps its ended tracks and can make the element ignore the new ones.
-  if (!(media instanceof MediaStream) || !media.getTracks().some((t) => t.readyState === 'live')) {
+  if (!(media instanceof MediaStream)) {
     media = new MediaStream();
     videoEl.srcObject = media;
   }
   const streams = event.streams ?? [];
   const incoming = streams.length ? streams.flatMap((s) => s.getTracks()) : [event.track];
   for (const track of incoming) {
-    if (track && !media.getTracks().some((t) => t.id === track.id)) media.addTrack(track);
+    if (!track) continue;
+    for (const existing of media.getTracks()) {
+      if (existing.kind === track.kind && existing.id !== track.id) {
+        media.removeTrack(existing);
+      }
+    }
+    if (!media.getTracks().some((t) => t.id === track.id)) media.addTrack(track);
   }
   return media;
 }

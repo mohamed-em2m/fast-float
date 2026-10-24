@@ -17,6 +17,7 @@ from fast_float.schemas.generation import (
     WebRTCOfferResponse,
 )
 from fast_float.streaming.live import CLOSE, live_queue_size
+from fast_float.utils.audio import load_pcm16_mono, slice_audio_for_frame
 from fast_float.utils.logger import logger
 
 try:
@@ -97,14 +98,96 @@ def _new_peer_connection(http_request: Request | None) -> "RTCPeerConnection":
 
 if AIORTC_AVAILABLE:
 
+    class LiveAudioFeed:
+        """Audio slices paired one-to-one with the video frames actually sent.
+
+        A ``MediaPlayer`` starts at t=0 when the peer connects, so a viewer
+        joining a render already in progress heard the beginning of the request
+        while watching the middle of the video.  The video track hands each
+        delivered frame's index to this feed and the audio track slices the
+        request audio at exactly that index, so neither side can run ahead.
+        """
+
+        def __init__(self, audio_path: str | None, fps: float, sample_rate: int = 16000) -> None:
+            self.sample_rate = int(sample_rate)
+            self._fps = max(1.0, float(fps or 25.0))
+            self._audio = load_pcm16_mono(audio_path, self.sample_rate)
+            self._queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+            self._closed = False
+
+        @property
+        def available(self) -> bool:
+            return self._audio is not None
+
+        def publish(self, idx: int) -> None:
+            """Record the index of a video frame that was just handed to RTP."""
+            if self._closed or self._audio is None:
+                return
+            try:
+                self._queue.put_nowait(int(idx))
+            except asyncio.QueueFull:
+                # The audio sender fell behind: keep the newest mapping instead
+                # of letting audio drift further behind the video.
+                with suppress(asyncio.QueueEmpty):
+                    self._queue.get_nowait()
+                with suppress(asyncio.QueueFull):
+                    self._queue.put_nowait(int(idx))
+
+        def close(self) -> None:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._queue.put_nowait(None)
+            except asyncio.QueueFull:
+                # Make room for the sentinel: the stream is over, so dropping
+                # one queued frame is better than leaving the audio track
+                # blocked on a queue that will never be filled again.
+                with suppress(asyncio.QueueEmpty):
+                    self._queue.get_nowait()
+                with suppress(asyncio.QueueFull):
+                    self._queue.put_nowait(None)
+
+        async def next_frame(self) -> tuple[bytes, int] | None:
+            idx = await self._queue.get()
+            if idx is None:
+                return None
+            return slice_audio_for_frame(self._audio, idx, self._fps, self.sample_rate)
+
+    class LiveAudioTrack(MediaStreamTrack):
+        """Audio track fed by :class:`LiveAudioFeed` in lockstep with the video."""
+
+        kind = "audio"
+
+        def __init__(self, feed: LiveAudioFeed) -> None:
+            super().__init__()
+            self._feed = feed
+            self._pts = 0
+
+        async def recv(self) -> "av.AudioFrame":
+            item = await self._feed.next_frame()
+            if item is None:
+                raise MediaStreamError("stream finished")
+            data, samples = item
+            frame = av.AudioFrame(format="s16", layout="mono", samples=samples)
+            frame.planes[0].update(data)
+            frame.sample_rate = self._feed.sample_rate
+            frame.pts = self._pts
+            frame.time_base = Fraction(1, self._feed.sample_rate)
+            # A continuous sample clock: audio content follows the video's
+            # index, but RTP timestamps never jump when a frame was dropped.
+            self._pts += samples
+            return frame
+
     class LiveVideoTrack(MediaStreamTrack):
         """Video track fed by a LiveStream subscription queue."""
 
         kind = "video"
 
-        def __init__(self, queue: asyncio.Queue, meta: Any) -> None:
+        def __init__(self, queue: asyncio.Queue, meta: Any, audio_feed: LiveAudioFeed | None = None) -> None:
             super().__init__()
             self._queue = queue
+            self._audio_feed = audio_feed
             self._fps = max(1.0, float(meta.fps or 25.0))
             self._next_at: float | None = None
             self._stopped = False
@@ -127,6 +210,8 @@ if AIORTC_AVAILABLE:
 
         def stop(self) -> None:
             self._stopped = True
+            if self._audio_feed is not None:
+                self._audio_feed.close()
             super().stop()
 
         async def recv(self) -> "av.VideoFrame":
@@ -140,7 +225,7 @@ if AIORTC_AVAILABLE:
                     raise MediaStreamError("stream finished")
                 if item[0] != "frame":
                     continue
-                _, _idx, pts_ms, frame_array = item
+                _, idx, pts_ms, frame_array = item
                 now = time.monotonic()
                 if self._next_at is None:
                     self._next_at = now
@@ -148,7 +233,9 @@ if AIORTC_AVAILABLE:
                 if delay > 0:
                     await asyncio.sleep(delay)
                 self._next_at = max(self._next_at + 1.0 / self._fps, time.monotonic())
-                self.clock.on_frame(_idx, pts_ms, time.monotonic())
+                self.clock.on_frame(idx, pts_ms, time.monotonic())
+                if self._audio_feed is not None:
+                    self._audio_feed.publish(idx)
 
                 frame = av.VideoFrame.from_ndarray(
                     np.ascontiguousarray(frame_array),
@@ -186,10 +273,12 @@ def _cleanup_peer(pc) -> None:
             pass
     sub = _live_subs.pop(id(pc), None)
     if sub is not None:
-        stream, queue, track = sub
+        stream, queue, track, audio_feed = sub
         stream.unsubscribe(queue)
         with suppress(RuntimeError):
             track.stop()
+        if audio_feed is not None:
+            audio_feed.close()
         with suppress(asyncio.QueueFull):
             queue.put_nowait(CLOSE)
     end_task = _live_end_tasks.pop(id(pc), None)
@@ -226,10 +315,18 @@ async def _live_offer(request: WebRTCOfferRequest, http_request: Request) -> Web
         offer = RTCSessionDescription(sdp=request.sdp, type=request.type)
         pc = _new_peer_connection(http_request)
         app_state.pcs.add(pc)
+        # The request audio is sliced in lockstep with the video track below.
+        # A MediaPlayer would start at t=0 even when the viewer joined in the
+        # middle of a render, putting audio and video seconds apart.
+        audio_feed = None
+        if stream.audio_path and os.path.exists(stream.audio_path):
+            feed = LiveAudioFeed(stream.audio_path, meta.fps)
+            if feed.available:
+                audio_feed = feed
         # Register the subscription before addTrack so any failure below is
         # cleaned up by _cleanup_peer (which unsubscribes it).
-        track = LiveVideoTrack(queue, meta)
-        _live_subs[id(pc)] = (stream, queue, track)
+        track = LiveVideoTrack(queue, meta, audio_feed)
+        _live_subs[id(pc)] = (stream, queue, track, audio_feed)
 
         @pc.on("iceconnectionstatechange")
         async def on_iceconnectionstatechange():
@@ -259,14 +356,8 @@ async def _live_offer(request: WebRTCOfferRequest, http_request: Request) -> Web
 
             _live_end_tasks[id(pc)] = asyncio.create_task(_close_when_stream_ends())
 
-            if stream.audio_path and os.path.exists(stream.audio_path):
-                try:
-                    player = MediaPlayer(stream.audio_path)
-                    if player.audio:
-                        pc.addTrack(player.audio)
-                    _players[id(pc)] = player
-                except Exception as exc:
-                    logger.warning(f"Live audio attach failed: {exc}")
+            if audio_feed is not None:
+                pc.addTrack(LiveAudioTrack(audio_feed))
 
             await pc.setRemoteDescription(offer)
             answer = await pc.createAnswer()

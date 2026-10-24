@@ -39,6 +39,7 @@ except ImportError:  # pragma: no cover
 from fast_float.streaming.dispatcher import FrameDispatcher
 from fast_float.streaming.live import CLOSE, LiveStream, live_queue_size
 from fast_float.streaming.types import StreamMeta
+from fast_float.utils.audio import frame_sample_bounds, load_pcm16_mono, slice_audio_at_time, slice_audio_for_frame
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,7 @@ class _LiveKitDispatcherBridge(FrameDispatcher):
         valid_samples: int,
         gen: int,
         is_current: Callable[[int], bool],
+        sample_rate: int = SAMPLE_RATE,
     ) -> None:
         super().__init__()
         self._loop = loop
@@ -100,6 +102,7 @@ class _LiveKitDispatcherBridge(FrameDispatcher):
         self._valid_samples = valid_samples
         self._gen = gen
         self._is_current = is_current
+        self._sample_rate = int(sample_rate)
         self._first_idx = 0
         self._fps = TARGET_FPS
 
@@ -122,13 +125,14 @@ class _LiveKitDispatcherBridge(FrameDispatcher):
             frame_idx = first + i
             if frame_idx < 0:
                 continue
-            start_sample = frame_idx * SAMPLES_PER_FRAME
+            start_sample, end_sample = frame_sample_bounds(frame_idx, self._fps, self._sample_rate)
             if start_sample >= self._valid_samples:
                 return  # padded tail: drop
             s = start_sample * 2
-            audio = self._audio_pcm[s : s + BYTES_PER_FRAME]
-            if len(audio) < BYTES_PER_FRAME:
-                audio = audio + bytes(BYTES_PER_FRAME - len(audio))
+            e = end_sample * 2
+            audio = self._audio_pcm[s:e]
+            if len(audio) < e - s:
+                audio = audio + bytes(e - s - len(audio))
             item = (frame_idx, frames[i], pts_ms + i * frame_ms, audio)
             self._loop.call_soon_threadsafe(self._push, self._gen, item)
 
@@ -384,7 +388,13 @@ class FloatVideoGenerator:
                     from fast_float.core.service import run_inference_blocking
 
                     bridge = _LiveKitDispatcherBridge(
-                        self.loop, self._push, pcm, valid_samples, gen, lambda g: g == self._gen and not self._stopped
+                        self.loop,
+                        self._push,
+                        pcm,
+                        valid_samples,
+                        gen,
+                        lambda g: g == self._gen and not self._stopped,
+                        sample_rate=self.sample_rate,
                     )
                     req_data = {
                         "a_cfg_scale": 2.0,
@@ -415,14 +425,15 @@ class FloatVideoGenerator:
 
                     await self.loop.run_in_executor(self._executor, _infer_and_close)
                 else:  # test pattern, one frame per 40 ms of real audio
-                    n_frames = -(-valid_samples // SAMPLES_PER_FRAME)
+                    n_frames = int(np.ceil(valid_samples * self.fps / self.sample_rate))
                     for i in range(n_frames):
                         pattern = np.zeros((self.height, self.width, 3), dtype=np.uint8)
                         pattern[:, :, 0] = (i * 5) % 255
                         pattern[:, :, 1] = 120
                         pattern[:, :, 2] = 180
-                        s = i * BYTES_PER_FRAME
-                        audio = pcm[s : s + BYTES_PER_FRAME].ljust(BYTES_PER_FRAME, b"\0")
+                        start_sample, end_sample = frame_sample_bounds(i, self.fps, self.sample_rate)
+                        s = start_sample * 2
+                        audio = pcm[s : end_sample * 2].ljust((end_sample - start_sample) * 2, b"\0")
                         self._push(gen, (i, pattern, i * 1000.0 / self.fps, audio))
 
                 if gen != self._gen:  # barge-in/stop: the chunk was discarded
@@ -502,7 +513,7 @@ class FloatVideoGenerator:
                     w, h, rtc.VideoBufferType.RGB24, np.ascontiguousarray(frame_array).tobytes()
                 )
                 if audio_data:
-                    audio_frame = rtc.AudioFrame(audio_data, self.sample_rate, 1, SAMPLES_PER_FRAME)
+                    audio_frame = rtc.AudioFrame(audio_data, self.sample_rate, 1, len(audio_data) // 2)
                     yield (video_frame, audio_frame)
                 else:
                     yield video_frame
@@ -524,28 +535,14 @@ class LiveStreamVideoGenerator:
         self._audio_data: np.ndarray | None = None
         self._audio_loaded = False
         self._first_emitted = False
+        self._fps = float(stream.meta.fps) if stream.meta and stream.meta.fps else TARGET_FPS
         self.on_first_frame: Any | None = None
 
     def _ensure_audio_loaded(self) -> None:
         if self._audio_loaded:
             return
         self._audio_loaded = True
-        audio_path = getattr(self.stream, "audio_path", None)
-        if audio_path and os.path.exists(audio_path):
-            try:
-                import soundfile as sf
-
-                data, sr = sf.read(audio_path, dtype="int16")
-                if sr != SAMPLE_RATE:
-                    import librosa
-
-                    data_f32, _ = librosa.load(audio_path, sr=SAMPLE_RATE, mono=True)
-                    data = (np.clip(data_f32, -1.0, 1.0) * 32767).astype(np.int16)
-                if data.ndim > 1:
-                    data = data[:, 0]
-                self._audio_data = data
-            except Exception as exc:
-                logger.warning(f"[livekit-gen] failed to load audio from {audio_path}: {exc}")
+        self._audio_data = load_pcm16_mono(getattr(self.stream, "audio_path", None), SAMPLE_RATE)
 
     def stop(self) -> None:
         if self._stopped:
@@ -568,6 +565,11 @@ class LiveStreamVideoGenerator:
 
     async def __aiter__(self) -> AsyncIterator[Any]:
         self._ensure_audio_loaded()
+        # The subscription is created before meta is known in some callers;
+        # grow it now so a fast render is buffered instead of dropped.
+        if self.stream.meta is not None:
+            self._fps = float(self.stream.meta.fps or TARGET_FPS)
+            self._queue.resize(live_queue_size(self.stream.meta))
         while True:
             if self._stop_pending and self._queue.empty():
                 break
@@ -598,18 +600,8 @@ class LiveStreamVideoGenerator:
 
                 audio_frame = None
                 if self._audio_data is not None:
-                    start_s = idx * SAMPLES_PER_FRAME
-                    end_s = start_s + SAMPLES_PER_FRAME
-                    if start_s < len(self._audio_data):
-                        chunk = self._audio_data[start_s:end_s]
-                        if len(chunk) < SAMPLES_PER_FRAME:
-                            chunk = np.pad(chunk, (0, SAMPLES_PER_FRAME - len(chunk)))
-                        audio_frame = rtc.AudioFrame(
-                            chunk.tobytes(),
-                            SAMPLE_RATE,
-                            1,
-                            SAMPLES_PER_FRAME,
-                        )
+                    chunk, samples = slice_audio_for_frame(self._audio_data, idx, self._fps, SAMPLE_RATE)
+                    audio_frame = rtc.AudioFrame(chunk, SAMPLE_RATE, 1, samples)
 
                 yield (video_frame, audio_frame) if audio_frame else video_frame
             else:
@@ -653,51 +645,90 @@ class MediaFileVideoGenerator:
     def stop(self) -> None:
         self._stopped = True
 
+    def _load_audio(self) -> tuple[np.ndarray | None, float]:
+        """Decode the file's audio to mono 16 kHz PCM once.
+
+        The audio is paired with video by PTS below, so it must be available
+        before the first video frame.  FIFO pairing (one slice per decoded
+        frame) drifts whenever the container is not CFR or the audio stream
+        starts with encoder priming.
+        """
+        try:
+            import av
+
+            with av.open(self.file_path) as container:
+                if not container.streams.audio:
+                    return None, 0.0
+                stream = container.streams.audio[0]
+                resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+                chunks: list[bytes] = []
+                first_pts: float | None = None
+                for packet in container.demux(stream):
+                    for a_frame in packet.decode():
+                        if first_pts is None and a_frame.pts is not None and a_frame.time_base is not None:
+                            first_pts = float(a_frame.pts * a_frame.time_base)
+                        chunks.extend(bytes(resampled.planes[0]) for resampled in resampler.resample(a_frame))
+                chunks.extend(bytes(resampled.planes[0]) for resampled in resampler.resample(None))
+                # The first decoded sample sits at the first audio frame's PTS;
+                # the stream start time is only a fallback for containers that
+                # do not tag individual frames.
+                start_s = first_pts if first_pts is not None else 0.0
+                if stream.start_time is not None and stream.time_base is not None and first_pts is None:
+                    start_s = float(stream.start_time * stream.time_base)
+                if not chunks:
+                    return None, start_s
+                return np.frombuffer(b"".join(chunks), dtype=np.int16), start_s
+        except Exception as exc:
+            logger.warning(f"[livekit-gen] could not decode audio from {self.file_path}: {exc}")
+            return None, 0.0
+
     async def __aiter__(self) -> AsyncIterator[Any]:
         import av
+
+        # Probe before the first frame so direct users get the file's real fps
+        # (the publisher already probes to size its VideoSource).
+        self.probe()
+        audio_data, audio_start_s = self._load_audio()
+        frame_interval = 1.0 / max(self.fps, 1e-6)
 
         while not self._stopped:
             container = av.open(self.file_path)
             try:
                 video_stream = container.streams.video[0] if container.streams.video else None
-                audio_stream = container.streams.audio[0] if container.streams.audio else None
 
                 if not video_stream:
                     break
 
-                resampler = None
-                if audio_stream:
-                    resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
-
-                # One audio slice per video frame, sized by the file's own
-                # frame rate so audio and video stay the same length.
-                samples_per_frame = max(1, round(SAMPLE_RATE / max(self.fps, 1e-6)))
-                bytes_per_frame = samples_per_frame * 2
-                audio_samples_buf = bytearray()
-
-                for packet in container.demux():
+                frame_index = 0
+                for packet in container.demux(video_stream):
                     if self._stopped:
                         break
 
-                    if packet.stream == audio_stream and resampler:
-                        for a_frame in packet.decode():
-                            for resampled in resampler.resample(a_frame):
-                                audio_samples_buf.extend(bytes(resampled.planes[0]))
+                    if packet.stream != video_stream:
+                        continue
+                    for v_frame in packet.decode():
+                        arr = v_frame.to_ndarray(format="rgb24")
+                        h, w, _ = arr.shape
+                        video_frame = rtc.VideoFrame(w, h, rtc.VideoBufferType.RGB24, arr.tobytes())
 
-                    elif packet.stream == video_stream:
-                        for v_frame in packet.decode():
-                            arr = v_frame.to_ndarray(format="rgb24")
-                            h, w, _ = arr.shape
-                            video_frame = rtc.VideoFrame(w, h, rtc.VideoBufferType.RGB24, arr.tobytes())
+                        audio_frame = None
+                        if audio_data is not None:
+                            if v_frame.pts is not None and v_frame.time_base is not None:
+                                media_t = float(v_frame.pts * v_frame.time_base)
+                            else:
+                                media_t = frame_index * frame_interval
+                            frame_index += 1
+                            chunk, samples = slice_audio_at_time(
+                                audio_data,
+                                media_t,
+                                self.fps,
+                                SAMPLE_RATE,
+                                audio_start_s,
+                            )
+                            audio_frame = rtc.AudioFrame(chunk, SAMPLE_RATE, 1, samples)
 
-                            audio_frame = None
-                            if len(audio_samples_buf) >= bytes_per_frame:
-                                chunk = bytes(audio_samples_buf[:bytes_per_frame])
-                                del audio_samples_buf[:bytes_per_frame]
-                                audio_frame = rtc.AudioFrame(chunk, SAMPLE_RATE, 1, samples_per_frame)
-
-                            yield (video_frame, audio_frame) if audio_frame else video_frame
-                            await asyncio.sleep(0.001)  # Cooperate with event loop
+                        yield (video_frame, audio_frame) if audio_frame else video_frame
+                        await asyncio.sleep(0.001)  # Cooperate with event loop
             finally:
                 container.close()
 

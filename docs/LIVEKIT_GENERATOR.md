@@ -176,6 +176,32 @@ Example: 7 s of audio in three 3 s chunks with 0.5 s overlap used to publish
 audio. It now publishes 174 frames, matching the merged MP4, with no repeated
 chunk head and with audio pairing aligned through the final frame.
 
+### File and in-flight stream publishers
+
+The other two LiveKit generators use the shared helpers in
+`fast_float/utils/audio.py` and also pair audio by media time, never by decode
+order:
+
+- `LiveStreamVideoGenerator` (the `/generate?live=true` tap) slices the
+  full-request WAV with `frame_sample_bounds(idx, fps)`. Both slice boundaries
+  are rounded from the frame index, so a non-integer ratio does not accumulate
+  drift (30 fps alternates 533/534 samples instead of losing 1/3 sample per
+  frame). The dispatcher's `idx` stays continuous across chunks and
+  overlap-trimmed frames do not advance it, so the same index selects both the
+  picture and its sound.
+- `MediaFileVideoGenerator` decodes the file's audio once, then slices it at
+  each video frame's own PTS with `slice_audio_at_time()`. One-slice-per-decoded
+  frame (FIFO) pairing drifts on variable-frame-rate containers and whenever
+  the audio stream starts at a non-zero offset; a positive audio start is
+  honoured with silence before it, and the tail is padded with silence.
+
+The raw WebRTC transport (`fast_float/routers/webrtc.py`) uses the same helpers:
+`LiveVideoTrack` publishes the index of every frame it hands to the RTP sender,
+and `LiveAudioTrack` slices the request audio at exactly that index. It
+replaced a `MediaPlayer`, which always started at t=0 even when the viewer
+joined a render already in progress, so the soundtrack used to be seconds away
+from the picture.
+
 ---
 
 ## 5. Cancellation and backpressure
@@ -239,6 +265,13 @@ and played out in order; a multi-minute render still has a hard memory
 ceiling. Only if the render outruns that budget does the queue drop the
 oldest frame, which is counted and logged
 (`subscriber_dropped_frames` in `metrics()`).
+
+`AvatarRunner` paces its forward loop at `options.video_fps` **before** pushing
+a frame's video and audio into `AVSynchronizer`. The synchronizer queues video
+(100 ms by default) but captures audio immediately, so a bursty generator used
+to let the soundtrack lead the picture by up to two frames (~80 ms). Pacing the
+loop keeps the video queue near empty, so a frame's audio and video are captured
+together. The same pacing applies to the file and in-flight stream publishers.
 
 Note that the publisher's video track must also be configured at the source
 frame rate: LiveKit's native default caps a track at 20 fps, which used to drop

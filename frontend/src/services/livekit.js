@@ -148,10 +148,12 @@ export async function fetchLiveKitPublishStatus(requestId) {
 /**
  * Connect to a LiveKit room and stream avatar tracks to the video element.
  *
- * Video track is attached directly to `videoElement`.
- * Audio track is attached to a separate hidden <audio> element that is
- * appended to the document body so playback is never blocked by autoplay
- * policies that apply to <video>.
+ * Video *and* audio are attached to `videoElement`, so the browser renders
+ * them from one MediaStream on a single clock. Attaching audio to a separate
+ * hidden <audio> element gives it an independent jitter buffer and playback
+ * start, which shows up as a constant lip-sync offset (and can be much worse
+ * when that element's autoplay is delayed). A hidden element is only used as
+ * a fallback when no video element is available.
  *
  * @param {Object} options
  * @param {string} options.room - Room name to join
@@ -195,9 +197,8 @@ export async function connectLiveKitSession({
     resolveFirstTrack = resolve;
   });
 
-  // Hidden <audio> element for the avatar audio track.
-  // Kept separate from <video> to avoid double-playback (video element
-  // already decodes audio from the muxed track in some browsers).
+  // Fallback audio element, used only when no video element is available.
+  // With a <video> we attach both tracks to it so they share one clock.
   let audioEl = null;
   const getAudioEl = () => {
     if (!audioEl) {
@@ -234,9 +235,16 @@ export async function connectLiveKitSession({
       // instead of leaving a black <video> that "has" a track.
       videoElement.play?.().catch(() => {});
     } else if (track.kind === Track.Kind.Audio) {
-      const el = getAudioEl();
-      track.attach(el);
-      el.play?.().catch(() => {});
+      if (videoElement) {
+        // LiveKit merges the track into the element's existing MediaStream,
+        // so video and audio share one playback clock.
+        track.attach(videoElement);
+        videoElement.play?.().catch(() => {});
+      } else {
+        const el = getAudioEl();
+        track.attach(el);
+        el.play?.().catch(() => {});
+      }
     } else {
       return;
     }

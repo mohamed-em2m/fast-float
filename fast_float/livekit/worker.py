@@ -167,6 +167,27 @@ class AvatarRunner:
         self._running = False
         self._forward_task: asyncio.Task[Any] | None = None
         self._stopped = False
+        # Pace the forward loop ourselves. AVSynchronizer queues video but
+        # captures audio immediately; with a bursty generator (inference is
+        # much faster than real time) the video queue fills and the audio for
+        # frame N is captured up to two frames before its video. Pacing before
+        # pushing both keeps the queue near empty, so a frame's audio and video
+        # are captured together instead of leading it by ~80 ms.
+        fps = float(options.video_fps or 25.0)
+        self._frame_interval = 1.0 / (fps if fps > 0 else 25.0)
+        self._next_frame_at: float | None = None
+
+    async def _pace(self) -> None:
+        """Sleep until the next frame slot, staying live after a stall."""
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if self._next_frame_at is None:
+            self._next_frame_at = now
+        delay = self._next_frame_at - now
+        if delay > 0:
+            await asyncio.sleep(delay)
+        # max() drops a backlog after a stall instead of bursting old frames.
+        self._next_frame_at = max(self._next_frame_at + self._frame_interval, loop.time())
 
     async def start(self) -> None:
         """Initialize sources, publish tracks, and start media forwarding."""
@@ -255,6 +276,10 @@ class AvatarRunner:
                             )
                         except Exception as exc:
                             logger.debug(f"[avatar-runner] playback_started rpc skipped: {exc}")
+
+                # Pace *before* pushing so AVSynchronizer's video queue stays
+                # empty and this frame's audio is captured with its video.
+                await self._pace()
 
                 if isinstance(item, tuple):
                     v_frame, a_frame = item
