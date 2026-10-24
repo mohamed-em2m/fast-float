@@ -74,6 +74,14 @@ FLOAT-side (main repo, `fast_float/livekit/settings.py`):
 | `FLOAT_GEMINI_AGENT_NAME` | `float-gemini` | agent name registered by the worker |
 | `FLOAT_GEMINI_AUTODISPATCH` | on | auto-dispatch the agent on `agent: "gemini"` start |
 
+The Gemini API key and model defaults live in the repo's shared config, so
+one place serves both the API and the worker:
+
+| shared place | keys |
+| --- | --- |
+| `fast_float/config/secerts.toml` `[gemini].api_key` | the Gemini API key (git-ignored) |
+| `fast_float/config/settings.toml` `[gemini]` | `model`, `voice`, `language`, `vertexai`… |
+
 Worker-side (see [`agents/.env.example`](../agents/.env.example)):
 `LIVEKIT_URL` + `LIVEKIT_API_KEY` + `LIVEKIT_API_SECRET`, `GOOGLE_API_KEY`
 (or Vertex AI flags), and optional `GEMINI_MODEL` / `GEMINI_VOICE` /
@@ -87,7 +95,8 @@ Worker-side (see [`agents/.env.example`](../agents/.env.example)):
 # 3. the Gemini worker
 cd agents
 uv sync
-cp .env.example .env    # fill in keys
+cp .env.example .env    # optional — the worker also reads the repo's
+                        # secerts.toml ([gemini].api_key) + settings.toml
 uv run python -m float_agent.agent dev
 ```
 

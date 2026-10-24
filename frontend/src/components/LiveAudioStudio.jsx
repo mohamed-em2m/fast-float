@@ -488,6 +488,13 @@ export default function LiveAudioStudio({
               Auto-dispatch is off. Start the Gemini worker with an explicit dispatch for this room.
             </p>
           )}
+          {engine === 'gemini' && liveKit?.gemini_configured === false && (
+            <p className="inline-warning">
+              <TriangleAlert size={14} />
+              No Gemini API key on the server. Add it to <code>fast_float/config/secerts.toml</code> under{' '}
+              <code>[gemini] &rarr; api_key</code>, or export <code>GOOGLE_API_KEY</code>, then reload.
+            </p>
+          )}
 
           <div className={`live-level ${isLive && !muted ? 'is-active' : ''}`} aria-hidden="true">
             {Array.from({ length: LEVEL_BARS }).map((_, index) => {

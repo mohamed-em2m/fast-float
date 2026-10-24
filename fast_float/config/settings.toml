@@ -62,3 +62,33 @@ turn_username = ""
 turn_credential = ""
 turn_secret = ""
 turn_ttl_s = 3600
+
+[gemini]
+# Gemini Live voice agent (agents/ — a livekit-agents worker that runs the
+# conversation with Gemini speech-to-speech and streams its TTS to the FLOAT
+# avatar). These are the non-secret defaults; the API key does NOT go here.
+# Put the key in secerts.toml instead:
+#
+#   [gemini]
+#   api_key = "..."            # or export GOOGLE_API_KEY / GEMINI_API_KEY
+#
+# The worker (agents/float_agent) reads that same file when the environment
+# variable is absent, so one key works for both processes.
+#
+# Env overrides (highest precedence): GOOGLE_API_KEY / GEMINI_API_KEY,
+# GEMINI_MODEL, GEMINI_VOICE, GEMINI_LANGUAGE, GOOGLE_GENAI_USE_VERTEXAI,
+# GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION, FLOAT_AVATAR_IDENTITY,
+# FLOAT_GEMINI_AGENT_NAME, FLOAT_GEMINI_AUTODISPATCH.
+#
+# Leave model empty to use the plugin's current stable Gemini Live model.
+model = ""
+voice = "Puck"
+language = ""
+# Vertex AI instead of the Gemini Developer API:
+vertexai = false
+project = ""
+location = ""
+# Identities/settings the API uses when a Gemini session starts:
+avatar_identity = "float-avatar"
+agent_name = "float-gemini"
+autodispatch = true

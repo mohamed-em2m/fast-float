@@ -21,7 +21,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
@@ -40,6 +40,15 @@ logger = logging.getLogger(__name__)
 _ROOM_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 _FALSE_STRINGS = {"0", "false", "no", "off"}
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    """Coerce a TOML/env value to bool (``"false"``/``"0"`` are falsy)."""
+    if isinstance(value, str):
+        return value.strip().lower() not in _FALSE_STRINGS
+    if isinstance(value, bool):
+        return value
+    return bool(value) if value is not None else default
 
 
 def valid_room_name(name: str) -> bool:
@@ -80,6 +89,33 @@ def host_only(value: str | None) -> str:
 
 
 @dataclass(frozen=True)
+class GeminiSettings:
+    """Configuration for the external Gemini Live voice agent (``agents/``).
+
+    Read with the usual precedence: environment variables first, then
+    ``secerts.toml`` for the API key and ``settings.toml`` for non-secret
+    defaults. The key is consumed by the ``agents/`` worker; the API only
+    reports whether it is configured and never exposes the secret over HTTP.
+    """
+
+    #: Google Gemini API key: env ``GOOGLE_API_KEY``/``GEMINI_API_KEY``, else
+    #: ``[gemini].api_key`` in secerts.toml.
+    api_key: str = ""
+    #: ``GEMINI_MODEL`` / ``[gemini].model`` — empty means the plugin default.
+    model: str = ""
+    #: ``GEMINI_VOICE`` / ``[gemini].voice`` — a Gemini prebuilt voice.
+    voice: str = "Puck"
+    #: ``GEMINI_LANGUAGE`` / ``[gemini].language`` — optional BCP-47 hint.
+    language: str = ""
+    #: ``GOOGLE_GENAI_USE_VERTEXAI`` / ``[gemini].vertexai`` — Vertex AI mode.
+    vertexai: bool = False
+    #: ``GOOGLE_CLOUD_PROJECT`` / ``[gemini].project`` (Vertex AI).
+    project: str = ""
+    #: ``GOOGLE_CLOUD_LOCATION`` / ``[gemini].location`` (Vertex AI).
+    location: str = ""
+
+
+@dataclass(frozen=True)
 class LiveKitSettings:
     """Everything the server needs to talk to the LiveKit deployment."""
 
@@ -112,12 +148,19 @@ class LiveKitSettings:
     avatar_identity: str = DEFAULT_AVATAR_IDENTITY
     agent_name: str = DEFAULT_AGENT_NAME
     autodispatch: bool = True
+    #: Gemini Live settings (API key + model/voice defaults, see GeminiSettings).
+    gemini: GeminiSettings = field(default_factory=GeminiSettings)
     source: str = "none"
 
     @property
     def configured(self) -> bool:
         """True when a token can be minted (url + key + secret are all set)."""
         return bool(self.url and self.api_key and self.api_secret)
+
+    @property
+    def gemini_configured(self) -> bool:
+        """True when the Gemini Live API key is available (env or config)."""
+        return bool(self.gemini.api_key)
 
     @classmethod
     def from_env(cls) -> LiveKitSettings:
@@ -145,6 +188,45 @@ class LiveKitSettings:
             (os.getenv("LIVEKIT_API_SECRET", "").strip(), "env"),
             (_s(secrets.get("api_secret")), "secerts.toml"),
             (_s(config.get("api_secret")), "settings.toml"),
+        )
+
+        # Gemini Live voice agent. The worker (agents/) consumes the key; the
+        # API only stores it for the configured/status checks.
+        gemini_secrets = all_secrets.get("gemini", {})
+        gemini_cfg = all_config.get("gemini", {})
+        gemini_key, _ = first_value(
+            (
+                os.getenv("GOOGLE_API_KEY", "").strip() or os.getenv("GEMINI_API_KEY", "").strip(),
+                "env",
+            ),
+            (_s(gemini_secrets.get("api_key")), "secerts.toml"),
+            (_s(gemini_cfg.get("api_key")), "settings.toml"),
+        )
+        gemini_model, _ = first_value(
+            (os.getenv("GEMINI_MODEL", "").strip(), "env"),
+            (_s(gemini_cfg.get("model")), "settings.toml"),
+        )
+        gemini_voice, _ = first_value(
+            (os.getenv("GEMINI_VOICE", "").strip(), "env"),
+            (_s(gemini_cfg.get("voice")), "settings.toml"),
+        )
+        gemini_lang, _ = first_value(
+            (os.getenv("GEMINI_LANGUAGE", "").strip(), "env"),
+            (_s(gemini_cfg.get("language")), "settings.toml"),
+        )
+        gemini_vertex_raw = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "").strip()
+        gemini_vertex = (
+            gemini_vertex_raw.lower() not in _FALSE_STRINGS
+            if gemini_vertex_raw
+            else _as_bool(gemini_cfg.get("vertexai", False))
+        )
+        gemini_project, _ = first_value(
+            (os.getenv("GOOGLE_CLOUD_PROJECT", "").strip(), "env"),
+            (_s(gemini_cfg.get("project")), "settings.toml"),
+        )
+        gemini_location, _ = first_value(
+            (os.getenv("GOOGLE_CLOUD_LOCATION", "").strip(), "env"),
+            (_s(gemini_cfg.get("location")), "settings.toml"),
         )
 
         ttl_raw, _ttl_src = first_value(
@@ -257,17 +339,20 @@ class LiveKitSettings:
 
         avatar_identity, _ = first_value(
             (os.getenv("FLOAT_AVATAR_IDENTITY", "").strip(), "env"),
+            (_s(gemini_cfg.get("avatar_identity")), "settings.toml"),
             (_s(config.get("avatar_identity")), "settings.toml"),
         )
         agent_name, _ = first_value(
             (os.getenv("FLOAT_GEMINI_AGENT_NAME", "").strip(), "env"),
+            (_s(gemini_cfg.get("agent_name")), "settings.toml"),
             (_s(config.get("agent_name")), "settings.toml"),
         )
         autodispatch_raw = os.getenv("FLOAT_GEMINI_AUTODISPATCH", "").strip()
-        if autodispatch_raw:
-            autodispatch = autodispatch_raw.lower() not in _FALSE_STRINGS
-        else:
-            autodispatch = bool(config.get("autodispatch", True))
+        autodispatch = (
+            autodispatch_raw.lower() not in _FALSE_STRINGS
+            if autodispatch_raw
+            else _as_bool(gemini_cfg.get("autodispatch", config.get("autodispatch", True)))
+        )
 
         return cls(
             url=url,
@@ -287,6 +372,15 @@ class LiveKitSettings:
             avatar_identity=avatar_identity or DEFAULT_AVATAR_IDENTITY,
             agent_name=agent_name or DEFAULT_AGENT_NAME,
             autodispatch=autodispatch,
+            gemini=GeminiSettings(
+                api_key=gemini_key,
+                model=gemini_model,
+                voice=gemini_voice or "Puck",
+                language=gemini_lang,
+                vertexai=gemini_vertex,
+                project=gemini_project,
+                location=gemini_location,
+            ),
             source=source,
         )
 
@@ -362,6 +456,7 @@ __all__ = [
     "DEFAULT_STUN_PORT",
     "DEFAULT_TTL_S",
     "DEFAULT_TURN_TTL_S",
+    "GeminiSettings",
     "LiveKitSettings",
     "host_only",
     "stun_url",

@@ -182,6 +182,8 @@ async def livekit_status(request: Request) -> dict[str, Any]:
         "avatar_identity": settings.avatar_identity,
         "gemini_agent_name": settings.agent_name,
         "gemini_autodispatch": settings.autodispatch,
+        # Presence only — the key itself never leaves the server.
+        "gemini_configured": settings.gemini_configured,
         # The WebSocket live transport still exists, but it is a last resort:
         # the frontend falls back from LiveKit to raw WebRTC first.
         "ws_fallback": True,

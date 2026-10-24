@@ -64,10 +64,22 @@ The system prompt is in `float_agent/config.py`; override it with
 
 ## Configuration
 
+Values are read from the environment (or `agents/.env`) first; the Gemini
+model/voice and the LiveKit credentials fall back to the *shared* FLOAT
+config files, so the operator can keep everything in one place:
+
+| shared place | keys |
+| --- | --- |
+| `fast_float/config/secerts.toml` `[gemini]` | `api_key` (and `[livekit]` url/key/secret) |
+| `fast_float/config/settings.toml` `[gemini]` | `model`, `voice`, `language`, `vertexai`, `project`, `location` |
+
+Override the config directory with `FLOAT_CONFIG_DIR` (defaults to the
+sibling `fast_float/config` of this repo).
+
 | env | default | meaning |
 | --- | --- | --- |
-| `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | — | SFU credentials (required) |
-| `GOOGLE_API_KEY` or `GEMINI_API_KEY` | — | Gemini Developer API key (required unless Vertex AI) |
+| `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | shared `[livekit]` | SFU credentials (required) |
+| `GOOGLE_API_KEY` or `GEMINI_API_KEY` | shared `[gemini].api_key` | Gemini Developer API key (required unless Vertex AI) |
 | `GEMINI_MODEL` | plugin default | Live API model; useful for pinning a preview |
 | `GEMINI_VOICE` | `Puck` | Gemini prebuilt voice |
 | `GEMINI_LANGUAGE` | auto | BCP-47 language hint |

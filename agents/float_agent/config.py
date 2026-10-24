@@ -1,9 +1,21 @@
-"""Environment-driven configuration for the Gemini Live worker."""
+"""Environment-driven configuration for the Gemini Live worker.
+
+The worker prefers environment variables (including ``agents/.env``), but the
+Gemini API key and model defaults can also live in the FLOAT repo's shared
+config files, so one key serves both processes:
+
+* ``fast_float/config/secerts.toml`` → ``[gemini].api_key`` (secret)
+* ``fast_float/config/settings.toml`` → ``[gemini].model/voice/language``
+
+Override the config directory with ``FLOAT_CONFIG_DIR`` (defaults to the
+sibling ``fast_float/config`` of this repository).
+"""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 DEFAULT_INSTRUCTIONS = """\
 You are the voice interface of FLOAT, a real-time talking-avatar system.
@@ -29,9 +41,67 @@ def _flag(name: str, default: bool = False) -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
+def _repo_config_dir() -> Path:
+    """Directory holding settings.toml / secerts.toml for the main repo."""
+    override = os.getenv("FLOAT_CONFIG_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    # agents/float_agent/config.py -> agents -> repository root.
+    return Path(__file__).resolve().parents[2] / "fast_float" / "config"
+
+
+def _read_toml(path: Path) -> dict[str, object]:
+    """Parse one TOML file; returns {} when absent, unreadable or invalid."""
+    try:
+        import tomllib  # Python 3.11+
+    except ImportError:  # pragma: no cover - 3.10 fallback
+        try:
+            import tomli as tomllib  # type: ignore[no-redef]
+        except ImportError:
+            return {}
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _shared_sections(*names: str) -> dict[str, dict[str, object]]:
+    """Read the requested sections of settings.toml / secerts.toml.
+
+    Returns one mapping per section; secerts.toml (per-machine) wins over
+    settings.toml (defaults) per key.
+    """
+    out: dict[str, dict[str, object]] = {name: {} for name in names}
+    config_dir = _repo_config_dir()
+    for filename in ("secerts.toml", "settings.toml"):
+        data = _read_toml(config_dir / filename)
+        for name in names:
+            section = data.get(name, {})
+            if not isinstance(section, dict):
+                continue
+            for key, value in section.items():
+                if key not in out[name] and value not in (None, ""):
+                    out[name][key] = value
+    return out
+
+
+def _first_set(*candidates: object) -> str:
+    """First candidate that is a non-empty string, stripped."""
+    for value in candidates:
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
 @dataclass(frozen=True)
 class AgentConfig:
-    """Everything the worker reads from the environment at startup."""
+    """Everything the worker reads from the environment at startup.
+
+    Precedence: environment variable → shared ``secerts.toml`` /
+    ``settings.toml`` → built-in default.
+    """
 
     livekit_url: str = ""
     livekit_api_key: str = ""
@@ -51,8 +121,14 @@ class AgentConfig:
 
     @classmethod
     def from_env(cls) -> AgentConfig:
+        sections = _shared_sections("gemini", "livekit")
+        gemini_cfg = sections["gemini"]
+        livekit_cfg = sections["livekit"]
+
         api_key = os.getenv("GOOGLE_API_KEY", "").strip() or os.getenv("GEMINI_API_KEY", "").strip()
-        # google-genai reads GOOGLE_API_KEY; accept the GEMINI_* spelling too.
+        if not api_key:
+            api_key = str(gemini_cfg.get("api_key") or "").strip()
+        # google-genai reads GOOGLE_API_KEY; accept GEMINI_* / shared config.
         if api_key and not os.getenv("GOOGLE_API_KEY"):
             os.environ["GOOGLE_API_KEY"] = api_key
 
@@ -62,18 +138,26 @@ class AgentConfig:
             timeout = 8.0
 
         return cls(
-            livekit_url=os.getenv("LIVEKIT_URL", "").strip(),
-            livekit_api_key=os.getenv("LIVEKIT_API_KEY", "").strip(),
-            livekit_api_secret=os.getenv("LIVEKIT_API_SECRET", "").strip(),
+            livekit_url=_first_set(os.getenv("LIVEKIT_URL"), livekit_cfg.get("url")),
+            livekit_api_key=_first_set(os.getenv("LIVEKIT_API_KEY"), livekit_cfg.get("api_key")),
+            livekit_api_secret=_first_set(os.getenv("LIVEKIT_API_SECRET"), livekit_cfg.get("api_secret")),
             google_api_key=api_key,
-            vertexai=_flag("GOOGLE_GENAI_USE_VERTEXAI"),
-            google_cloud_project=os.getenv("GOOGLE_CLOUD_PROJECT", "").strip(),
-            google_cloud_location=os.getenv("GOOGLE_CLOUD_LOCATION", "").strip(),
-            model=os.getenv("GEMINI_MODEL", "").strip(),
-            voice=os.getenv("GEMINI_VOICE", "Puck").strip() or "Puck",
-            language=os.getenv("GEMINI_LANGUAGE", "").strip(),
-            avatar_identity=(os.getenv("FLOAT_AVATAR_IDENTITY", "float-avatar").strip() or "float-avatar"),
-            agent_name=(os.getenv("FLOAT_GEMINI_AGENT_NAME", "float-gemini").strip() or "float-gemini"),
+            vertexai=_flag("GOOGLE_GENAI_USE_VERTEXAI") or _as_bool(gemini_cfg.get("vertexai")),
+            google_cloud_project=_first_set(os.getenv("GOOGLE_CLOUD_PROJECT"), gemini_cfg.get("project")),
+            google_cloud_location=_first_set(os.getenv("GOOGLE_CLOUD_LOCATION"), gemini_cfg.get("location")),
+            model=_first_set(os.getenv("GEMINI_MODEL"), gemini_cfg.get("model")),
+            voice=_first_set(os.getenv("GEMINI_VOICE"), gemini_cfg.get("voice")) or "Puck",
+            language=_first_set(os.getenv("GEMINI_LANGUAGE"), gemini_cfg.get("language")),
+            avatar_identity=_first_set(
+                os.getenv("FLOAT_AVATAR_IDENTITY"),
+                gemini_cfg.get("avatar_identity"),
+                livekit_cfg.get("avatar_identity"),
+            )
+            or "float-avatar",
+            agent_name=_first_set(
+                os.getenv("FLOAT_GEMINI_AGENT_NAME"), gemini_cfg.get("agent_name"), livekit_cfg.get("agent_name")
+            )
+            or "float-gemini",
             float_api_url=(
                 os.getenv("FLOAT_API_URL", "http://127.0.0.1:8000").strip() or "http://127.0.0.1:8000"
             ).rstrip("/"),
@@ -93,8 +177,17 @@ class AgentConfig:
             if not value
         ]
         if not self.vertexai and not self.google_api_key:
-            missing.append("GOOGLE_API_KEY (or GEMINI_API_KEY)")
+            missing.append("GOOGLE_API_KEY (or [gemini].api_key in fast_float/config/secerts.toml)")
         return missing
+
+
+def _as_bool(value: object, default: bool = False) -> bool:
+    """Coerce a shared-config value to bool (strings included)."""
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    if isinstance(value, bool):
+        return value
+    return bool(value) if value is not None else default
 
 
 __all__ = ["DEFAULT_INSTRUCTIONS", "AgentConfig"]
