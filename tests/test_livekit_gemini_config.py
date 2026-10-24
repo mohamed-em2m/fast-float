@@ -279,3 +279,45 @@ def test_worker_parses_dispatch_metadata_overrides():
     assert full == {"gemini_api_key": "AI-padded", "gemini_model": "m-audio"}
     # Unknown keys and empty values are ignored.
     assert dispatch_config(json.dumps({"gemini_api_key": "", "other": "x"})) == {}
+
+
+def test_session_wires_dispatch_with_keyword_only_args(monkeypatch):
+    """Regression: _start_external_agent used to pass agent_name positionally,
+    which dispatch_agent() rejects (keyword-only after settings, room)."""
+    from types import SimpleNamespace
+
+    from fast_float.livekit.session import ConversationSession
+
+    captured = {}
+
+    async def fake_dispatch(settings, room, **kwargs):
+        captured["settings"] = settings
+        captured["room"] = room
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr("fast_float.livekit.session.dispatch_agent", fake_dispatch)
+    session = ConversationSession.__new__(ConversationSession)
+    session.settings = SimpleNamespace(autodispatch=True)
+    session.room_name = "float-wiring"
+    session.agent_name = "float-gemini"
+    session.gemini_api_key = "AI-wire"
+    session.gemini_model = "gemini-3.8-live"
+
+    assert asyncio.run(session._dispatch_external_agent()) is True
+    assert captured["room"] == "float-wiring"
+    assert captured == {
+        "settings": session.settings,
+        "room": "float-wiring",
+        "agent_name": "float-gemini",
+        "gemini_api_key": "AI-wire",
+        "gemini_model": "gemini-3.8-live",
+    }
+
+    # Auto-dispatch off -> no dispatch, returns None.
+    session.settings.autodispatch = False
+    assert asyncio.run(session._dispatch_external_agent()) is None
+    # Unset agent name -> no dispatch either.
+    session.settings.autodispatch = True
+    session.agent_name = ""
+    assert asyncio.run(session._dispatch_external_agent()) is None

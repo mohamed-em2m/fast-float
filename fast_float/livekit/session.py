@@ -270,14 +270,7 @@ class ConversationSession:
         self.worker_room = rtc.Room()
         await self.worker_room.connect(self.settings.url, token_result.token)
 
-        if self.settings.autodispatch and self.agent_name:
-            self.agent_dispatched = await dispatch_agent(
-                self.settings,
-                self.room_name,
-                self.agent_name,
-                gemini_api_key=self.gemini_api_key or None,
-                gemini_model=self.gemini_model or None,
-            )
+        self.agent_dispatched = await self._dispatch_external_agent()
 
         self.receiver = DataStreamAudioReceiver(self.worker_room)
         self.runner = AgentAvatarRunner(
@@ -293,6 +286,23 @@ class ConversationSession:
         self.identity = self.receiver.agent_identity or self.identity
         logger.info(
             f"[session] Gemini Live conversation ready in {self.room_name} ({self.identity} -> {self.avatar_identity})"
+        )
+
+    async def _dispatch_external_agent(self) -> bool | None:
+        """Ask the SFU to run the Gemini worker, forwarding Studio overrides.
+
+        Returns ``False`` when the dispatch failed, or ``None`` when
+        auto-dispatch is disabled or the agent name is unset (the operator
+        starts the worker manually then).
+        """
+        if not (self.settings.autodispatch and self.agent_name):
+            return None
+        return await dispatch_agent(
+            self.settings,
+            self.room_name,
+            agent_name=self.agent_name,
+            gemini_api_key=self.gemini_api_key or None,
+            gemini_model=self.gemini_model or None,
         )
 
     @property
