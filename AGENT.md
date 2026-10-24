@@ -817,8 +817,13 @@ Pick any two of {contiguous `idx`, bounded memory, never block the producer}:
 
 **Pipeline wiring** (already applied — follow the same shape for new writers):
 `inference_and_save(..., dispatcher=)` calls `dispatcher.bind(StreamMeta(...))`
-once per run, `dispatcher.submit(buf[:n].numpy())` in **all three** writer
-branches *before* `pool.put(buf)`, and `dispatcher.error(exc)` on writer failure.
+once per run, `dispatcher.submit(buf[:n].numpy())` in **every** writer branch
+(stream-only, torchcodec, PyAV, FFmpeg) *before* `pool.put(buf)`, and
+`dispatcher.error(exc)` on writer failure.
+`video_path=None` selects the stream-only branch: no file is muxed and no
+encoder/`ffmpeg` is spawned, because live callers (LiveKit) consume frames
+through the dispatcher only. A run with neither `video_path` nor a dispatcher
+raises `ValueError` up front instead of failing inside `subprocess.Popen`.
 `generate_video` owns the terminal `await asyncio.to_thread(dispatcher.shutdown)`
 in its outermost `finally` (so preprocessing failures shut down too).
 `run_inference` / `generate` forward the tap; the batched path warns and ignores
