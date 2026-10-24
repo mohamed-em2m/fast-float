@@ -20,9 +20,25 @@ Browser mic ──WebRTC──▶ LiveKit SFU ──▶ Gemini Live worker (this
 ```bash
 cd agents
 uv sync
-cp .env.example .env      # LiveKit keys + GOOGLE_API_KEY
-uv run python -m float_agent.agent dev
+# Values come from ../fast_float/config/secerts.toml + settings.toml; only
+# copy the env file on a box without the shared config.
+cp .env.example .env      # optional fallback
+uv run python -m float_agent.agent start
 ```
+
+Use `start`, not the deprecated `dev` command: livekit-agents removed
+in-process auto-reload, so `dev` now only prints deprecation notices.
+
+A healthy worker logs two lines at startup:
+
+```
+worker starting: agent_name=float-gemini url=wss://… config_dir=…/fast_float/config livekit_credentials=True gemini_key=True model=…
+registered worker  (livekit.agents)  agent_name=float-gemini url=wss://…
+```
+
+`worker starting` shows which SFU, agent name and config directory the
+process actually resolved; `registered worker` confirms the SFU accepted it.
+No `registered worker` line ⇒ the API's dispatch reports `NO job`.
 
 The worker registers as `float-gemini`. It stays idle until the FLOAT API
 dispatches it into a room (which happens automatically when the Studio starts

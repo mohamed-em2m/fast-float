@@ -112,13 +112,120 @@ cd agents
 uv sync
 cp .env.example .env    # optional — the shared secerts.toml/settings.toml
                         # is preferred; agents/.env is only the fallback
-uv run python -m float_agent.agent dev
+uv run python -m float_agent.agent start
 ```
+
+`start` replaces the deprecated `dev` command (livekit-agents removed
+in-process auto-reload, so `dev` only warns). A healthy worker logs
+
+```
+worker starting: agent_name=float-gemini url=wss://… config_dir=…/fast_float/config livekit_credentials=True gemini_key=True model=…
+registered worker: agent_name=float-gemini url=wss://…
+```
+
+The first line is this repo's summary of what the process resolved (SFU,
+agent name, config directory, credential/key presence); the second comes
+from livekit-agents and proves the SFU accepted the registration. If the
+process instead exits with `ws_url is required, or set LIVEKIT_URL
+environment variable`, the `[livekit]` block did not resolve — check
+`secerts.toml` and the worker's `FLOAT_CONFIG_DIR`. Both the worker and the
+API export the resolved LiveKit values to their own environment, because
+`livekit-agents` and google-genai read `os.environ` directly.
 
 Then open the Studio → **Live audio** → engine **Gemini Live** → **Go Live**.
 When the agent joins and streams its first audio, the API reports
 `agent_dispatched` / `agent_connected` on
 `GET /livekit/conversation/status?room=…`.
+
+## How the agent works inside FLOAT (end to end)
+
+A Gemini session involves four parties: the browser (mic + preview), the
+LiveKit SFU, the Gemini worker (`agents/`) and the FLOAT avatar worker (this
+repo). The sequence below is what happens between *Go Live* and the first
+frame on screen:
+
+```
+Studio → POST /livekit/conversation/start?agent=gemini
+   │
+   ├─① API connects FLOAT avatar ('float-avatar', kind=AGENT) into the room
+   ├─② API creates an SFU AgentDispatch for 'float-gemini' (+ Studio
+   │     overrides in dispatch metadata), stores its dispatch id
+   ├─③ SFU offers the job to the worker registered under 'float-gemini'
+   ├─④ Worker → AgentSession(Gemini Live) → RoomIO mic track
+   ├─⑤ Gemini TTS PCM streams on lk.audio_stream → DataStreamAudioReceiver
+   ├─⑥ AgentAvatarRenderer renders lip-synced frames → avatar_video/audio
+   └─⑦ Browser plays the avatar tracks; playback_finished RPCs close each
+        segment loop
+```
+
+### Who decides which key/model is used
+
+The value chain is layered so that *deployment* truth and *session* intent
+have separate owners. Both processes (API and worker) resolve the deployment
+layers identically:
+
+| layer | wins over | belong to |
+| --- | --- | --- |
+| Studio dispatch metadata | everything | this session only (`gemini_api_key`, `gemini_model`) |
+| `secerts.toml` / `settings.toml` `[livekit]` `[gemini]` | env | deployment: both processes must agree |
+| `GOOGLE_API_KEY`, `LIVEKIT_*` env / `agents/.env` | defaults | fallback for boxes without the shared config |
+
+Rules that keep the stack honest:
+
+- **Studio overrides are session-scoped.** They ride in dispatch metadata
+  and reach `RealtimeModel` as explicit arguments; the worker never writes
+  them into `os.environ` (a process-global map that would leak a Studio key
+  into later jobs). In Vertex AI mode a session key has no effect and this
+  is logged.
+- **The env copy never silently overrides the file.** An env value that
+  differs from `secerts.toml`/`settings.toml` is ignored on both sides with
+  a warning naming the variable — a drifted copy is exactly how a worker
+  ends up registered on a different LiveKit project than the API
+  dispatches into.
+- **Studio model names are validated at the boundary.** `RealtimeModel`
+  accepts any string and only fails on the Gemini websocket seconds later;
+  the worker normalizes case/quotes and warns about unknown-but-plausible
+  ids instead of starting a session that cannot connect.
+
+### Dispatch lifecycle (and why "NO job" appears)
+
+LiveKit explicit dispatch is one queued entry per room, consumed by the
+first worker registered under that agent name. Per session the API:
+
+1. creates the dispatch and remembers its id;
+2. waits up to `FLOAT_GEMINI_AGENT_WAIT_S` (default 45) for an agent-kind
+   participant to appear;
+3. on teardown (normal stop, **or** the start timing out) deletes the same
+   dispatch, so failed starts do not accumulate queue entries.
+
+Diagnosing *“the Gemini worker did not join … NO job”*: the message lists
+one line per existing dispatch. One dispatch line ⇒ the current attempt;
+several lines from an old deploy ⇒ dispatches leaked by stops before this
+cleanup (they can be removed via `livekit-cli dispatch delete` or by
+restarting the SFU). It always means **no worker is currently registered
+under the agent name on that SFU** — check in this order:
+
+1. Is the worker up? `worker starting: …` proves it resolved config and
+   `registered worker` proves the SFU accepted it. An exit with
+   `ws_url is required, or set LIVEKIT_URL environment variable` means the
+   resolved values never reached livekit-agents (fixed here by exporting
+   them, but a hand-rolled entrypoint can still hit it).
+2. Do API and worker read the **same** `fast_float/config` directory
+   (`FLOAT_CONFIG_DIR`)? With file-first resolution a second checkout
+   reading another directory is a silent different-deployment bug — compare
+   the `config_dir=` field on `worker starting` with the API's
+   `GET /livekit/status`.
+3. Any stale env copies? Both processes log them as
+   `"The shared file wins — remove or align the env copy"`.
+
+### API endpoints involved
+
+| route | role in a Gemini session |
+| --- | --- |
+| `POST /livekit/conversation/start` | token + room + avatar join + dispatch create |
+| `GET /livekit/conversation/status` | `agent_dispatched`, `agent_connected` for the UI |
+| `POST /livekit/conversation/stop` | disconnect, drain, delete the dispatch |
+| `GET /livekit/status` (`?verify=1`) | readiness checks the Studio shows before going live |
 
 ## Notes
 
