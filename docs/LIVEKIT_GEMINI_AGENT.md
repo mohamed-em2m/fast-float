@@ -182,10 +182,15 @@ Rules that keep the stack honest:
   a warning naming the variable — a drifted copy is exactly how a worker
   ends up registered on a different LiveKit project than the API
   dispatches into.
-- **Studio model names are validated at the boundary.** `RealtimeModel`
-  accepts any string and only fails on the Gemini websocket seconds later;
-  the worker normalizes case/quotes and warns about unknown-but-plausible
-  ids instead of starting a session that cannot connect.
+- **Model names are validated at the boundary — including the configured
+  one.** `RealtimeModel` accepts any string and only fails on the Gemini
+  websocket seconds later, so the worker normalizes case/quotes, strips a
+  provider prefix (`google/gemini-3.8-live` → `gemini-3.8-live`, which
+  otherwise becomes the nonexistent path `models/google/…` and dies with
+  `1008 policy violation`), and warns about unknown-but-plausible ids
+  instead of starting a session that cannot connect. `settings.toml`'s
+  `model` goes through the same function as the Studio override: use the
+  bare id, e.g. `gemini-3.8-live`.
 
 ### Dispatch lifecycle (and why "NO job" appears)
 
@@ -240,6 +245,9 @@ under the agent name on that SFU** — check in this order:
 - Keep the built-in engine as the default: `agent` defaults to `"builtin"`,
   so existing clients and tests are unchanged.
 - Barge-in in Gemini mode stops the avatar's queued frames immediately via
-  `lk.clear_buffer`; the agent keeps its own turn state.
+  `lk.clear_buffer`; the agent keeps its own turn state. Because avatar audio
+  is streamed to the renderer as it is produced, the output cannot pause or
+  rewind, so the worker disables `resume_false_interruption` (upstream would
+  otherwise warn that it is ignored on every session).
 - The worker uses one Gemini Live session per room job; `AgentServer` isolates
   jobs per process, so concurrent rooms scale across cores.

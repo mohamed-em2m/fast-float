@@ -61,7 +61,13 @@ def api_client(monkeypatch):
         yield client
 
 
-def _write_configs(tmp_path: Path, *, gemini_key: str = "", livekit_url: str = "ws://127.0.0.1:7880") -> Path:
+def _write_configs(
+    tmp_path: Path,
+    *,
+    gemini_key: str = "",
+    livekit_url: str = "ws://127.0.0.1:7880",
+    model: str = "gemini-3.8-live",
+) -> Path:
     (tmp_path / "secerts.toml").write_text(
         "[livekit]\n"
         f'url = "{livekit_url}"\n'
@@ -72,7 +78,7 @@ def _write_configs(tmp_path: Path, *, gemini_key: str = "", livekit_url: str = "
         encoding="utf-8",
     )
     (tmp_path / "settings.toml").write_text(
-        '[gemini]\nmodel = "gemini-3.8-live"\nvoice = "Zephyr"\nlanguage = "en-US"\n',
+        f'[gemini]\nmodel = "{model}"\nvoice = "Zephyr"\nlanguage = "en-US"\n',
         encoding="utf-8",
     )
     return tmp_path
@@ -468,8 +474,30 @@ def test_sanitize_gemini_model_passes_known_and_wellformed_ids(caplog):
     assert (
         sanitize_gemini_model("gemini-9.9-flash-live-future-preview").startswith("gemini-9.9-flash-live")
     )
-    # models/ prefix is accepted.
-    assert sanitize_gemini_model("models/gemini-3.8-live") == "models/gemini-3.8-live"
+    # models/ prefix is stripped: the plugin adds it itself.
+    assert sanitize_gemini_model("models/gemini-3.8-live") == "gemini-3.8-live"
+    # Provider-qualified names from a Studio/gateway paste are normalized.
+    # "google/gemini-3.8-live" reached the Live API as
+    # "models/google/gemini-3.8-live" and the session died with 1008
+    # (policy violation) as if the model did not exist.
+    assert sanitize_gemini_model("google/gemini-3.8-live") == "gemini-3.8-live"
+    assert sanitize_gemini_model(' "Google/gemini-3.8-live" ') == "gemini-3.8-live"
+
+
+def test_configured_model_is_normalized_too(monkeypatch, tmp_path):
+    """The shared settings.toml value must pass the same validation as Studio.
+
+    Regression: sanitize_gemini_model() only guarded the dispatch override;
+    _build_realtime_model() then fell back to the raw config.model, so a
+    provider-prefixed settings.toml value bypassed validation and broke every
+    session with a 1008 from the Gemini websocket.
+    """
+    _write_configs(tmp_path, model="google/gemini-3.8-live")
+    monkeypatch.setenv("FLOAT_CONFIG_DIR", str(tmp_path))
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+
+    config = AgentConfig.from_env()
+    assert config.model == "gemini-3.8-live"
 
 
 def test_sanitize_gemini_model_drops_free_text():

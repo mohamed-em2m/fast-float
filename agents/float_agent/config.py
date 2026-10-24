@@ -233,6 +233,23 @@ def sanitize_gemini_model(value: str | None) -> str:
     if not cleaned:
         return ""
     cleaned = cleaned.lower()
+    # Studios and gateways often hand over a provider-qualified name
+    # ("google/gemini-3.8-live", "models/gemini-..."). The google plugin
+    # prefixes "models/" itself, so such a value reaches the Live API as
+    # "models/google/gemini-3.8-live" and is rejected with
+    # "1008 ... not found ... for bidiGenerateContent" — a connect failure
+    # that looks like a bad key. Strip the prefix before validating.
+    bare = cleaned
+    for prefix in ("models/", "google/", "google-ai/", "gemini/"):
+        while bare.startswith(prefix):
+            bare = bare[len(prefix) :]
+    if bare != cleaned:
+        logger.info(
+            "[config] normalized gemini_model %r -> %r (provider prefix removed)",
+            value,
+            bare,
+        )
+        cleaned = bare
     if cleaned in known_live_models():
         return cleaned
     if _MODEL_ID_RE.match(cleaned):
@@ -308,7 +325,7 @@ class AgentConfig:
             ),
             google_cloud_project=_shared_first("GOOGLE_CLOUD_PROJECT", gemini_cfg.get("project")),
             google_cloud_location=_shared_first("GOOGLE_CLOUD_LOCATION", gemini_cfg.get("location")),
-            model=_shared_first("GEMINI_MODEL", gemini_cfg.get("model")),
+            model=sanitize_gemini_model(_shared_first("GEMINI_MODEL", gemini_cfg.get("model"))),
             voice=_shared_first("GEMINI_VOICE", gemini_cfg.get("voice")) or "Puck",
             language=_shared_first("GEMINI_LANGUAGE", gemini_cfg.get("language")),
             avatar_identity=_shared_first("FLOAT_AVATAR_IDENTITY", gemini_cfg.get("avatar_identity"))

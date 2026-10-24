@@ -43,6 +43,7 @@ from livekit.agents import (
     JobContext,
     RoomOutputOptions,
     RunContext,
+    TurnHandlingOptions,
     cli,
     function_tool,
     get_job_context,
@@ -207,7 +208,18 @@ async def entrypoint(ctx: JobContext) -> None:
     if session_model:
         logger.info("using a per-session Gemini model supplied by the FLOAT API (%s)", session_model)
 
-    session = AgentSession(llm=_build_realtime_model(session_api_key, session_model))
+    session = AgentSession(
+        llm=_build_realtime_model(session_api_key, session_model),
+        # Avatar audio is streamed to the renderer as it is produced, so it
+        # cannot be paused/rewound: the plugin's DataStreamAudioOutput.pause()
+        # only logs "pause is not supported". Upstream enables
+        # resume_false_interruption by default and warns on every session that
+        # the output cannot honour it, so disable it explicitly instead of
+        # letting a resumed "false interruption" silently do nothing.
+        turn_handling=TurnHandlingOptions(
+            interruption={"resume_false_interruption": False}
+        ),
+    )
 
     # The agent's voice is not published directly: it is streamed to FLOAT,
     # which renders the avatar and publishes synchronized A/V (and sends back
