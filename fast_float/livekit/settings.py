@@ -443,10 +443,19 @@ class LiveKitSettings:
         return tuple(servers)
 
     def room_for(self, name: str | None = None) -> str:
-        """The room to use: the requested one, or a prefixed generated name."""
+        """The room to use: the requested one, or a prefixed generated name.
+
+        Generated names always satisfy :func:`valid_room_name`; if the
+        configured ``room_prefix`` would break the charset (or the 64-char
+        cap), the default prefix is used instead so a bad operator setting can
+        never mint an unusable room.
+        """
         if name:
             return name
-        return f"{self.room_prefix}-{uuid4().hex[:12]}"
+        candidate = f"{self.room_prefix}-{uuid4().hex[:12]}"
+        if valid_room_name(candidate):
+            return candidate
+        return f"{DEFAULT_ROOM_PREFIX}-{uuid4().hex[:12]}"
 
 
 __all__ = [
