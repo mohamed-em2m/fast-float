@@ -207,6 +207,11 @@ class FloatVideoGenerator:
         self._bg_tasks: set[asyncio.Task[Any]] = set()
         self.on_first_frame: Any | None = None
         self.last_chunk_rtf: float | None = None  # inference_time / audio_time; must stay < 1
+        # Signals that every sample pushed so far has been generated and the
+        # consumer has drained the queue. The external-agent runner uses it to
+        # report `lk.playback_finished` after a TTS segment has fully rendered.
+        self._idle_event = asyncio.Event()
+        self._idle_event.set()
 
     # ------------------------------------------------------------------ input
 
@@ -244,6 +249,7 @@ class FloatVideoGenerator:
         self._audio_pcm.extend(self._to_pcm16_mono(audio))
         self._pump()
         self._arm_idle_flush()
+        self._refresh_idle()
 
     def _arm_idle_flush(self) -> None:
         if self._idle_handle:
@@ -252,6 +258,37 @@ class FloatVideoGenerator:
         if self.idle_flush_sec is None:
             return
         self._idle_handle = self.loop.call_later(self.idle_flush_sec, self.flush)
+
+    # --------------------------------------------------------------- idle state
+
+    @property
+    def idle(self) -> bool:
+        """True when no audio is buffered, no inference is running and the queue is empty."""
+        return (
+            not self._audio_pcm
+            and not self._flush_requested
+            and not self._inference_running
+            and self._frame_queue.empty()
+        )
+
+    def _refresh_idle(self) -> None:
+        if self.idle:
+            self._idle_event.set()
+        else:
+            self._idle_event.clear()
+
+    async def wait_until_idle(self, timeout: float | None = None) -> bool:
+        """Wait until every pushed sample has been generated and consumed.
+
+        Returns ``True`` when idle, ``False`` on timeout. Used by the
+        conversational runner to know when a TTS segment has finished
+        rendering, so it can notify the agent that playback is over.
+        """
+        try:
+            await asyncio.wait_for(self._idle_event.wait(), timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
 
     # ------------------------------------------------------------- scheduling
 
@@ -263,9 +300,11 @@ class FloatVideoGenerator:
         if n == 0:
             self._flush_requested = False
             self._segment_started = False
+            self._refresh_idle()
             return
         need = MIN_AUDIO_SAMPLES if self._segment_started else self._first_chunk_samples
         if n < need and not self._flush_requested:
+            self._refresh_idle()
             return
         # Backpressure: don't let production outrun playout. Queuing the whole
         # utterance at inference speed overflows the frame queue, which then
@@ -296,6 +335,7 @@ class FloatVideoGenerator:
     def _launch_chunk(self) -> None:
         self._inference_running = True
         self._segment_started = True
+        self._idle_event.clear()
 
         take = min(len(self._audio_pcm), MIN_AUDIO_SAMPLES * 2) & ~1  # whole int16 samples only
         if take <= 0:
@@ -325,6 +365,7 @@ class FloatVideoGenerator:
         if self._audio_pcm:
             self._flush_requested = True
             self._pump()  # if inference is running, _run_chunk_inference's finally picks it up
+        self._refresh_idle()
 
     def clear_buffer(self) -> None:
         """Barge-in / interrupt: drop buffered audio, queued frames and in-flight inference."""
@@ -343,6 +384,7 @@ class FloatVideoGenerator:
                 self._frame_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+        self._refresh_idle()
 
     # -------------------------------------------------------------- inference
 
@@ -358,6 +400,7 @@ class FloatVideoGenerator:
             if self._dropped_frames % 25 == 1:
                 logger.warning(f"[livekit-gen] consumer behind; dropped {self._dropped_frames} frames total")
         self._frame_queue.put_nowait(item)
+        self._refresh_idle()
 
     def _write_wav(self, pcm: bytes) -> str:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False, dir=_TMP_DIR) as f:
@@ -458,6 +501,7 @@ class FloatVideoGenerator:
                     os.remove(wav_path)
             self._inference_running = False
             self._pump()  # next full chunk, or a flush that arrived while we were busy
+            self._refresh_idle()
 
     # ----------------------------------------------------------------- output
 
@@ -488,6 +532,7 @@ class FloatVideoGenerator:
             if self._stop_pending and self._frame_queue.empty():
                 break
             item = await self._frame_queue.get()
+            self._refresh_idle()
             if item is _QUEUE_SENTINEL or item is CLOSE:
                 break
 

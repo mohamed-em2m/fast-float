@@ -31,6 +31,8 @@ DEFAULT_TTL_S = 3600
 DEFAULT_ROOM_PREFIX = "float"
 DEFAULT_STUN_PORT = 3478
 DEFAULT_TURN_TTL_S = 3600
+DEFAULT_AVATAR_IDENTITY = "float-avatar"
+DEFAULT_AGENT_NAME = "float-gemini"
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +105,13 @@ class LiveKitSettings:
     # are minted instead of exposing a static username/password.
     turn_secret: str = ""
     turn_ttl_s: int = DEFAULT_TURN_TTL_S
+    # External conversational agent (livekit-agents + Gemini Live).
+    #   avatar_identity: room identity the agent streams TTS audio to.
+    #   agent_name: LiveKit agent name to dispatch when a Gemini session starts.
+    #   autodispatch: ask the SFU to dispatch that agent automatically.
+    avatar_identity: str = DEFAULT_AVATAR_IDENTITY
+    agent_name: str = DEFAULT_AGENT_NAME
+    autodispatch: bool = True
     source: str = "none"
 
     @property
@@ -246,6 +255,20 @@ class LiveKitSettings:
                 str(api_key)[:4],
             )
 
+        avatar_identity, _ = first_value(
+            (os.getenv("FLOAT_AVATAR_IDENTITY", "").strip(), "env"),
+            (_s(config.get("avatar_identity")), "settings.toml"),
+        )
+        agent_name, _ = first_value(
+            (os.getenv("FLOAT_GEMINI_AGENT_NAME", "").strip(), "env"),
+            (_s(config.get("agent_name")), "settings.toml"),
+        )
+        autodispatch_raw = os.getenv("FLOAT_GEMINI_AUTODISPATCH", "").strip()
+        if autodispatch_raw:
+            autodispatch = autodispatch_raw.lower() not in _FALSE_STRINGS
+        else:
+            autodispatch = bool(config.get("autodispatch", True))
+
         return cls(
             url=url,
             api_key=api_key,
@@ -261,6 +284,9 @@ class LiveKitSettings:
             turn_credential=turn_credential,
             turn_secret=turn_secret,
             turn_ttl_s=max(60, min(turn_ttl, 24 * 3600)),
+            avatar_identity=avatar_identity or DEFAULT_AVATAR_IDENTITY,
+            agent_name=agent_name or DEFAULT_AGENT_NAME,
+            autodispatch=autodispatch,
             source=source,
         )
 
@@ -284,7 +310,9 @@ class LiveKitSettings:
     def turn_credentials(self, ttl_s: int | None = None) -> tuple[str, str]:
         """Mint coturn REST credentials from ``turn_secret``.
 
-        coturn's ``use-auth-secret`` mode expects::
+        coturn's ``use-auth-secret`` mode expects:
+
+        .. code-block:: text
 
             username   = "<unix-expiry>:<opaque>"
             credential = base64(HMAC-SHA1(secret, username))
@@ -328,6 +356,8 @@ class LiveKitSettings:
 
 
 __all__ = [
+    "DEFAULT_AGENT_NAME",
+    "DEFAULT_AVATAR_IDENTITY",
     "DEFAULT_ROOM_PREFIX",
     "DEFAULT_STUN_PORT",
     "DEFAULT_TTL_S",

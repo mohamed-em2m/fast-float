@@ -11,7 +11,7 @@ import base64
 import binascii
 import logging
 import os
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -66,7 +66,6 @@ def _connect_error_detail(settings: LiveKitSettings, exc: BaseException) -> str:
     )
 
 
-
 def _request_host(request: Request) -> str | None:
     """Public host the client used, preferring proxy headers over the socket."""
     return (
@@ -83,6 +82,10 @@ class LiveKitTokenRequest(BaseModel):
     identity: str | None = Field(default=None, description="Participant identity (generated when omitted)")
     name: str | None = Field(default=None, description="Display name")
     ttl_s: int | None = Field(default=None, ge=60, le=86400, description="Token lifetime")
+    publish_mic: bool = Field(
+        default=False,
+        description="Allow publishing (needed by Gemini Live, which listens to the room microphone)",
+    )
 
 
 class LiveKitPublishRequest(BaseModel):
@@ -92,7 +95,7 @@ class LiveKitPublishRequest(BaseModel):
 
 
 class ConversationStartRequest(BaseModel):
-    """Start an in-process conversational avatar session (agent + renderer + worker)."""
+    """Start a conversational avatar session (renderer + avatar worker)."""
 
     room: str | None = Field(default=None, description="Room to run the conversation in (generated when omitted)")
     image_path: str | None = Field(default=None, description="Reference face image (default placeholder when omitted)")
@@ -102,6 +105,14 @@ class ConversationStartRequest(BaseModel):
         description="Reference face image as base64 (browser upload); image_path wins when both are set",
     )
     image_format: str = Field(default="jpg", description="Image container hint: jpg, png, webp or bmp")
+    agent: Literal["builtin", "gemini"] = Field(
+        default="builtin",
+        description="'builtin' keeps the in-process agent; 'gemini' expects the livekit-agents worker",
+    )
+    agent_name: str | None = Field(
+        default=None,
+        description="LiveKit agent name to dispatch for the Gemini backend (defaults to FLOAT_GEMINI_AGENT_NAME)",
+    )
 
 
 class ConversationAudioRequest(BaseModel):
@@ -168,6 +179,9 @@ async def livekit_status(request: Request) -> dict[str, Any]:
         "ice_servers": ice_servers,
         "turn_urls": list(settings.turn_urls),
         "stun_port": app_state.stun_port,
+        "avatar_identity": settings.avatar_identity,
+        "gemini_agent_name": settings.agent_name,
+        "gemini_autodispatch": settings.autodispatch,
         # The WebSocket live transport still exists, but it is a last resort:
         # the frontend falls back from LiveKit to raw WebRTC first.
         "ws_fallback": True,
@@ -200,9 +214,10 @@ async def livekit_token(request: LiveKitTokenRequest) -> dict[str, Any]:
             name=request.name,
             room=room,
             ttl_s=request.ttl_s or settings.token_ttl_s,
-            # A browser only ever watches: publish-capable tokens are minted
-            # internally for the avatar worker, never handed to a client.
-            can_publish=False,
+            # Browsers only watch by default. Gemini Live needs the microphone
+            # published into the room, so that mode opts in explicitly and the
+            # grant is scoped to this room and token lifetime.
+            can_publish=request.publish_mic,
         )
     except LiveKitUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -288,7 +303,12 @@ def _conversation_guards() -> LiveKitSettings:
 
 @router.post("/livekit/conversation/start")
 async def conversation_start(request: ConversationStartRequest) -> dict[str, Any]:
-    """Spin up an in-process conversational session: agent + renderer + worker."""
+    """Start a conversational avatar session: renderer + avatar worker.
+
+    ``agent="builtin"`` keeps the original in-process agent (browser posts PCM).
+    ``agent="gemini"`` connects the avatar, dispatches the external
+    ``livekit-agents`` Gemini Live worker, and waits for its first audio stream.
+    """
     settings = _conversation_guards()
     room = settings.room_for(request.room)
     if not valid_room_name(room):
@@ -301,6 +321,8 @@ async def conversation_start(request: ConversationStartRequest) -> dict[str, Any
             image_path=request.image_path,
             image_base64=request.image_base64,
             image_format=request.image_format,
+            agent_backend=request.agent,
+            agent_name=request.agent_name,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -316,9 +338,28 @@ async def conversation_start(request: ConversationStartRequest) -> dict[str, Any
     return {
         "status": "ready",
         "room": session.room_name,
-        "identity": session.identity,
+        "agent": session.agent_backend,
+        "identity": session.resolved_agent_identity,
         "avatar_identity": session.avatar_identity,
+        "agent_dispatched": session.agent_dispatched,
         "tts": session.tts_fn is not None,
+    }
+
+
+@router.get("/livekit/conversation/status")
+async def conversation_status(room: str) -> dict[str, Any]:
+    """Report the live session for ``room`` (used by the Studio and agent tools)."""
+    session = get_session(room)
+    if session is None:
+        return {"room": room, "active": False}
+    return {
+        "room": room,
+        "active": True,
+        "agent": session.agent_backend,
+        "identity": session.resolved_agent_identity,
+        "avatar_identity": session.avatar_identity,
+        "agent_dispatched": session.agent_dispatched,
+        "agent_connected": session.receiver is not None and bool(session.receiver.agent_identity),
     }
 
 
@@ -336,6 +377,11 @@ async def conversation_audio(request: ConversationAudioRequest) -> dict[str, Any
         raise HTTPException(
             status_code=404,
             detail=f"No live session in room {request.room} — start one at /livekit/conversation/start",
+        )
+    if session.agent_backend == "gemini":
+        raise HTTPException(
+            status_code=409,
+            detail="Gemini Live takes the microphone through LiveKit; publish the browser mic track instead.",
         )
     if request.sample_rate != 16000:
         raise HTTPException(
@@ -385,6 +431,11 @@ async def conversation_speak(request: ConversationSpeakRequest) -> dict[str, Any
         raise HTTPException(
             status_code=404,
             detail=f"No conversation session in room {request.room} — start one at /livekit/conversation/start",
+        )
+    if session.agent_backend == "gemini":
+        raise HTTPException(
+            status_code=409,
+            detail="Gemini Live owns the voice; speak into the browser microphone instead.",
         )
     if session.tts_fn is None:
         raise HTTPException(status_code=400, detail="This session has no TTS engine attached")

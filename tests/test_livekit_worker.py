@@ -488,9 +488,13 @@ def test_conversation_endpoints_flow(api_client, monkeypatch):
         room_name="room-conv",
         identity="float-agent",
         avatar_identity="avatar-room-conv",
+        agent_backend="builtin",
+        agent_dispatched=None,
+        resolved_agent_identity="float-agent",
         tts_fn=lambda text: b"",
         is_stopped=False,
         speak=AsyncMock(),
+        receiver=None,
     )
 
     async def fake_start(room_name, **kwargs):
@@ -509,8 +513,10 @@ def test_conversation_endpoints_flow(api_client, monkeypatch):
     assert res.json() == {
         "status": "ready",
         "room": "room-conv",
+        "agent": "builtin",
         "identity": "float-agent",
         "avatar_identity": "avatar-room-conv",
+        "agent_dispatched": None,
         "tts": True,
     }
 

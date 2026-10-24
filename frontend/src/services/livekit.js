@@ -7,7 +7,7 @@
  * - attaches video + audio to the preview <video> element
  */
 
-import { Room, RoomEvent, Track } from 'livekit-client';
+import { Room, RoomEvent, Track, createAudioAnalyser } from 'livekit-client';
 import { getApiUrl } from './api';
 
 /**
@@ -101,12 +101,16 @@ export async function fetchLiveKitStatus() {
 
 /**
  * Mint a viewer token for a given room.
+ *
+ * `publishMicrophone` opts into a publish grant so the browser can send its
+ * microphone into the room. The Gemini Live backend listens to that track
+ * instead of receiving PCM over HTTP.
  */
-export async function fetchLiveKitToken(room, name = 'FLOAT Viewer') {
+export async function fetchLiveKitToken(room, name = 'FLOAT Viewer', { publishMicrophone = false } = {}) {
   const res = await fetch(`${getApiUrl()}/livekit/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ room, name, can_publish: false }),
+    body: JSON.stringify({ room, name, publish_mic: publishMicrophone }),
   });
 
   if (!res.ok) {
@@ -150,16 +154,29 @@ export async function fetchLiveKitPublishStatus(requestId) {
 }
 
 /**
- * Start the in-process live-audio session (agent + renderer + avatar worker).
+ * Start a live-audio session (agent + renderer + avatar worker).
  *
- * The browser only receives a room name; media is published by the server and
- * watched through the normal LiveKit viewer token.
+ * `agent` picks the conversation engine: `builtin` renders browser PCM in the
+ * API process, `gemini` dispatches the external Gemini Live worker, which
+ * listens to the room microphone and streams A/V back through the avatar.
  */
-export async function startConversation({ room = null, imageBase64 = null, imageFormat = 'jpg' } = {}) {
+export async function startConversation({
+  room = null,
+  imageBase64 = null,
+  imageFormat = 'jpg',
+  agent = 'builtin',
+  agentName = null,
+} = {}) {
   const res = await fetch(`${getApiUrl()}/livekit/conversation/start`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ room, image_base64: imageBase64, image_format: imageFormat }),
+    body: JSON.stringify({
+      room,
+      image_base64: imageBase64,
+      image_format: imageFormat,
+      agent,
+      agent_name: agentName,
+    }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -220,6 +237,7 @@ export async function stopConversation(room) {
  * @param {function} [options.onStatus] - Callback for status updates ('connecting', 'reconnecting', 'live', 'done', 'error')
  * @param {number} [options.connectTimeoutMs] - Bound on the SFU handshake
  * @param {number} [options.trackTimeoutMs] - Bound on waiting for the first track
+ * @param {boolean} [options.publishMicrophone] - Publish the browser microphone (Gemini Live mode)
  * @returns {Promise<{ room: Room, disconnect: function }>}
  */
 export async function connectLiveKitSession({
@@ -228,11 +246,12 @@ export async function connectLiveKitSession({
   onStatus,
   connectTimeoutMs = CONNECT_TIMEOUT_MS,
   trackTimeoutMs = FIRST_TRACK_TIMEOUT_MS,
+  publishMicrophone = false,
 }) {
   onStatus?.('connecting');
 
   // 1. Get token
-  const tokenData = await fetchLiveKitToken(roomName);
+  const tokenData = await fetchLiveKitToken(roomName, 'FLOAT Viewer', { publishMicrophone });
   const overrideUrl = getLiveKitUrlOverride();
   const livekitUrl = alignLiveKitUrl(overrideUrl || tokenData.url);
   const token = tokenData.token;
@@ -371,6 +390,13 @@ export async function connectLiveKitSession({
       }
     }
 
+    // Gemini Live subscribes to the browser microphone, so the publisher has
+    // to exist before the agent starts listening. Enabling it here keeps the
+    // permission prompt attached to the click that started the session.
+    if (publishMicrophone) {
+      await room.localParticipant.setMicrophoneEnabled(true);
+    }
+
     // Connected to the SFU but nobody published: the backend publisher either
     // failed or has not started. Wait a bounded time, then surface an error so
     // the caller can fall back instead of showing an empty player forever.
@@ -428,4 +454,28 @@ export async function connectLiveKitSession({
   };
 
   return { room, disconnect };
+}
+
+/** Mute or unmute the published microphone of a Gemini Live session. */
+export async function setRoomMicrophoneMuted(room, muted) {
+  if (!room?.localParticipant) return false;
+  await room.localParticipant.setMicrophoneEnabled(!muted);
+  return true;
+}
+
+/**
+ * Sample the room microphone level for the studio meter.
+ *
+ * Only valid after `connectLiveKitSession({ publishMicrophone: true })`;
+ * returns a no-op cleanup when no microphone track is published.
+ */
+export function createMicrophoneMeter(room, onLevel, { intervalMs = 120 } = {}) {
+  const track = room?.localParticipant?.getTrackPublication?.(Track.Source.Microphone)?.track;
+  if (!track) return () => {};
+  const { calculateVolume, cleanup } = createAudioAnalyser(track, { smoothingTimeConstant: 0.3 });
+  const timer = setInterval(() => onLevel?.(calculateVolume()), intervalMs);
+  return () => {
+    clearInterval(timer);
+    Promise.resolve(cleanup()).catch(() => {});
+  };
 }

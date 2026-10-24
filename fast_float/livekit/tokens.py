@@ -52,12 +52,18 @@ def issue_token(
     room: str,
     ttl_s: int = 3600,
     can_publish: bool = False,
+    agent: bool = False,
 ) -> IssuedToken:
     """Mint a room-scoped access token.
 
     ``can_publish`` stays off by default: a browser that only *watches* must
     not be able to publish into the room. The avatar worker (a server-side
     participant) gets its own token with publishing enabled.
+
+    ``agent`` marks the participant as kind ``AGENT``. The FLOAT avatar worker
+    uses that in external-agent mode so ``livekit-agents``' RoomIO does not
+    mistake the avatar for the human participant and subscribe to its own
+    synthesized voice.
     """
     try:
         from livekit.api import AccessToken, VideoGrants
@@ -74,6 +80,7 @@ def issue_token(
         can_publish=can_publish,
         can_subscribe=True,
         can_publish_data=can_publish,
+        agent=agent or None,
     )
     token = (
         AccessToken(api_key, api_secret)

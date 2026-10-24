@@ -17,8 +17,10 @@ import { MicStreamer } from '../services/audio';
 import { getApiUrl } from '../services/api';
 import {
   connectLiveKitSession,
+  createMicrophoneMeter,
   fetchLiveKitStatus,
   interruptConversation,
+  setRoomMicrophoneMuted,
   startConversation,
   stopConversation,
 } from '../services/livekit';
@@ -32,6 +34,34 @@ const PHASE_LABEL = {
 };
 
 const LEVEL_BARS = 28;
+
+const ENGINE_STORAGE_KEY = 'float_live_engine';
+
+/**
+ * Conversation engines exposed by the API.
+ *
+ * `builtin` streams browser PCM into the in-process agent/renderer.
+ * `gemini` publishes the microphone to LiveKit and lets the external
+ * livekit-agents Gemini Live worker drive the avatar instead.
+ */
+const ENGINES = {
+  builtin: {
+    label: 'Built-in',
+    hint: 'In-process voice, HTTP PCM',
+  },
+  gemini: {
+    label: 'Gemini Live',
+    hint: 'Speech-to-speech over LiveKit',
+  },
+};
+
+function storedEngine() {
+  try {
+    return localStorage.getItem(ENGINE_STORAGE_KEY) === 'gemini' ? 'gemini' : 'builtin';
+  } catch {
+    return 'builtin';
+  }
+}
 
 function newRoomName() {
   const slug = Math.random().toString(36).slice(2, 8);
@@ -62,6 +92,10 @@ export default function LiveAudioStudio({
   const [level, setLevel] = useState(0);
   const [room, setRoom] = useState(null);
   const [elapsed, setElapsed] = useState(0);
+  const [engine, setEngine] = useState(storedEngine);
+  // Which engine the running session actually uses; the selector may change
+  // while idle, but muting must follow the live session.
+  const [activeEngine, setActiveEngine] = useState('builtin');
   // Autoplay with sound can be rejected even after a click; offer a retry.
   const [needsGesture, setNeedsGesture] = useState(false);
 
@@ -69,6 +103,7 @@ export default function LiveAudioStudio({
   const roomRef = useRef(null);
   const viewerRef = useRef(null);
   const micRef = useRef(null);
+  const micMeterRef = useRef(null);
   const mountedRef = useRef(true);
   // Every start/stop bumps this; a late await from an older start must not
   // resurrect a session the user already ended.
@@ -83,6 +118,12 @@ export default function LiveAudioStudio({
       sessionRef.current += 1;
       const activeRoom = roomRef.current;
       roomRef.current = null;
+      try {
+        micMeterRef.current?.();
+      } catch {
+        /* ignore */
+      }
+      micMeterRef.current = null;
       try {
         micRef.current?.stop({ flush: false });
       } catch {
@@ -125,6 +166,14 @@ export default function LiveAudioStudio({
   }, [phase]);
 
   const teardownLocal = async ({ flush = true } = {}) => {
+    if (micMeterRef.current) {
+      try {
+        micMeterRef.current();
+      } catch {
+        /* analyser already closed */
+      }
+      micMeterRef.current = null;
+    }
     if (micRef.current) {
       const mic = micRef.current;
       micRef.current = null;
@@ -209,6 +258,7 @@ export default function LiveAudioStudio({
     setMuted(false);
     setError(null);
     setElapsed(0);
+    setActiveEngine('builtin');
     stoppingRef.current = false;
     if (!silent) onToast?.('Live session ended.', 'info');
   };
@@ -234,8 +284,11 @@ export default function LiveAudioStudio({
         room: targetRoom,
         imageBase64,
         imageFormat: imageFormat || 'jpg',
+        agent: engine,
       });
       startedRoom = started.room;
+      const mode = started.agent === 'gemini' ? 'gemini' : 'builtin';
+      if (isActive()) setActiveEngine(mode);
 
       // The user may have pressed End while the server was warming up.
       if (!isActive()) {
@@ -250,6 +303,9 @@ export default function LiveAudioStudio({
         videoElement: videoRef.current,
         connectTimeoutMs: 20000,
         trackTimeoutMs: 30000,
+        // Gemini Live listens to the room microphone; the built-in agent gets
+        // PCM over HTTP instead, so it never needs a publish grant.
+        publishMicrophone: mode === 'gemini',
         onStatus: (status) => {
           if (!isActive()) return;
           if (status === 'error') {
@@ -289,24 +345,32 @@ export default function LiveAudioStudio({
         return;
       }
 
-      const mic = new MicStreamer({
-        room: started.room,
-        onError: (message) => onToast?.(message, 'error'),
-        onLevel: setLevel,
-      });
-      await mic.start();
-      micRef.current = mic;
+      if (mode === 'gemini') {
+        // The microphone is already published by connectLiveKitSession; the
+        // meter only drives the UI, the agent consumes the track itself.
+        micMeterRef.current = createMicrophoneMeter(viewer.room, setLevel);
+      } else {
+        const mic = new MicStreamer({
+          room: started.room,
+          onError: (message) => onToast?.(message, 'error'),
+          onLevel: setLevel,
+        });
+        await mic.start();
+        micRef.current = mic;
+      }
 
       if (!isActive() || roomRef.current !== started.room) {
-        micRef.current = null;
-        await mic.stop({ flush: false });
+        await teardownLocal({ flush: false });
         viewer.disconnect?.();
         await stopConversation(started.room).catch(() => {});
         return;
       }
       setPhase('live');
       setElapsed(0);
-      onToast?.('Live avatar is on air — start speaking.', 'success');
+      onToast?.(
+        mode === 'gemini' ? 'Gemini Live is on air — start speaking.' : 'Live avatar is on air — start speaking.',
+        'success'
+      );
       // The audio track may unmute the element after the click that started
       // the session, so autoplay can still be rejected. Surface a retry.
       videoRef.current?.play?.().catch(() => setNeedsGesture(true));
@@ -329,10 +393,29 @@ export default function LiveAudioStudio({
     }
   };
 
+  const chooseEngine = (next) => {
+    if (next === engine || startingRef.current || stoppingRef.current || roomRef.current) return;
+    setEngine(next);
+    try {
+      localStorage.setItem(ENGINE_STORAGE_KEY, next);
+    } catch {
+      /* private mode: keep the in-memory choice */
+    }
+  };
+
   const toggleMute = () => {
     const next = !muted;
     setMuted(next);
-    micRef.current?.setMuted(next);
+    if (activeEngine === 'gemini') {
+      const liveRoom = viewerRef.current?.room;
+      if (liveRoom) {
+        setRoomMicrophoneMuted(liveRoom, next).catch(() => {
+          onToast?.('Could not change the microphone state.', 'error');
+        });
+      }
+    } else {
+      micRef.current?.setMuted(next);
+    }
     onToast?.(next ? 'Microphone muted.' : 'Microphone live.', 'info');
   };
 
@@ -383,6 +466,29 @@ export default function LiveAudioStudio({
             </span>
           </div>
 
+          <div className="live-engine-row" role="group" aria-label="Conversation engine">
+            {Object.entries(ENGINES).map(([key, meta]) => (
+              <button
+                key={key}
+                type="button"
+                className={`live-engine-option ${engine === key ? 'is-active' : ''}`}
+                onClick={() => chooseEngine(key)}
+                disabled={isLive || busy}
+                aria-pressed={engine === key}
+                title={meta.hint}
+              >
+                <span className="live-engine-label">{meta.label}</span>
+                <span className="live-engine-hint">{meta.hint}</span>
+              </button>
+            ))}
+          </div>
+          {engine === 'gemini' && liveKit?.gemini_autodispatch === false && (
+            <p className="inline-warning">
+              <TriangleAlert size={14} />
+              Auto-dispatch is off. Start the Gemini worker with an explicit dispatch for this room.
+            </p>
+          )}
+
           <div className={`live-level ${isLive && !muted ? 'is-active' : ''}`} aria-hidden="true">
             {Array.from({ length: LEVEL_BARS }).map((_, index) => {
               // A stable pseudo-random silhouette keeps the idle state alive
@@ -400,8 +506,12 @@ export default function LiveAudioStudio({
 
           <p className="live-help">
             {isLive
-              ? 'Speak naturally. The avatar renders a 2-second window and keeps up in real time.'
-              : 'Your mic is only used for the avatar. Nothing is recorded or stored.'}
+              ? activeEngine === 'gemini'
+                ? 'Speak naturally. Gemini answers speech-to-speech and the avatar lip-syncs the reply.'
+                : 'Speak naturally. The avatar renders a 2-second window and keeps up in real time.'
+              : engine === 'gemini'
+                ? 'Gemini Live listens to your microphone through LiveKit and answers in its own voice.'
+                : 'Your mic is only used for the avatar. Nothing is recorded or stored.'}
           </p>
 
           <div className="live-start-row">
@@ -566,7 +676,9 @@ export default function LiveAudioStudio({
             End &amp; clear
           </button>
           <span className="live-controls-hint">
-            Audio goes straight to the GPU renderer — no clips are stored.
+            {isLive && activeEngine === 'gemini'
+              ? 'Gemini Live owns the voice — the avatar only renders it.'
+              : 'Audio goes straight to the GPU renderer — no clips are stored.'}
           </span>
         </div>
       </section>

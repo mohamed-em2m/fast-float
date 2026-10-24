@@ -1,11 +1,12 @@
 """Conversation session: wires the agent, the FLOAT renderer and the avatar worker.
 
-Brings the Phase-3 pieces together in one process so a conversation actually
-runs end to end:
+Two backends are supported:
 
-    ConversationalAgent (float-agent)  -- talk/speak + playback RPCs
-    FloatVideoGenerator                -- audio in -> lip-synced VideoFrames
-    AvatarRunner (avatar-<room>)       -- publishes the synced A/V tracks
+* ``builtin`` — :class:`ConversationalAgent` (mic PCM posted by the browser) +
+  :class:`FloatVideoGenerator` + :class:`AvatarRunner`, all in this process.
+* ``gemini`` — a separate ``livekit-agents`` worker (Gemini Live
+  speech-to-speech) streams TTS audio over LiveKit DataStream;
+  :class:`AgentAvatarRunner` renders it and publishes synchronized A/V.
 
 The browser joins the same room with a viewer token (POST /livekit/token) and
 attaches the tracks published by the avatar worker. One session per room, kept
@@ -33,7 +34,9 @@ except ImportError:  # pragma: no cover
 
 from fast_float.core.state import app_state
 from fast_float.livekit.agent import DEFAULT_AGENT_IDENTITY, ConversationalAgent
+from fast_float.livekit.agent_runner import AgentAvatarRunner
 from fast_float.livekit.generator import FloatVideoGenerator
+from fast_float.livekit.receiver import DataStreamAudioReceiver
 from fast_float.livekit.settings import LiveKitSettings
 from fast_float.livekit.tokens import issue_token
 from fast_float.livekit.worker import AvatarOptions, AvatarRunner
@@ -74,6 +77,32 @@ def _materialize_image(image_base64: str, image_format: str) -> str:
     return path
 
 
+async def dispatch_agent(settings: LiveKitSettings, room: str, *, agent_name: str | None = None) -> bool:
+    """Ask the SFU to dispatch the Gemini worker into ``room``.
+
+    Returns ``False`` (and logs) when the LiveKit API is unavailable or the
+    request is rejected; the avatar session stays up so an operator can start
+    the worker manually.
+    """
+    name = (agent_name or settings.agent_name or "").strip()
+    if not name:
+        return False
+    try:
+        from livekit.api import CreateAgentDispatchRequest, LiveKitAPI
+
+        async with LiveKitAPI(
+            url=settings.url,
+            api_key=settings.api_key,
+            api_secret=settings.api_secret,
+        ) as lk:
+            await lk.agent_dispatch.create_dispatch(CreateAgentDispatchRequest(room=room, agent_name=name))
+    except Exception as exc:
+        logger.warning(f"[session] could not dispatch agent {name!r} into {room}: {exc}")
+        return False
+    logger.info(f"[session] dispatched agent {name!r} into {room}")
+    return True
+
+
 class ConversationSession:
     """One conversational avatar session in a LiveKit room."""
 
@@ -87,11 +116,19 @@ class ConversationSession:
         image_base64: str | None = None,
         image_format: str = "jpg",
         tts_fn: Callable[[str], bytes] | None = None,
+        agent_backend: str = "builtin",
+        agent_name: str | None = None,
     ) -> None:
         self.room_name = room_name
         self.settings = settings or LiveKitSettings.from_env()
+        self.agent_backend = (agent_backend or "builtin").strip().lower()
+        if self.agent_backend not in {"builtin", "gemini"}:
+            raise ValueError("agent_backend must be 'builtin' or 'gemini'")
         self.identity = identity or DEFAULT_AGENT_IDENTITY
-        self.avatar_identity = f"avatar-{room_name[:24]}"
+        self.avatar_identity = (
+            self.settings.avatar_identity if self.agent_backend == "gemini" else f"avatar-{room_name[:24]}"
+        )
+        self.agent_name = (agent_name or self.settings.agent_name or "").strip()
         self.image_path = image_path
         self.image_base64 = image_base64
         self.image_format = _safe_image_format(image_format)
@@ -104,7 +141,9 @@ class ConversationSession:
         self.agent: ConversationalAgent | None = None
         self.generator: FloatVideoGenerator | None = None
         self.worker_room: Any = None
-        self.runner: AvatarRunner | None = None
+        self.runner: AvatarRunner | AgentAvatarRunner | None = None
+        self.receiver: DataStreamAudioReceiver | None = None
+        self.agent_dispatched: bool | None = None
         self._stopped = False
 
     @property
@@ -135,6 +174,10 @@ class ConversationSession:
             image_path=self.image_path,
             semaphore=_render_lock,
         )
+
+        if self.agent_backend == "gemini":
+            await self._start_external_agent()
+            return
 
         self.agent = ConversationalAgent(
             room_name=self.room_name,
@@ -167,8 +210,55 @@ class ConversationSession:
         await self.runner.start()
         logger.info(f"[session] conversation ready in {self.room_name} ({self.identity} + {self.avatar_identity})")
 
+    async def _start_external_agent(self) -> None:
+        """Connect the avatar worker and wait for the Gemini Live agent."""
+        if self.generator is None:
+            raise RuntimeError("Generator was not created")
+
+        token_result = issue_token(
+            url=self.settings.url,
+            api_key=self.settings.api_key,
+            api_secret=self.settings.api_secret,
+            identity=self.avatar_identity,
+            name="FLOAT Avatar (Gemini Live)",
+            room=self.room_name,
+            can_publish=True,
+            # Kind=AGENT keeps the avatar out of livekit-agents' RoomIO
+            # participant selection; its synthesized voice must not loop back.
+            agent=True,
+        )
+        self.worker_room = rtc.Room()
+        await self.worker_room.connect(self.settings.url, token_result.token)
+
+        if self.settings.autodispatch and self.agent_name:
+            self.agent_dispatched = await dispatch_agent(self.settings, self.room_name, self.agent_name)
+
+        self.receiver = DataStreamAudioReceiver(self.worker_room)
+        self.runner = AgentAvatarRunner(
+            self.worker_room,
+            video_gen=self.generator,
+            receiver=self.receiver,
+            options=AvatarOptions(),
+        )
+        try:
+            await self.runner.start()
+        except TimeoutError as exc:
+            raise RuntimeError(str(exc)) from exc
+        self.identity = self.receiver.agent_identity or self.identity
+        logger.info(
+            f"[session] Gemini Live conversation ready in {self.room_name} ({self.identity} -> {self.avatar_identity})"
+        )
+
+    @property
+    def resolved_agent_identity(self) -> str:
+        if self.receiver is not None and self.receiver.agent_identity:
+            return self.receiver.agent_identity
+        return self.identity
+
     async def speak(self, text: str) -> None:
         """Turn a user utterance reply into audio and push it to the renderer."""
+        if self.agent_backend == "gemini":
+            raise RuntimeError("Gemini Live owns the voice; use the room microphone instead")
         if self.agent is None:
             raise RuntimeError("Session not started")
         if self.tts_fn is None:
@@ -180,21 +270,27 @@ class ConversationSession:
 
         The browser posts short chunks; :class:`FloatVideoGenerator` buffers
         them and starts a 2 s render window as soon as enough audio arrives.
-        Call this from the event-loop thread.
+        Call this from the event-loop thread. Gemini sessions take the
+        microphone through LiveKit instead, so this path is disabled there.
         """
+        if self.agent_backend == "gemini":
+            raise RuntimeError("Gemini sessions publish the microphone track to the room")
         if self.generator is None:
             raise RuntimeError("Session not started")
         self.generator.push_audio(pcm16_mono)
 
     def flush_audio(self) -> None:
         """Render the tail of the current utterance immediately."""
-        if self.generator is None:
+        if self.agent_backend == "gemini" or self.generator is None:
             return
         self.generator.flush()
 
     def interrupt(self) -> None:
         """Barge-in: drop buffered audio and any queued/in-flight render."""
         if self.generator is None:
+            return
+        if isinstance(self.runner, AgentAvatarRunner):
+            self.runner.interrupt()
             return
         self.generator.clear_buffer()
 
@@ -208,6 +304,7 @@ class ConversationSession:
             with contextlib.suppress(Exception):
                 await self.runner.stop()
             self.runner = None
+        self.receiver = None
         if self.worker_room is not None:
             with contextlib.suppress(Exception):
                 await self.worker_room.disconnect()
@@ -242,6 +339,8 @@ async def start_session(
     image_base64: str | None = None,
     image_format: str = "jpg",
     tts_fn: Callable[[str], bytes] | None = None,
+    agent_backend: str = "builtin",
+    agent_name: str | None = None,
 ) -> ConversationSession:
     """Start (or reuse) the conversation session for ``room_name``."""
     existing = get_session(room_name)
@@ -256,6 +355,8 @@ async def start_session(
         image_base64=image_base64,
         image_format=image_format,
         tts_fn=tts_fn,
+        agent_backend=agent_backend,
+        agent_name=agent_name,
     )
     try:
         await session.start()
@@ -276,6 +377,7 @@ async def stop_session(room_name: str) -> None:
 
 __all__ = [
     "ConversationSession",
+    "dispatch_agent",
     "get_session",
     "start_session",
     "stop_session",
