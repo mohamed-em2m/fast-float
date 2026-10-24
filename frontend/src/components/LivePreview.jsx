@@ -24,7 +24,7 @@ const STATUS_LABEL = {
  * (signalled by this API host, ICE via its built-in STUN responder); only if
  * that also fails does it degrade to the WebSocket transport.
  */
-export default function LivePreview({ requestId, transport, onStatus, onFallback }) {
+export default function LivePreview({ requestId, transport, onStatus, onFallback, onEnded }) {
   const canvasRef = useRef(null);
   const videoRef = useRef(null);
   const [status, setStatus] = useState('connecting');
@@ -32,17 +32,27 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
   const [size, setSize] = useState(null);
   // Kept in a ref so a new callback identity never restarts the socket.
   const onStatusRef = useRef(onStatus);
+  const onEndedRef = useRef(onEnded);
 
   useEffect(() => {
     onStatusRef.current = onStatus;
+    onEndedRef.current = onEnded;
   });
 
   useEffect(() => {
     if (!requestId) return undefined;
     let cancelled = false;
+    let ended = false;
 
     const report = (s) => {
-      if (!cancelled) setStatus(s);
+      if (cancelled) return;
+      setStatus(s);
+      // A transport can report 'done' more than once (track unsubscribe +
+      // room disconnect); let the parent switch to the MP4 exactly once.
+      if (s === 'done' && !ended) {
+        ended = true;
+        onEndedRef.current?.(requestId);
+      }
     };
 
     if (transport === 'ws') {
@@ -175,6 +185,32 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
     let fellBack = false;
     const videoEl = videoRef.current;
     const ICE_TIMEOUT_MS = 12000;
+    // aiortc keeps the peer open when the live track finishes; the remote
+    // MediaStreamTrack's 'ended' event is what tells us the clip is over.
+    const watchedTracks = new Set();
+    const watchTrackEnd = () => {
+      const media = videoEl?.srcObject;
+      for (const track of media?.getTracks?.() || []) {
+        if (track.kind !== 'video' || watchedTracks.has(track)) continue;
+        watchedTracks.add(track);
+        track.addEventListener('ended', () => report('done'));
+      }
+    };
+    // Some browsers do not fire 'ended' for a remote track, and the peer can
+    // take seconds to report the close: treat a long gap between rendered
+    // frames as the end of the clip so the preview never freezes forever.
+    const VIDEO_STALL_MS = 4000;
+    let lastFrameAt = performance.now();
+    const markFrame = () => {
+      lastFrameAt = performance.now();
+      videoEl?.requestVideoFrameCallback?.(markFrame);
+    };
+    videoEl?.requestVideoFrameCallback?.(markFrame);
+    const stallTimer = setInterval(() => {
+      if (cancelled || fellBack) return;
+      if (!videoEl || videoEl.readyState < 2) return;
+      if (performance.now() - lastFrameAt > VIDEO_STALL_MS) report('done');
+    }, 1000);
 
     const clearConnectionTimer = () => {
       if (connectionTimer) {
@@ -207,6 +243,7 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
         // Video and audio may arrive as separate streams; merge them so the
         // second ontrack does not replace the first track.
         if (attachRemoteTrack(videoEl, event)) {
+          watchTrackEnd();
           clearConnectionTimer();
           videoEl.play().catch(() => {});
           report('live');
@@ -246,6 +283,7 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
 
     return () => {
       cancelled = true;
+      clearInterval(stallTimer);
       clearConnectionTimer();
       try {
         pc?.close();

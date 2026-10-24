@@ -145,7 +145,9 @@ export default function App() {
       stopProgressPolling();
       setProgress(null);
       setIsGenerating(false);
-      setLiveRequestId(null);
+      // Keep `liveRequestId` until the live transport reports 'done': a
+      // real-time stream is still playing the frames buffered during the
+      // fast render. StudioStage only shows it while it matches the result.
     }
   };
 

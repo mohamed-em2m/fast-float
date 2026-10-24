@@ -45,6 +45,10 @@ export default function StudioStage({
   // null = unknown (checking), true/false = server responded
   const [liveKitAvailable, setLiveKitAvailable] = useState(null);
   const [isDownloading, setIsDownloading] = useState(false);
+  // Request id whose live preview has reported 'done' (or was dismissed by
+  // switching to MP4); generation itself finishing is not the end of the
+  // stream, because a real-time transport is still playing buffered frames.
+  const [endedLiveRequestId, setEndedLiveRequestId] = useState(null);
 
   const videoRef = useRef(null);
   const webRtcVideoRef = useRef(null);
@@ -88,6 +92,14 @@ export default function StudioStage({
       if (toast) toast('LiveKit unavailable — switched to WebRTC via the main server', 'error');
     }
   }, [liveKitAvailable, transport, setTransport]);
+
+  // Picking the MP4 transport is an explicit "leave the live view" action; do
+  // not silently reattach to a stream the user navigated away from. A new
+  // generation publishes a new request id, so the marker no longer matches.
+  const handleTransportChange = (next) => {
+    if (next === 'mp4') setEndedLiveRequestId(liveRequestId ?? null);
+    setTransport?.(next);
+  };
 
   const handleLiveFallback = useCallback(
     (reason) => {
@@ -190,7 +202,13 @@ export default function StudioStage({
             if (onToast) onToast('LiveKit stream failed — back to MP4', 'error');
             handleStopLiveKit();
           }
-          if (state === 'done') setLiveKitConnected(false);
+          if (state === 'done') {
+            // The publisher finished (or the room closed): return to the MP4
+            // instead of leaving a blank "Connecting…" player on screen.
+            setLiveKitConnected(false);
+            if (onToast) onToast('LiveKit stream ended — back to MP4', 'info');
+            handleStopLiveKit();
+          }
         },
       });
       liveKitSessionRef.current = session;
@@ -204,10 +222,15 @@ export default function StudioStage({
 
   const handleWebRtcState = (state) => {
     if (state === 'connected') setWebRtcConnected(true);
-    if (state === 'failed' || state === 'disconnected' || state === 'closed') {
+    if (state === 'failed') {
       setWebRtcConnected(false);
-      if (state === 'failed' && onToast) onToast('WebRTC connection failed — back to MP4', 'error');
-      if (state === 'failed') handleStopWebRtc();
+      if (onToast) onToast('WebRTC connection failed — back to MP4', 'error');
+      handleStopWebRtc();
+    } else if (state === 'disconnected' || state === 'closed') {
+      // The server closes the peer when the stream finishes; return to the
+      // MP4 player instead of freezing on the last frame.
+      setWebRtcConnected(false);
+      handleStopWebRtc();
     }
   };
 
@@ -283,6 +306,19 @@ export default function StudioStage({
   const downloadUrl = generationResult?.download_url
     || (generationResult ? `${getApiUrl()}/download/${generationResult.request_id}` : null);
 
+  // Keep the live preview mounted after the POST returns: a real-time
+  // transport is still playing the frames buffered during the fast render.
+  // Hand over to the finished MP4 only once the transport reports 'done'
+  // (or the user explicitly picks the MP4 transport).
+  const livePreviewRequestId = (() => {
+    if (!liveRequestId) return null;
+    if (isGenerating) return liveRequestId;
+    if (endedLiveRequestId === liveRequestId) return null;
+    // A failed run has no result for this id; do not attach to a dead stream.
+    if (generationResult?.request_id !== liveRequestId) return null;
+    return liveRequestId;
+  })();
+
   // Prefer real server progress when available; otherwise fall back to the
   // cosmetic stage cycler so the UI still moves during a single-pass run.
   const hasRealProgress = isGenerating && progress && typeof progress.percent === 'number';
@@ -333,7 +369,7 @@ export default function StudioStage({
             key={opt.id}
             type="button"
             className={`transport-btn ${transport === opt.id ? 'is-active' : ''}`}
-            onClick={() => setTransport?.(opt.id)}
+            onClick={() => handleTransportChange(opt.id)}
             disabled={isGenerating}
             title={opt.title}
           >
@@ -365,12 +401,13 @@ export default function StudioStage({
 
       {/* Video Viewport */}
       <div className="video-viewport-wrapper">
-        {isGenerating && liveRequestId && transport !== 'mp4' ? (
+        {livePreviewRequestId && transport !== 'mp4' ? (
           <LivePreview
-            requestId={liveRequestId}
+            requestId={livePreviewRequestId}
             transport={transport}
             onStatus={(message) => onToast?.(message || 'Live stream ended', 'error')}
             onFallback={handleLiveFallback}
+            onEnded={(id) => setEndedLiveRequestId(id ?? livePreviewRequestId)}
           />
         ) : useLiveKit ? (
           <div className="webrtc-player-box">
