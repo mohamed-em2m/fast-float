@@ -25,10 +25,8 @@ from fast_float.initialize_env import initialize_environment, initialize_onnx_li
 initialize_environment()
 initialize_onnx_lib_paths()
 
-from fast_float.core.inference_optimized import (
-    InferenceOptions,
-    OptimizedInferenceAgent,
-)
+from fast_float.config.float_settings import load_float_options
+from fast_float.core.inference_optimized import OptimizedInferenceAgent
 from fast_float.core.service import (
     run_inference_batched_blocking,
     run_inference_blocking,
@@ -60,10 +58,7 @@ PORT = int(os.getenv("PORT", "8000"))
 # thread cannot be killed; we only guarantee that the server stops reporting
 # "warming up" and says what happened.
 WARMUP_TIMEOUT_S = float(os.getenv("WARMUP_TIMEOUT_S", "900"))
-RESULTS_DIR = os.getenv("RESULTS_DIR", "./results")
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "10"))
-OPTIMIZATION_MODE = os.getenv("OPTIMIZATION_MODE", "all")
-USE_FP16 = os.getenv("USE_FP16", "true").lower() in ("true", "1", "yes")
 # Comma-separated list of allowed browser origins, e.g.
 # CORS_ORIGINS=http://localhost:3000,https://studio.example.com
 # localhost and 127.0.0.1 are different origins to a browser, so allow both.
@@ -183,6 +178,13 @@ async def lifespan(app: FastAPI):
     app_state.initialize_runtime()
     app_state.max_concurrent_requests = MAX_CONCURRENT_REQUESTS
 
+    # Model/inference options come from settings.toml [float] (env values are
+    # only fallbacks for boxes without the shared file). Load them before the
+    # model is constructed so architecture, ODE and decode knobs agree.
+    opt = load_float_options()
+    opt.rank = 0
+    app_state.opt = opt
+
     # Built-in STUN responder for ICE gathering on the raw WebRTC transport.
     # The API host itself is the STUN endpoint (instead of requiring LiveKit's
     # coturn or a public Google server); an explicit [webrtc].stun_urls list
@@ -205,7 +207,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("=" * 70)
     logger.info("🚀 Starting FLOAT Fast API - NVENC Optimized v5.1.0")
-    logger.info(f"⚡ Optimization: {OPTIMIZATION_MODE} | FP16: {USE_FP16}")
+    logger.info(f"⚡ Optimization: {opt.optimization_mode} | FP16: {opt.use_fp16}")
     logger.info(f"📐 Target resolution: {TARGET_IMAGE_SIZE}x{TARGET_IMAGE_SIZE}")
 
     # 1. Initialize video optimizer
@@ -217,29 +219,11 @@ async def lifespan(app: FastAPI):
     # 2. Ensure default image exists
     ensure_default_image(DEFAULT_IMAGE_PATH, TARGET_IMAGE_SIZE)
 
-    # 3. Initialize inference options
-    orig_argv = sys.argv.copy()
-    sys.argv = [sys.argv[0]]
-
-    opt = InferenceOptions().parse()
-    opt.rank = 0
-    # run_all.sh / run_api.sh export NGPUS (decode GPUs); sys.argv belongs to
-    # hypercorn so the flag can't be passed on the command line.
-    opt.ngpus = int(os.getenv("NGPUS", str(getattr(opt, "ngpus", 1))))
-    opt.res_dir = RESULTS_DIR
-    opt.no_crop = False
-    opt.optimization_mode = OPTIMIZATION_MODE
-    opt.use_fp16 = USE_FP16
-    opt.n_diff_steps = 100
-    opt.diff_schedule = "cosine"
-    opt.diffusion_mode = "sample"
-    sys.argv = orig_argv
-
+    # 3. Prepare runtime directories from the configured options
     os.makedirs(opt.res_dir, exist_ok=True)
-    app_state.opt = opt
 
     # 4. Load FLOAT model
-    logger.info(f"🤖 Loading FLOAT model with {OPTIMIZATION_MODE} optimization...")
+    logger.info(f"🤖 Loading FLOAT model with {opt.optimization_mode} optimization...")
     app_state.agent = OptimizedInferenceAgent(opt)
     logger.info("✅ Model loaded successfully")
 

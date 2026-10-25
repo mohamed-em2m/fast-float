@@ -341,17 +341,44 @@ See [`docs/BACKEND_SELECTION.md`](docs/BACKEND_SELECTION.md) for the measurement
 | `FRONTEND_PORT` | `3000` | Studio dev port (`run_all.sh`) |
 | `VITE_API_URL` | `http://localhost:${PORT}` | Backend URL used by the frontend |
 | `CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | Comma-separated allowed origins |
-| `NGPUS` | `1` | GPUs used for parallel decoding |
+| `NGPUS` | `1` | Fallback for `[float.runtime].ngpus` (GPUs used for parallel decoding) |
 | `MAX_CONCURRENT_REQUESTS` | `10` | Request semaphore |
-| `RESULTS_DIR` | `./results` | Output directory |
+| `RESULTS_DIR` | `./results` | Fallback for `[float.checkpoint].res_dir` |
 | `WARMUP_TIMEOUT_S` | `900` | Boot warmup budget before serving anyway |
 | `WARMUP_WAIT_TIMEOUT_S` | `600` | How long `/generate` waits for warmup |
 | `SKIP_WARMUP` | `0` | `1` skips boot warmup (debug) |
 | `AVATER_PUBLIC_URL` | `http://localhost:${PORT}` | Public base URL returned in responses |
 | `BACKUP_AVATER_PUBLIC_URL` | unset | Secondary public URL |
-| `OPTIMIZATION_MODE` | `all` | Legacy inference optimization preset |
-| `USE_FP16` | `true` | FP16 model weights |
+| `OPTIMIZATION_MODE` | `all` | Fallback for `[float.runtime].optimization_mode` |
+| `USE_FP16` | `true` | Fallback for `[float.runtime].use_fp16` |
 | `HYPERCORN_STARTUP_TIMEOUT` | `1200` | Hypercorn startup timeout (seconds) |
+
+### FLOAT model & inference (`settings.toml [float]`)
+
+All FLOAT model/inference options live in `fast_float/config/settings.toml`
+under `[float]`; the API and the LiveKit avatar read the same file, so both
+render identically. Edit the file instead of exporting env vars. The old
+`NGPUS` / `OPTIMIZATION_MODE` / `USE_FP16` / `RESULTS_DIR` variables remain
+fallbacks only for keys the file omits.
+
+| Table | Keys |
+|---|---|
+| `[float]` | `livekit_nfe` — conversational avatar sampling steps (5–25) |
+| `[float.checkpoint]` | `pretrained_dir`, `ckpt_path`, `res_dir` |
+| `[float.runtime]` | `seed`, `fix_noise_seed`, `ngpus`, `optimization_mode`, `use_fp16`, `benchmark`, `video_encoder`, `no_crop`, `decode_batch_size`, `decode_channels_last`, `decode_autocast` |
+| `[float.video]` | `input_size`, `input_nc`, `fps` |
+| `[float.audio]` | `sampling_rate`, `audio_marcing`, `wav2vec_sec`, `attention_window`, `only_last_features`, `average_emotion` |
+| `[float.paths]` | `wav2vec_model_path`, `audio2emotion_path`, `emotion_onnx_path`, `wav2vec_onnx_path`, `fmt_onnx_path`, `ref_path`, `aud_path`, `res_video_path`, `emo` |
+| `[float.model]` | `style_dim`, `dim_a`, `dim_w`, `dim_h`, `dim_m`, `dim_e`, `fmt_depth`, `num_heads`, `mlp_ratio`, `no_learned_pe`, `num_prev_frames`, `max_grad_norm`, `*_dropout_prob` |
+| `[float.ode]` | `nfe`, `ode_atol`, `ode_rtol`, `torchdiffeq_ode_method` |
+| `[float.guidance]` | `a_cfg_scale`, `e_cfg_scale`, `r_cfg_scale` |
+| `[float.diffusion]` | `n_diff_steps`, `diff_schedule`, `diffusion_mode` |
+| `[float.request]` | `/generate` defaults: `nfe`, `seed`, `emotion`, `a_cfg_scale`, `e_cfg_scale`, `r_cfg_scale`, `no_crop`, `decode_batch_size` |
+
+> Architecture values (`dim_*`, `fmt_depth`, `input_size`, `fps`,
+> `wav2vec_sec`, …) are part of the checkpoint's shape and must match
+> `checkpoints/float.pth`. Tune `[float.runtime]`, `[float.ode]`,
+> `[float.guidance]` or `[float.request]` for speed/quality instead.
 
 ### Backends
 

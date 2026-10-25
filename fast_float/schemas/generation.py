@@ -1,6 +1,9 @@
+from functools import partial
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+
+from fast_float.config.float_settings import request_default
 
 
 class GenerationRequest(BaseModel):
@@ -15,14 +18,38 @@ class GenerationRequest(BaseModel):
     )
     image_format: str | None = Field("jpg", description="Format of image_base64 (jpg, png, etc.)")
     emotion: Literal["S2E", "neutral", "happy", "sad", "angry", "surprise", "disgust"] = Field(
-        "S2E", description="Emotion conditioning mode"
+        default_factory=partial(request_default, "emotion"),
+        description="Emotion conditioning mode",
     )
-    nfe: int = Field(10, ge=5, le=25, description="Number of ODE solver function evaluations (steps)")
-    seed: int = Field(25, ge=0, description="Random seed")
-    a_cfg_scale: float = Field(2.0, ge=0.5, le=5.0, description="Audio classifier-free guidance scale")
-    r_cfg_scale: float = Field(1.0, ge=0.5, le=3.0, description="Reference classifier-free guidance scale")
-    e_cfg_scale: float = Field(1.0, ge=0.5, le=3.0, description="Emotion classifier-free guidance scale")
-    no_crop: bool = Field(False, description="Disable automatic face crop")
+    nfe: int = Field(
+        default_factory=partial(request_default, "nfe"),
+        ge=5,
+        le=25,
+        description="Number of ODE solver function evaluations (steps)",
+    )
+    seed: int = Field(default_factory=partial(request_default, "seed"), ge=0, description="Random seed")
+    a_cfg_scale: float = Field(
+        default_factory=partial(request_default, "a_cfg_scale"),
+        ge=0.5,
+        le=5.0,
+        description="Audio classifier-free guidance scale",
+    )
+    r_cfg_scale: float = Field(
+        default_factory=partial(request_default, "r_cfg_scale"),
+        ge=0.5,
+        le=3.0,
+        description="Reference classifier-free guidance scale",
+    )
+    e_cfg_scale: float = Field(
+        default_factory=partial(request_default, "e_cfg_scale"),
+        ge=0.5,
+        le=3.0,
+        description="Emotion classifier-free guidance scale",
+    )
+    no_crop: bool = Field(
+        default_factory=partial(request_default, "no_crop"),
+        description="Disable automatic face crop",
+    )
     compress: bool = Field(True, description="Compress output video using optimized encoder")
     quality: Literal["fast", "balanced", "high"] = Field(
         "balanced", description="Encoding quality (fast, balanced, high)"
@@ -42,7 +69,7 @@ class GenerationRequest(BaseModel):
         "each later chunk when merging to avoid duplicated frames.",
     )
     decode_batch_size: int = Field(
-        0,
+        default_factory=partial(request_default, "decode_batch_size"),
         ge=0,
         le=64,
         description="Frames decoded per micro-batch on the GPU. 0 lets the VRAM "

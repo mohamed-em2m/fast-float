@@ -100,9 +100,145 @@ avatar_identity = "float-avatar"
 agent_name = "float-gemini"
 autodispatch = true
 
+# =============================================================================
+# FLOAT model + inference
+# =============================================================================
+# Everything the FLOAT pipeline used to read from CLI flags / env vars is here.
+# The file wins; the old env vars (NGPUS, OPTIMIZATION_MODE, USE_FP16,
+# RESULTS_DIR) are only fallbacks when a key is absent. The HTTP API and the
+# LiveKit avatar read this same file, so both processes render identically.
+#
+# Architecture values are part of the checkpoint's shape. They MUST match
+# checkpoints/float.pth; changing dim_*, fmt_depth, input_size, fps or
+# wav2vec_sec makes the weights fail to load or produces the wrong motion.
+# Tune sampling / decode / guidance instead.
+
 [float]
 # FLOAT renderer used by the live avatar (/livekit/conversation). The avatar
 # must generate each 2 s chunk faster than the audio plays it; NFE is the main
 # speed/quality knob. 5 = fastest, 10 = balanced, 25 = best quality.
 # If the log says "[livekit-gen] slower than real time: RTF=1.2x", lower this.
-livekit_nfe = 6
+# The file /generate path uses [float.request].nfe instead.
+livekit_nfe = 5
+
+[float.checkpoint]
+# Weights and output locations.
+pretrained_dir = "./checkpoints"
+ckpt_path = "./checkpoints/float.pth"
+# Env fallback: RESULTS_DIR.
+res_dir = "./results"
+
+[float.runtime]
+# Defaults for the process/model. A per-request value still wins.
+seed = 15
+# Reuse the same initial noise for every render (reproducible comparisons).
+fix_noise_seed = false
+# GPUs used for parallel decoding. Env fallback: NGPUS.
+ngpus = 1
+# none | torch_compile | channels_last | amp | cudnn_benchmark | all.
+# Env fallback: OPTIMIZATION_MODE.
+optimization_mode = "all"
+# FP16 model weights. Env fallback: USE_FP16.
+use_fp16 = true
+# Time every stage (slower; useful for profiling).
+benchmark = false
+# FFmpeg NVENC | CPU PyAV | Torchcodec.
+video_encoder = "FFmpeg NVENC"
+# Default for direct/CLI inference. /generate uses [float.request].no_crop.
+no_crop = false
+# Frames decoded per GPU micro-batch. 0 = auto-size from free VRAM.
+# Per-request decode_batch_size overrides this.
+decode_batch_size = 0
+# Run the eager/compiled decoder in channels_last (A/B per GPU; off by default).
+# Env fallback: FLOAT_DECODE_CHANNELS_LAST.
+decode_channels_last = false
+# Decoder autocast: "off", "fp16" or "bf16". Off is the numerics-safe default.
+# Env fallback: FLOAT_DECODE_AUTOCAST.
+decode_autocast = "off"
+
+[float.video]
+# input_size is the model's working resolution (checkpoint-dependent).
+input_size = 512
+input_nc = 3
+fps = 25.0
+
+[float.audio]
+sampling_rate = 16000
+# Adjacent frames: for value v, t -> [t-v, ..., t, ..., t+v].
+audio_marcing = 2
+# Audio window length in seconds (50 frames at 25 fps).
+wav2vec_sec = 2.0
+# Attention window: 1 attends to t-1, t, t+1 for frame t.
+attention_window = 2
+only_last_features = false
+average_emotion = false
+
+[float.paths]
+# Feature extractors / ONNX artifacts. The ONNX files are optional: a missing
+# file falls back to the torch path.
+wav2vec_model_path = "./checkpoints/wav2vec2-base-960h"
+audio2emotion_path = "./checkpoints/wav2vec-english-speech-emotion-recognition"
+emotion_onnx_path = "./onnx/emotion_v1.onnx"
+wav2vec_onnx_path = "./onnx/wav2vec_v1.onnx"
+fmt_onnx_path = "./onnx/fmt_step_v1.onnx"
+# Optional inputs for the one-shot CLI; the API supplies these per request.
+# Empty means "not set".
+ref_path = ""
+aud_path = ""
+res_video_path = ""
+emo = ""
+
+[float.model]
+# Architecture: keep these equal to the checkpoint.
+style_dim = 512
+dim_a = 512
+dim_w = 512
+dim_h = 1024
+dim_m = 20
+dim_e = 7
+fmt_depth = 8
+num_heads = 8
+mlp_ratio = 4.0
+no_learned_pe = false
+num_prev_frames = 10
+max_grad_norm = 1.0
+# Dropout is a training knob; inference ignores it but it is kept here so the
+# option set is complete.
+audio_dropout_prob = 0.1
+ref_dropout_prob = 0.1
+emotion_dropout_prob = 0.1
+
+[float.ode]
+# Model/CLI sampling default. The live avatar uses livekit_nfe above and the
+# HTTP API uses [float.request].nfe below.
+nfe = 10
+ode_atol = 1e-5
+ode_rtol = 1e-5
+torchdiffeq_ode_method = "euler"
+
+[float.guidance]
+# Classifier-free guidance (vector-field scales). Higher = stronger condition.
+# These are the direct/CLI defaults; /generate uses [float.request] below.
+a_cfg_scale = 2.0
+e_cfg_scale = 1.0
+r_cfg_scale = 1.0
+
+[float.diffusion]
+# Ablation path; sample/cosine is the production configuration.
+n_diff_steps = 100
+diff_schedule = "cosine"
+diffusion_mode = "sample"
+
+[float.request]
+# Defaults POST /generate uses when the client omits a field. A value in the
+# request body always wins. Keep nfe in 5..25. These are intentionally separate
+# from [float.ode]/[float.guidance] so the HTTP API can use a different budget;
+# keep them aligned if you want one sampling/guidance configuration.
+nfe = 10
+seed = 25
+emotion = "S2E"
+a_cfg_scale = 2.0
+r_cfg_scale = 1.0
+e_cfg_scale = 1.0
+no_crop = false
+decode_batch_size = 0

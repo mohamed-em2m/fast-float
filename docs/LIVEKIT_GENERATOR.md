@@ -363,12 +363,15 @@ When `last_chunk_rtf >= 1.0`, the generator logs:
 ```
 
 Sustained RTF ≥ 1 means the GPU cannot keep up with the incoming audio. The
-conversational generator reads `[float].livekit_nfe` from `settings.toml` and
-defaults to `6`, while the file `/generate` path keeps its own per-request NFE
-(10 by default). Lower `livekit_nfe` to 5 for the fastest render, or raise it up
-to 25 for quality. A faster model backend also helps. Otherwise the queue drains
-and playback starves (silence between chunks), because production is paced to
-playout rather than dropping frames.
+conversational generator reads `[float].livekit_nfe` from `settings.toml`
+(built-in fallback: 6), while the file `/generate` path uses the request value
+(fallback: `[float.request].nfe`, 10). Lower `livekit_nfe` to 5 for the fastest
+render, or raise it up to 25 for quality. A faster model backend also helps.
+Otherwise the queue drains and playback starves (silence between chunks),
+because production is paced to playout rather than dropping frames. The rest of
+the model/inference options (ODE, guidance, decode batch, checkpoint paths) live
+in the same `[float]` table; see `README.md` and
+`fast_float/config/settings.toml`.
 
 ---
 
