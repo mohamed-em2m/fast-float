@@ -573,7 +573,7 @@ function normalizeIceServer(entry) {
   if (typeof entry === 'string') return { urls: alignIceUrl(entry) };
   if (!entry || typeof entry !== 'object') return null;
   const rawUrls = Array.isArray(entry.urls) ? entry.urls : [entry.urls];
-  const urls = rawUrls.filter(Boolean).map(alignIceUrl);
+  const urls = rawUrls.filter(usableIceUrl).map(alignIceUrl);
   if (!urls.length) return null;
   const server = { urls: urls.length === 1 ? urls[0] : urls };
   if (entry.username) server.username = entry.username;
@@ -582,17 +582,47 @@ function normalizeIceServer(entry) {
 }
 
 /**
+ * Drop a STUN target the browser provably cannot reach. The page's own HTTPS
+ * origin is served by an HTTP(S)-only tunnel (cloudflared/ngrok): it never
+ * carries UDP, so a server that advertises its loopback STUN responder gets
+ * rewritten by alignIceUrl() to the tunnel host — worthless for gathering, but
+ * worse, it would REPLACE the public Google fallback when it is the sole
+ * entry, leaving the browser without any working STUN (blank video, no audio
+ * over LiveKit and the raw WebRTC fallback alike). TURN is kept: a TURN relay
+ * on the page's own host can legitimately listen on TCP/TLS 443.
+ */
+function usableIceUrl(url) {
+  const value = String(url || '').trim();
+  if (!value) return false;
+  const match = /^(stuns?):(\[[^\]]+\]|[^:?]+)/i.exec(value);
+  if (!match) return true; // TURN or an unparsable URL: leave the judgement up
+  if (typeof window === 'undefined' || window.location.protocol !== 'https:') return true;
+  return match[2].replace(/^\[|\]$/g, '').toLowerCase() !== window.location.hostname.toLowerCase();
+}
+
+/**
  * Feed the raw WebRTC transport an ICE list from `/livekit/status`.
  * Accepts either `ice_servers` objects (`{urls, username, credential}`) or a
  * plain STUN URL list for compatibility. An explicit empty list is kept as
  * empty so a deployment that disabled ICE can opt out of the Google default.
  */
+/**
+ * Feed the raw WebRTC transport an ICE list from `/livekit/status`.
+ * Accepts either `ice_servers` objects (`{urls, username, credential}`) or a
+ * plain STUN URL list for compatibility. An explicit empty list is kept as
+ * empty so a deployment that disabled ICE can opt out of the Google default.
+ * Entries that are unusable from the page (loopback STUN behind an HTTPS
+ * tunnel — see usableIceUrl) are dropped instead; when the server *provided*
+ * entries but none of them is usable, the list falls back to null so the
+ * public Google default survives.
+ */
 export function setIceServers(servers) {
-  if (Array.isArray(servers)) {
-    serverIceServers = servers.map(normalizeIceServer).filter(Boolean);
-  } else {
+  if (!Array.isArray(servers)) {
     serverIceServers = null;
+    return;
   }
+  const mapped = servers.map(normalizeIceServer).filter(Boolean);
+  serverIceServers = servers.length && !mapped.length ? null : mapped;
 }
 
 export function getIceServers() {
