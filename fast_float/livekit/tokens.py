@@ -64,6 +64,14 @@ def issue_token(
     uses that in external-agent mode so ``livekit-agents``' RoomIO does not
     mistake the avatar for the human participant and subscribe to its own
     synthesized voice.
+
+    The kind is encoded as the JWT ``kind`` claim (``AccessToken.with_kind``),
+    NOT only as the ``video.agent`` grant: the grant is a permission flag, and
+    the SFU still reports such a participant as ``STANDARD``. RoomIO accepts
+    ``STANDARD`` participants, so an avatar that only had the grant became the
+    agent's "human" — it swallowed its own voice instead of the user's mic and
+    the reply never reached the renderer (blank stage, no voice). Only the
+    ``kind`` claim makes the SFU report ``AGENT``, which RoomIO skips.
     """
     try:
         from livekit.api import AccessToken, VideoGrants
@@ -88,8 +96,13 @@ def issue_token(
         .with_name(name)
         .with_ttl(timedelta(seconds=ttl_s))
         .with_grants(grants)
-        .to_jwt()
     )
+    if agent:
+        # The participant *kind* claim — this is what the SFU reports as
+        # ``PARTICIPANT_KIND_AGENT`` and what makes livekit-agents' RoomIO
+        # ignore the avatar instead of subscribing to it as the human.
+        token = token.with_kind("agent")
+    token = token.to_jwt()
     expires_at = datetime.now(timezone.utc).timestamp() + ttl_s
     return IssuedToken(
         token=token,
