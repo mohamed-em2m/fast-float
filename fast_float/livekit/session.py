@@ -44,13 +44,38 @@ from fast_float.livekit.receiver import DataStreamAudioReceiver
 from fast_float.livekit.settings import LiveKitSettings
 from fast_float.livekit.tokens import issue_token
 from fast_float.livekit.worker import AvatarOptions, AvatarRunner
+from fast_float.utils.gpu import auto_detect_max_streams
 from fast_float.utils.media import ensure_default_image
 
 logger = logging.getLogger(__name__)
 
-# One GPU, one inference at a time: a session render and a /generate request
-# must never run concurrently on the same weights.
-_render_lock = asyncio.Semaphore(1)
+# GPU concurrency semaphore initialized dynamically or on first access.
+_render_semaphore: asyncio.Semaphore | None = None
+_current_max_streams: int = 1
+
+
+def get_render_semaphore(max_streams: int | None = None) -> asyncio.Semaphore:
+    """Get or configure the GPU inference concurrency semaphore.
+
+    If max_streams is not specified or 0, automatically determines the optimal
+    parallel streams based on GPU VRAM.
+    """
+    global _render_semaphore, _current_max_streams
+    if max_streams is None:
+        from fast_float.livekit.settings import LiveKitSettings
+
+        cfg = LiveKitSettings.from_env()
+        max_streams = getattr(cfg, "livekit_max_streams", 0)
+
+    target_streams = auto_detect_max_streams(max_streams)
+
+    if _render_semaphore is None or _current_max_streams != target_streams:
+        _current_max_streams = target_streams
+        _render_semaphore = asyncio.Semaphore(target_streams)
+        logger.info(f"[session] GPU parallel streams capacity set to {target_streams}")
+
+    return _render_semaphore
+
 
 # room -> running session
 _sessions: dict[str, ConversationSession] = {}
@@ -281,10 +306,12 @@ class ConversationSession:
         if self.image_path is None:
             self.image_path = ensure_default_image()
 
+        semaphore = get_render_semaphore(getattr(self.settings, "livekit_max_streams", 0))
+
         self.generator = FloatVideoGenerator(
             agent=engine,
             image_path=self.image_path,
-            semaphore=_render_lock,
+            semaphore=semaphore,
             nfe=self.settings.livekit_nfe,
             first_chunk_sec=getattr(self.settings, "livekit_first_chunk_sec", 0.4),
         )
@@ -560,6 +587,7 @@ async def stop_session(room_name: str) -> None:
 __all__ = [
     "ConversationSession",
     "dispatch_agent",
+    "get_render_semaphore",
     "get_session",
     "start_session",
     "stop_session",

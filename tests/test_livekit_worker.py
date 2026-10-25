@@ -793,3 +793,15 @@ def test_float_video_generator_silence_loop():
         gen.stop()
 
     asyncio.run(_test())
+
+
+def test_auto_detect_max_streams():
+    from fast_float.utils.gpu import auto_detect_max_streams
+
+    # Explicit config overrides auto
+    assert auto_detect_max_streams(config_val=4) == 4
+    assert auto_detect_max_streams(config_val=1) == 1
+    # Auto detection returns at least 1
+    detected = auto_detect_max_streams(config_val=0)
+    assert isinstance(detected, int)
+    assert detected >= 1

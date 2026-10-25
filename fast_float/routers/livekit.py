@@ -215,6 +215,7 @@ async def livekit_status(request: Request) -> dict[str, Any]:
         # The WebSocket live transport still exists, but it is a last resort:
         # the frontend falls back from LiveKit to raw WebRTC first.
         "ws_fallback": True,
+        "max_streams": settings.livekit_max_streams,
     }
 
 

@@ -73,3 +73,34 @@ def print_gpu_status() -> None:
 
     if mem:
         logger.info(f"   Current: {mem['allocated_gb']}GB ({mem['usage_percent']}%) | Reserved: {mem['reserved_gb']}GB")
+
+
+def auto_detect_max_streams(
+    config_val: int = 0,
+    per_stream_gib: float = 2.0,
+    min_streams: int = 1,
+    max_streams_cap: int = 8,
+) -> int:
+    """Determine the optimal number of parallel live avatar streams for the GPU.
+
+    If ``config_val > 0``, honors the user configuration directly.
+    Otherwise (when ``config_val <= 0`` or auto), inspects total GPU VRAM:
+      * Allocates ~2.5 GB baseline for model weights + runtime.
+      * Each active stream needs ~1.5 - 2.0 GB transient VRAM during render bursts.
+      * Clamps between ``min_streams`` (1) and ``max_streams_cap``.
+    """
+    if config_val > 0:
+        return max(1, int(config_val))
+
+    if not torch.cuda.is_available():
+        return 1
+
+    try:
+        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        # Model baseline: ~2.5 GB. Each concurrent stream takes ~2.0 GB.
+        available_for_streams = max(0.0, total_vram_gb - 2.5)
+        streams = max(min_streams, min(max_streams_cap, int(available_for_streams // per_stream_gib)))
+        return streams
+    except Exception as e:
+        logger.warning(f"Error auto-detecting max streams, falling back to 1: {e}")
+        return 1
