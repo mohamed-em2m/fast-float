@@ -26,7 +26,7 @@ float-fast/
 ├── pyproject.toml                  # Project metadata, deps, uv indexes, ruff config
 ├── uv.lock                         # Pinned dependency lockfile (do not hand-edit)
 ├── .python-version                 # Pinned interpreter (3.10)
-├── Dockerfile                      # Container build definition (CUDA 12.1 base)
+├── Dockerfile                      # Container build (CUDA 12.6 base, entrypoint python fast_float/main.py)
 ├── config/
 │   ├── api.json                    # Endpoint and public URL configurations
 │   └── backends.yaml               # Committed all-eager backend default
@@ -36,13 +36,18 @@ float-fast/
 │   ├── setup.sh                    # System deps, env, checkpoints
 │   ├── environments.sh             # uv sync + CUDA/NVIDIA lib paths
 │   ├── setup_cuda_libs.sh          # Export nvidia site-packages lib dirs
+│   ├── _onnx_env.sh                # Shared helpers (venv/pip/probe/ORT libs), sourced everywhere
+│   ├── install_tensorrt.sh         # Pin TensorRT to the ORT major (10.9)
 │   ├── convert_to_onnx.sh          # Export all ONNX units + run selector
 │   ├── convert_fmt_to_onnx.sh      # Per-unit converters
 │   ├── convert_wav2vec_to_onnx.sh
 │   ├── download_checkpoints.sh     # Fetch model weights
-│   ├── run_all.sh                  # Backend + frontend together
+│   ├── bench_perf.py               # Performance benchmark helper
+│   ├── diagnose_fmt_ab.py          # FMT A/B diagnostic tool
+│   ├── run_all.sh                  # Backend + frontend + Gemini worker together
 │   ├── run_api.sh                  # Launch FastAPI server via hypercorn
-│   ├── run_frontend.sh             # Launch Vite dev server
+│   ├── run_frontend.sh             # Launch Vite dev server (FRONTEND_PORT)
+│   ├── run_gemini_agent.sh         # Launch the standalone Gemini Live worker
 │   ├── run_gradio.sh               # Launch Gradio batch web app
 │   └── run_live.sh                 # Launch Gradio live audio streaming app
 ├── checkpoints/                    # Model weights directory
@@ -99,9 +104,10 @@ float-fast/
     │   ├── select_backends.py      # measure-and-pick selector -> YAML
     │   └── convert_*.py            # per-unit ONNX converters
     ├── interfaces/                 # Web interfaces
-    │   ├── gradio_interface.py     # Batch UI for image + audio upload
     │   ├── float_live_app.py       # Live mic streaming UI
-    │   └── test_gradio.py          # Testing UI with WebRTC player integration
+    │   └── legacy/                 # Legacy entrypoints kept for reference
+    │       ├── gradio_interface.py # Batch UI for image + audio upload
+    │       └── test_gradio.py      # Testing UI with WebRTC player integration
     ├── livekit/                    # LiveKit transport + Gemini Live worker
     │   ├── settings.py             # LiveKit/Gemini config (shared files first)
     │   ├── tokens.py               # room JWT grants
@@ -137,7 +143,7 @@ We use **`uv`** exclusively. The Python version is pinned by `.python-version`
 uv sync --frozen
 
 # Run anything in the project environment (scripts, python, pre-commit, ...)
-uv run <command>          # e.g. uv run python fast_float/interfaces/gradio_interface.py
+uv run <command>          # e.g. uv run python fast_float/legacy/gradio_interface.py
 uv run --frozen <command> # when in doubt, force lockfile-honoring
 
 # Change dependencies (updates BOTH pyproject.toml and uv.lock)
@@ -373,7 +379,9 @@ cd frontend && npm run dev
 ### 3. Launch Gradio Batch App
 
 ```bash
-uv run python fast_float/interfaces/gradio_interface.py
+uv run python fast_float/legacy/gradio_interface.py
+# Or using the launcher script
+./scripts/run_gradio.sh
 ```
 
 ### 4. Launch Gradio Live App
@@ -428,7 +436,31 @@ run.
 
 ---
 
-## 7. API Reference
+### 6. Docker
+
+```bash
+docker build -t float-fast .
+docker run --gpus all -p 8080:8080 float-fast
+```
+
+- **Base:** `nvidia/cuda:12.6.0-devel-ubuntu22.04` — matches the cu126 wheel
+  pins (`onnxruntime-gpu` 1.23 dlopens CUDA 12 sonames; the driver comes from
+  the host).
+- **Layer order**: dependency manifests (`pyproject.toml`, `uv.lock`,
+  `.python-version`) are copied and synced *before* `COPY . .`, so a code-only
+  change does not re-extract the ~7 GiB torch stack; `setup.sh` reuses the
+  venv from the earlier layer. The same `.dockerignore` keeps `.git`,
+  `node_modules`, the `.venv`, `results/`, TRT engine caches and `logs.txt`
+  out of the build context — and **excludes `.env`**: secrets are injected at
+  deploy time, never baked into the image.
+- **Entrypoint:** `python fast_float/main.py`, *not* the `hypercorn` CLI.
+  Two reasons: hypercorn has no `--startup-timeout` flag (that is uvicorn —
+  the old CMD died with an unrecognized-argument error instead of booting),
+  and main.py's `__main__` block sets `startup_timeout = 600` and maps
+  `$PORT` itself, which the CLI leaves at the 60 s default. `NGPUS`,
+  `WARMUP_TIMEOUT_S` etc. are plain env vars on `docker run --gpus all …`.
+
+### 7. API Reference
 
 | Method | Endpoint | Description |
 | --- | --- | --- |
