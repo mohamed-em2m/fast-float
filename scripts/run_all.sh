@@ -141,14 +141,26 @@ raise SystemExit(0 if ready else 1)
 PY
 }
 
+gemini_worker_running() {
+    # pgrep -f matches full command lines, including this script's own whenever
+    # the pattern appears in it — split the string so it can never self-match.
+    pgrep -f "fast_float.livekit.gemini.age"nt" start" >/dev/null 2>&1
+}
+
 AGENT_PID=""
 if [ "${FLOAT_GEMINI_WORKER}" = "no" ]; then
     echo "ℹ️  Gemini worker disabled (FLOAT_GEMINI_WORKER=no)."
 elif gemini_worker_ready; then
-    echo "🤖 Starting Gemini Live worker (separate process, shared config)..."
-    uv run --frozen --no-sync python -m fast_float.livekit.gemini.agent start 2>&1 \
-        | sed -u 's/^/[agent] /' &
-    AGENT_PID=$!
+    if gemini_worker_running; then
+        echo "ℹ️  Gemini Live worker already running — reusing it instead of starting a second one."
+        echo "   (Stop that process first if you want a fresh worker: pkill -f 'fast_float.livekit.gemini.agent start')"
+        AGENT_PID=""
+    else
+        echo "🤖 Starting Gemini Live worker (separate process, shared config)..."
+        uv run --frozen --no-sync python -m fast_float.livekit.gemini.agent start 2>&1 \
+            | sed -u 's/^/[agent] /' &
+        AGENT_PID=$!
+    fi
 else
     if [ "${FLOAT_GEMINI_WORKER}" = "yes" ]; then
         echo "❌ FLOAT_GEMINI_WORKER=yes but LiveKit + Gemini are not configured."

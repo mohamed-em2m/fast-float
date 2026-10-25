@@ -78,6 +78,13 @@ server = AgentServer(
     ws_url=config.livekit_url or None,
     api_key=config.livekit_api_key or None,
     api_secret=config.livekit_api_secret or None,
+    # Bind the health HTTP server to an ephemeral port (0) instead of the SDK's
+    # production default 8081: a second worker — or a leftover one from an
+    # earlier run — otherwise dies on startup with
+    # "[Errno 98] ... ('0.0.0.0', 8081): address already in use" and then sits
+    # draining for up to an hour while looking alive. Nothing probes this
+    # endpoint (no K8s here) and SFU registration doesn't need a fixed port.
+    port=0,
 )
 
 
