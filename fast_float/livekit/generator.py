@@ -232,6 +232,130 @@ class FloatVideoGenerator:
         self._idle_event = asyncio.Event()
         self._idle_event.set()
 
+        # Silence / idle loop: a pre-rendered list of (frame_array, audio_bytes)
+        # pairs that keep the video track alive between speech segments. Generated
+        # once by prepare_silence() and then looped in __aiter__ whenever the
+        # avatar is idle. None means "not yet generated"; empty list means
+        # generation failed. Both cases fall back to blocking on the frame queue.
+        self._silence_frames: list[tuple[np.ndarray, bytes]] | None = None
+        self._silence_idx = 0  # round-robin cursor into _silence_frames
+
+    # --------------------------------------------------- silence / idle frames
+
+    async def prepare_silence(self) -> None:
+        """Generate the silence idle loop once, in the background executor.
+
+        Runs FLOAT inference on 2 s of zero PCM so the avatar has a natural
+        resting expression for when it is not speaking. Call this once after
+        creating the generator; ``__aiter__`` will loop the result while idle.
+
+        Safe to call multiple times — only the first call runs inference.
+        """
+        if self._silence_frames is not None:
+            return  # already done or in progress
+        self._silence_frames = []  # mark "in progress" so a second call is a no-op
+
+        silence_pcm = bytes(MIN_AUDIO_SAMPLES * 2)  # 2 s of 16-bit silence
+        captured: list[tuple[np.ndarray, bytes]] = []
+
+        def _collect_silence() -> None:
+            """Run inference on silence PCM and capture the frames."""
+            wav_path = None
+            try:
+                wav_path = self._write_wav(silence_pcm)
+                if self.agent is not None and self.image_path:
+                    from fast_float.core.service import run_inference_blocking
+
+                    # Use a throw-away dispatcher that stores frames locally.
+                    _loop = self.loop
+
+                    class _SilenceDispatcher(FrameDispatcher):
+                        abort_on_error = False
+                        max_queue_frames = 128
+                        max_lag_ms = 0.0
+
+                        def open(self, meta: StreamMeta) -> None:
+                            pass
+
+                        def dispatch(self, idx: int, frames: np.ndarray, pts_ms: float) -> None:
+                            if frames.ndim == 3:
+                                frames = frames[None]
+                            n_frames = len(frames)
+                            fps = TARGET_FPS
+                            for i in range(n_frames):
+                                frame_idx = int(idx) + i
+                                start_s, end_s = frame_sample_bounds(frame_idx, fps, SAMPLE_RATE)
+                                s = start_s * 2
+                                e = end_s * 2
+                                audio = silence_pcm[s:e]
+                                if len(audio) < e - s:
+                                    audio = audio + bytes(e - s - len(audio))
+                                arr = frames[i]
+                                if arr.ndim == 3 and arr.shape[2] == 4:
+                                    arr = arr[:, :, :3]
+                                captured.append((arr.copy(), audio))
+
+                        def error(self, exc: BaseException) -> None:
+                            logger.debug(f"[livekit-gen] silence dispatcher error: {exc}")
+
+                        def close(self) -> None:
+                            pass
+
+                    bridge = _SilenceDispatcher()
+                    req_data = {
+                        "a_cfg_scale": 2.0,
+                        "r_cfg_scale": 1.0,
+                        "e_cfg_scale": 1.0,
+                        "emotion": "S2E",
+                        "nfe": self.nfe,
+                        "no_crop": False,
+                        "seed": 25,
+                    }
+                    try:
+                        run_inference_blocking(
+                            self.agent,
+                            None,
+                            self.image_path,
+                            wav_path,
+                            req_data,
+                            bridge,
+                        )
+                    finally:
+                        with contextlib.suppress(Exception):
+                            bridge.shutdown()
+                else:
+                    # Test / no-model path: synthesize a colour-cycling pattern.
+                    n_frames = int(np.ceil(MIN_AUDIO_SAMPLES * TARGET_FPS / SAMPLE_RATE))
+                    for i in range(n_frames):
+                        arr = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+                        arr[:, :, 0] = 60
+                        arr[:, :, 1] = 80
+                        arr[:, :, 2] = 120
+                        start_s = int(i * SAMPLE_RATE / TARGET_FPS)
+                        end_s = int((i + 1) * SAMPLE_RATE / TARGET_FPS)
+                        audio = silence_pcm[start_s * 2 : end_s * 2]
+                        if len(audio) < (end_s - start_s) * 2:
+                            audio = audio + bytes((end_s - start_s) * 2 - len(audio))
+                        captured.append((arr, audio))
+            except Exception as exc:
+                logger.warning(f"[livekit-gen] silence pre-render failed: {exc}")
+            finally:
+                if wav_path:
+                    with contextlib.suppress(OSError):
+                        os.remove(wav_path)
+
+        try:
+            await self.loop.run_in_executor(self._executor, _collect_silence)
+        except Exception as exc:
+            logger.warning(f"[livekit-gen] silence executor error: {exc}")
+
+        if captured:
+            self._silence_frames = captured
+            logger.info(f"[livekit-gen] silence loop ready: {len(captured)} frames")
+        else:
+            self._silence_frames = []  # failed — keep empty, no idle loop
+            logger.warning("[livekit-gen] silence loop generation produced no frames; avatar will freeze when idle")
+
     # ------------------------------------------------------------------ input
 
     def _to_pcm16_mono(self, audio: Any) -> bytes:
@@ -547,10 +671,95 @@ class FloatVideoGenerator:
             self._frame_queue.put_nowait(_QUEUE_SENTINEL)
 
     async def __aiter__(self) -> AsyncIterator[Any]:
+        # How long to sleep between silence frames (40 ms at 25 fps).
+        _silence_frame_sec = 1.0 / (self.fps if self.fps > 0 else TARGET_FPS)
+        _silence_audio_len = SAMPLES_PER_FRAME * 2  # bytes for one 40 ms frame
+
         while True:
             if self._stop_pending and self._frame_queue.empty():
                 break
-            item = await self._frame_queue.get()
+
+            # --- idle / silence path ------------------------------------------
+            # When the frame queue is empty and stop is not pending we check
+            # whether we have a pre-rendered silence clip. If so, yield one
+            # silence frame and then wait up to one frame period for a real
+            # frame to arrive (so the loop rate stays close to TARGET_FPS while
+            # still reacting instantly when speech starts).
+            if self._frame_queue.empty() and not self._stop_pending:
+                sil = self._silence_frames  # snapshot for thread-safety
+                if sil:  # non-None and non-empty
+                    sil_arr, sil_audio = sil[self._silence_idx % len(sil)]
+                    self._silence_idx += 1
+
+                    if RTC_AVAILABLE:
+                        h, w, c = sil_arr.shape
+                        video_frame = rtc.VideoFrame(
+                            w,
+                            h,
+                            rtc.VideoBufferType.RGB24,
+                            np.ascontiguousarray(sil_arr).tobytes(),
+                        )
+                        # Silence audio: use pre-computed chunk (already correct
+                        # length) padded/trimmed just in case.
+                        padded = (sil_audio + bytes(_silence_audio_len))[:_silence_audio_len]
+                        audio_frame = rtc.AudioFrame(padded, self.sample_rate, 1, SAMPLES_PER_FRAME)
+                        yield (video_frame, audio_frame)
+                    else:
+                        yield (self._silence_idx, sil_arr, 0.0)
+
+                    # Pace: try to get a real frame for one frame period.
+                    try:
+                        item = await asyncio.wait_for(self._frame_queue.get(), timeout=_silence_frame_sec)
+                    except asyncio.TimeoutError:
+                        # No real frame arrived; loop back to silence.
+                        continue
+                    # A real item arrived while we were waiting — fall through
+                    # to the processing block below.
+                    self._refresh_idle()
+                    if item is _QUEUE_SENTINEL or item is CLOSE:
+                        break
+                    # Process the real frame (duplicate the yield block below to
+                    # avoid a goto; keep this block in sync with the normal path).
+                    idx, frame_array, pts_ms, audio_data = item
+                    if not self._first_frame_emitted:
+                        self._first_frame_emitted = True
+                        if callable(self.on_first_frame):
+                            try:
+                                res = self.on_first_frame()
+                                if asyncio.iscoroutine(res):
+                                    await res
+                            except Exception as exc:
+                                logger.warning(f"[livekit-gen] on_first_frame callback failed: {exc}")
+                    self._frame_count += 1
+                    if RTC_AVAILABLE:
+                        h, w, c = frame_array.shape
+                        if c == 4:
+                            frame_array = frame_array[:, :, :3]
+                        video_frame = rtc.VideoFrame(
+                            w,
+                            h,
+                            rtc.VideoBufferType.RGB24,
+                            np.ascontiguousarray(frame_array).tobytes(),
+                        )
+                        if audio_data:
+                            audio_frame = rtc.AudioFrame(audio_data, self.sample_rate, 1, len(audio_data) // 2)
+                            yield (video_frame, audio_frame)
+                        else:
+                            yield video_frame
+                    else:
+                        yield (idx, frame_array, pts_ms)
+                    continue  # back to top of while-loop
+
+                # silence not available yet (None = prepare_silence never called,
+                # [] = generation failed): fall through to blocking get()
+
+            # --- normal path: block until a real frame arrives ----------------
+            try:
+                item = await asyncio.wait_for(self._frame_queue.get(), timeout=_silence_frame_sec)
+            except asyncio.TimeoutError:
+                # Queue still empty; re-evaluate the stop / silence condition.
+                continue
+
             self._refresh_idle()
             if item is _QUEUE_SENTINEL or item is CLOSE:
                 break
@@ -574,7 +783,10 @@ class FloatVideoGenerator:
                 if c == 4:
                     frame_array = frame_array[:, :, :3]
                 video_frame = rtc.VideoFrame(
-                    w, h, rtc.VideoBufferType.RGB24, np.ascontiguousarray(frame_array).tobytes()
+                    w,
+                    h,
+                    rtc.VideoBufferType.RGB24,
+                    np.ascontiguousarray(frame_array).tobytes(),
                 )
                 if audio_data:
                     audio_frame = rtc.AudioFrame(audio_data, self.sample_rate, 1, len(audio_data) // 2)

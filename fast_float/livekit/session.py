@@ -289,6 +289,12 @@ class ConversationSession:
             first_chunk_sec=getattr(self.settings, "livekit_first_chunk_sec", 0.4),
         )
 
+        # Pre-render the silence idle loop once: FLOAT on 2 s of zero PCM so
+        # the avatar has a natural resting expression between speech segments.
+        # Uses the same GPU semaphore as live inference — runs first (before any
+        # audio arrives) then frees the slot for real speech chunks.
+        await self.generator.prepare_silence()
+
         if self.agent_backend == "gemini":
             await self._start_external_agent()
             return

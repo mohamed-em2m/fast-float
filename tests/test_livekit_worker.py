@@ -758,3 +758,38 @@ def test_live_queue_size_is_bounded_by_frame_dimensions():
 
     # Small frames are bounded by the frame-count cap, not the byte budget.
     assert live_queue_size(StreamMeta(width=8, height=8, channels=3)) == LIVE_QUEUE_MAX_FRAMES
+
+
+def test_float_video_generator_silence_loop():
+    async def _test():
+        loop = asyncio.get_running_loop()
+        gen = FloatVideoGenerator(loop=loop)
+        assert gen._silence_frames is None
+
+        # Prepare silence loop (no agent/image -> uses fallback test pattern generator)
+        await gen.prepare_silence()
+        assert gen._silence_frames is not None
+        assert len(gen._silence_frames) > 0
+
+        # Idempotency: second call does not re-generate
+        initial_frames = gen._silence_frames
+        await gen.prepare_silence()
+        assert gen._silence_frames is initial_frames
+
+        # Consume a few silence frames from the generator iterator
+        # Since frame_queue is empty, it should yield silence frames
+        collected = []
+        gen_iter = gen.__aiter__()
+        for _ in range(5):
+            item = await gen_iter.__anext__()
+            collected.append(item)
+
+        assert len(collected) == 5
+        if RTC_AVAILABLE:
+            v_frame, a_frame = collected[0]
+            assert isinstance(v_frame, rtc.VideoFrame)
+            assert isinstance(a_frame, rtc.AudioFrame)
+
+        gen.stop()
+
+    asyncio.run(_test())
