@@ -285,6 +285,7 @@ class ConversationSession:
             agent=engine,
             image_path=self.image_path,
             semaphore=_render_lock,
+            nfe=self.settings.livekit_nfe,
         )
 
         if self.agent_backend == "gemini":

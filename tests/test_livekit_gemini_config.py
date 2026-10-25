@@ -200,6 +200,43 @@ def test_agent_shared_file_wins_over_env_secret(monkeypatch, tmp_path):
     assert config.google_api_key == "from-env"
 
 
+def test_agent_reads_instructions_from_shared_settings(monkeypatch, tmp_path):
+    """The spoken persona is operator configuration, not a Python constant."""
+    (tmp_path / "prompt.md").write_text("Speak like a calm documentary narrator.", encoding="utf-8")
+    (tmp_path / "settings.toml").write_text(
+        '[gemini]\ninstructions_file = "prompt.md"\ninstructions = "inline fallback"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("FLOAT_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("FLOAT_AGENT_INSTRUCTIONS", "stale env prompt")
+
+    config = AgentConfig.from_env()
+    assert config.instructions == "Speak like a calm documentary narrator."
+
+    # A missing prompt file falls back to the inline value, then the env
+    # fallback for boxes without the shared config, then the built-in prompt.
+    (tmp_path / "prompt.md").unlink()
+    assert AgentConfig.from_env().instructions == "inline fallback"
+    (tmp_path / "settings.toml").write_text('[gemini]\ninstructions_file = "prompt.md"\n', encoding="utf-8")
+    assert AgentConfig.from_env().instructions == "stale env prompt"
+    monkeypatch.delenv("FLOAT_AGENT_INSTRUCTIONS")
+    assert AgentConfig.from_env().instructions
+
+
+def test_float_live_nfe_comes_from_shared_settings(monkeypatch, tmp_path):
+    """FLOAT renderer tuning belongs in settings.toml like the Gemini values."""
+    monkeypatch.setenv("FLOAT_CONFIG_DIR", str(tmp_path))
+
+    (tmp_path / "settings.toml").write_text("[float]\nlivekit_nfe = 5\n", encoding="utf-8")
+    assert LiveKitSettings.from_env().livekit_nfe == 5
+
+    (tmp_path / "settings.toml").write_text("[float]\nlivekit_nfe = 99\n", encoding="utf-8")
+    assert LiveKitSettings.from_env().livekit_nfe == 25
+
+    (tmp_path / "settings.toml").write_text('[float]\nlivekit_nfe = "fast"\n', encoding="utf-8")
+    assert LiveKitSettings.from_env().livekit_nfe == 6
+
+
 def test_livekit_settings_gemini_from_shared_files(monkeypatch):
     monkeypatch.setattr(
         "fast_float.livekit.settings.load_secrets",

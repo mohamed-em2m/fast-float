@@ -168,6 +168,50 @@ def test_float_generator_shuts_down_bridge_per_chunk(monkeypatch):
     asyncio.run(_test())
 
 
+def test_float_generator_uses_configured_live_nfe(monkeypatch):
+    """The conversational path needs a lower sampling budget than /generate.
+
+    NFE=10 made a 2 s chunk take 2.48 s on the affected box (RTF 1.24), so the
+    playout queue starved. ``[float].livekit_nfe`` defaults to 6; the session
+    passes it to the generator, and an explicit constructor value wins.
+    """
+
+    async def _test():
+        loop = asyncio.get_running_loop()
+        captured = {}
+
+        def fake_inference(agent, video, image, wav_path, request, bridge):
+            captured["nfe"] = request["nfe"]
+            return "ok"
+
+        monkeypatch.setattr("fast_float.core.service.run_inference_blocking", fake_inference)
+        gen = FloatVideoGenerator(
+            agent=object(),
+            image_path="fake.jpg",
+            loop=loop,
+            width=8,
+            height=8,
+            nfe=5,
+        )
+        assert gen.nfe == 5
+        gen.push_audio(np.zeros(32000, dtype=np.int16).tobytes())
+
+        for _ in range(200):
+            if "nfe" in captured:
+                break
+            await asyncio.sleep(0.01)
+        assert captured["nfe"] == 5
+        gen.stop()
+
+        # Direct construction without a value uses the same built-in default
+        # as settings.toml, and the accepted range is clamped.
+        assert FloatVideoGenerator(loop=loop).nfe == 6
+        assert FloatVideoGenerator(loop=loop, nfe=99).nfe == 25
+        assert FloatVideoGenerator(loop=loop, nfe="nope").nfe == 6
+
+    asyncio.run(_test())
+
+
 def test_generator_bridge_cancelled_aborts_dispatcher():
     async def _test():
         loop = asyncio.get_running_loop()
@@ -436,6 +480,7 @@ def test_conversation_session_wiring():
             url="ws://127.0.0.1:7880",
             api_key="devkey",
             api_secret="devsecretdevsecretdevsecretdevsecret",
+            livekit_nfe=5,
         )
         try:
             app_state.agent = MagicMock()
@@ -463,6 +508,7 @@ def test_conversation_session_wiring():
                 assert session.agent is not None
                 assert session.runner is not None
                 assert session.runner.agent_identity == session.agent.identity
+                assert session.generator.nfe == settings.livekit_nfe
                 assert fake_room.connect.call_count == 1
                 # avatar video + audio published into the worker room
                 assert fake_room.local_participant.publish_track.call_count == 2

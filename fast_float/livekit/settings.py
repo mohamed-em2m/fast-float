@@ -33,6 +33,11 @@ DEFAULT_STUN_PORT = 3478
 DEFAULT_TURN_TTL_S = 3600
 DEFAULT_AVATAR_IDENTITY = "float-avatar"
 DEFAULT_AGENT_NAME = "float-gemini"
+# FLOAT's live renderer: NFE (ODE sampling steps) trades quality for latency.
+# 5 is the fastest value the public /generate API accepts, 25 the slowest.
+DEFAULT_LIVE_NFE = 6
+MIN_LIVE_NFE = 5
+MAX_LIVE_NFE = 25
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +119,10 @@ class GeminiSettings:
     project: str = ""
     #: ``GOOGLE_CLOUD_LOCATION`` / ``[gemini].location`` (Vertex AI).
     location: str = ""
+    #: ``[gemini].instructions`` — inline spoken persona, or
+    #: ``[gemini].instructions_file`` — a Markdown/text file with the prompt.
+    instructions: str = ""
+    instructions_file: str = ""
 
 
 @dataclass(frozen=True)
@@ -149,6 +158,9 @@ class LiveKitSettings:
     avatar_identity: str = DEFAULT_AVATAR_IDENTITY
     agent_name: str = DEFAULT_AGENT_NAME
     autodispatch: bool = True
+    #: FLOAT live renderer ODE steps (``[float].livekit_nfe``): 5 fastest,
+    #: 25 best quality. The file /generate path keeps its own per-request NFE.
+    livekit_nfe: int = DEFAULT_LIVE_NFE
     #: Gemini Live settings (API key + model/voice defaults, see GeminiSettings).
     gemini: GeminiSettings = field(default_factory=GeminiSettings)
     source: str = "none"
@@ -171,6 +183,7 @@ class LiveKitSettings:
         config = all_config.get("livekit", {})
         web = all_config.get("webrtc", {})
         web_secrets = all_secrets.get("webrtc", {})
+        float_cfg = all_config.get("float", {})
 
         def _s(value: Any) -> str:
             return str(value or "").strip()
@@ -257,6 +270,19 @@ class LiveKitSettings:
             (_s(gemini_cfg.get("location")), "settings.toml"),
             (os.getenv("GOOGLE_CLOUD_LOCATION", "").strip(), "env"),
         )
+        # The spoken persona lives in settings.toml (inline or a prompt file)
+        # so an operator can edit it without touching code. The env fallback
+        # is kept for existing boxes.
+        gemini_instructions = _s(gemini_cfg.get("instructions"))
+        gemini_instructions_file = _s(gemini_cfg.get("instructions_file"))
+
+        # FLOAT live renderer speed/quality. This is intentionally file-first:
+        # the API and the avatar worker must render every chunk identically.
+        try:
+            livekit_nfe = int(float_cfg.get("livekit_nfe", DEFAULT_LIVE_NFE))
+        except (TypeError, ValueError):
+            livekit_nfe = DEFAULT_LIVE_NFE
+        livekit_nfe = max(MIN_LIVE_NFE, min(MAX_LIVE_NFE, livekit_nfe))
 
         ttl_raw, _ttl_src = first_value(
             (os.getenv("LIVEKIT_TOKEN_TTL_S", "").strip(), "env"),
@@ -399,6 +425,7 @@ class LiveKitSettings:
             avatar_identity=avatar_identity or DEFAULT_AVATAR_IDENTITY,
             agent_name=agent_name or DEFAULT_AGENT_NAME,
             autodispatch=autodispatch,
+            livekit_nfe=livekit_nfe,
             gemini=GeminiSettings(
                 api_key=gemini_key,
                 model=gemini_model,
@@ -407,6 +434,8 @@ class LiveKitSettings:
                 vertexai=gemini_vertex,
                 project=gemini_project,
                 location=gemini_location,
+                instructions=gemini_instructions,
+                instructions_file=gemini_instructions_file,
             ),
             source=source,
         )
@@ -488,10 +517,13 @@ class LiveKitSettings:
 __all__ = [
     "DEFAULT_AGENT_NAME",
     "DEFAULT_AVATAR_IDENTITY",
+    "DEFAULT_LIVE_NFE",
     "DEFAULT_ROOM_PREFIX",
     "DEFAULT_STUN_PORT",
     "DEFAULT_TTL_S",
     "DEFAULT_TURN_TTL_S",
+    "MAX_LIVE_NFE",
+    "MIN_LIVE_NFE",
     "GeminiSettings",
     "LiveKitSettings",
     "host_only",

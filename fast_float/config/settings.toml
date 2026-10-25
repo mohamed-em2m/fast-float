@@ -64,33 +64,45 @@ turn_secret = ""
 turn_ttl_s = 3600
 
 [gemini]
-# Gemini Live voice agent (fast_float/livekit/gemini — a livekit-agents worker
-# that runs the conversation with Gemini speech-to-speech and streams its TTS
-# to the FLOAT avatar). These are the non-secret defaults; the API key does NOT
-# go here. Put the key in secerts.toml instead:
+# Gemini Live voice agent (agents/ — a livekit-agents worker that runs the
+# conversation with Gemini speech-to-speech and streams its TTS to the FLOAT
+# avatar). These are the non-secret defaults; the API key does NOT go here.
+# Put the key in secerts.toml instead:
 #
 #   [gemini]
 #   api_key = "..."            # or export GOOGLE_API_KEY / GEMINI_API_KEY
 #
-# The worker reads the same shared files as the API, so one key/config works
-# for both processes. Start it with ./scripts/run_gemini_agent.sh (run_all.sh
-# can start it automatically with FLOAT_GEMINI_WORKER=auto).
+# The worker (agents/float_agent) reads that same file when the environment
+# variable is absent, so one key works for both processes.
 #
-# The shared files win over the environment; the env is a fallback for boxes
-# without them: GOOGLE_API_KEY / GEMINI_API_KEY, GEMINI_MODEL, GEMINI_VOICE,
-# GEMINI_LANGUAGE, GOOGLE_GENAI_USE_VERTEXAI, GOOGLE_CLOUD_PROJECT,
-# GOOGLE_CLOUD_LOCATION, FLOAT_AVATAR_IDENTITY, FLOAT_GEMINI_AGENT_NAME,
-# FLOAT_GEMINI_AUTODISPATCH.
+# Env overrides (highest precedence): GOOGLE_API_KEY / GEMINI_API_KEY,
+# GEMINI_MODEL, GEMINI_VOICE, GEMINI_LANGUAGE, GOOGLE_GENAI_USE_VERTEXAI,
+# GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION, FLOAT_AVATAR_IDENTITY,
+# FLOAT_GEMINI_AGENT_NAME, FLOAT_GEMINI_AUTODISPATCH.
 #
 # Leave model empty to use the plugin's current stable Gemini Live model.
-model = "gemini-3.8-live"
+model = "google/gemini-3.8-live"
 voice = "Puck"
 language = ""
 # Vertex AI instead of the Gemini Developer API:
 vertexai = false
 project = ""
 location = ""
+# System prompt for the Gemini Live worker. This is the avatar's spoken
+# persona; edit prompts/gemini_agent.md instead of the Python source.
+# Relative paths are resolved against this config directory, the working
+# directory, then the repository root.
+instructions_file = "prompts/gemini_agent.md"
+# Optional inline prompt; used only when instructions_file is empty/missing.
+# instructions = """..."""
 # Identities/settings the API uses when a Gemini session starts:
 avatar_identity = "float-avatar"
 agent_name = "float-gemini"
 autodispatch = true
+
+[float]
+# FLOAT renderer used by the live avatar (/livekit/conversation). The avatar
+# must generate each 2 s chunk faster than the audio plays it; NFE is the main
+# speed/quality knob. 5 = fastest, 10 = balanced, 25 = best quality.
+# If the log says "[livekit-gen] slower than real time: RTF=1.2x", lower this.
+livekit_nfe = 6

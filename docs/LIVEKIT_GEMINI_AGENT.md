@@ -85,7 +85,17 @@ one place serves both the API and the worker:
 | shared place | keys |
 | --- | --- |
 | `fast_float/config/secerts.toml` `[gemini].api_key` | the Gemini API key (git-ignored) |
-| `fast_float/config/settings.toml` `[gemini]` | `model`, `voice`, `language`, `vertexai`… |
+| `fast_float/config/settings.toml` `[gemini]` | `model`, `voice`, `language`, `instructions_file`, `vertexai`… |
+| `fast_float/config/settings.toml` `[float]` | `livekit_nfe`: avatar sampling steps (< 1 s RTF) |
+| `prompts/gemini_agent.md` | the spoken persona (`[gemini].instructions_file`) |
+
+The worker's spoken persona is the Markdown file `prompts/gemini_agent.md`,
+referenced by `[gemini].instructions_file`; edit the file rather than the
+Python constant. An inline `[gemini].instructions` still works as a fallback,
+and `FLOAT_AGENT_INSTRUCTIONS` is the last-resort env fallback for boxes
+without the shared file. The avatar renderer's speed knob is
+`[float].livekit_nfe` (5 fastest … 25 best quality, default 6); lower it if the
+log reports `[livekit-gen] slower than real time`.
 
 The Studio can also supply **per-session overrides** from its header
 **Config** panel (stored in the browser only): a Gemini API key and/or a

@@ -33,20 +33,53 @@ from fast_float.livekit.settings import LiveKitSettings
 logger = logging.getLogger(__name__)
 
 DEFAULT_INSTRUCTIONS = """\
-You are the voice interface of FLOAT, a real-time talking-avatar system.
-Speak naturally, concisely and warmly. Your words are rendered by a talking
-portrait, so keep turns short unless the user asks for detail.
+Your goal is to make every interaction feel natural, warm, and human.
 
-You can inspect the FLOAT system through tools:
-- float_health / float_gpu for service and GPU status,
-- generation_progress for a running render,
-- conversation_status for this room,
-- end_conversation to stop the session.
+### Speaking Style
+- Speak naturally, warmly, and conversationally.
+- Keep responses concise, usually 1–3 short sentences.
+- Use simple, clear language that sounds natural when spoken aloud.
+- Answer directly without unnecessary introductions, repetition, or filler.
+- Adapt your tone and level of detail to the user's needs.
+- Expand only when the user asks for more detail.
+- Ask one brief follow-up question when clarification is needed.
 
-Use a tool when the user asks about status or wants to end the call. Never
-invent status values: call the tool. Do not mention tool names, JSON, or
-internal implementation details out loud.
+### Real-Time Conversation
+- Respond directly to what the user says.
+- Maintain context across turns and avoid repeating information.
+- Handle interruptions, corrections, and topic changes naturally.
+- Never sound overly scripted, robotic, or excessively enthusiastic.
+- Avoid long lists, dense explanations, and complicated phrasing.
+
+Be helpful, present, and human-sounding. Say only what adds value to the conversation.
 """
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _read_instructions_file(value: str, config_dir: Path) -> str:
+    """Load the configured Markdown prompt, resolving common relative bases.
+
+    ``settings.toml`` lives in ``fast_float/config`` but the prompt folder is
+    at the repository root, so a relative path is tried against the config
+    directory, the current working directory and the repo root. The first
+    existing file wins; a missing file falls back to the inline/env/default
+    prompt instead of taking the worker down.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    path = Path(raw).expanduser()
+    candidates = [path] if path.is_absolute() else [config_dir / path, Path.cwd() / path, _REPO_ROOT / path]
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            logger.warning("[config] could not read instructions file %s: %s", candidate, exc)
+            return ""
+    logger.warning("[config] instructions_file not found: %s (checked %s)", raw, ", ".join(map(str, candidates)))
+    return ""
 
 
 def _export_env(name: str, value: str) -> None:
@@ -250,7 +283,12 @@ class AgentConfig:
                 os.getenv("FLOAT_API_URL", "http://127.0.0.1:8000").strip() or "http://127.0.0.1:8000"
             ).rstrip("/"),
             float_api_timeout_s=max(1.0, min(timeout, 60.0)),
-            instructions=os.getenv("FLOAT_AGENT_INSTRUCTIONS", "").strip() or DEFAULT_INSTRUCTIONS,
+            instructions=(
+                _read_instructions_file(settings.gemini.instructions_file, resolve_config_dir())
+                or settings.gemini.instructions.strip()
+                or os.getenv("FLOAT_AGENT_INSTRUCTIONS", "").strip()
+                or DEFAULT_INSTRUCTIONS
+            ),
             config_dir=resolve_config_dir(),
         )
         # livekit-agents (AgentServer / run) and google-genai read the

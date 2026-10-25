@@ -345,6 +345,7 @@ All constructor parameters are keyword-only:
 | `first_chunk_sec` | `1.0` | audio needed before the first chunk (clamped to 2 s) |
 | `idle_flush_sec` | `0.25` | flush buffered tail after this silence; `None` disables |
 | `max_queue_frames` | `128` | bounded output queue length |
+| `nfe` | `DEFAULT_LIVE_NFE` (6) | ODE sampling steps; lower is faster, 5–25 |
 | `executor` | `None` | custom inference executor; caller keeps ownership |
 
 Runtime attributes:
@@ -358,11 +359,14 @@ Runtime attributes:
 When `last_chunk_rtf >= 1.0`, the generator logs:
 
 ```
-[livekit-gen] slower than real time: RTF=1.23 (consider lower nfe / smaller chunks)
+[livekit-gen] slower than real time: RTF=1.23 (nfe=6; lower [float].livekit_nfe in settings.toml or use a faster backend)
 ```
 
-Sustained RTF ≥ 1 means the GPU cannot keep up with the incoming audio. Options
-are fewer `nfe` steps or a smaller model/backend; otherwise the queue drains
+Sustained RTF ≥ 1 means the GPU cannot keep up with the incoming audio. The
+conversational generator reads `[float].livekit_nfe` from `settings.toml` and
+defaults to `6`, while the file `/generate` path keeps its own per-request NFE
+(10 by default). Lower `livekit_nfe` to 5 for the fastest render, or raise it up
+to 25 for quality. A faster model backend also helps. Otherwise the queue drains
 and playback starves (silence between chunks), because production is paced to
 playout rather than dropping frames.
 

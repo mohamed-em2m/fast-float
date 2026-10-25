@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover
     rtc = None  # type: ignore[assignment]
     RTC_AVAILABLE = False
 
+from fast_float.livekit.settings import DEFAULT_LIVE_NFE, MAX_LIVE_NFE, MIN_LIVE_NFE
 from fast_float.streaming.dispatcher import FrameDispatcher
 from fast_float.streaming.live import CLOSE, LiveStream, live_queue_size
 from fast_float.streaming.types import StreamMeta
@@ -52,7 +53,21 @@ MIN_AUDIO_SAMPLES = int(SAMPLE_RATE * MIN_AUDIO_SEC)  # 32,000 samples for 2s
 SAMPLES_PER_FRAME = int(SAMPLE_RATE / TARGET_FPS)  # 640 samples per 40ms frame
 BYTES_PER_FRAME = SAMPLES_PER_FRAME * 2  # 16-bit mono = 1280 bytes
 
+# Live rendering must keep up with the audio arriving from Gemini. NFE is the
+# one knob that trades FLOAT quality for latency: the file API keeps its
+# balanced default (10), while the conversational path defaults to 6. At a
+# measured RTF of 1.24 (see the warning below), 6 leaves ~25% headroom.
+# Configure it in settings.toml as ``[float].livekit_nfe`` (5..25).
 _QUEUE_SENTINEL = object()
+
+
+def _resolve_live_nfe(value: int | str | None) -> int:
+    """Clamp a requested NFE to the range the public generation API accepts."""
+    try:
+        nfe = int(value) if value is not None else DEFAULT_LIVE_NFE
+    except (TypeError, ValueError):
+        nfe = DEFAULT_LIVE_NFE
+    return max(MIN_LIVE_NFE, min(MAX_LIVE_NFE, nfe))
 
 
 # Scratch dir for the temp WAVs: RAM-backed when available, so no disk I/O per chunk.
@@ -165,6 +180,7 @@ class FloatVideoGenerator:
         first_chunk_sec: float = 1.0,
         idle_flush_sec: float | None = 0.25,
         max_queue_frames: int = 128,
+        nfe: int | str | None = None,
         executor: ThreadPoolExecutor | None = None,
     ) -> None:
         self.agent = agent
@@ -175,6 +191,9 @@ class FloatVideoGenerator:
         self.fps = fps
         self.sample_rate = sample_rate
         self.semaphore = semaphore
+        # Explicit argument > ``[float].livekit_nfe`` > the built-in default.
+        # Read once so every chunk in a session reuses the same sampling budget.
+        self.nfe = _resolve_live_nfe(nfe)
 
         # Start a segment after `first_chunk_sec` of audio instead of waiting for a full 2 s.
         self._first_chunk_samples = int(sample_rate * min(first_chunk_sec, MIN_AUDIO_SAMPLES / sample_rate))
@@ -444,7 +463,7 @@ class FloatVideoGenerator:
                         "r_cfg_scale": 1.0,
                         "e_cfg_scale": 1.0,
                         "emotion": "S2E",
-                        "nfe": 10,
+                        "nfe": self.nfe,
                         "no_crop": False,
                         "seed": 25,
                     }
@@ -486,7 +505,7 @@ class FloatVideoGenerator:
                 if self.last_chunk_rtf >= 1.0:
                     logger.warning(
                         f"[livekit-gen] slower than real time: RTF={self.last_chunk_rtf:.2f} "
-                        f"(consider lower nfe / smaller chunks)"
+                        f"(nfe={self.nfe}; lower [float].livekit_nfe in settings.toml or use a faster backend)"
                     )
             finally:
                 if self.semaphore:
