@@ -37,6 +37,7 @@ DEFAULT_AGENT_NAME = "float-gemini"
 # 5 is the fastest value the public /generate API accepts, 25 the slowest.
 DEFAULT_LIVE_NFE = 6
 DEFAULT_LIVE_FIRST_CHUNK_SEC = 0.4
+DEFAULT_LIVE_CHUNK_SEC = 2.0  # ongoing chunk window (FLOAT always renders 2 s internally)
 DEFAULT_LIVE_SILENCE_SEC = 2.0
 DEFAULT_LIVE_MAX_STREAMS = 0  # 0 = auto-detect based on GPU VRAM
 MIN_LIVE_NFE = 5
@@ -165,6 +166,7 @@ class LiveKitSettings:
     #: 25 best quality. The file /generate path keeps its own per-request NFE.
     livekit_nfe: int = DEFAULT_LIVE_NFE
     livekit_first_chunk_sec: float = DEFAULT_LIVE_FIRST_CHUNK_SEC
+    livekit_chunk_sec: float = DEFAULT_LIVE_CHUNK_SEC  # ongoing chunk window (seconds)
     livekit_silence_sec: float = DEFAULT_LIVE_SILENCE_SEC
     livekit_max_streams: int = DEFAULT_LIVE_MAX_STREAMS
     #: Gemini Live settings (API key + model/voice defaults, see GeminiSettings).
@@ -293,7 +295,17 @@ class LiveKitSettings:
             livekit_first_chunk_sec = float(float_cfg.get("livekit_first_chunk_sec", DEFAULT_LIVE_FIRST_CHUNK_SEC))
         except (TypeError, ValueError):
             livekit_first_chunk_sec = DEFAULT_LIVE_FIRST_CHUNK_SEC
-        livekit_first_chunk_sec = max(0.2, min(2.0, livekit_first_chunk_sec))
+        # Upper bound raised to 10 s so operators can buffer a full utterance before
+        # the avatar starts moving (e.g. set to 5.0 to wait 5 s of speech first).
+        livekit_first_chunk_sec = max(0.2, min(10.0, livekit_first_chunk_sec))
+        try:
+            livekit_chunk_sec = float(float_cfg.get("livekit_chunk_sec", DEFAULT_LIVE_CHUNK_SEC))
+        except (TypeError, ValueError):
+            livekit_chunk_sec = DEFAULT_LIVE_CHUNK_SEC
+        # FLOAT always renders in 2 s windows internally; values < 2 are clamped up.
+        # Higher values (e.g. 4 s, 5 s) collect more audio before triggering each
+        # subsequent render — more natural pacing at the cost of higher latency.
+        livekit_chunk_sec = max(2.0, min(10.0, livekit_chunk_sec))
         try:
             livekit_silence_sec = float(float_cfg.get("livekit_silence_sec", DEFAULT_LIVE_SILENCE_SEC))
         except (TypeError, ValueError):
@@ -448,6 +460,7 @@ class LiveKitSettings:
             autodispatch=autodispatch,
             livekit_nfe=livekit_nfe,
             livekit_first_chunk_sec=livekit_first_chunk_sec,
+            livekit_chunk_sec=livekit_chunk_sec,
             livekit_silence_sec=livekit_silence_sec,
             livekit_max_streams=livekit_max_streams,
             gemini=GeminiSettings(

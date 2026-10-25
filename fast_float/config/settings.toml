@@ -120,13 +120,22 @@ autodispatch = true
 # If the log says "[livekit-gen] slower than real time: RTF=1.2x", lower this.
 # The file /generate path uses [float.request].nfe instead.
 livekit_nfe = 5
-# Audio buffer threshold (seconds) before launching the avatar's first render chunk.
-# Lower values (e.g. 0.4s) cut latency before the avatar begins responding;
-# 2.0s is the full chunk window.
-livekit_first_chunk_sec = 0.4
+# Audio buffer threshold (seconds) before launching the avatar's FIRST render chunk.
+# Lower values (e.g. 0.4s) cut latency — the avatar starts moving almost immediately.
+# Higher values (e.g. 5.0s) collect a longer utterance before the avatar begins
+# responding (better sentence pacing). Range: 0.2..10 s.
+livekit_first_chunk_sec = 5.0
+# Ongoing chunk window (seconds) — how much audio to collect between render groups.
+# FLOAT accepts the full window and automatically iterates its internal 2 s sub-windows
+# with smooth seam blending across them:
+#   2.0 = fire a render after every 2 s of audio (lowest latency).
+#   5.0 = buffer 5 s of speech, then pass all 5 s directly to FLOAT in one render pass
+#         for cohesive sentence pacing and better temporal continuity.
+# Range: 2.0..10 s (values below 2 are clamped to 2 — the model's minimum window).
+livekit_chunk_sec = 5.0
 # Duration (seconds) of the pre-rendered silence/idle loop video generated once
 # at session start (default 2.0s). Looped while the avatar is idle.
-livekit_silence_sec = 2.0
+livekit_silence_sec = 10.0
 # Maximum concurrent live avatar streams allowed to render in parallel on the GPU.
 # 0 = auto-detect based on available GPU VRAM (recommended).
 livekit_max_streams = 0
@@ -164,7 +173,7 @@ decode_batch_size = 0
 decode_channels_last = false
 # Decoder autocast: "off", "fp16" or "bf16". Off is the numerics-safe default.
 # Env fallback: FLOAT_DECODE_AUTOCAST.
-decode_autocast = "off"
+decode_autocast = "on"
 
 [float.video]
 # input_size is the model's working resolution (checkpoint-dependent).

@@ -314,6 +314,7 @@ class ConversationSession:
             semaphore=semaphore,
             nfe=self.settings.livekit_nfe,
             first_chunk_sec=getattr(self.settings, "livekit_first_chunk_sec", 0.4),
+            chunk_sec=getattr(self.settings, "livekit_chunk_sec", 2.0),
         )
 
         # Pre-render the silence idle loop once: FLOAT on silence audio (duration

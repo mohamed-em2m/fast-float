@@ -1,13 +1,14 @@
 """FloatVideoGenerator: audio in -> synchronized (VideoFrame, AudioFrame) out.
 
 Implements the custom avatar video generator interface for LiveKit.
-FLOAT conditions on a 2-second audio window (50 frames at 25 fps, 16 kHz audio)
-and is autoregressive over chunks.
+FLOAT internally windows any length of audio into 2-second clips (50 frames at
+25 fps, 16 kHz) with seam blending between them, so the generator passes the
+full configured ``chunk_sec`` buffer in one call and lets FLOAT handle windowing.
 
 This module provides:
-1. `FloatVideoGenerator`: generates video from live audio input in 2.0 s chunks,
-   pairing each 40 ms video frame with its exact 40 ms audio slice (640 samples @ 16 kHz)
-   for drift-free A/V sync.
+1. `FloatVideoGenerator`: buffers audio for ``chunk_sec`` seconds then passes the
+   full buffer to FLOAT in one inference call, pairing each 40 ms video frame
+   with its exact 40 ms audio slice (640 samples @ 16 kHz) for drift-free A/V sync.
 2. `LiveStreamVideoGenerator`: taps an in-flight `LiveStream` from `/generate`,
    pairing decoded frames with audio from `stream.audio_path`.
 3. `MediaFileVideoGenerator`: plays back an existing rendered MP4 file into LiveKit.
@@ -178,6 +179,7 @@ class FloatVideoGenerator:
         sample_rate: int = SAMPLE_RATE,
         semaphore: asyncio.Semaphore | None = None,
         first_chunk_sec: float = 0.4,
+        chunk_sec: float = 2.0,
         idle_flush_sec: float | None = 0.25,
         max_queue_frames: int = 256,
         nfe: int | str | None = None,
@@ -196,7 +198,13 @@ class FloatVideoGenerator:
         self.nfe = _resolve_live_nfe(nfe)
 
         # Start a segment after `first_chunk_sec` of audio instead of waiting for a full 2 s.
-        self._first_chunk_samples = int(sample_rate * min(first_chunk_sec, MIN_AUDIO_SAMPLES / sample_rate))
+        # No inner clamp here — settings.py already enforces 0.2..10 s.
+        self._first_chunk_samples = max(1, int(sample_rate * first_chunk_sec))
+        # Ongoing chunk window: how many samples to collect before launching each
+        # subsequent render. Clamped to >= MIN_AUDIO_SAMPLES so FLOAT always
+        # receives at least one full 2 s window of PCM. Higher values (e.g. 4 s,
+        # 5 s) group more speech into one image-change cycle.
+        self._chunk_samples = max(MIN_AUDIO_SAMPLES, int(sample_rate * chunk_sec))
         self.idle_flush_sec = idle_flush_sec
 
         # One dedicated worker: serialises GPU work and doesn't compete with the
@@ -206,11 +214,11 @@ class FloatVideoGenerator:
 
         self._audio_pcm = bytearray()
         self._frame_queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue_frames)
-        # Largest burst one chunk can add: a full 2 s window rendered at
-        # ``TARGET_FPS``. Production is paced so that a new chunk only starts
-        # when this many slots are free, i.e. the queue never has to drop the
-        # oldest frames of the utterance being played.
-        self._max_chunk_frames = int(np.ceil(MIN_AUDIO_SAMPLES / SAMPLES_PER_FRAME))
+        # Largest burst one chunk can add: the chunk window rendered at TARGET_FPS.
+        # Production is paced so that a new chunk only starts when this many slots
+        # are free, i.e. the queue never has to drop the oldest frames of the
+        # utterance being played.
+        self._max_chunk_frames = int(np.ceil(self._chunk_samples / SAMPLES_PER_FRAME))
         self._pump_retry: asyncio.TimerHandle | None = None
         self._queue_retry_s = 0.04
         self._stopped = False
@@ -259,16 +267,13 @@ class FloatVideoGenerator:
         silence_pcm = bytes(silence_samples * 2)  # 16-bit silence
         captured: list[tuple[np.ndarray, bytes]] = []
 
-        def _collect_silence() -> None:
-            """Run inference on silence PCM and capture the frames."""
+        async def _collect_silence_coro() -> None:
+            """Run inference on silence PCM under the GPU semaphore and capture frames."""
             wav_path = None
             try:
                 wav_path = self._write_wav(silence_pcm)
                 if self.agent is not None and self.image_path:
                     from fast_float.core.service import run_inference_blocking
-
-                    # Use a throw-away dispatcher that stores frames locally.
-                    _loop = self.loop
 
                     class _SilenceDispatcher(FrameDispatcher):
                         abort_on_error = False
@@ -312,18 +317,28 @@ class FloatVideoGenerator:
                         "no_crop": False,
                         "seed": 25,
                     }
+
+                    def _run_sync() -> None:
+                        try:
+                            run_inference_blocking(
+                                self.agent,
+                                None,
+                                self.image_path,
+                                wav_path,
+                                req_data,
+                                bridge,
+                            )
+                        finally:
+                            with contextlib.suppress(Exception):
+                                bridge.shutdown()
+
+                    if self.semaphore:
+                        await self.semaphore.acquire()
                     try:
-                        run_inference_blocking(
-                            self.agent,
-                            None,
-                            self.image_path,
-                            wav_path,
-                            req_data,
-                            bridge,
-                        )
+                        await self.loop.run_in_executor(self._executor, _run_sync)
                     finally:
-                        with contextlib.suppress(Exception):
-                            bridge.shutdown()
+                        if self.semaphore:
+                            self.semaphore.release()
                 else:
                     # Test / no-model path: synthesize a colour-cycling pattern.
                     n_frames = int(np.ceil(silence_samples * TARGET_FPS / SAMPLE_RATE))
@@ -346,7 +361,7 @@ class FloatVideoGenerator:
                         os.remove(wav_path)
 
         try:
-            await self.loop.run_in_executor(self._executor, _collect_silence)
+            await _collect_silence_coro()
         except Exception as exc:
             logger.warning(f"[livekit-gen] silence executor error: {exc}")
 
@@ -437,7 +452,16 @@ class FloatVideoGenerator:
     # ------------------------------------------------------------- scheduling
 
     def _pump(self) -> None:
-        """Start the next chunk if there is enough audio (or a flush is pending)."""
+        """Start the next chunk if there is enough audio (or a flush is pending).
+
+        Threshold logic:
+        - Not yet started: wait for ``_first_chunk_samples`` (e.g. 5 s to buffer a full utterance).
+        - Segment started: wait for ``_chunk_samples`` before the next group.
+
+        FLOAT's sampler iterates its own internal 2 s windows with seam blending,
+        so we pass the full ``_chunk_samples`` buffer in one call — no manual
+        sub-window slicing needed here.
+        """
         if self._stopped or self._inference_running:
             return
         n = len(self._audio_pcm) // 2
@@ -446,7 +470,8 @@ class FloatVideoGenerator:
             self._segment_started = False
             self._refresh_idle()
             return
-        need = MIN_AUDIO_SAMPLES if self._segment_started else self._first_chunk_samples
+        # Between utterances wait for chunk_sec; very first chunk waits for first_chunk_sec.
+        need = self._chunk_samples if self._segment_started else self._first_chunk_samples
         if n < need and not self._flush_requested:
             self._refresh_idle()
             return
@@ -481,16 +506,40 @@ class FloatVideoGenerator:
         self._segment_started = True
         self._idle_event.clear()
 
-        take = min(len(self._audio_pcm), MIN_AUDIO_SAMPLES * 2) & ~1  # whole int16 samples only
+        # Take the full configured chunk window (or whatever remains on flush).
+        # FLOAT's sampler internally iterates 2 s sub-windows with seam blending
+        # between them, so passing the whole buffer in one call gives better
+        # temporal coherence than manual sub-window draining.
+        take = min(len(self._audio_pcm), self._chunk_samples * 2) & ~1
         if take <= 0:
+            # Edge case: buffer holds a stray sub-sample byte (< 2 bytes).
+            # Discard it and reset state so the pump can close the segment cleanly
+            # instead of stalling forever.
+            self._audio_pcm.clear()
+            if self._flush_requested:
+                self._flush_requested = False
+                self._segment_started = False
             self._inference_running = False
+            self._refresh_idle()
             return
+
         pcm = bytes(self._audio_pcm[:take])
         del self._audio_pcm[:take]
         valid_samples = take // 2
-        pcm += bytes(MIN_AUDIO_SAMPLES * 2 - len(pcm))  # FLOAT wants exactly 2 s
 
-        if not self._audio_pcm and self._flush_requested:  # tail consumed: segment over
+        logger.debug(
+            "[livekit-gen] launching chunk: %.2f s (%d samples); %d samples remain in buffer",
+            valid_samples / self.sample_rate,
+            valid_samples,
+            len(self._audio_pcm) // 2,
+        )
+
+        # `valid_samples` tells the dispatcher bridge how many samples are real
+        # audio; any frames that FLOAT emits beyond this point (tail padding from
+        # its internal replicate-pad on the last 2 s window) are dropped by the
+        # bridge and never reach the LiveKit track.
+        if self._flush_requested and not self._audio_pcm:
+            # All buffered audio consumed — segment is done after this inference.
             self._flush_requested = False
             self._segment_started = False
 
