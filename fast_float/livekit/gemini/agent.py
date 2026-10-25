@@ -26,8 +26,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import ssl
 from pathlib import Path
 from typing import Any
+
+try:  # certifi ships with httpx/google-genai; the system store is a fallback.
+    import certifi
+except ImportError:  # pragma: no cover
+    certifi = None
 
 from dotenv import load_dotenv
 
@@ -43,7 +50,6 @@ from livekit.agents import (
     AgentServer,
     AgentSession,
     JobContext,
-    RoomOutputOptions,
     RunContext,
     TurnHandlingOptions,
     cli,
@@ -51,6 +57,11 @@ from livekit.agents import (
     get_job_context,
 )
 from livekit.agents.voice.avatar import DataStreamAudioOutput
+
+# RoomOptions is not (yet) re-exported at livekit.agents top level in 1.8.x —
+# only the legacy RoomInput/OutputOptions pair is (hence the SDK deprecation
+# warning we silence here by switching).
+from livekit.agents.voice.room_io import RoomOptions
 from livekit.plugins import google
 
 from fast_float.livekit.gemini.config import AgentConfig, dispatch_config, sanitize_gemini_model
@@ -145,7 +156,39 @@ class FloatAssistant(Agent):
         await context.session.shutdown(drain=False)
 
 
-def _build_realtime_model(api_key: str | None = None, model: str | None = None) -> google.realtime.RealtimeModel:
+_GENAI_SSL_CONTEXT: ssl.SSLContext | None = None
+
+
+async def _genai_ssl_context() -> ssl.SSLContext:
+    """The TLS context google-genai builds for every HTTPX client.
+
+    google-genai 2.x builds `ssl.create_default_context(...)` synchronously
+    inside each Client construction — i.e. on the agent loop, right when a
+    session starts. On this box that stall measured ~283 ms on the first
+    session, which `livekit.agents` flags with
+    "event loop blocked ... delays audio and turn handling". The context only
+    depends on the trust store, so build it once in a thread and hand the same
+    one to every session through `HttpOptions.client_args["verify"]`
+    (the documented hook `_ensure_httpx_ssl_ctx` consults before building).
+    """
+    global _GENAI_SSL_CONTEXT
+    if _GENAI_SSL_CONTEXT is None:
+        cafile = os.environ.get("SSL_CERT_FILE") or (certifi.where() if certifi else None)
+        capath = os.environ.get("SSL_CERT_DIR")
+
+        def _build() -> ssl.SSLContext:
+            """Mirror google/genai/_api_client.py's context construction."""
+            if cafile or capath:
+                return ssl.create_default_context(cafile=cafile, capath=capath)
+            return ssl.create_default_context()
+
+        _GENAI_SSL_CONTEXT = await asyncio.to_thread(_build)
+    return _GENAI_SSL_CONTEXT
+
+
+def _build_realtime_model(
+    api_key: str | None = None, model: str | None = None, ssl_ctx: ssl.SSLContext | None = None
+) -> google.realtime.RealtimeModel:
     """Create the Gemini Live model from the environment.
 
     ``api_key`` / ``model`` win over the environment/shared config: the FLOAT
@@ -179,6 +222,18 @@ def _build_realtime_model(api_key: str | None = None, model: str | None = None) 
             )
     elif api_key or config.google_api_key:
         kwargs["api_key"] = api_key or config.google_api_key
+    if ssl_ctx is not None:
+        # Keep the plugin's own default here: RealtimeSession builds
+        # `types.HttpOptions(timeout=int(DEFAULT_API_CONNECT_OPTIONS.timeout *
+        # 1000))` (10.0 s -> 10_000 ms) when no http_options is given. Pre-seed
+        # `client_args["verify"]` — the hook google-genai's
+        # `_ensure_httpx_ssl_ctx` consults first — so no session ever builds a
+        # fresh TLS context on the agent loop (see _genai_ssl_context).
+        kwargs["http_options"] = genai_types.HttpOptions(
+            timeout=10_000,
+            client_args={"verify": ssl_ctx},
+            async_client_args={"verify": ssl_ctx},
+        )
     return google.realtime.RealtimeModel(**kwargs)  # type: ignore[arg-type]
 
 
@@ -221,7 +276,10 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.info("using a per-session Gemini model supplied by the FLOAT API (%s)", session_model)
 
     session = AgentSession(
-        llm=_build_realtime_model(session_api_key, session_model),
+        # The shared TLS context is built in a thread before session.start, so
+        # the plugin's GenAI client construction (which would otherwise build a
+        # fresh SSL context synchronously on this loop) inherits it.
+        llm=_build_realtime_model(session_api_key, session_model, ssl_ctx=await _genai_ssl_context()),
         # Avatar audio is streamed to the renderer as it is produced, so it
         # cannot be paused/rewound: the plugin's DataStreamAudioOutput.pause()
         # only logs "pause is not supported". Upstream enables
@@ -243,7 +301,10 @@ async def entrypoint(ctx: JobContext) -> None:
     await session.start(
         agent=FloatAssistant(),
         room=ctx.room,
-        room_output_options=RoomOutputOptions(audio_enabled=False),
+        # room_options= (not the deprecated RoomOutputOptions): the agent's
+        # voice is streamed to the renderer via DataStreamAudioOutput, not
+        # published as its own track.
+        room_options=RoomOptions(audio_output=False),
     )
 
     # Keep the job alive for the whole conversation. AgentSession emits
