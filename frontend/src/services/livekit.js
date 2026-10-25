@@ -276,6 +276,23 @@ export async function stopConversation(room) {
 }
 
 /**
+ * Whether the conversation's agent participant has actually joined the room.
+ *
+ * Reaching 'Live' only proves the avatar's tracks exist; in Gemini Live mode
+ * the stage stays silent until the worker joins, so the studio polls this and
+ * tells the user what is still missing. Returns null when the room is gone.
+ */
+export async function fetchConversationStatus(room) {
+  try {
+    const res = await fetch(`${getApiUrl()}/livekit/conversation/status?room=${encodeURIComponent(room)}`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Connect to a LiveKit room and stream avatar tracks to the video element.
  *
  * Video *and* audio are attached to `videoElement`, so the browser renders

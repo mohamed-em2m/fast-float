@@ -18,6 +18,7 @@ import { getApiUrl } from '../services/api';
 import {
   connectLiveKitSession,
   createMicrophoneMeter,
+  fetchConversationStatus,
   fetchLiveKitStatus,
   getGeminiApiKey,
   getGeminiModel,
@@ -100,6 +101,13 @@ export default function LiveAudioStudio({
   const [activeEngine, setActiveEngine] = useState('builtin');
   // Autoplay with sound can be rejected even after a click; offer a retry.
   const [needsGesture, setNeedsGesture] = useState(false);
+  // The portrait stays visible behind the <video> until it actually plays:
+  // the avatar publishes its tracks instantly but renders no frames until
+  // speech arrives, so without the backdrop the stage is a black rectangle.
+  const [videoStarted, setVideoStarted] = useState(false);
+  // Gemini Live only: whether the worker has actually joined the room.
+  const [agentConnected, setAgentConnected] = useState(null);
+  const isLive = phase === 'live';
 
   const videoRef = useRef(null);
   const roomRef = useRef(null);
@@ -166,6 +174,56 @@ export default function LiveAudioStudio({
     const timer = setInterval(() => setElapsed((Date.now() - started) / 1000), 1000);
     return () => clearInterval(timer);
   }, [phase]);
+
+  // The portrait stays on the stage until the avatar's first REAL video frame
+  // renders. 'playing' is not enough: the tracks are attached to one element,
+  // so audio alone can satisfy the browser while the video stays black.
+  // requestVideoFrameCallback only fires on actual decoded frames; fall back
+  // to 'playing' when the browser does not support it (see onPlaying below).
+  useEffect(() => {
+    if (!isLive) {
+      setVideoStarted(false);
+      return undefined;
+    }
+    const video = videoRef.current;
+    if (!video || typeof video.requestVideoFrameCallback !== 'function') {
+      return undefined;
+    }
+    let cancelled = false;
+    const onFirstFrame = (_now, _meta) => {
+      if (!cancelled) setVideoStarted(true);
+    };
+    const register = () => video.requestVideoFrameCallback(onFirstFrame);
+    register();
+    return () => {
+      cancelled = true;
+    };
+  }, [isLive, room]);
+
+  // Poll the agent connection while a Gemini session is on air. 'Live' only
+  // means the avatar's tracks exist: until the worker joins, nothing speaks
+  // and the room is silent, so say so instead of a black stage.
+  useEffect(() => {
+    if (phase !== 'live' || activeEngine !== 'gemini') {
+      setAgentConnected(null);
+      return undefined;
+    }
+    let cancelled = false;
+    let timer = null;
+    const poll = async () => {
+      const roomNow = roomRef.current;
+      if (!roomNow) return;
+      const status = await fetchConversationStatus(roomNow);
+      if (cancelled || roomRef.current !== roomNow) return;
+      setAgentConnected(Boolean(status?.active && status?.agent_connected));
+      timer = setTimeout(poll, 3000);
+    };
+    poll();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [phase, activeEngine, room]);
 
   const teardownLocal = async ({ flush = true } = {}) => {
     if (micMeterRef.current) {
@@ -248,6 +306,7 @@ export default function LiveAudioStudio({
     roomRef.current = null;
     setPhase('stopping');
     setNeedsGesture(false);
+    setVideoStarted(false);
     await teardownLocal({ flush: true });
     if (activeRoom) await stopConversation(activeRoom).catch(() => {});
     if (!mountedRef.current) {
@@ -279,6 +338,8 @@ export default function LiveAudioStudio({
     let startedRoom = null;
     setError(null);
     setNeedsGesture(false);
+    setVideoStarted(false);
+    setAgentConnected(null);
     setPhase('starting');
     const targetRoom = newRoomName();
     try {
@@ -432,7 +493,6 @@ export default function LiveAudioStudio({
   const configured = liveKit?.configured;
   const backendReachable = liveKit?.reachable !== false;
   const busy = phase === 'starting' || phase === 'stopping';
-  const isLive = phase === 'live';
   const minutes = String(Math.floor(elapsed / 60)).padStart(2, '0');
   const seconds = String(Math.floor(elapsed % 60)).padStart(2, '0');
 
@@ -592,12 +652,28 @@ export default function LiveAudioStudio({
         </div>
 
         <div className={`live-video ${isLive ? 'is-live' : ''}`}>
+          {isLive && imagePreview && !videoStarted && (
+            <img
+              src={imagePreview}
+              alt=""
+              aria-hidden="true"
+              className="live-video-backdrop"
+            />
+          )}
           <video
             ref={videoRef}
             autoPlay
             playsInline
             className="live-video-el"
-            onPlaying={() => setNeedsGesture(false)}
+            onPlaying={() => {
+              // Without requestVideoFrameCallback this is the best signal for
+              // "rendering started"; with it, only a real video frame hides
+              // the portrait (audio alone can fire 'playing' on a black stage).
+              if (typeof videoRef.current?.requestVideoFrameCallback !== 'function') {
+                setVideoStarted(true);
+              }
+              setNeedsGesture(false);
+            }}
           />
           {isLive && needsGesture && (
             <button type="button" className="live-play-overlay" onClick={resumePlayback}>
@@ -650,7 +726,16 @@ export default function LiveAudioStudio({
               <span className="live-badge">
                 <span className="live-badge-dot" /> LIVE
               </span>
-              <span className="live-hud-room">{room}</span>
+              <div className="live-hud-side">
+                {activeEngine === 'gemini' && agentConnected !== null && (
+                  <span
+                    className={`live-agent-chip ${agentConnected ? 'is-connected' : 'is-waiting'}`}
+                  >
+                    {agentConnected ? 'Gemini agent connected' : 'Waiting for the Gemini agent…'}
+                  </span>
+                )}
+                <span className="live-hud-room">{room}</span>
+              </div>
             </div>
           )}
         </div>
