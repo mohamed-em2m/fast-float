@@ -8,6 +8,7 @@ import logging
 import os
 import struct
 import tempfile
+import threading
 import time
 from contextlib import suppress
 from dataclasses import replace
@@ -47,6 +48,25 @@ LIVE_QUEUE_MAX_FRAMES = 4096  # ~164 s at 25 fps, ~3.2 GiB at 512x512
 # filling the disk; it is far above any normal clip (4 GiB ~ 55 min at 25 fps).
 LIVE_SPILL_BYTES = 4 * 1024 * 1024 * 1024  # 4 GiB
 LIVE_SPILL_JPEG_QUALITY = 85
+
+_spool_io_lock = threading.Lock()
+
+
+def _pwrite(fd: int, data: bytes | memoryview, offset: int) -> int:
+    if hasattr(os, "pwrite"):
+        return os.pwrite(fd, data, offset)
+    with _spool_io_lock:
+        os.lseek(fd, offset, os.SEEK_SET)
+        return os.write(fd, data)
+
+
+def _pread(fd: int, n: int, offset: int) -> bytes:
+    if hasattr(os, "pread"):
+        return os.pread(fd, n, offset)
+    with _spool_io_lock:
+        os.lseek(fd, offset, os.SEEK_SET)
+        return os.read(fd, n)
+
 
 # Spool record headers.  ``kind`` is 0=frame, 1=gap, 2=close.
 _SPILL_FRAME = struct.Struct(">BIdHHBBI")  # kind, idx, pts_ms, h, w, c, codec, nbytes
@@ -278,7 +298,7 @@ class LiveQueue:
         view = memoryview(data)
         written = 0
         while written < len(view):
-            written += os.pwrite(self._spool_fd, view[written:], offset + written)
+            written += _pwrite(self._spool_fd, view[written:], offset + written)
 
     def _append_record(self, header: bytes, payload: bytes = b"") -> bool:
         total = len(header) + len(payload)
@@ -300,7 +320,9 @@ class LiveQueue:
         except OSError as exc:
             if not self._spill_error_logged:
                 self._spill_error_logged = True
-                logger.warning("[live] %s: frame spool write failed (%s); falling back to dropping", self._request_id, exc)
+                logger.warning(
+                    "[live] %s: frame spool write failed (%s); falling back to dropping", self._request_id, exc
+                )
             return False
         self._spool_write += total
         self._spool_bytes += total
@@ -362,7 +384,7 @@ class LiveQueue:
         remaining = nbytes
         offset = self._spool_read_off
         while remaining > 0:
-            chunk = os.pread(self._spool_fd, remaining, offset)
+            chunk = _pread(self._spool_fd, remaining, offset)
             if not chunk:
                 raise OSError("frame spool is truncated")
             chunks.append(chunk)

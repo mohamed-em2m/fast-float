@@ -36,6 +36,7 @@ DEFAULT_AGENT_NAME = "float-gemini"
 # FLOAT's live renderer: NFE (ODE sampling steps) trades quality for latency.
 # 5 is the fastest value the public /generate API accepts, 25 the slowest.
 DEFAULT_LIVE_NFE = 6
+DEFAULT_LIVE_FIRST_CHUNK_SEC = 0.4
 MIN_LIVE_NFE = 5
 MAX_LIVE_NFE = 25
 
@@ -161,6 +162,7 @@ class LiveKitSettings:
     #: FLOAT live renderer ODE steps (``[float].livekit_nfe``): 5 fastest,
     #: 25 best quality. The file /generate path keeps its own per-request NFE.
     livekit_nfe: int = DEFAULT_LIVE_NFE
+    livekit_first_chunk_sec: float = DEFAULT_LIVE_FIRST_CHUNK_SEC
     #: Gemini Live settings (API key + model/voice defaults, see GeminiSettings).
     gemini: GeminiSettings = field(default_factory=GeminiSettings)
     source: str = "none"
@@ -283,6 +285,11 @@ class LiveKitSettings:
         except (TypeError, ValueError):
             livekit_nfe = DEFAULT_LIVE_NFE
         livekit_nfe = max(MIN_LIVE_NFE, min(MAX_LIVE_NFE, livekit_nfe))
+        try:
+            livekit_first_chunk_sec = float(float_cfg.get("livekit_first_chunk_sec", DEFAULT_LIVE_FIRST_CHUNK_SEC))
+        except (TypeError, ValueError):
+            livekit_first_chunk_sec = DEFAULT_LIVE_FIRST_CHUNK_SEC
+        livekit_first_chunk_sec = max(0.2, min(2.0, livekit_first_chunk_sec))
 
         ttl_raw, _ttl_src = first_value(
             (os.getenv("LIVEKIT_TOKEN_TTL_S", "").strip(), "env"),
@@ -426,6 +433,7 @@ class LiveKitSettings:
             agent_name=agent_name or DEFAULT_AGENT_NAME,
             autodispatch=autodispatch,
             livekit_nfe=livekit_nfe,
+            livekit_first_chunk_sec=livekit_first_chunk_sec,
             gemini=GeminiSettings(
                 api_key=gemini_key,
                 model=gemini_model,

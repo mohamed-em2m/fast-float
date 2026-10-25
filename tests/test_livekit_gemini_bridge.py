@@ -118,8 +118,8 @@ def test_receiver_keeps_partial_audio_after_a_stream_error():
         receiver._reader_event.set()
         task = asyncio.create_task(receiver._read_loop())
         try:
-            for _ in range(100):
-                if receiver._queue.qsize() >= 4:  # broken tail + good frames + 2 ends
+            for _ in range(200):
+                if receiver._queue.qsize() >= 5:  # broken tail + good frames + 2 ends
                     break
                 await asyncio.sleep(0.01)
         finally:

@@ -120,6 +120,10 @@ autodispatch = true
 # If the log says "[livekit-gen] slower than real time: RTF=1.2x", lower this.
 # The file /generate path uses [float.request].nfe instead.
 livekit_nfe = 5
+# Audio buffer threshold (seconds) before launching the avatar's first render chunk.
+# Lower values (e.g. 0.4s) cut latency before the avatar begins responding;
+# 2.0s is the full chunk window.
+livekit_first_chunk_sec = 0.4
 
 [float.checkpoint]
 # Weights and output locations.

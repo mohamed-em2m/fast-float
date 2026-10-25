@@ -177,9 +177,9 @@ class FloatVideoGenerator:
         fps: float = TARGET_FPS,
         sample_rate: int = SAMPLE_RATE,
         semaphore: asyncio.Semaphore | None = None,
-        first_chunk_sec: float = 1.0,
+        first_chunk_sec: float = 0.4,
         idle_flush_sec: float | None = 0.25,
-        max_queue_frames: int = 128,
+        max_queue_frames: int = 256,
         nfe: int | str | None = None,
         executor: ThreadPoolExecutor | None = None,
     ) -> None:
@@ -212,7 +212,7 @@ class FloatVideoGenerator:
         # oldest frames of the utterance being played.
         self._max_chunk_frames = int(np.ceil(MIN_AUDIO_SAMPLES / SAMPLES_PER_FRAME))
         self._pump_retry: asyncio.TimerHandle | None = None
-        self._queue_retry_s = 0.1
+        self._queue_retry_s = 0.04
         self._stopped = False
         self._stop_pending = False
         self._inference_running = False
@@ -336,8 +336,8 @@ class FloatVideoGenerator:
         # (waiting would deadlock), so it keeps the old drop-oldest behaviour.
         maxsize = self._frame_queue.maxsize
         if maxsize >= self._max_chunk_frames:
-            margin = self._max_chunk_frames if maxsize >= 2 * self._max_chunk_frames else 0
-            if self._frame_queue.qsize() + self._max_chunk_frames + margin > maxsize:
+            headroom = self._max_chunk_frames + 10
+            if self._frame_queue.qsize() + headroom > maxsize:
                 self._schedule_pump_retry()
                 return
         self._launch_chunk()

@@ -164,7 +164,11 @@ class AgentAvatarRunner:
         delay = self._next_frame_at - now
         if delay > 0:
             await asyncio.sleep(delay)
-        self._next_frame_at = max(self._next_frame_at + self._frame_interval, loop.time())
+        now_after = loop.time()
+        if now_after - self._next_frame_at > 3.0 * self._frame_interval:
+            self._next_frame_at = now_after
+        else:
+            self._next_frame_at += self._frame_interval
 
     def _spawn(self, coro: Any) -> None:
         task = asyncio.create_task(coro)

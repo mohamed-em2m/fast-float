@@ -135,7 +135,7 @@ class AvatarOptions:
     video_fps: float = 25.0
     audio_sample_rate: int = 16000
     audio_channels: int = 1
-    queue_size_ms: int = 100
+    queue_size_ms: int = 400
 
 
 class AvatarRunner:
@@ -186,8 +186,11 @@ class AvatarRunner:
         delay = self._next_frame_at - now
         if delay > 0:
             await asyncio.sleep(delay)
-        # max() drops a backlog after a stall instead of bursting old frames.
-        self._next_frame_at = max(self._next_frame_at + self._frame_interval, loop.time())
+        now_after = loop.time()
+        if now_after - self._next_frame_at > 3.0 * self._frame_interval:
+            self._next_frame_at = now_after
+        else:
+            self._next_frame_at += self._frame_interval
 
     async def start(self) -> None:
         """Initialize sources, publish tracks, and start media forwarding."""

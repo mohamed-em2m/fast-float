@@ -286,6 +286,7 @@ class ConversationSession:
             image_path=self.image_path,
             semaphore=_render_lock,
             nfe=self.settings.livekit_nfe,
+            first_chunk_sec=getattr(self.settings, "livekit_first_chunk_sec", 0.4),
         )
 
         if self.agent_backend == "gemini":
