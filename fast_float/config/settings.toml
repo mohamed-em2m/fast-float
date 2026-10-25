@@ -124,6 +124,9 @@ livekit_nfe = 5
 # Lower values (e.g. 0.4s) cut latency before the avatar begins responding;
 # 2.0s is the full chunk window.
 livekit_first_chunk_sec = 0.4
+# Duration (seconds) of the pre-rendered silence/idle loop video generated once
+# at session start (default 2.0s). Looped while the avatar is idle.
+livekit_silence_sec = 2.0
 
 [float.checkpoint]
 # Weights and output locations.

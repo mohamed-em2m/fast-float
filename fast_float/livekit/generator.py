@@ -242,12 +242,12 @@ class FloatVideoGenerator:
 
     # --------------------------------------------------- silence / idle frames
 
-    async def prepare_silence(self) -> None:
+    async def prepare_silence(self, duration_sec: float = 2.0) -> None:
         """Generate the silence idle loop once, in the background executor.
 
-        Runs FLOAT inference on 2 s of zero PCM so the avatar has a natural
-        resting expression for when it is not speaking. Call this once after
-        creating the generator; ``__aiter__`` will loop the result while idle.
+        Runs FLOAT inference on ``duration_sec`` of zero PCM so the avatar has
+        a natural resting expression for when it is not speaking. Call this once
+        after creating the generator; ``__aiter__`` will loop the result while idle.
 
         Safe to call multiple times — only the first call runs inference.
         """
@@ -255,7 +255,8 @@ class FloatVideoGenerator:
             return  # already done or in progress
         self._silence_frames = []  # mark "in progress" so a second call is a no-op
 
-        silence_pcm = bytes(MIN_AUDIO_SAMPLES * 2)  # 2 s of 16-bit silence
+        silence_samples = max(int(self.sample_rate * 0.5), int(self.sample_rate * duration_sec))
+        silence_pcm = bytes(silence_samples * 2)  # 16-bit silence
         captured: list[tuple[np.ndarray, bytes]] = []
 
         def _collect_silence() -> None:
@@ -325,7 +326,7 @@ class FloatVideoGenerator:
                             bridge.shutdown()
                 else:
                     # Test / no-model path: synthesize a colour-cycling pattern.
-                    n_frames = int(np.ceil(MIN_AUDIO_SAMPLES * TARGET_FPS / SAMPLE_RATE))
+                    n_frames = int(np.ceil(silence_samples * TARGET_FPS / SAMPLE_RATE))
                     for i in range(n_frames):
                         arr = np.zeros((self.height, self.width, 3), dtype=np.uint8)
                         arr[:, :, 0] = 60
@@ -679,86 +680,42 @@ class FloatVideoGenerator:
             if self._stop_pending and self._frame_queue.empty():
                 break
 
-            # --- idle / silence path ------------------------------------------
-            # When the frame queue is empty and stop is not pending we check
-            # whether we have a pre-rendered silence clip. If so, yield one
-            # silence frame and then wait up to one frame period for a real
-            # frame to arrive (so the loop rate stays close to TARGET_FPS while
-            # still reacting instantly when speech starts).
-            if self._frame_queue.empty() and not self._stop_pending:
-                sil = self._silence_frames  # snapshot for thread-safety
-                if sil:  # non-None and non-empty
-                    sil_arr, sil_audio = sil[self._silence_idx % len(sil)]
-                    self._silence_idx += 1
+            # If there are real speech/response frames queued, ALWAYS drain them first
+            # without delay to ensure immediate lip-sync with audio.
+            if not self._frame_queue.empty():
+                item = await self._frame_queue.get()
+            elif not self._stop_pending and self._silence_frames:
+                # Frame queue is empty: emit a silence/idle frame to keep the video
+                # track alive, then wait at most one frame period for a real frame.
+                sil = self._silence_frames
+                sil_arr, sil_audio = sil[self._silence_idx % len(sil)]
+                self._silence_idx += 1
 
-                    if RTC_AVAILABLE:
-                        h, w, c = sil_arr.shape
-                        video_frame = rtc.VideoFrame(
-                            w,
-                            h,
-                            rtc.VideoBufferType.RGB24,
-                            np.ascontiguousarray(sil_arr).tobytes(),
-                        )
-                        # Silence audio: use pre-computed chunk (already correct
-                        # length) padded/trimmed just in case.
-                        padded = (sil_audio + bytes(_silence_audio_len))[:_silence_audio_len]
-                        audio_frame = rtc.AudioFrame(padded, self.sample_rate, 1, SAMPLES_PER_FRAME)
-                        yield (video_frame, audio_frame)
-                    else:
-                        yield (self._silence_idx, sil_arr, 0.0)
+                if RTC_AVAILABLE:
+                    h, w, c = sil_arr.shape
+                    video_frame = rtc.VideoFrame(
+                        w,
+                        h,
+                        rtc.VideoBufferType.RGB24,
+                        np.ascontiguousarray(sil_arr).tobytes(),
+                    )
+                    padded = (sil_audio + bytes(_silence_audio_len))[:_silence_audio_len]
+                    audio_frame = rtc.AudioFrame(padded, self.sample_rate, 1, SAMPLES_PER_FRAME)
+                    yield (video_frame, audio_frame)
+                else:
+                    yield (self._silence_idx, sil_arr, 0.0)
 
-                    # Pace: try to get a real frame for one frame period.
-                    try:
-                        item = await asyncio.wait_for(self._frame_queue.get(), timeout=_silence_frame_sec)
-                    except asyncio.TimeoutError:
-                        # No real frame arrived; loop back to silence.
-                        continue
-                    # A real item arrived while we were waiting — fall through
-                    # to the processing block below.
-                    self._refresh_idle()
-                    if item is _QUEUE_SENTINEL or item is CLOSE:
-                        break
-                    # Process the real frame (duplicate the yield block below to
-                    # avoid a goto; keep this block in sync with the normal path).
-                    idx, frame_array, pts_ms, audio_data = item
-                    if not self._first_frame_emitted:
-                        self._first_frame_emitted = True
-                        if callable(self.on_first_frame):
-                            try:
-                                res = self.on_first_frame()
-                                if asyncio.iscoroutine(res):
-                                    await res
-                            except Exception as exc:
-                                logger.warning(f"[livekit-gen] on_first_frame callback failed: {exc}")
-                    self._frame_count += 1
-                    if RTC_AVAILABLE:
-                        h, w, c = frame_array.shape
-                        if c == 4:
-                            frame_array = frame_array[:, :, :3]
-                        video_frame = rtc.VideoFrame(
-                            w,
-                            h,
-                            rtc.VideoBufferType.RGB24,
-                            np.ascontiguousarray(frame_array).tobytes(),
-                        )
-                        if audio_data:
-                            audio_frame = rtc.AudioFrame(audio_data, self.sample_rate, 1, len(audio_data) // 2)
-                            yield (video_frame, audio_frame)
-                        else:
-                            yield video_frame
-                    else:
-                        yield (idx, frame_array, pts_ms)
-                    continue  # back to top of while-loop
-
-                # silence not available yet (None = prepare_silence never called,
-                # [] = generation failed): fall through to blocking get()
-
-            # --- normal path: block until a real frame arrives ----------------
-            try:
-                item = await asyncio.wait_for(self._frame_queue.get(), timeout=_silence_frame_sec)
-            except asyncio.TimeoutError:
-                # Queue still empty; re-evaluate the stop / silence condition.
-                continue
+                # Wait for real speech frames or next idle tick
+                try:
+                    item = await asyncio.wait_for(self._frame_queue.get(), timeout=_silence_frame_sec)
+                except asyncio.TimeoutError:
+                    continue
+            else:
+                # No silence clip ready yet and queue is empty: wait for real frame
+                try:
+                    item = await asyncio.wait_for(self._frame_queue.get(), timeout=_silence_frame_sec)
+                except asyncio.TimeoutError:
+                    continue
 
             self._refresh_idle()
             if item is _QUEUE_SENTINEL or item is CLOSE:
