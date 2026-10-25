@@ -503,6 +503,32 @@ def test_configured_model_is_normalized_too(monkeypatch, tmp_path):
     assert config.model == "gemini-3.8-live"
 
 
+def test_realtime_model_passes_tls_context_to_httpx_and_aiohttp(monkeypatch):
+    """Regression: only ``verify`` was pre-seeded, so google-genai's aiohttp
+    websocket path still built a TLS context synchronously on the agent loop.
+
+    httpx reads ``verify``; aiohttp requests and websockets read ``ssl``.
+    """
+    import ssl
+
+    from fast_float.livekit.gemini import agent as gemini_agent
+
+    captured = {}
+
+    class _FakeRealtimeModel:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(gemini_agent.google.realtime, "RealtimeModel", _FakeRealtimeModel)
+    ctx = ssl.create_default_context()
+    gemini_agent._build_realtime_model(api_key="AI-test", model="gemini-3.8-live", ssl_ctx=ctx)
+
+    http_options = captured["http_options"]
+    assert http_options.client_args["verify"] is ctx
+    assert http_options.async_client_args["verify"] is ctx
+    assert http_options.async_client_args["ssl"] is ctx
+
+
 def test_sanitize_gemini_model_drops_free_text():
     from fast_float.livekit.gemini.config import sanitize_gemini_model
 

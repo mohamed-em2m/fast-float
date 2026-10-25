@@ -233,13 +233,17 @@ def _build_realtime_model(
         # Keep the plugin's own default here: RealtimeSession builds
         # `types.HttpOptions(timeout=int(DEFAULT_API_CONNECT_OPTIONS.timeout *
         # 1000))` (10.0 s -> 10_000 ms) when no http_options is given. Pre-seed
-        # `client_args["verify"]` — the hook google-genai's
-        # `_ensure_httpx_ssl_ctx` consults first — so no session ever builds a
-        # fresh TLS context on the agent loop (see _genai_ssl_context).
+        # the TLS context in both spellings google-genai consults:
+        #   * httpx clients read `verify` (`_ensure_httpx_ssl_ctx`)
+        #   * aiohttp requests/websockets read `ssl` (`_ensure_aiohttp_ssl_ctx`
+        #     and `_ensure_websocket_ssl_ctx`)
+        # Without the `ssl` key the Live session still built a fresh context
+        # synchronously on the agent loop, which livekit-agents flagged as
+        # "event loop blocked ... in create_default_context".
         kwargs["http_options"] = genai_types.HttpOptions(
             timeout=10_000,
             client_args={"verify": ssl_ctx},
-            async_client_args={"verify": ssl_ctx},
+            async_client_args={"verify": ssl_ctx, "ssl": ssl_ctx},
         )
     return google.realtime.RealtimeModel(**kwargs)  # type: ignore[arg-type]
 

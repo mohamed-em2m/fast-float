@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import jwt
 import numpy as np
 import pytest
 
+from fast_float.livekit.agent_runner import AgentAvatarRunner
 from fast_float.livekit.generator import FloatVideoGenerator
 from fast_float.livekit.receiver import SEGMENT_END, DataStreamAudioReceiver, _PcmFramer
 from fast_float.livekit.tokens import issue_token
@@ -49,6 +50,7 @@ class _FakeReader:
         self._chunks = list(chunks)
         self.info = MagicMock()
         self.info.attributes = {"sample_rate": str(sample_rate), "num_channels": "1"}
+        self.closed = False
 
     def __aiter__(self):
         return self
@@ -57,6 +59,18 @@ class _FakeReader:
         if not self._chunks:
             raise StopAsyncIteration
         return self._chunks.pop(0)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _BrokenReader(_FakeReader):
+    """A reader whose trailer never arrives; the native SDK raises instead."""
+
+    async def __anext__(self) -> bytes:
+        if self._chunks:
+            return self._chunks.pop(0)
+        raise RuntimeError("expected chunk index to be exactly one more than the previous")
 
 
 @pytest.mark.skipif(not RTC_AVAILABLE, reason="LiveKit RTC SDK not installed")
@@ -78,6 +92,57 @@ def test_receiver_emits_frames_then_segment_end():
         assert all(isinstance(f, rtc.AudioFrame) for f in frames)
         assert sum(f.samples_per_channel for f in frames) == 4800
         assert frames[0].sample_rate == 24000
+
+    asyncio.run(_test())
+
+
+@pytest.mark.skipif(not RTC_AVAILABLE, reason="LiveKit RTC SDK not installed")
+def test_receiver_keeps_partial_audio_after_a_stream_error():
+    """One corrupted segment must not poison the queue and stop the avatar.
+
+    A native ByteStreamReader can raise ``expected chunk index ...`` when its
+    trailer/chunks are lost. That error is scoped to the segment: flush what
+    was received, emit SEGMENT_END so playback_finished is still reported, and
+    keep the receiver alive for the next TTS segment.
+    """
+
+    async def _test():
+        receiver = DataStreamAudioReceiver(MagicMock(), sender_identity="agent-1")
+        receiver.agent_identity = "agent-1"
+
+        pcm = np.arange(4800, dtype=np.int16).tobytes()
+        broken = _BrokenReader([pcm[:4000]])
+        good = _FakeReader([pcm])
+
+        receiver._readers.extend([broken, good])
+        receiver._reader_event.set()
+        task = asyncio.create_task(receiver._read_loop())
+        try:
+            for _ in range(100):
+                if receiver._queue.qsize() >= 4:  # broken tail + good frames + 2 ends
+                    break
+                await asyncio.sleep(0.01)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        items = []
+        while not receiver._queue.empty():
+            items.append(receiver._queue.get_nowait())
+
+        # No Exception object in the stream: the consumer would raise it and
+        # abandon every later segment.
+        assert not any(isinstance(item, Exception) for item in items)
+        assert sum(item is SEGMENT_END for item in items) == 2
+        frames = [item for item in items if item is not SEGMENT_END]
+        assert frames
+        assert all(isinstance(frame, rtc.AudioFrame) for frame in frames)
+        # Partial audio from the broken segment survived, and the next reader
+        # was still consumed.
+        assert sum(frame.samples_per_channel for frame in frames) == 2000 + 4800
+        assert broken.closed
+        assert good.closed
 
     asyncio.run(_test())
 
@@ -182,3 +247,36 @@ def test_playback_finished_payload_matches_livekit_agents():
     )
     event = PlaybackFinishedEvent(**json.loads(payload))
     assert asdict(event)["playback_position"] == 1.25
+
+
+@pytest.mark.skipif(not RTC_AVAILABLE, reason="LiveKit RTC SDK not installed")
+def test_avatar_interrupt_awaits_av_sync_clear_queue():
+    """Barge-in must actually drain AVSynchronizer's async queue."""
+
+    async def _test():
+        cleared = asyncio.Event()
+
+        av_sync = MagicMock()
+
+        async def _clear_queue() -> None:
+            cleared.set()
+
+        av_sync.clear_queue = _clear_queue
+        receiver = MagicMock()
+        receiver.agent_identity = "agent-1"
+        receiver.notify_playback_finished = AsyncMock()
+
+        runner = AgentAvatarRunner(
+            MagicMock(),
+            video_gen=MagicMock(),
+            receiver=receiver,
+        )
+        runner._av_sync = av_sync
+        runner._last_agent_identity = "agent-1"
+
+        runner.interrupt()
+        await asyncio.wait_for(cleared.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        receiver.notify_playback_finished.assert_awaited_once()
+
+    asyncio.run(_test())

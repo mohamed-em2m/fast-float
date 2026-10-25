@@ -273,11 +273,21 @@ class AgentAvatarRunner:
         with contextlib.suppress(Exception):
             self.video_gen.clear_buffer()
         if self._av_sync is not None:
-            with contextlib.suppress(Exception):
-                self._av_sync.clear_queue()
+            # AVSynchronizer.clear_queue() is async (it also drains the video
+            # queue). Calling it without awaiting left the coroutine unrun,
+            # so stale frames kept playing after a barge-in and Python logged
+            # "coroutine ... was never awaited".
+            self._spawn(self._clear_av_queue())
         logger.info("[agent-avatar] playback interrupted; cleared buffered audio")
         if self._last_agent_identity:
             self._spawn(self.receiver.notify_playback_finished(playback_position=position, interrupted=True))
+
+    async def _clear_av_queue(self) -> None:
+        av_sync = self._av_sync
+        if av_sync is None:
+            return
+        with contextlib.suppress(Exception):
+            await av_sync.clear_queue()
 
     # ------------------------------------------------------------------ stop
 

@@ -263,15 +263,19 @@ class DataStreamAudioReceiver:
         try:
             while not self._closing:
                 await self._reader_event.wait()
+                # Clear before consuming: a stream that arrives while this
+                # batch is being read must set the event again, not have its
+                # wake-up wiped out after the loop.
+                self._reader_event.clear()
                 while self._readers and not self._closing:
                     reader = self._readers.popleft()
                     await self._consume_reader(reader)
-                self._reader_event.clear()
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            logger.exception(f"[receiver] audio stream reader failed: {exc}")
-            await self._queue.put(exc)
+        except Exception:
+            # A broken reader must not take the whole receiver down: the room
+            # keeps sending TTS segments after a corrupted one.
+            logger.exception("[receiver] audio stream reader failed")
 
     async def _consume_reader(self, reader: Any) -> None:
         self._current_cleared = False
@@ -301,8 +305,25 @@ class DataStreamAudioReceiver:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning(f"[receiver] segment read failed: {exc}")
-            await self._queue.put(exc)
+            if self._current_cleared:
+                logger.debug("[receiver] segment ended after clear_buffer: %s", exc)
+            else:
+                # A native stream error ("expected chunk index ...", a
+                # disconnect, a lost trailer) is scoped to this segment. The
+                # audio already received is still usable, and ending the
+                # segment lets the renderer flush its tail and report
+                # playback_finished instead of leaving the agent waiting.
+                logger.warning("[receiver] segment read failed: %s", exc)
+                for frame in framer.flush():
+                    self._queue.put_nowait(frame)
+                self._queue.put_nowait(SEGMENT_END)
+        finally:
+            # Readers abandoned after a trailer error / supersede / barge-in
+            # otherwise keep an FFI subscription for the life of the process.
+            close = getattr(reader, "close", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    close()
 
     async def _iter_reader(self, reader: Any) -> AsyncIterator[bytes]:
         while True:
