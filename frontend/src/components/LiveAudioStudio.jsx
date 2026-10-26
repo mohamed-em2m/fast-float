@@ -463,6 +463,15 @@ export default function LiveAudioStudio({
       // the session, so autoplay can still be rejected. Surface a retry.
       videoRef.current?.play?.().catch(() => setNeedsGesture(true));
     } catch (err) {
+      // An intentional abort is not a failure: the user pressed End and
+      // endSession already resets the UI.
+      if (controller.signal.aborted && !isActive()) {
+        // The server may still have created the room before the abort landed;
+        // the room name is client-generated, so ask it to shut that room down.
+        if (startedRoom) stopConversation(startedRoom).catch(() => {});
+        else stopConversation(targetRoom).catch(() => {});
+        return;
+      }
       console.error('Live session failed', err);
       if (startedRoom) await stopConversation(startedRoom).catch(() => {});
       if (!isActive()) return;

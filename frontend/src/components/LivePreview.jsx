@@ -72,6 +72,9 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
         if (!canvas || !meta) return;
         const { width, height, channels } = meta;
         const ctx = canvas.getContext('2d');
+        // A canvas without 2D support (headless/embedded webviews) must not
+        // throw on every incoming frame.
+        if (!ctx) return;
         const pixels = width * height;
         if (!frameBuffer || frameBuffer.length !== pixels * 4) {
           frameBuffer = new Uint8ClampedArray(pixels * 4);

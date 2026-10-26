@@ -265,14 +265,25 @@ export default function StudioStage({
       const source = transport === 'auto' ? activeTransport : transport;
       const next = source === 'livekit' ? 'webrtc' : source === 'webrtc' ? 'ws' : 'mp4';
       const detail = reason ? ` (${reason})` : '';
-      if (next === 'mp4') setEndedLiveRequestId(liveRequestId ?? null);
+      if (next === 'mp4') {
+        // The last transport failed too. Hide the dead preview for this
+        // request, but keep the user's transport preference: a transient
+        // failure in one render must not silently disable live preview for
+        // every future render.
+        setEndedLiveRequestId(liveRequestId ?? null);
+        onToastRef.current?.(
+          `Live preview unavailable${detail} — the MP4 will appear when the render finishes.`,
+          'error'
+        );
+        return;
+      }
       setTransport?.(next);
-      const message = next === 'webrtc'
-        ? `LiveKit failed${detail} — switched to WebRTC.`
-        : next === 'ws'
-          ? `WebRTC failed${detail} — switched to low-latency frames.`
-          : `Live preview unavailable${detail} — the MP4 will appear when the render finishes.`;
-      onToastRef.current?.(message, 'error');
+      onToastRef.current?.(
+        next === 'webrtc'
+          ? `LiveKit failed${detail} — switched to WebRTC.`
+          : `WebRTC failed${detail} — switched to low-latency frames.`,
+        'error'
+      );
     },
     [activeTransport, liveRequestId, transport, setTransport]
   );

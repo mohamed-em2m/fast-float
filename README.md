@@ -424,9 +424,16 @@ uv run --frozen --no-sync ruff format .
 cd frontend
 npm ci
 npm run lint        # oxlint
+npm test            # Vitest + Testing Library (jsdom)
 npm run build
 npm run dev         # :3000, proxies /api -> :8000 (including WebSockets)
 ```
+
+The frontend tests cover the API-base resolution, safe storage, request
+timeouts, the shared telemetry poller, progress rendering, the live-preview
+transport lifecycle and the generation error path; they need no backend.
+`npm run preview` serves the production build through the same `/api` proxy
+and honours `PORT` / `VITE_API_PROXY_TARGET` like the dev server.
 
 The ONNX export tests need the conversion stack (`onnxscript`, `onnx>=1.17`), which is **not** part of the portable runtime lockfile — install it with `./scripts/convert_to_onnx.sh` or skip those tests on a runtime-only box.
 
