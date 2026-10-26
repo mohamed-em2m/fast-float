@@ -27,6 +27,13 @@ else
     echo "=== Running in local environment ==="
 fi
 
+install_npm() {
+
+cd frontend && apt install npm && npm install && cd ..
+
+}
+
+
 # Run a command with root privileges -- apt needs them. Root runs it directly,
 # a normal user goes through sudo when sudo is available.
 run_as_root() {
@@ -111,6 +118,7 @@ else
         # Drop the hashed path entry, otherwise bash keeps resolving the old
         # binary and the version check below still sees Node 18.
         hash -r
+        
         echo "installed node $(node -v)"
     else
         echo "⚠️ Node upgrade failed — the frontend needs Node 20.19+/22.12+; the backend is unaffected."
@@ -126,7 +134,10 @@ if [ -f "${PROJECT_ROOT}/frontend/package.json" ] && command -v npm >/dev/null 2
     if node_version_ok; then
         echo "=== Installing frontend dependencies (npm ci) ==="
         (cd "${PROJECT_ROOT}/frontend" && npm ci) \
-            || echo "⚠️ npm ci failed — run it in frontend/ before ./scripts/run_all.sh"
+            || echo "⚠️ npm ci failed — run it in frontend/ before ./scripts/run_all.sh" 
+        
+        (cd "${PROJECT_ROOT}/frontend" && npm install) \
+            || echo "⚠️ npm install failed — run it in frontend/ before ./scripts/run_all.sh"     
     fi
 fi
 

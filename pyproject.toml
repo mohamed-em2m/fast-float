@@ -100,6 +100,8 @@ dependencies = [
     # shared fast_float/config/{settings,secerts}.toml files.
     "python-dotenv>=1.0,<2",
     "pre-commit>=4.6.2",
+    "pyzm>=2.5.6",
+    "pyzmq>=27.2.0",
 ]
 
 [dependency-groups]
