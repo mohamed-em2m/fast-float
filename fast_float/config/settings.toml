@@ -261,3 +261,10 @@ r_cfg_scale = 1.0
 e_cfg_scale = 1.0
 no_crop = false
 decode_batch_size = 0
+
+[ipc]
+enabled = false
+zmq_control_endpoint = "tcp://127.0.0.1:5555"
+zmq_frames_endpoint = "tcp://127.0.0.1:5556"
+shm_name = "float_frame_ring"
+shm_ring_size = 64

@@ -306,16 +306,34 @@ class ConversationSession:
         if self.image_path is None:
             self.image_path = ensure_default_image()
 
-        semaphore = get_render_semaphore(getattr(self.settings, "livekit_max_streams", 0))
+        from fast_float.config.dynamic import load_settings
 
-        self.generator = FloatVideoGenerator(
-            agent=engine,
-            image_path=self.image_path,
-            semaphore=semaphore,
-            nfe=self.settings.livekit_nfe,
-            first_chunk_sec=getattr(self.settings, "livekit_first_chunk_sec", 0.4),
-            chunk_sec=getattr(self.settings, "livekit_chunk_sec", 2.0),
-        )
+        ipc_cfg = load_settings().get("ipc", {})
+        if isinstance(ipc_cfg, dict) and ipc_cfg.get("enabled", False):
+            from fast_float.livekit.zmq_generator import ZmqFloatVideoGenerator
+
+            self.generator = ZmqFloatVideoGenerator(
+                ref_image_path=self.image_path,
+                nfe=self.settings.livekit_nfe,
+                first_chunk_sec=getattr(self.settings, "livekit_first_chunk_sec", 5.0),
+                chunk_sec=getattr(self.settings, "livekit_chunk_sec", 5.0),
+                control_endpoint=ipc_cfg.get("zmq_control_endpoint", "tcp://127.0.0.1:5555"),
+                frames_endpoint=ipc_cfg.get("zmq_frames_endpoint", "tcp://127.0.0.1:5556"),
+                shm_name=ipc_cfg.get("shm_name", "float_frame_ring"),
+                shm_slots=ipc_cfg.get("shm_ring_size", 64),
+                session_id=self.room_name,
+            )
+        else:
+            semaphore = get_render_semaphore(getattr(self.settings, "livekit_max_streams", 0))
+
+            self.generator = FloatVideoGenerator(
+                agent=engine,
+                image_path=self.image_path,
+                semaphore=semaphore,
+                nfe=self.settings.livekit_nfe,
+                first_chunk_sec=getattr(self.settings, "livekit_first_chunk_sec", 0.4),
+                chunk_sec=getattr(self.settings, "livekit_chunk_sec", 2.0),
+            )
 
         # Pre-render the silence idle loop once: FLOAT on silence audio (duration
         # configured via settings.toml [float].livekit_silence_sec, default 2.0s) so
@@ -323,7 +341,10 @@ class ConversationSession:
         # Uses the same GPU semaphore as live inference — runs first (before any
         # audio arrives) then frees the slot for real speech chunks.
         silence_sec = getattr(self.settings, "livekit_silence_sec", 2.0)
-        await self.generator.prepare_silence(duration_sec=silence_sec)
+        try:
+            await self.generator.prepare_silence(duration_sec=silence_sec)
+        except TypeError:
+            await self.generator.prepare_silence()
 
         if self.agent_backend == "gemini":
             await self._start_external_agent()
@@ -499,7 +520,11 @@ class ConversationSession:
             return
         self._stopped = True
         if self.generator is not None:
-            self.generator.stop()
+            if hasattr(self.generator, "stop"):
+                self.generator.stop()
+            elif hasattr(self.generator, "close"):
+                with contextlib.suppress(Exception):
+                    await self.generator.close()
         if self.runner is not None:
             with contextlib.suppress(Exception):
                 await self.runner.stop()
