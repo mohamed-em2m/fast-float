@@ -185,8 +185,21 @@ class AgentAvatarRunner:
                 if item is SEGMENT_END:
                     # The agent flushed this TTS segment: render the tail, then
                     # let the segment watcher report playback_finished.
-                    self.video_gen.flush()
-                    await self._segment_queue.put(self._epoch)
+                    try:
+                        self.video_gen.flush()
+                        await self._segment_queue.put(self._epoch)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # A failed tail flush must not kill the feed the same
+                        # way a poisoned item used to; the segment watcher is
+                        # not queued, so playback_finished for this segment is
+                        # skipped, but later segments keep flowing.
+                        logger.warning(
+                            "[agent-avatar] segment flush failed (%s): %s",
+                            type(item).__name__,
+                            exc,
+                        )
                 else:
                     # One poisoned item must not kill the whole audio feed —
                     # that used to freeze the avatar for the rest of the
@@ -202,8 +215,10 @@ class AgentAvatarRunner:
                         )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            logger.warning(f"[agent-avatar] audio receive loop stopped: {exc}")
+        except Exception:
+            # Full stack trace: a bare "{exc}" hid where e.g.
+            # "'AudioFrame' object has no len()" actually fired.
+            logger.exception("[agent-avatar] audio receive loop stopped")
 
     # ------------------------------------------------------------- forwarding
 

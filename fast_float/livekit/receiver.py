@@ -53,6 +53,14 @@ RPC_PLAYBACK_FINISHED = "lk.playback_finished"
 DEFAULT_FRAME_SIZE_MS = 100
 DEFAULT_IDLE_TIMEOUT_S = 10.0
 
+# A "MissedChunk" stream error (a chunk lost/overwritten in transport, e.g.
+# under packet loss) does not necessarily end the segment: the native reader
+# can keep delivering the chunks after the gap. Keep pulling for a few
+# attempts before declaring the segment dead, so one lost 16 KB chunk skips
+# a fraction of a second instead of truncating the whole reply.
+READER_ERROR_RETRIES = 3
+READER_ERROR_RETRY_DELAY_S = 0.05
+
 
 @dataclass(frozen=True)
 class SegmentEnd:
@@ -326,6 +334,7 @@ class DataStreamAudioReceiver:
                     close()
 
     async def _iter_reader(self, reader: Any) -> AsyncIterator[bytes]:
+        consecutive_errors = 0
         while True:
             next_chunk = asyncio.ensure_future(reader.__anext__())
             superseded = asyncio.ensure_future(self._superseded.wait())
@@ -342,9 +351,28 @@ class DataStreamAudioReceiver:
             if next_chunk in done:
                 superseded.cancel()
                 try:
-                    yield next_chunk.result()
+                    data = next_chunk.result()
                 except StopAsyncIteration:
                     return
+                except Exception as exc:
+                    # e.g. "expected chunk index to be exactly one more than
+                    # the previous" (MissedChunk): one chunk was lost in
+                    # transport. That does not have to end the segment — the
+                    # reader may still deliver the chunks after the gap. Retry
+                    # a few times; abort only on repeated failure.
+                    consecutive_errors += 1
+                    if consecutive_errors > READER_ERROR_RETRIES:
+                        raise
+                    logger.warning(
+                        "[receiver] stream chunk lost, retrying (%d/%d): %s",
+                        consecutive_errors,
+                        READER_ERROR_RETRIES,
+                        exc,
+                    )
+                    await asyncio.sleep(READER_ERROR_RETRY_DELAY_S)
+                    continue
+                consecutive_errors = 0
+                yield data
                 continue
             # Superseded, cleared, or idle: stop this segment. The reader's
             # trailer is gone, and waiting for it would wedge the receiver.
