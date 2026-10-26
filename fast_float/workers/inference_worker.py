@@ -573,90 +573,18 @@ def _write_wav(path: str, pcm_int16: np.ndarray, sample_rate: int) -> None:
 def _build_cfg():
     """Build a config namespace from settings.toml + InferenceOptions defaults."""
     try:
-        from fast_float.config.float_settings import FloatSettings
+        from fast_float.config.float_settings import load_float_options
 
-        s = FloatSettings()
-
-        import types
-
-        cfg = types.SimpleNamespace()
-
-        # Model
-        cfg.ckpt_path = s.checkpoint.ckpt_path
-        cfg.rank = 0
-        cfg.optimization_mode = s.runtime.optimization_mode
-        cfg.use_fp16 = s.runtime.use_fp16
-        cfg.fps = s.video.fps
-        cfg.ngpus = s.runtime.ngpus
-        cfg.seed = s.runtime.seed
-        cfg.fix_noise_seed = s.runtime.fix_noise_seed
-        cfg.benchmark = s.runtime.benchmark
-        cfg.video_encoder = s.runtime.video_encoder
-        cfg.no_crop = s.runtime.no_crop
-        cfg.decode_batch_size = s.runtime.decode_batch_size
-        cfg.decode_channels_last = s.runtime.decode_channels_last
-        cfg.decode_autocast = s.runtime.decode_autocast
-
-        # Audio/WAV2VEC
-        cfg.sampling_rate = s.audio.sampling_rate
-        cfg.audio_marcing = s.audio.audio_marcing
-        cfg.wav2vec_sec = s.audio.wav2vec_sec
-        cfg.attention_window = s.audio.attention_window
-        cfg.only_last_features = s.audio.only_last_features
-        cfg.average_emotion = s.audio.average_emotion
-
-        # Paths
-        cfg.wav2vec_model_path = s.paths.wav2vec_model_path
-        cfg.audio2emotion_path = s.paths.audio2emotion_path
-        cfg.emotion_onnx_path = s.paths.emotion_onnx_path
-        cfg.wav2vec_onnx_path = s.paths.wav2vec_onnx_path
-        cfg.fmt_onnx_path = s.paths.fmt_onnx_path
-        cfg.res_dir = s.checkpoint.res_dir
-
-        # Model arch
-        cfg.style_dim = s.model.style_dim
-        cfg.dim_a = s.model.dim_a
-        cfg.dim_w = s.model.dim_w
-        cfg.dim_h = s.model.dim_h
-        cfg.dim_m = s.model.dim_m
-        cfg.dim_e = s.model.dim_e
-        cfg.fmt_depth = s.model.fmt_depth
-        cfg.num_heads = s.model.num_heads
-        cfg.mlp_ratio = s.model.mlp_ratio
-        cfg.no_learned_pe = s.model.no_learned_pe
-        cfg.num_prev_frames = s.model.num_prev_frames
-        cfg.max_grad_norm = s.model.max_grad_norm
-        cfg.audio_dropout_prob = s.model.audio_dropout_prob
-        cfg.ref_dropout_prob = s.model.ref_dropout_prob
-        cfg.emotion_dropout_prob = s.model.emotion_dropout_prob
-
-        # ODE / guidance / diffusion
-        cfg.nfe = s.ode.nfe
-        cfg.ode_atol = s.ode.ode_atol
-        cfg.ode_rtol = s.ode.ode_rtol
-        cfg.torchdiffeq_ode_method = s.ode.torchdiffeq_ode_method
-        cfg.a_cfg_scale = s.guidance.a_cfg_scale
-        cfg.e_cfg_scale = s.guidance.e_cfg_scale
-        cfg.r_cfg_scale = s.guidance.r_cfg_scale
-        cfg.n_diff_steps = s.diffusion.n_diff_steps
-        cfg.diff_schedule = s.diffusion.diff_schedule
-        cfg.diffusion_mode = s.diffusion.diffusion_mode
-
-        # Video input
-        cfg.input_size = s.video.input_size
-        cfg.input_nc = s.video.input_nc
-
-        # LiveKit / IPC convenience fields
-        cfg.livekit_nfe = s.livekit_nfe
-        cfg.livekit_silence_sec = s.livekit_silence_sec
-
-        return cfg
-
+        opt = load_float_options()
+        opt.rank = 0
+        return opt
     except Exception as exc:
-        logger.warning("Could not load FloatSettings (%s); falling back to InferenceOptions", exc)
+        logger.warning(
+            "Could not load float options via load_float_options (%s); falling back to InferenceOptions", exc
+        )
         from fast_float.core.options import InferenceOptions
 
-        opt = InferenceOptions().parse([])  # empty args → defaults
+        opt = InferenceOptions().parse()
         opt.rank = 0
         return opt
 
