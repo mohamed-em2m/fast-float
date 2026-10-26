@@ -137,6 +137,14 @@ class ZmqFloatVideoGenerator:
         self._req_sock: Any = None  # DEALER/REQ to control port
         self._sub_sock: Any = None  # SUB to frames port
 
+        # REQ/REQ sockets are strictly stateful (send -> reply -> send ...):
+        # control requests MUST be serialized, or the second in-flight
+        # ``send_string`` raises ZMQError EFSM and the chunk is silently
+        # dropped — every chunk submitted while the previous one still waits
+        # for its reply used to vanish ("avatar talks the first 5 s chunk,
+        # then stops").
+        self._req_lock: asyncio.Lock | None = None
+
         # Shared memory (attached once, consumer side)
         self._ring: FrameRingBuffer | None = None
 
@@ -207,6 +215,9 @@ class ZmqFloatVideoGenerator:
 
         # Start the background frame-listener.
         self._listener_task = asyncio.create_task(self._frame_listener(), name="zmq-frame-listener")
+        # Bound to this event loop (started here); bind it on the same thread
+        # that runs the request dispatchers.
+        self._req_lock = asyncio.Lock()
         logger.info(
             "[zmq-gen] connected session=%s ctrl=%s frames=%s shm=%s",
             self._session_id,
@@ -216,10 +227,20 @@ class ZmqFloatVideoGenerator:
         )
 
     async def _send_request(self, req: IPCRequest) -> IPCResponse:
-        """Send a synchronous IPC request and await the reply."""
-        await self._req_sock.send_string(req.to_json())
-        raw = await self._req_sock.recv()
-        return IPCResponse.from_json(raw)
+        """Send a synchronous IPC request and await the reply.
+
+        Serialized: a REQ socket cannot accept a second request before the
+        previous reply was received, and the control channel carries infer
+        requests *and* interrupts that can overlap while audio keeps streaming.
+        """
+        if self._req_lock is None:
+            # _ensure_connected was bypassed by a stub in a test; run unlocked.
+            await self._req_sock.send_string(req.to_json())
+            return IPCResponse.from_json(await self._req_sock.recv())
+        async with self._req_lock:
+            await self._req_sock.send_string(req.to_json())
+            raw = await self._req_sock.recv()
+            return IPCResponse.from_json(raw)
 
     # ------------------------------------------------------------------
     # Silence pre-rendering
@@ -377,8 +398,20 @@ class ZmqFloatVideoGenerator:
         return np.interp(np.linspace(0, len(x) - 1, n_out), np.arange(len(x)), x)
 
     async def _dispatch_infer(self, pcm_bytes: bytes, gen: int) -> None:
-        """Send an infer request to the worker for the given audio chunk."""
-        await self._ensure_connected()
+        """Send an infer request to the worker for the given audio chunk.
+
+        Runs as a fire-and-forget task, so failure MUST be accounted for here:
+        otherwise ``_idle_event`` stays cleared („work outstanding" that will
+        never finish) and the runner's ``wait_until_idle`` waits out the full
+        timeout, freezing the segment watcher mid-conversation.
+        """
+        try:
+            await self._ensure_connected()
+        except Exception as exc:
+            logger.warning("[zmq-gen] connect failed before infer (gen=%d): %s", gen, exc)
+            self._account_failed_gen(gen)
+            return
+
         pcm_b64 = base64.b64encode(pcm_bytes).decode()
         n_samples = len(pcm_bytes) // 2
 
@@ -393,9 +426,39 @@ class ZmqFloatVideoGenerator:
             ref_image_path=self._ref_image_path,
             gen=gen,
         )
-        resp = await self._send_request(req)
-        if resp.status not in ("ok", "interrupted"):
-            logger.warning("[zmq-gen] infer failed (gen=%d): %s", gen, resp.error_msg)
+        try:
+            resp = await self._send_request(req)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # EFSM (overlapping request), dead socket, worker restart … the
+            # chunk is lost either way — log it and free the runner instead of
+            # wedging idle forever.
+            logger.warning("[zmq-gen] infer dispatch failed (gen=%d): %s", gen, exc)
+            self._account_failed_gen(gen)
+            return
+
+        if resp.status == "ok":
+            logger.info(
+                "[zmq-gen] infer ok (gen=%d frames=%s rtf=%.2fx)",
+                gen,
+                getattr(resp, "total_frames", -1) or -1,
+                float(getattr(resp, "rtf", 0.0) or 0.0),
+            )
+        else:
+            logger.warning(
+                "[zmq-gen] infer failed (gen=%d): %s", gen, resp.error_msg
+            )
+
+    def _account_failed_gen(self, gen: int) -> None:
+        """Treat a generation that will never produce a sentinel as completed.
+
+        Marks it done in the idle bookkeeping so ``wait_until_idle`` resolves
+        (bounded by the queue drain) instead of hanging until the timeout. The
+        speech in that chunk is already lost — playback of the rest continues.
+        """
+        self._sentinel_gen = max(self._sentinel_gen, gen)
+        self._refresh_idle()
 
     def clear_buffer(self) -> None:
         """Discard buffered audio and interrupt any in-flight inference."""

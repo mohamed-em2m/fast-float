@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, patch
 import numpy as np
 import pytest
 
+from fast_float.ipc.messages import IPCRequest
 from fast_float.livekit.zmq_generator import ZmqFloatVideoGenerator
 
 try:
@@ -337,5 +338,71 @@ def test_wait_until_idle_resolves_on_sentinel_and_drain():
         gen._refresh_idle()
         assert gen._idle_event.is_set()
         assert await gen.wait_until_idle() is True
+
+    asyncio.run(_test())
+
+
+def test_concurrent_control_requests_are_serialized():
+    """Overlapping infer/interrupt requests must not hit the REQ socket twice.
+
+    A REQ socket forbids a second ``send`` while a request is in flight
+    (EFSM). Gemini audio streams continuously, so gen N+1 can be submitted
+    while gen N still awaits its reply — the unserialized version raised and
+    silently dropped the chunk (avatar froze after the first chunk).
+    """
+
+    async def _test():
+        pytest.importorskip("zmq")
+        gen = ZmqFloatVideoGenerator(shm_name="test_shm_serial", shm_slots=4)
+        gen._req_lock = asyncio.Lock()
+
+        inflight = set()
+        sends = {"count": 0}
+
+        class _Sock:
+            async def send_string(self, *_a, **_k):
+                # Mimic the REQ protocol: reject any overlapping send.
+                assert not inflight, "second send while a request is in flight"
+                inflight.add(object())
+                sends["count"] += 1
+
+            async def recv(self):
+                await asyncio.sleep(0.05)  # in-flight generation
+                inflight.clear()
+                return b'{"status": "ok"}'
+
+        gen._req_sock = _Sock()
+
+        # Fire three requests overlapping in time before awaiting them.
+        await asyncio.gather(
+            gen._send_request(IPCRequest(cmd="infer")),
+            gen._send_request(IPCRequest(cmd="infer")),
+            gen._send_request(IPCRequest(cmd="infer")),
+        )
+        assert sends["count"] == 3
+
+    asyncio.run(_test())
+
+
+def test_failed_infer_keeps_idle_accounting_consistent():
+    """A dead dispatch must not wedge wait_until_idle until the long timeout."""
+
+    async def _test():
+        pytest.importorskip("zmq")
+        gen = ZmqFloatVideoGenerator(shm_name="test_shm_fail", shm_slots=4)
+        gen._ensure_connected = AsyncMock()
+
+        async def _boom(_pcm, _gen):
+            raise RuntimeError("EFSM: overlapping send")
+
+        gen._send_request = _boom
+        gen._gen = 1  # _submit_chunk incremented it before scheduling the task
+
+        task = asyncio.create_task(gen._dispatch_infer(b"\x00\x00" * 100, 1))
+        await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+        # The failed generation is accounted as completed: idle resolves.
+        assert gen._sentinel_gen == 1
+        assert gen._idle_event.is_set()
+        assert await gen.wait_until_idle(timeout=0.1) is True
 
     asyncio.run(_test())
