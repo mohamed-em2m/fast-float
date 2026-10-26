@@ -1,0 +1,25 @@
+# Keep the build context lean (and secret-free). Copying git metadata,
+# node_modules and the local .venv into the image wastes hundreds of MBs and
+# breaks layer caching; the setup script recreates everything that is needed.
+.git/
+.antigravitycli/
+.ipynb_checkpoints/
+.venv/
+.pre-commit-config.yaml
+_typos.toml
+logs.txt
+cloudflared-linux-amd64.deb
+
+# Local development state the app creates/installs itself
+**/__pycache__/
+frontend/node_modules/
+frontend/dist/
+results/
+
+# TensorRT engine caches are tied to the GPU + TRT version of the build box;
+# the runtime rebuilds them on the target GPU.
+onnx/trt_cache/
+
+# Runtime-injected configuration: never bake secrets into the image.
+# Pass LiveKit/Gemini values via the deployment's env vars instead.
+.env

@@ -1,0 +1,44 @@
+# Self-hosted LiveKit server for the live mode.
+#
+#   docker compose -f docker-compose.livekit.yml up -d
+#
+# The keys below are the dev keys: they must match LIVEKIT_API_KEY and
+# LIVEKIT_API_SECRET in the API's environment.
+#
+#   LIVEKIT_API_KEY=devkey
+#   LIVEKIT_API_SECRET=secret
+#   LIVEKIT_URL=ws://127.0.0.1:7880
+#
+# Ports: 7880 = HTTP/WebSocket, 7881/7882 = UDP for ICE (WebRTC media).
+# For a real deployment use a TLS domain (wss://) and set
+# LIVEKIT_URL accordingly.
+
+services:
+  livekit-server:
+    image: livekit/livekit-server:latest
+    command: --dev --bind 0.0.0.0
+    ports:
+      - "7880:7880"
+      - "7881:7881/udp"
+      - "7882:7882/udp"
+    environment:
+      LIVEKIT_KEYS: "${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:-secret}"
+    restart: unless-stopped
+
+  # Optional pure STUN (no TURN) for the raw aiortc 'webrtc' transport; point
+  # [webrtc].stun_urls in fast_float/config/settings.toml at it. No auth —
+  # STUN only, never run TURN without credentials. Enabled with:
+  #   docker compose -f docker-compose.livekit.yml --profile stun up -d
+  stun-server:
+    image: coturn/coturn:latest
+    command:
+      - --no-cli
+      - --no-auth
+      - --no-tls
+      - --no-dtls
+      - --listening-port=3478
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+    restart: unless-stopped
+    profiles: ["stun"]

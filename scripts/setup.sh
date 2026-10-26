@@ -181,6 +181,54 @@ source .venv/bin/activate
 # failure this script has to survive on a 50 GiB disk.
 uv sync --inexact
 
+echo "=== Verifying LiveKit + Gemini worker stack ==="
+# `uv sync --inexact` above already installed the normal dependencies. This
+# probe fails loudly if the resolved matrix no longer imports (the previous
+# split existed only because these versions used to conflict).
+if uv run --frozen --no-sync python - <<'PY'
+from importlib.metadata import version
+
+import numpy
+from livekit import api as livekit_api
+from livekit import rtc  # noqa: F401
+from livekit.agents import AgentServer  # noqa: F401
+from livekit.plugins import google  # noqa: F401
+
+from fast_float.livekit.gemini import config as gemini_config  # noqa: F401
+
+token = livekit_api.AccessToken(
+    "probe-key", "probe-secret-0123456789abcdef0123456789"
+).with_grants(
+    livekit_api.VideoGrants(room_join=True, room="probe")
+).with_identity("probe").to_jwt()
+print(
+    "  livekit-api", version("livekit-api"),
+    "ok, rtc", version("livekit"),
+    "ok, agents", version("livekit-agents"),
+    "ok, numpy", numpy.__version__,
+    "- token minted (len", len(token), ")",
+)
+PY
+then
+    echo "LiveKit + Gemini worker stack installed."
+else
+    echo "⚠️ LiveKit/Gemini probe failed — live transport or Gemini worker will be unavailable."
+fi
+
+echo "=== Starting the LiveKit SFU server container (best effort) ==="
+# The dev server (docker-compose.livekit.yml) plus the dev keys already set in
+# the environment above make the live transport usable right after setup.
+if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    if docker compose -f "${PROJECT_ROOT}/docker-compose.livekit.yml" up -d; then
+        echo "LiveKit SFU running on ws://127.0.0.1:7880 (stop: docker compose -f docker-compose.livekit.yml down)"
+    else
+        echo "⚠️ LiveKit server container failed to start — scripts/run_all.sh retries it."
+    fi
+else
+    echo "docker not found — the live transport falls back to MP4 until the LiveKit"
+    echo "server is started (docker compose -f docker-compose.livekit.yml up -d)."
+fi
+
 echo "=== Installing optional video codecs (torchcodec) ==="
 # torchcodec is optional; install if compatible binary wheel exists for torch/cuda
 uv pip install --python .venv/bin/python torchcodec || echo "⚠️ torchcodec install skipped or unavailable for current platform/PyTorch version (PyAV and FFmpeg NVENC remain available)."

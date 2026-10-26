@@ -47,9 +47,16 @@ def _close_live(dispatcher, request_id: str, message: str) -> None:
     """Retire a live stream so watchers stop waiting for frames."""
     if dispatcher is None:
         return
-    if app_state.live_streams.get(request_id) is dispatcher.stream:
+    stream = dispatcher.stream
+    if app_state.live_streams.get(request_id) is stream:
         app_state.live_streams.pop(request_id, None)
-    dispatcher.stream.finish(error=message)
+    # Keep the delivery metrics readable after the stream is retired: a client
+    # that polls /progress once the request is done should still see how many
+    # frames were buffered on disk or dropped.
+    metrics = stream.metrics()
+    if metrics:
+        app_state.set_progress(request_id, delivery_metrics=metrics)
+    stream.finish(error=message)
 
 
 @router.post("/generate", response_model=GenerationResponse)
@@ -94,6 +101,21 @@ async def generate(request: GenerationRequest):
         # per-frame transport.
         if int(getattr(request, "chunk_batch_size", 1) or 1) > 1:
             logger.info(f"[{request_id}] live stream: forcing chunk_batch_size=1")
+
+        try:
+            from fast_float.livekit.settings import LiveKitSettings
+
+            lk_settings = LiveKitSettings.from_env()
+            if lk_settings.configured:
+                from fast_float.livekit.worker import spawn_live_publish_task
+
+                _t = spawn_live_publish_task(live_dispatcher.stream, room_name=request_id, settings=lk_settings)
+                if _t is None:
+                    logger.info(f"[{request_id}] livekit publisher already running for room {request_id}")
+                else:
+                    logger.info(f"[{request_id}] spawned LiveKit avatar publisher for room {request_id}")
+        except Exception as exc:
+            logger.debug(f"[{request_id}] livekit publisher auto-spawn skipped: {exc}")
 
     try:
         await asyncio.wait_for(app_state.request_semaphore.acquire(), timeout=ACQUIRE_TIMEOUT_S)

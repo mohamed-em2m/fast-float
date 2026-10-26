@@ -1,20 +1,39 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { CheckCircle2, Info, TriangleAlert, X } from 'lucide-react';
 import Header from './components/Header';
 import PortraitCanvas from './components/PortraitCanvas';
 import AudioEngine from './components/AudioEngine';
 import ParameterControls from './components/ParameterControls';
 import StudioStage from './components/StudioStage';
-import TelemetryDashboard from './components/TelemetryDashboard';
-import PerfMatrixPanel from './components/PerfMatrixPanel';
+import InsightsPanel from './components/InsightsPanel';
+import LiveAudioStudio from './components/LiveAudioStudio';
 import { generateVideo, blobToBase64, alignUrlToApi, fetchProgress } from './services/api';
 
 const DEFAULT_PORTRAIT = '/samples/portrait1.jpg';
 const PROGRESS_POLL_MS = 1000;
+const MODE_KEY = 'float_mode';
+
+const TOAST_ICON = {
+  success: CheckCircle2,
+  error: TriangleAlert,
+  info: Info,
+};
 
 export default function App() {
+  // Workspace mode: async studio render vs. live microphone avatar.
+  const [mode, setMode] = useState(() => {
+    try {
+      return localStorage.getItem(MODE_KEY) === 'live' ? 'live' : 'studio';
+    } catch {
+      return 'studio';
+    }
+  });
+
   // Input State
   const [imagePreview, setImagePreview] = useState(DEFAULT_PORTRAIT);
   const [imageBase64, setImageBase64] = useState(null);
+  // Container hint for image_base64; portrait uploads set the real format.
+  const [imageFormat, setImageFormat] = useState('jpg');
   const [noCrop, setNoCrop] = useState(false);
 
   const [audioBlob, setAudioBlob] = useState(null);
@@ -42,10 +61,11 @@ export default function App() {
   const [generationResult, setGenerationResult] = useState(null);
   const [history, setHistory] = useState([]);
   const [toast, setToast] = useState(null);
-  // 'mp4' streams the finished file; 'ws'/'webrtc' stream frames live.
-  const [transport, setTransport] = useState('mp4');
+  // 'auto' streams the finished file; live transports stream frames live.
+  const [transport, setTransport] = useState('auto');
   const [liveRequestId, setLiveRequestId] = useState(null);
   const progressTimerRef = useRef(null);
+  const toastTimerRef = useRef(null);
 
   const stopProgressPolling = () => {
     if (progressTimerRef.current) {
@@ -57,14 +77,36 @@ export default function App() {
   // Clear any in-flight progress polling on unmount.
   useEffect(() => stopProgressPolling, []);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(MODE_KEY, mode);
+    } catch {
+      /* private mode */
+    }
+  }, [mode]);
+
   const showToast = (message, type = 'info') => {
+    if (!message) return;
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     setToast({ message, type });
-    setTimeout(() => setToast(null), 4000);
+    toastTimerRef.current = setTimeout(() => setToast(null), 4500);
+  };
+
+  useEffect(() => () => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+  }, []);
+
+  const handleModeChange = (next) => {
+    if (next === mode) return;
+    if (isGenerating) {
+      showToast('Let the current render finish before switching modes.', 'info');
+      return;
+    }
+    setMode(next);
   };
 
   // Preload the default sample portrait so the preview the user SEES is the
-  // image the backend RECEIVES. Previously imageBase64 stayed null and the
-  // server silently fell back to its placeholder image.
+  // image the backend RECEIVES.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -83,7 +125,7 @@ export default function App() {
 
   const handleGenerate = async () => {
     if (!audioBase64) {
-      showToast('Please record microphone audio or upload a speech clip first.', 'error');
+      showToast('Add a voice clip first — record, upload or use the sample.', 'error');
       return;
     }
 
@@ -94,9 +136,8 @@ export default function App() {
         ? crypto.randomUUID()
         : `c${Date.now()}${Math.random().toString(16).slice(2)}`;
     setProgress({ status: 'queued', stage: 'queued', percent: 0, completed_chunks: 0, total_chunks: 0 });
-    // Publish the id before the POST so the live transports can attach while
-    // the request is still generating.
-    setLiveRequestId(transport === 'mp4' ? null : clientRequestId);
+    const live = transport !== 'mp4';
+    setLiveRequestId(live ? clientRequestId : null);
     stopProgressPolling();
     progressTimerRef.current = setInterval(async () => {
       const p = await fetchProgress(clientRequestId);
@@ -111,7 +152,7 @@ export default function App() {
         channels: 1,
         sample_width: 2,
         image_base64: imageBase64 || null,
-        image_format: 'jpg',
+        image_format: imageFormat || 'jpg',
         emotion: params.emotion,
         nfe: params.nfe,
         seed: params.seed,
@@ -126,93 +167,127 @@ export default function App() {
         decode_batch_size: params.decode_batch_size,
         chunk_batch_size: params.chunk_batch_size,
         client_request_id: clientRequestId,
-        live: transport !== 'mp4',
+        live,
       };
 
       const result = await generateVideo(payload);
-      // Point playback/download URLs at the API host the browser can reach.
       result.stream_url = alignUrlToApi(result.stream_url);
       result.download_url = alignUrlToApi(result.download_url);
       if (result.download_backup) result.download_backup = alignUrlToApi(result.download_backup);
       setGenerationResult(result);
       setHistory((prev) => [result, ...prev]);
-      const chunkNote = result.chunks > 1 ? ` (${result.chunks} chunks)` : '';
-      showToast(`Talking portrait generated in ${result.performance?.total_time}s${chunkNote}!`, 'success');
+      const chunkNote = result.chunks > 1 ? ` · ${result.chunks} chunks` : '';
+      showToast(`Talking portrait ready in ${result.performance?.total_time ?? '—'}s${chunkNote}.`, 'success');
     } catch (err) {
       console.error('Generation failed', err);
-      showToast(err.message || 'Generation failed. Check server status.', 'error');
+      showToast(err.message || 'Generation failed. Check that the server is running.', 'error');
+      // A failed live request must not leave a dead preview attached.
+      if (live) setLiveRequestId(null);
     } finally {
       stopProgressPolling();
       setProgress(null);
       setIsGenerating(false);
-      setLiveRequestId(null);
+      // Keep `liveRequestId` until the live transport reports 'done': a
+      // real-time stream is still playing the frames buffered during render.
     }
   };
 
+  const portraitCard = (
+    <PortraitCanvas
+      imagePreview={imagePreview}
+      setImagePreview={setImagePreview}
+      setImageBase64={setImageBase64}
+      setImageFormat={setImageFormat}
+      noCrop={noCrop}
+      setNoCrop={setNoCrop}
+      step={1}
+      onToast={showToast}
+    />
+  );
+
+  const ToastIcon = toast ? TOAST_ICON[toast.type] || Info : Info;
+
   return (
-    <div className="app-container">
-      {/* Toast Notification */}
+    <div className="app-shell">
       {toast && (
-        <div className={`toast-notification toast-${toast.type}`}>
+        <div
+          className={`toast-notification toast-${toast.type}`}
+          role="status"
+          aria-live="polite"
+        >
+          <ToastIcon size={17} className="toast-icon" />
           <span>{toast.message}</span>
+          <button
+            type="button"
+            className="toast-close"
+            onClick={() => setToast(null)}
+            aria-label="Dismiss notification"
+          >
+            <X size={14} />
+          </button>
         </div>
       )}
 
-      {/* Navigation Header */}
-      <Header onToast={showToast} />
+      <Header onToast={showToast} mode={mode} onModeChange={handleModeChange} />
 
-      {/* Main Studio Grid
-          The grid is filled column-first and paired row by row, so the
-          Reference Portrait sits level with the Studio Canvas, the audio
-          panel with the telemetry hub, and the parameters with the perf
-          matrix. Every row shares one height, so the cards match. */}
-      <main className="studio-main-grid">
-        {/* Left Column: Creator Workbench */}
-        <>
-          <PortraitCanvas
-            imagePreview={imagePreview}
-            setImagePreview={setImagePreview}
-            setImageBase64={setImageBase64}
-            noCrop={noCrop}
-            setNoCrop={setNoCrop}
-          />
+      {mode === 'live' ? (
+        <LiveAudioStudio
+          imagePreview={imagePreview}
+          imageBase64={imageBase64}
+          imageFormat={imageFormat}
+          onToast={showToast}
+          onOpenStudio={() => setMode('studio')}
+          portraitPicker={portraitCard}
+        />
+      ) : (
+        <main className="studio-workspace">
+          <aside className="studio-composer">
+            {portraitCard}
 
-          <AudioEngine
-            audioBlob={audioBlob}
-            setAudioBlob={setAudioBlob}
-            audioBase64={audioBase64}
-            setAudioBase64={setAudioBase64}
-            setAudioFormat={setAudioFormat}
-          />
+            <AudioEngine
+              audioBlob={audioBlob}
+              setAudioBlob={setAudioBlob}
+              audioBase64={audioBase64}
+              setAudioBase64={setAudioBase64}
+              setAudioFormat={setAudioFormat}
+              step={2}
+              onToast={showToast}
+            />
 
-          <ParameterControls
-            params={params}
-            setParams={setParams}
-          />
-        </>
+            <ParameterControls params={params} setParams={setParams} step={3} />
+          </aside>
 
-        {/* Right Column: Stage & Telemetry */}
-        <>
-          <StudioStage
-            onGenerate={handleGenerate}
-            isGenerating={isGenerating}
-            progress={progress}
-            generationResult={generationResult}
-            hasAudio={Boolean(audioBase64)}
-            onToast={showToast}
-            transport={transport}
-            setTransport={setTransport}
-            liveRequestId={liveRequestId}
-          />
+          <div className="studio-stage-column">
+            <StudioStage
+              onGenerate={handleGenerate}
+              isGenerating={isGenerating}
+              progress={progress}
+              generationResult={generationResult}
+              hasAudio={Boolean(audioBase64)}
+              onToast={showToast}
+              transport={transport}
+              setTransport={setTransport}
+              liveRequestId={liveRequestId}
+              imagePreview={imagePreview}
+            />
 
-          <TelemetryDashboard
-            latestResult={generationResult}
-            history={history}
-          />
+            <InsightsPanel
+              latestResult={generationResult}
+              history={history}
+              onToast={showToast}
+            />
+          </div>
+        </main>
+      )}
 
-          <PerfMatrixPanel onToast={showToast} />
-        </>
-      </main>
+      <footer className="app-footer">
+        <span>
+          Built on <strong>FLOAT</strong> (ICCV 2025) — research use only.
+        </span>
+        <a href="https://github.com/deepbrainai-research/float" target="_blank" rel="noreferrer">
+          Original project &amp; credits
+        </a>
+      </footer>
     </div>
   );
 }

@@ -11,7 +11,7 @@ import {
 } from 'lucide-react';
 import { fetchGpuMetrics, fetchHealth } from '../services/api';
 
-export default function TelemetryDashboard({ latestResult, history = [] }) {
+export default function TelemetryDashboard({ latestResult, history = [], embedded = false }) {
   const [gpu, setGpu] = useState(null);
   const [health, setHealth] = useState(null);
 
@@ -44,16 +44,18 @@ export default function TelemetryDashboard({ latestResult, history = [] }) {
   };
 
   return (
-    <div className="telemetry-section glass-panel">
-      <div className="section-header">
-        <div className="section-title-wrap">
-          <Activity size={18} className="section-icon text-cyan" />
-          <h2 className="section-title">Telemetry & Performance Hub</h2>
+    <div className={`telemetry-section glass-panel ${embedded ? 'is-embedded' : ''}`}>
+      {!embedded && (
+        <div className="section-header">
+          <div className="section-title-wrap">
+            <Activity size={18} className="section-icon text-cyan" />
+            <h2 className="section-title">Telemetry &amp; Performance Hub</h2>
+          </div>
+          <button className="btn-icon-subtle" onClick={refreshTelemetry} title="Refresh telemetry" aria-label="Refresh telemetry">
+            <RotateCw size={15} />
+          </button>
         </div>
-        <button className="btn-icon-subtle" onClick={refreshTelemetry} title="Refresh Telemetry">
-          <RotateCw size={15} />
-        </button>
-      </div>
+      )}
 
       {/* Grid of Key Performance Indicators */}
       <div className="kpi-grid">

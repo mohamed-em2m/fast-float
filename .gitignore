@@ -16,3 +16,19 @@ wav2vec2-base-960h/
 wav2vec-english-speech-emotion-recognition/
 results/
 *.egg-info
+.deepeval
+.antigravitycli
+.ipynb_checkpoints
+.mypy_cache
+.ruff_cache
+# Machine-local secrets (key material); settings.toml is committed.
+# Covers the historical "secerts.toml" typo as well as the correct spelling.
+**/secerts*.toml
+**/secrets*.toml
+# Tunnel-agent downloads (cloudflared) land in the repo root when wget/curl
+# is re-run without -O; they are 19 MB binaries, not sources.
+cloudflared-*
+*.deb
+.env
+.env.*
+!.env.example

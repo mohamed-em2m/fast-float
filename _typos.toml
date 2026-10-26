@@ -7,8 +7,12 @@ ser = "ser"
 ot = "ot"
 # CC BY-NC-ND license acronym (No-Derivatives)
 ND = "ND"
+# secerts.toml — historical name of the machine-local secrets file
+# (intentionally "secerts", used across config, docs and tooling)
+secerts = "secerts"
 
 [default.extend-identifiers]
 ser = "ser"
 "rust_model.ot" = "rust_model.ot"
 ND = "ND"
+secerts = "secerts"

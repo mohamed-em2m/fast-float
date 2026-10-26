@@ -1,11 +1,17 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  Sparkles,
+  AudioLines,
+  Clapperboard,
+  Radio,
+  ShieldCheck,
+  TriangleAlert,
   Trash2,
   Settings,
   Cpu,
-  RefreshCw
+  RefreshCw,
+  Sparkles,
 } from 'lucide-react';
+import { fetchLiveKitStatus, getLiveKitUrlOverride, setLiveKitUrlOverride, getGeminiApiKey, setGeminiApiKey, getGeminiModel, setGeminiModel } from '../services/livekit';
 import { fetchHealth, fetchGpuMetrics, clearGpuMemory, getApiUrl, setApiUrl, resetApiUrl, isDefaultApiUrl, testApiUrl, isLoopbackUrl, isPageOnLoopback, DEFAULT_API_URL } from '../services/api';
 
 // Consecutive failed polls before the pill flips to Disconnected. A single
@@ -13,12 +19,16 @@ import { fetchHealth, fetchGpuMetrics, clearGpuMemory, getApiUrl, setApiUrl, res
 // flight) must not flap the UI offline.
 const OFFLINE_AFTER_FAILURES = 3;
 
-export default function Header({ onToast }) {
+export default function Header({ onToast, mode = 'studio', onModeChange }) {
   const [health, setHealth] = useState(null);
   const [gpu, setGpu] = useState(null);
   const [isOnline, setIsOnline] = useState(false);
+  const [liveKitStatus, setLiveKitStatus] = useState(null);
   const [showSettings, setShowSettings] = useState(false);
   const [apiUrlInput, setApiUrlInput] = useState(getApiUrl());
+  const [liveKitUrlInput, setLiveKitUrlInput] = useState(getLiveKitUrlOverride());
+  const [geminiKeyInput, setGeminiKeyInput] = useState(getGeminiApiKey());
+  const [geminiModelInput, setGeminiModelInput] = useState(getGeminiModel());
   const [configError, setConfigError] = useState(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
@@ -33,6 +43,7 @@ export default function Header({ onToast }) {
   const checkStatus = async () => {
     try {
       const hData = await fetchHealth();
+      fetchLiveKitStatus().then((lk) => setLiveKitStatus(lk)).catch(() => setLiveKitStatus({ configured: false }));
       setHealth(hData);
       failuresRef.current = 0;
       setIsOnline(true);
@@ -86,6 +97,9 @@ export default function Header({ onToast }) {
       // Verify before committing so a typo can't strand the whole studio.
       const hData = await testApiUrl(value);
       setApiUrl(value);
+      setLiveKitUrlOverride(liveKitUrlInput);
+      setGeminiApiKey(geminiKeyInput);
+      setGeminiModel(geminiModelInput);
       failuresRef.current = 0;
       if (hData && typeof hData === 'object') setHealth(hData);
       setIsOnline(true);
@@ -99,15 +113,66 @@ export default function Header({ onToast }) {
     }
   };
 
+  const handleSaveDirect = (e) => {
+    e?.preventDefault();
+    const value = trimmedInput || DEFAULT_API_URL;
+    // Reject if the user pasted the full page URL (e.g. http://localhost:3000/?api=https://...)
+    try {
+      const u = new URL(value);
+      if (u.search.includes('api=') || u.search.includes('backend=')) {
+        setConfigError('That looks like a page URL, not an API base URL. Paste only the backend address (e.g. https://my-server.com).');
+        return;
+      }
+    } catch { /* non-absolute URL — let setApiUrl handle it */ }
+    setApiUrl(value);
+    setLiveKitUrlOverride(liveKitUrlInput);
+    setGeminiApiKey(geminiKeyInput);
+    setGeminiModel(geminiModelInput);
+    failuresRef.current = 0;
+    setShowSettings(false);
+    if (onToast) onToast(`Saved direct endpoint: ${value}`, 'info');
+    checkStatus();
+  };
+
   const openSettings = () => {
     setApiUrlInput(getApiUrl());
+    setLiveKitUrlInput(getLiveKitUrlOverride());
+    setGeminiKeyInput(getGeminiApiKey());
+    setGeminiModelInput(getGeminiModel());
     setConfigError(null);
     setShowSettings(true);
   };
 
+  const handleVerifyConnection = async () => {
+    setIsSaving(true);
+    try {
+      const lk = await fetchLiveKitStatus({ verify: true });
+      setLiveKitStatus(lk);
+      const bad = (lk?.warnings || []).length;
+      if (onToast) {
+        onToast(
+          bad === 0
+            ? 'Connection checks passed — LiveKit + Gemini ready.'
+            : `Connection check found ${bad} issue${bad === 1 ? '' : 's'} — see the list below.`,
+          bad === 0 ? 'success' : 'error'
+        );
+      }
+    } catch (err) {
+      setConfigError(err?.message || 'Verification failed.');
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
   const handleResetApiUrl = () => {
     const base = resetApiUrl();
+    setLiveKitUrlOverride('');
+    setGeminiApiKey('');
+    setGeminiModel('');
     setApiUrlInput(base);
+    setLiveKitUrlInput('');
+    setGeminiKeyInput('');
+    setGeminiModelInput('');
     setConfigError(null);
     failuresRef.current = 0;
     if (onToast) onToast('Reset to default endpoint', 'info');
@@ -115,35 +180,73 @@ export default function Header({ onToast }) {
   };
 
   return (
-    <header className="header-container glass-panel">
+    <header className="app-header glass-panel">
       <div className="header-brand">
         <div className="brand-logo">
-          <Sparkles className="brand-icon" size={22} />
+          <Sparkles className="brand-icon" size={20} />
         </div>
         <div>
           <div className="brand-title-wrap">
             <h1 className="brand-title">FLOAT <span className="gradient-text">Studio</span></h1>
-            <span className="version-badge">v5.1 NVENC</span>
+            <span className="version-badge">v5.2</span>
           </div>
-          <p className="brand-subtitle">Fast Flow Matching Talking Portrait Generator</p>
+          <p className="brand-subtitle">Audio-driven talking portraits</p>
         </div>
       </div>
 
+      <nav className="mode-switch" role="tablist" aria-label="Workspace mode">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={mode === 'studio'}
+          className={`mode-tab ${mode === 'studio' ? 'is-active' : ''}`}
+          onClick={() => onModeChange?.('studio')}
+        >
+          <Clapperboard size={15} />
+          <span>Studio</span>
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={mode === 'live'}
+          className={`mode-tab ${mode === 'live' ? 'is-active' : ''}`}
+          onClick={() => onModeChange?.('live')}
+        >
+          <AudioLines size={15} />
+          <span>Live Audio</span>
+          <span className="mode-live-dot" />
+        </button>
+      </nav>
+
       <div className="header-actions">
         {/* Connection Status Pill */}
-        <div className={`status-pill ${isOnline ? 'status-online' : 'status-offline'}`}>
+        <div
+          className={`status-pill ${isOnline ? 'status-online' : 'status-offline'}`}
+          title={isOnline ? `Backend: ${getApiUrl()}` : 'Backend unreachable'}
+        >
           <span className={isOnline ? 'live-dot' : 'offline-dot'} />
           <span className="status-label">
             {isOnline
-              ? (health?.model_loaded ? 'Model Ready' : 'Server Online')
+              ? (health?.model_loaded ? 'Model ready' : 'Server online')
               : 'Disconnected'}
+          </span>
+        </div>
+
+        {/* LiveKit SFU Status Pill */}
+        <div
+          className={`status-pill ${liveKitStatus?.configured ? 'status-online' : 'status-standby'}`}
+          title={liveKitStatus?.configured ? `LiveKit SFU active (${liveKitStatus.url})` : 'LiveKit SFU standby (run docker-compose.livekit.yml)'}
+        >
+          <Radio size={13} />
+          <span className="status-label">
+            {liveKitStatus?.configured ? 'LiveKit' : 'LiveKit off'}
           </span>
         </div>
 
         {/* GPU Memory Widget */}
         {gpu?.memory && (
           <div className="gpu-widget" title={`GPU: ${gpu.info?.name || 'NVIDIA GPU'}`}>
-            <Cpu size={16} className="gpu-icon" />
+            <Cpu size={15} className="gpu-icon" />
             <div className="gpu-text">
               <span className="gpu-val">
                 {gpu.memory.allocated_gb} / {gpu.memory.total_gb} GB
@@ -156,10 +259,11 @@ export default function Header({ onToast }) {
               </div>
             </div>
             <button
-              className="btn-icon"
+              className="btn-icon-subtle"
               onClick={handleClearGpu}
               disabled={isClearing}
               title="Clear GPU VRAM cache"
+              aria-label="Clear GPU VRAM cache"
             >
               <Trash2 size={14} className={isClearing ? 'animate-spin' : ''} />
             </button>
@@ -167,35 +271,81 @@ export default function Header({ onToast }) {
         )}
 
         {/* Refresh Status */}
-        <button className="btn-icon" onClick={checkStatus} title="Refresh Server Status">
+        <button className="btn-icon" onClick={checkStatus} title="Refresh server status" aria-label="Refresh server status">
           <RefreshCw size={16} />
         </button>
 
         {/* Settings Toggle */}
         <button
-          className="btn-secondary btn-sm"
+          className="btn-icon"
           onClick={openSettings}
-          title="Configure API Endpoint"
+          title="Server & network settings"
+          aria-label="Server and network settings"
         >
-          <Settings size={15} />
-          <span>Config</span>
+          <Settings size={16} />
         </button>
       </div>
 
       {/* Settings Modal Popover */}
       {showSettings && (
-        <div className="settings-popover glass-panel">
-          <h3 className="settings-title">Backend Connection</h3>
+        <div className="settings-popover glass-panel" style={{ width: '380px' }}>
+          <h3 className="settings-title">Server & Network Configuration</h3>
 
           <div className="settings-active">
             <span className="settings-label">
-              Active endpoint {hasOverride ? '(custom override)' : '(default proxy)'}
+              Active API Endpoint {hasOverride ? '(custom override)' : '(default proxy)'}
             </span>
             <code className="settings-active-url">{activeUrl}</code>
+            {getLiveKitUrlOverride() && (
+              <span className="settings-label" style={{ marginTop: '4px' }}>
+                LiveKit Override: <code className="settings-active-url">{getLiveKitUrlOverride()}</code>
+              </span>
+            )}
+            {getGeminiApiKey() && (
+              <span className="settings-label" style={{ marginTop: '4px' }}>
+                Gemini API key: <code className="settings-active-url">••••{getGeminiApiKey().slice(-4)}</code>
+              </span>
+            )}
+            {getGeminiModel() && (
+              <span className="settings-label" style={{ marginTop: '4px' }}>
+                Gemini model: <code className="settings-active-url">{getGeminiModel()}</code>
+              </span>
+            )}
           </div>
 
           <form onSubmit={handleSaveApiUrl}>
-            <label className="settings-label" htmlFor="api-url-input">API base URL</label>
+            {/* Direct Presets for API */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px' }}>
+              <label className="settings-label" htmlFor="api-url-input" style={{ marginBottom: 0 }}>
+                API Base URL (FastAPI)
+              </label>
+              <div style={{ display: 'flex', gap: '4px' }}>
+                <button
+                  type="button"
+                  className="btn-secondary btn-xs"
+                  onClick={() => {
+                    const host = typeof window !== 'undefined' ? window.location.hostname || '127.0.0.1' : '127.0.0.1';
+                    setApiUrlInput(`http://${host}:8000`);
+                    setConfigError(null);
+                  }}
+                  title="Direct to backend server port 8000"
+                >
+                  Direct (:8000)
+                </button>
+                <button
+                  type="button"
+                  className="btn-secondary btn-xs"
+                  onClick={() => {
+                    setApiUrlInput(DEFAULT_API_URL);
+                    setConfigError(null);
+                  }}
+                  title="Route through same-origin Vite proxy"
+                >
+                  Proxy (/api)
+                </button>
+              </div>
+            </div>
+
             <input
               id="api-url-input"
               type="text"
@@ -209,15 +359,153 @@ export default function Header({ onToast }) {
 
             {loopbackWarning && (
               <p className="settings-warning">
-                This page is served from {window.location.host} — <code>localhost</code> there
-                points at the visitor's own machine, so this endpoint may be unreachable remotely.
+                This page is served from {window.location.host} — <code>localhost</code> points at the visitor's machine.
               </p>
             )}
+
+            {/* LiveKit SFU URL Section */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px', marginTop: '10px' }}>
+              <label className="settings-label" htmlFor="livekit-url-input" style={{ marginBottom: 0 }}>
+                LiveKit SFU URL (WebSocket)
+              </label>
+              <div style={{ display: 'flex', gap: '4px' }}>
+                <button
+                  type="button"
+                  className="btn-secondary btn-xs"
+                  onClick={() => {
+                    const host = typeof window !== 'undefined' ? window.location.hostname || '127.0.0.1' : '127.0.0.1';
+                    setLiveKitUrlInput(`ws://${host}:7880`);
+                  }}
+                  title="Direct to LiveKit SFU port 7880"
+                >
+                  Direct (:7880)
+                </button>
+                {liveKitUrlInput && (
+                  <button
+                    type="button"
+                    className="btn-secondary btn-xs"
+                    onClick={() => setLiveKitUrlInput('')}
+                    title="Clear override to receive URL from backend"
+                  >
+                    Auto
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <input
+              id="livekit-url-input"
+              type="text"
+              value={liveKitUrlInput}
+              onChange={(e) => setLiveKitUrlInput(e.target.value)}
+              placeholder="ws://127.0.0.1:7880 (default auto-aligned)"
+              className="settings-input"
+              spellCheck={false}
+              autoComplete="off"
+            />
+
+            {/* Gemini API Key Section */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px', marginTop: '10px' }}>
+              <label className="settings-label" htmlFor="gemini-key-input" style={{ marginBottom: 0 }}>
+                Gemini API Key
+              </label>
+              {geminiKeyInput && (
+                <button
+                  type="button"
+                  className="btn-secondary btn-xs"
+                  onClick={() => setGeminiKeyInput('')}
+                  title="Clear the stored Gemini API key"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+
+            <input
+              id="gemini-key-input"
+              type="password"
+              value={geminiKeyInput}
+              onChange={(e) => setGeminiKeyInput(e.target.value)}
+              placeholder="AIza… (used by the Gemini Live engine)"
+              className="settings-input"
+              spellCheck={false}
+              autoComplete="off"
+              autoCapitalize="none"
+            />
+            <p className="settings-hint">
+              Sent to the server with each <strong>Gemini Live</strong> session. Stored only in this
+              browser; for a persistent key use <code>[gemini] &rarr; api_key</code> in{' '}
+              <code>fast_float/config/secerts.toml</code> instead.
+            </p>
+
+            {/* Gemini Model Section */}
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px', marginTop: '10px' }}>
+              <label className="settings-label" htmlFor="gemini-model-input" style={{ marginBottom: 0 }}>
+                Gemini Model
+              </label>
+              {geminiModelInput && (
+                <button
+                  type="button"
+                  className="btn-secondary btn-xs"
+                  onClick={() => setGeminiModelInput('')}
+                  title="Use the server's default (plugin) Gemini Live model"
+                >
+                  Auto
+                </button>
+              )}
+            </div>
+
+            <input
+              id="gemini-model-input"
+              type="text"
+              value={geminiModelInput}
+              onChange={(e) => setGeminiModelInput(e.target.value)}
+              placeholder="gemini-2.5-flash-native-audio-preview-12-2025 (empty = plugin default)"
+              className="settings-input"
+              spellCheck={false}
+              autoComplete="off"
+              autoCapitalize="none"
+            />
+            <p className="settings-hint">
+              Pins the Live API model for <strong>Gemini Live</strong> sessions. Empty uses the worker's
+              default (server <code>[gemini] &rarr; model</code> or <code>GEMINI_MODEL</code>).
+            </p>
+
+            {/* Connection / readiness checks */}
+            <div className="settings-checks">
+              <div className="settings-checks-head">
+                <span className="settings-label">Connection Checks</span>
+                <button
+                  type="button"
+                  className="btn-secondary btn-xs"
+                  onClick={handleVerifyConnection}
+                  disabled={isSaving}
+                  title="Probe the LiveKit SFU and re-run every readiness check"
+                >
+                  {isSaving ? 'Verifying…' : 'Verify'}
+                </button>
+              </div>
+              {liveKitStatus?.checks?.length ? (
+                <ul className="settings-checks-list">
+                  {liveKitStatus.checks.map((check) => (
+                    <li key={check.name} className={`settings-check settings-check--${check.status || 'skip'}`}>
+                      {check.status === 'ok' ? <ShieldCheck size={13} /> : <TriangleAlert size={13} />}
+                      <span>
+                        <strong>{check.name.replace(/_/g, ' ')}</strong>
+                        {check.message}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="settings-warning">Not available — is the backend reachable?</p>
+              )}
+            </div>
+
             {configError && <p className="settings-error">{configError}</p>}
 
             <p className="settings-hint">
-              Leave as the default to route through the same-origin <code>/api</code> proxy.
-              Set a full URL only to talk to the FastAPI server directly.
+              Use <code>Direct (:8000)</code> to talk straight to FastAPI, or <code>Proxy (/api)</code> for reverse proxying.
             </p>
 
             <div className="settings-buttons">
@@ -226,6 +514,7 @@ export default function Header({ onToast }) {
                 className="btn-secondary btn-sm"
                 disabled={isSaving}
                 onClick={handleResetApiUrl}
+                title="Reset all URLs to factory defaults"
               >
                 Reset
               </button>
@@ -236,6 +525,15 @@ export default function Header({ onToast }) {
                 onClick={() => setShowSettings(false)}
               >
                 Cancel
+              </button>
+              <button
+                type="button"
+                className="btn-secondary btn-sm"
+                disabled={isSaving}
+                onClick={handleSaveDirect}
+                title="Save URLs directly without checking connection"
+              >
+                Save Direct
               </button>
               <button type="submit" className="btn-primary btn-sm" disabled={isSaving}>
                 {isSaving ? 'Testing…' : 'Test & Save'}

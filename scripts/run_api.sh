@@ -14,7 +14,14 @@ export HYPERCORN_STARTUP_TIMEOUT="${HYPERCORN_STARTUP_TIMEOUT:-1200}"
 # --no-sync: the lock pins the portable CPU onnxruntime, while setup.sh /
 # convert_to_onnx.sh layer onnx + onnxruntime-gpu + TensorRT on top. A plain
 # `uv run` re-syncs the venv and the server boots without a CUDA/TensorRT EP.
-exec uv run --frozen --no-sync hypercorn fast_float.main:app \
+# Pass the repo-root .env to the API when present, same as run_all.sh: it is
+# the fallback for boxes without fast_float/config/{settings,secerts}.toml
+# (shared config files still win).
+ENV_ARGS=()
+if [ -f "${PROJECT_ROOT}/.env" ]; then
+    ENV_ARGS=(--env-file "${PROJECT_ROOT}/.env")
+fi
+exec uv run "${ENV_ARGS[@]}" --frozen --no-sync hypercorn fast_float.main:app \
     --bind "0.0.0.0:${PORT}" \
     --worker-class asyncio \
     --log-level info \

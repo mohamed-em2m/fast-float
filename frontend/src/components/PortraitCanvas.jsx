@@ -1,23 +1,41 @@
-import React, { useRef, useEffect } from 'react';
-import { Upload, Image as ImageIcon, X, Crop } from 'lucide-react';
-import { blobToBase64 } from '../services/api';
+import React, { useRef, useEffect, useState } from 'react';
+import { Upload, Image as ImageIcon, X, Crop, Loader2 } from 'lucide-react';
+import {
+  blobToBase64,
+  formatBytes,
+  imageFormatFromFile,
+} from '../services/api';
 
 const SAMPLE_PORTRAITS = [
   { id: 'sam', name: 'Sam Altman', url: '/samples/portrait1.jpg' },
   { id: 'avatar', name: 'Studio Avatar', url: '/samples/portrait2.jpg' },
 ];
 
+// Keep the JSON payload sane: base64 is ~33% larger than the file, and the
+// backend decodes the whole thing in memory.
+const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
+
 export default function PortraitCanvas({
   imagePreview,
   setImagePreview,
   setImageBase64,
+  setImageFormat,
   noCrop,
-  setNoCrop
+  setNoCrop,
+  step = 1,
+  onToast,
 }) {
   const fileInputRef = useRef(null);
   // Tracks blob: preview URLs we created so we can revoke them (static
   // /samples/* URLs must NOT be revoked).
   const blobUrlRef = useRef(null);
+  // The latest selection wins: a slow FileReader must not overwrite the photo
+  // the user picked afterwards.
+  const selectionRef = useRef(0);
+  const dragDepthRef = useRef(0);
+  const [isDragging, setIsDragging] = useState(false);
+  // null | 'file' | sample id
+  const [loading, setLoading] = useState(null);
 
   useEffect(() => {
     return () => {
@@ -26,7 +44,7 @@ export default function PortraitCanvas({
   }, []);
 
   const setPreview = (url, { isBlob = false } = {}) => {
-    if (blobUrlRef.current) {
+    if (blobUrlRef.current && blobUrlRef.current !== url) {
       URL.revokeObjectURL(blobUrlRef.current);
       blobUrlRef.current = null;
     }
@@ -34,53 +52,106 @@ export default function PortraitCanvas({
     setImagePreview(url);
   };
 
-  const handleFileUpload = async (file) => {
-    if (!file || !file.type.startsWith('image/')) return;
-    setPreview(URL.createObjectURL(file), { isBlob: true });
+  const validate = (file) => {
+    const format = imageFormatFromFile(file);
+    if (!format) {
+      return 'That file is not a supported image. Use a JPG, PNG or WebP photo.';
+    }
+    if (!file.size) {
+      return 'That image is empty. Choose another photo.';
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      return `That image is ${formatBytes(file.size)} — the limit is ${formatBytes(MAX_IMAGE_BYTES)}.`;
+    }
+    return null;
+  };
 
+  const handleFileUpload = async (file) => {
+    if (!file) return;
+    const problem = validate(file);
+    if (problem) {
+      onToast?.(problem, 'error');
+      return;
+    }
+
+    const token = ++selectionRef.current;
+    setLoading('file');
     try {
+      // Read first, then swap the preview: if the read fails the previous
+      // portrait (and its base64) stays intact instead of a broken image.
       const base64 = await blobToBase64(file);
+      if (token !== selectionRef.current) return;
+      setPreview(URL.createObjectURL(file), { isBlob: true });
       setImageBase64(base64);
-    } catch (e) {
-      console.error('Failed to convert image to base64', e);
+      setImageFormat?.(imageFormatFromFile(file) || 'jpg');
+    } catch (err) {
+      console.error('Failed to convert image to base64', err);
+      if (token === selectionRef.current) {
+        onToast?.('Could not read that image. Try another JPG, PNG or WebP file.', 'error');
+      }
+    } finally {
+      if (token === selectionRef.current) setLoading(null);
     }
   };
 
   const handleDrop = (e) => {
     e.preventDefault();
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      handleFileUpload(e.dataTransfer.files[0]);
-    }
+    dragDepthRef.current = 0;
+    setIsDragging(false);
+    const file = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (file) handleFileUpload(file);
   };
 
   const handleSelectSample = async (sample) => {
-    setPreview(sample.url);
+    const token = ++selectionRef.current;
+    setLoading(sample.id);
     try {
-      const response = await fetch(sample.url);
-      if (!response.ok) throw new Error(`Sample fetch failed: ${response.status}`);
+      const response = await fetch(sample.url, { cache: 'no-cache' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const blob = await response.blob();
+      if (!blob.size) throw new Error('empty sample');
       const base64 = await blobToBase64(blob);
+      if (token !== selectionRef.current) return;
+      setPreview(sample.url);
       setImageBase64(base64);
-    } catch (e) {
-      console.error('Failed to load sample image', e);
+      setImageFormat?.(imageFormatFromFile(blob) || 'jpg');
+    } catch (err) {
+      console.error('Failed to load sample image', err);
+      if (token === selectionRef.current) {
+        onToast?.(`Could not load "${sample.name}". Check that the sample images are available.`, 'error');
+      }
+    } finally {
+      if (token === selectionRef.current) setLoading(null);
     }
   };
 
   const handleClearImage = () => {
+    selectionRef.current += 1;
+    setLoading(null);
     setPreview(null);
     setImageBase64(null);
+    setImageFormat?.('jpg');
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
+
+  const busy = Boolean(loading);
 
   return (
     <div className="card-section glass-panel">
       <div className="section-header">
         <div className="section-title-wrap">
+          <span className="step-index">{step}</span>
           <ImageIcon size={18} className="section-icon text-indigo" />
-          <h2 className="section-title">Reference Portrait</h2>
+          <h2 className="section-title">Portrait</h2>
         </div>
         {imagePreview && (
-          <button className="btn-icon-subtle" onClick={handleClearImage} title="Clear Image">
+          <button
+            className="btn-icon-subtle"
+            onClick={handleClearImage}
+            title="Clear image"
+            aria-label="Clear portrait"
+            disabled={busy}
+          >
             <X size={16} />
           </button>
         )}
@@ -88,16 +159,33 @@ export default function PortraitCanvas({
 
       {/* Drag & Drop Canvas */}
       <div
-        className={`portrait-dropzone ${imagePreview ? 'has-image' : ''}`}
-        onDragOver={(e) => e.preventDefault()}
+        className={`portrait-dropzone ${imagePreview ? 'has-image' : ''} ${isDragging ? 'is-dragging' : ''}`}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setIsDragging(true);
+        }}
+        onDragEnter={() => {
+          dragDepthRef.current += 1;
+          setIsDragging(true);
+        }}
+        onDragLeave={() => {
+          dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+          if (!dragDepthRef.current) setIsDragging(false);
+        }}
         onDrop={handleDrop}
-        onClick={() => !imagePreview && fileInputRef.current?.click()}
+        onClick={() => !imagePreview && !busy && fileInputRef.current?.click()}
+        aria-busy={busy}
       >
         <input
           type="file"
           ref={fileInputRef}
-          accept="image/*"
-          onChange={(e) => handleFileUpload(e.target.files[0])}
+          accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            // Reset first so picking the same file twice still fires onChange.
+            e.target.value = '';
+            handleFileUpload(file);
+          }}
           style={{ display: 'none' }}
         />
 
@@ -111,8 +199,9 @@ export default function PortraitCanvas({
                 className="btn-change-image"
                 onClick={(e) => {
                   e.stopPropagation();
-                  fileInputRef.current?.click();
+                  if (!busy) fileInputRef.current?.click();
                 }}
+                disabled={busy}
               >
                 Change Photo
               </button>
@@ -125,6 +214,13 @@ export default function PortraitCanvas({
             </div>
             <p className="upload-hint-main">Drop portrait image here, or <span>browse</span></p>
             <p className="upload-hint-sub">PNG, JPG, WebP (Frontal face works best)</p>
+          </div>
+        )}
+
+        {busy && (
+          <div className="portrait-loading" role="status" aria-live="polite">
+            <Loader2 size={20} className="spin" />
+            <span>Reading image…</span>
           </div>
         )}
       </div>
@@ -154,8 +250,13 @@ export default function PortraitCanvas({
               type="button"
               className={`sample-pill ${imagePreview === sample.url ? 'active' : ''}`}
               onClick={() => handleSelectSample(sample)}
+              disabled={busy}
             >
-              <img src={sample.url} alt={sample.name} className="sample-thumbnail" />
+              {loading === sample.id ? (
+                <Loader2 size={14} className="spin" />
+              ) : (
+                <img src={sample.url} alt="" className="sample-thumbnail" />
+              )}
               <span>{sample.name}</span>
             </button>
           ))}

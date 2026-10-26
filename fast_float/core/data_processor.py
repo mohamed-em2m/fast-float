@@ -47,6 +47,7 @@ class DataProcessor:
                 A_pytorch.ToTensorV2(),
             ]
         )
+        self._ref_image_cache: dict[tuple[str, float, bool], torch.Tensor] = {}
 
     @torch.no_grad()
     def process_img(self, img: np.ndarray) -> np.ndarray:
@@ -103,16 +104,30 @@ class DataProcessor:
         if isinstance(ref_path, (list, tuple)):
             s_list = []
             for rp in ref_path:
-                img = self.default_img_loader(rp)
-                if not no_crop:
-                    img = self.process_img(img)
-                s_list.append(self.transform(image=img)["image"])
+                mtime = os.path.getmtime(rp) if isinstance(rp, str) and os.path.exists(rp) else 0.0
+                cache_key = (rp, mtime, no_crop)
+                if cache_key in self._ref_image_cache:
+                    s_tensor = self._ref_image_cache[cache_key]
+                else:
+                    img = self.default_img_loader(rp)
+                    if not no_crop:
+                        img = self.process_img(img)
+                    s_tensor = self.transform(image=img)["image"]
+                    self._ref_image_cache[cache_key] = s_tensor
+                s_list.append(s_tensor)
             s = torch.stack(s_list, dim=0)
         else:
-            s = self.default_img_loader(ref_path)
-            if not no_crop:
-                s = self.process_img(s)
-            s = self.transform(image=s)["image"].unsqueeze(0)
+            mtime = os.path.getmtime(ref_path) if isinstance(ref_path, str) and os.path.exists(ref_path) else 0.0
+            cache_key = (ref_path, mtime, no_crop)
+            if cache_key in self._ref_image_cache:
+                s = self._ref_image_cache[cache_key].unsqueeze(0)
+            else:
+                s_img = self.default_img_loader(ref_path)
+                if not no_crop:
+                    s_img = self.process_img(s_img)
+                s_t = self.transform(image=s_img)["image"]
+                self._ref_image_cache[cache_key] = s_t
+                s = s_t.unsqueeze(0)
 
         if isinstance(audio_path, (list, tuple)):
             a_list = [self.default_aud_loader(ap) for ap in audio_path]

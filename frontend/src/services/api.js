@@ -46,8 +46,46 @@ export const DEFAULT_API_URL =
     ? import.meta.env.VITE_API_URL.replace(/\/$/, '')
     : sameOriginApiBase();
 
+/**
+ * Returns true when a stored/entered value looks like a browser page URL
+ * rather than a bare API base — e.g. it contains `?api=` or `?backend=`.
+ * These must never be used as the API base URL.
+ */
+function looksLikePageUrl(url) {
+  if (!url) return false;
+  try {
+    const u = new URL(url);
+    return u.search.includes('api=') || u.search.includes('backend=');
+  } catch {
+    return false;
+  }
+}
+
 function resolveInitialApiUrl() {
+  if (typeof window !== 'undefined') {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const urlParam = params.get('api') || params.get('backend');
+      if (urlParam) {
+        const clean = urlParam.trim().replace(/\/$/, '');
+        localStorage.setItem('float_api_url', clean);
+        // Remove the ?api= param from the browser URL so it never leaks into
+        // subsequent candidate generation or loopback-fallback logic.
+        try { window.history.replaceState({}, '', window.location.pathname); } catch { /* ignore */ }
+        return clean;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
   const stored = localStorage.getItem('float_api_url');
+  // Reject a stored value that looks like a full page URL (e.g. the user
+  // accidentally pasted http://localhost:3000/?api=https://... into the
+  // Config modal). Fall back to the default so the UI isn't permanently stuck.
+  if (stored && looksLikePageUrl(stored)) {
+    localStorage.removeItem('float_api_url');
+    return DEFAULT_API_URL;
+  }
   // Drop a stale loopback URL when the page is served from a public host —
   // it can only ever point back at the user's own machine.
   if (stored && isLoopbackUrl(stored) && !isLoopbackHost(window.location.hostname)) {
@@ -96,12 +134,18 @@ export function alignUrlToApi(url) {
 export function setApiUrl(url) {
   currentApiUrl = url.replace(/\/$/, '');
   localStorage.setItem('float_api_url', currentApiUrl);
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('float:api_url_changed', { detail: currentApiUrl }));
+  }
 }
 
 /** Forget any stored override and fall back to the default (proxy) base. */
 export function resetApiUrl() {
   localStorage.removeItem('float_api_url');
   currentApiUrl = DEFAULT_API_URL;
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('float:api_url_changed', { detail: currentApiUrl }));
+  }
   return currentApiUrl;
 }
 
@@ -147,6 +191,12 @@ export async function testApiUrl(base) {
  * a custom LAN IP or domain is left alone. Port and protocol preserved.
  */
 export function getApiCandidates() {
+  // Guard: if currentApiUrl somehow contains ?api= (page URL leaked in),
+  // reset it so we don't generate broken loopback candidates.
+  if (looksLikePageUrl(currentApiUrl)) {
+    currentApiUrl = DEFAULT_API_URL;
+    localStorage.removeItem('float_api_url');
+  }
   const ordered = [currentApiUrl];
   try {
     const u = new URL(currentApiUrl, window.location.origin);
@@ -202,17 +252,117 @@ async function ensureBackend() {
   );
 }
 
-/** Convert a Blob or File to a Base64 string (without data URL header) */
+/** Convert a Blob or File to a Base64 string (without the data URL header). */
 export function blobToBase64(blob) {
   return new Promise((resolve, reject) => {
+    if (!blob) {
+      reject(new Error('No file selected.'));
+      return;
+    }
     const reader = new FileReader();
-    reader.onloadend = () => {
-      const base64String = reader.result.split(',')[1];
-      resolve(base64String);
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : '';
+      const comma = result.indexOf(',');
+      if (comma < 0 || comma === result.length - 1) {
+        reject(new Error('Could not read this file.'));
+        return;
+      }
+      resolve(result.slice(comma + 1));
     };
-    reader.onerror = reject;
+    // `onloadend` also fires after `onerror`; using it to resolve would throw
+    // on `null` and leave the caller's promise pending forever.
+    reader.onerror = () => reject(reader.error || new Error('Could not read this file.'));
+    reader.onabort = () => reject(new Error('Reading the file was cancelled.'));
     reader.readAsDataURL(blob);
   });
+}
+
+/** Lower-case, parameter-free MIME type (`audio/webm;codecs=opus` -> `audio/webm`). */
+function baseMime(value) {
+  return String(value || '').split(';')[0].trim().toLowerCase();
+}
+
+function extensionOf(name) {
+  const match = /\.([a-z0-9]+)$/i.exec(String(name || ''));
+  return match ? match[1].toLowerCase() : '';
+}
+
+const IMAGE_MIME_FORMATS = {
+  'image/jpeg': 'jpg',
+  'image/jpg': 'jpg',
+  'image/pjpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+};
+
+const IMAGE_EXTENSION_FORMATS = {
+  jpg: 'jpg',
+  jpeg: 'jpg',
+  png: 'png',
+  webp: 'webp',
+};
+
+// Only the containers the backend can decode. Extensions are mapped to the
+// container name pydub/ffmpeg understands (m4a -> mp4, opus -> ogg).
+const AUDIO_MIME_FORMATS = {
+  'audio/wav': 'wav',
+  'audio/wave': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/vnd.wave': 'wav',
+  'audio/mpeg': 'mp3',
+  'audio/mp3': 'mp3',
+  'audio/mpga': 'mp3',
+  'audio/mp4': 'mp4',
+  'audio/x-m4a': 'mp4',
+  'audio/m4a': 'mp4',
+  'audio/ogg': 'ogg',
+  'audio/opus': 'ogg',
+  'audio/webm': 'webm',
+  'audio/flac': 'flac',
+  'audio/x-flac': 'flac',
+  'audio/aac': 'aac',
+};
+
+const AUDIO_EXTENSION_FORMATS = {
+  wav: 'wav',
+  wave: 'wav',
+  mp3: 'mp3',
+  mpga: 'mp3',
+  m4a: 'mp4',
+  mp4: 'mp4',
+  ogg: 'ogg',
+  oga: 'ogg',
+  opus: 'ogg',
+  webm: 'webm',
+  flac: 'flac',
+  aac: 'aac',
+};
+
+/**
+ * Container hint for `image_format` / `image_base64`.
+ *
+ * Derive it from the MIME type first, then from the extension. `null` means
+ * the file is not an image the backend supports (BMP/GIF/SVG/TIFF are not).
+ */
+export function imageFormatFromFile(file) {
+  const mime = baseMime(file?.type);
+  if (IMAGE_MIME_FORMATS[mime]) return IMAGE_MIME_FORMATS[mime];
+  return IMAGE_EXTENSION_FORMATS[extensionOf(file?.name)] || null;
+}
+
+/** Container hint for `audio_format`; `null` when the file is not decodable. */
+export function audioFormatFromFile(file) {
+  const mime = baseMime(file?.type);
+  if (AUDIO_MIME_FORMATS[mime]) return AUDIO_MIME_FORMATS[mime];
+  return AUDIO_EXTENSION_FORMATS[extensionOf(file?.name)] || null;
+}
+
+/** Human-readable size for validation messages. */
+export function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(0)} KB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /** Log API failures so they are visible in the browser console, not silent. */
@@ -387,25 +537,130 @@ export async function generateVideo(payload) {
 }
 
 /**
+ * Server-provided STUN servers (fed from /livekit/status -> stun_urls, which
+ * reads fast_float/config/settings.toml [webrtc]). When the deployment ships
+ * no STUN list, the built-in public Google servers keep ICE working.
+ */
+let serverIceServers = null;
+
+/**
+ * Rewrite an ICE URL whose host is loopback to the host the browser actually
+ * uses for the API. The backend advertises itself (e.g. `stun:localhost:3478`)
+ * but a remote browser cannot gather candidates from its own machine — and
+ * when the API sits behind the Vite/prod proxy the request Host header is
+ * often loopback. Explicit operator hosts (coturn, a public DNS name) are left
+ * untouched. Both STUN and TURN schemes are supported.
+ */
+function alignIceUrl(url) {
+  const value = String(url || '').trim();
+  const match = /^(stuns?|turns?):(\[[^\]]+\]|[^:?]+)(?::(\d+))?([^ ]*)$/i.exec(value);
+  if (!match) return value;
+  const scheme = match[1].toLowerCase();
+  let host = match[2].replace(/^\[|\]$/g, '');
+  if (isLoopbackHost(host)) {
+    try {
+      const apiHost = new URL(currentApiUrl, window.location.origin).hostname;
+      if (apiHost && !isLoopbackHost(apiHost)) host = apiHost;
+    } catch {
+      /* keep the loopback host */
+    }
+  }
+  const port = match[3] ? `:${match[3]}` : '';
+  return `${scheme}:${host.includes(':') ? `[${host}]` : host}${port}${match[4] || ''}`;
+}
+
+function normalizeIceServer(entry) {
+  if (typeof entry === 'string') return { urls: alignIceUrl(entry) };
+  if (!entry || typeof entry !== 'object') return null;
+  const rawUrls = Array.isArray(entry.urls) ? entry.urls : [entry.urls];
+  const urls = rawUrls.filter(usableIceUrl).map(alignIceUrl);
+  if (!urls.length) return null;
+  const server = { urls: urls.length === 1 ? urls[0] : urls };
+  if (entry.username) server.username = entry.username;
+  if (entry.credential) server.credential = entry.credential;
+  return server;
+}
+
+/**
+ * Drop a STUN target the browser provably cannot reach. The page's own HTTPS
+ * origin is served by an HTTP(S)-only tunnel (cloudflared/ngrok): it never
+ * carries UDP, so a server that advertises its loopback STUN responder gets
+ * rewritten by alignIceUrl() to the tunnel host — worthless for gathering, but
+ * worse, it would REPLACE the public Google fallback when it is the sole
+ * entry, leaving the browser without any working STUN (blank video, no audio
+ * over LiveKit and the raw WebRTC fallback alike). TURN is kept: a TURN relay
+ * on the page's own host can legitimately listen on TCP/TLS 443.
+ */
+function usableIceUrl(url) {
+  const value = String(url || '').trim();
+  if (!value) return false;
+  const match = /^(stuns?):(\[[^\]]+\]|[^:?]+)/i.exec(value);
+  if (!match) return true; // TURN or an unparsable URL: leave the judgement up
+  if (typeof window === 'undefined' || window.location.protocol !== 'https:') return true;
+  return match[2].replace(/^\[|\]$/g, '').toLowerCase() !== window.location.hostname.toLowerCase();
+}
+
+/**
+ * Feed the raw WebRTC transport an ICE list from `/livekit/status`.
+ * Accepts either `ice_servers` objects (`{urls, username, credential}`) or a
+ * plain STUN URL list for compatibility. An explicit empty list is kept as
+ * empty so a deployment that disabled ICE can opt out of the Google default.
+ */
+/**
+ * Feed the raw WebRTC transport an ICE list from `/livekit/status`.
+ * Accepts either `ice_servers` objects (`{urls, username, credential}`) or a
+ * plain STUN URL list for compatibility. An explicit empty list is kept as
+ * empty so a deployment that disabled ICE can opt out of the Google default.
+ * Entries that are unusable from the page (loopback STUN behind an HTTPS
+ * tunnel — see usableIceUrl) are dropped instead; when the server *provided*
+ * entries but none of them is usable, the list falls back to null so the
+ * public Google default survives.
+ */
+export function setIceServers(servers) {
+  if (!Array.isArray(servers)) {
+    serverIceServers = null;
+    return;
+  }
+  const mapped = servers.map(normalizeIceServer).filter(Boolean);
+  serverIceServers = servers.length && !mapped.length ? null : mapped;
+}
+
+export function getIceServers() {
+  return serverIceServers ?? [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ];
+}
+
+/**
  * Attach a remote track to a <video>, merging tracks into one MediaStream.
  *
  * aiortc gives every sender its own stream id, so audio and video arrive in
  * separate MediaStream objects. Assigning `event.streams[0]` on each ontrack
  * would replace the previous one and drop whichever track came first.
+ *
+ * There is at most one track per kind: when a new request reuses the element,
+ * the previous session's track must be replaced, not left alongside the new
+ * one. A MediaStream with two video tracks renders whichever the browser
+ * picks first, which shows up as a frozen preview on the old track.
  */
 export function attachRemoteTrack(videoEl, event) {
   if (!videoEl) return null;
   let media = videoEl.srcObject;
-  // Reuse the element's stream only while it is still live: a stopped stream
-  // keeps its ended tracks and can make the element ignore the new ones.
-  if (!(media instanceof MediaStream) || !media.getTracks().some((t) => t.readyState === 'live')) {
+  if (!(media instanceof MediaStream)) {
     media = new MediaStream();
     videoEl.srcObject = media;
   }
   const streams = event.streams ?? [];
   const incoming = streams.length ? streams.flatMap((s) => s.getTracks()) : [event.track];
   for (const track of incoming) {
-    if (track && !media.getTracks().some((t) => t.id === track.id)) media.addTrack(track);
+    if (!track) continue;
+    for (const existing of media.getTracks()) {
+      if (existing.kind === track.kind && existing.id !== track.id) {
+        media.removeTrack(existing);
+      }
+    }
+    if (!media.getTracks().some((t) => t.id === track.id)) media.addTrack(track);
   }
   return media;
 }
@@ -414,10 +669,9 @@ export function attachRemoteTrack(videoEl, event) {
 export async function createWebRtcSession(streamId, onTrackCallback, onStateCallback, options = {}) {
   const { live = false } = options;
   const pc = new RTCPeerConnection({
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' },
-    ],
+    // Server-provided STUN/TURN list (see /livekit/status -> ice_servers)
+    // replaces the public Google default when present.
+    iceServers: getIceServers(),
   });
 
   // Recv-only viewer: declare the m-lines BEFORE createOffer. Without these
@@ -432,14 +686,71 @@ export async function createWebRtcSession(streamId, onTrackCallback, onStateCall
   if (onStateCallback) {
     pc.onconnectionstatechange = () => onStateCallback(pc.connectionState);
   }
+  // Surface STUN/TURN failures in the browser console; a TCP-only proxy
+  // produces candidate errors here even though SDP negotiation succeeds.
+  pc.onicecandidateerror = (event) => {
+    console.warn(
+      `[webrtc] ICE candidate error ${event.errorCode ?? '?'}: ${event.errorText || 'unknown'} (${event.url || 'no url'})`
+    );
+  };
+
+  // Trickle ICE. `/offer` only carries the initial SDP; candidates discovered
+  // afterwards (especially TURN/TCP allocations) are POSTed to
+  // /offer/candidate using the peer id returned with the answer.
+  let peerId = null;
+  let closed = false;
+  let endOfCandidatesPending = false;
+  const pendingCandidates = [];
+  let candidateChain = Promise.resolve();
+  const postCandidate = (candidate) => {
+    if (closed) return;
+    const payload = {
+      peer_id: peerId,
+      candidate: candidate ? candidate.candidate : null,
+      sdp_mid: candidate ? candidate.sdpMid : null,
+      sdp_mline_index: candidate ? candidate.sdpMLineIndex : null,
+    };
+    candidateChain = candidateChain
+      .then(() =>
+        fetch(`${currentApiUrl}/offer/candidate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        })
+      )
+      .then((candidateRes) => {
+        if (!candidateRes.ok) {
+          console.warn(`[webrtc] candidate rejected (HTTP ${candidateRes.status})`);
+        }
+      })
+      .catch((err) => {
+        if (!closed) console.warn('[webrtc] candidate post failed:', err);
+      });
+  };
+  pc.onicecandidate = (event) => {
+    if (closed) return;
+    if (event.candidate) {
+      if (peerId) postCandidate(event.candidate);
+      else pendingCandidates.push(event.candidate);
+    } else if (peerId) {
+      postCandidate(null);
+    } else {
+      // Gathering finished before /offer returned; flush after peer_id.
+      endOfCandidatesPending = true;
+    }
+  };
 
   // Create local offer
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
 
+  // The browser appends `a=end-of-candidates` once gathering completes. If
+  // that line is in the offer, aioice closes its remote-candidate list before
+  // later TURN candidates arrive. Omit it and send an explicit null candidate
+  // via /offer/candidate instead (after peer_id is known).
   const offerBody = () =>
     JSON.stringify({
-      sdp: pc.localDescription.sdp,
+      sdp: pc.localDescription.sdp.replace(/^a=end-of-candidates\r?\n/gm, ''),
       type: pc.localDescription.type,
       stream_id: streamId,
       live,
@@ -459,11 +770,13 @@ export async function createWebRtcSession(streamId, onTrackCallback, onStateCall
       body: offerBody(),
     });
   }).catch((err2) => {
+    closed = true;
     pc.close();
     throw new Error(`Cannot reach backend at ${currentApiUrl} — is it running? (${err2.message})`);
   });
 
   if (!res.ok) {
+    closed = true;
     pc.close();
     const errorData = await res.json().catch(() => ({}));
     const detail = errorData.detail || res.statusText;
@@ -472,7 +785,22 @@ export async function createWebRtcSession(streamId, onTrackCallback, onStateCall
   }
 
   const answer = await res.json();
-  await pc.setRemoteDescription(new RTCSessionDescription(answer));
+  peerId = answer.peer_id || null;
+  if (peerId) {
+    // Flush candidates that were gathered while /offer was in flight.
+    for (const candidate of pendingCandidates.splice(0)) postCandidate(candidate);
+    if (endOfCandidatesPending) postCandidate(null);
+  } else {
+    console.warn('[webrtc] backend did not return a peer_id; late ICE candidates are dropped');
+  }
+
+  try {
+    await pc.setRemoteDescription(new RTCSessionDescription(answer));
+  } catch (err) {
+    closed = true;
+    pc.close();
+    throw err;
+  }
 
   return pc;
 }

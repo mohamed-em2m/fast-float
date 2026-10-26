@@ -49,7 +49,7 @@ function MetricRow({ icon: Icon, tone = 'text-cyan', label, value, hint }) {
   );
 }
 
-export default function PerfMatrixPanel({ onToast }) {
+export default function PerfMatrixPanel({ onToast, embedded = false }) {
   const [state, setState] = useState(null);
   const [requests, setRequests] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -122,11 +122,11 @@ export default function PerfMatrixPanel({ onToast }) {
     : '--';
 
   return (
-    <div className="telemetry-section glass-panel perf-panel">
+    <div className={`telemetry-section glass-panel perf-panel ${embedded ? 'is-embedded' : ''}`}>
       <div className="section-header">
         <div className="section-title-wrap">
           <Gauge size={18} className="section-icon text-cyan" />
-          <h2 className="section-title">Performance Matrix</h2>
+          <h2 className="section-title">{embedded ? 'GPU benchmarks' : 'Performance Matrix'}</h2>
           {state?.finished_at ? (
             <span className="perf-subtitle-note">measured {clockTime(state.finished_at)}</span>
           ) : null}

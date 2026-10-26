@@ -29,6 +29,34 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _drain_ordered(done_q, state, stop, pool, deliver, timeout: float = 0.1) -> None:
+    """Re-order decoded batches, hand each to ``deliver``, then recycle its buffer.
+
+    Decode workers finish out of order, but the dispatcher (and every encoder)
+    needs generation order. Stops once ``state["total"]`` batches are delivered
+    or the shared ``stop`` event is set. Exceptions from ``deliver`` propagate
+    to the writer thread, which records them through ``fail``.
+    """
+    pending, nxt = {}, 0
+    while not stop.is_set():
+        total = state["total"]
+        if total is not None and nxt >= total:
+            return
+        try:
+            seq, buf, n, done = done_q.get(timeout=timeout)
+        except queue.Empty:
+            continue
+        pending[seq] = (buf, n, done)
+        while nxt in pending:
+            buf, n, done = pending.pop(nxt)
+            if done is not None:
+                done.synchronize()
+            deliver(buf, n)
+            state["frames"] += n
+            pool.put(buf)
+            nxt += 1
+
+
 class StreamingVideoSaver:
     """Auto-tuned, multi-stream, multi-GPU streaming decode and video save pipeline.
 
@@ -80,6 +108,10 @@ class StreamingVideoSaver:
         ]
 
     def _start_ffmpeg(self, video_path, audio_path, H, W, C, fps):
+        if not video_path:
+            # subprocess would otherwise fail deep inside Popen with the opaque
+            # "expected str, bytes or os.PathLike object, not NoneType".
+            raise ValueError(f"_start_ffmpeg requires a non-empty video_path (got {video_path!r})")
         cmd = [
             "ffmpeg",
             "-y",
@@ -115,7 +147,7 @@ class StreamingVideoSaver:
     def inference_and_save(
         self,
         data: dict,
-        video_path: str,
+        video_path: str | None,
         audio_path: str | None = None,
         a_cfg_scale=None,
         r_cfg_scale=None,
@@ -125,13 +157,20 @@ class StreamingVideoSaver:
         seed=None,
         video_encoder=None,
         dispatcher: FrameDispatcher | None = None,
-    ) -> str:
+    ) -> str | None:
         t_start = time.perf_counter()
         encoder_choice = str(video_encoder or getattr(self.opt, "video_encoder", "FFmpeg NVENC")).strip().lower()
         use_pyav = encoder_choice in ("cpu pyav", "pyav", "pyav_cpu")
         use_torchcodec = encoder_choice in ("torchcodec", "torch codec", "tc")
 
-        if not use_pyav and not use_torchcodec and shutil.which("ffmpeg") is None:
+        # Live transports (LiveKit, WebSocket taps) consume frames through the
+        # dispatcher and intentionally pass no output file (None/empty): there is
+        # nothing to mux, and spawning an encoder would either fail on the empty
+        # path or waste GPU/CPU time on a file nobody reads.
+        stream_only = not video_path
+        if stream_only and dispatcher is None:
+            raise ValueError("inference_and_save needs a video_path or a dispatcher")
+        if not stream_only and not use_pyav and not use_torchcodec and shutil.which("ffmpeg") is None:
             raise RuntimeError("ffmpeg not found in PATH")
 
         primary, devs = self._decode_devices()
@@ -154,7 +193,7 @@ class StreamingVideoSaver:
             r_cfg_scale = self.opt.r_cfg_scale
         if e_cfg_scale is None:
             e_cfg_scale = self.opt.e_cfg_scale
-        fps = int(getattr(self.opt, "fps", 25))
+        fps = int(getattr(self.opt, "fps", 25) or 25)
 
         # cuDNN's algorithm search is per *thread*: with benchmark=True every
         # fresh decode worker re-autotunes ~40 conv shapes, which costs ~1.2 s
@@ -360,6 +399,21 @@ class StreamingVideoSaver:
 
         # ---- writer: restore order, feed video encoder (torchcodec / PyAV / FFmpeg) ----
         def writer():
+            if stream_only:
+                # No file: deliver frames to the dispatcher in order and recycle
+                # their buffers. The dispatcher copies on submit, so the pool
+                # buffer can be reused immediately.
+
+                def deliver(buf, n):
+                    with timed("video_write"):
+                        dispatcher.submit(buf[:n].numpy())
+
+                try:
+                    _drain_ordered(done_q, state, stop, pool, deliver)
+                except BaseException as e:
+                    fail("writer", e)
+                return
+
             if use_torchcodec:
                 all_frames = []
                 pending, nxt = {}, 0
@@ -524,8 +578,9 @@ class StreamingVideoSaver:
 
         dt = time.perf_counter() - t_start
         self.last_stats = {"frames": state["frames"], "seconds": dt}
+        dest = video_path or "dispatcher stream"
         logger.info(
-            f"[DONE] {state['frames']} frames in {dt:.2f}s ({state['frames'] / dt:.1f} fps end-to-end) -> {video_path}"
+            f"[DONE] {state['frames']} frames in {dt:.2f}s ({state['frames'] / dt:.1f} fps end-to-end) -> {dest}"
         )
         return video_path
 

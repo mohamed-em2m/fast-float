@@ -11,27 +11,29 @@ import soundfile as sf
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# Ensure current directory and repository root are in sys.path
+# Only the repository root belongs on sys.path. Adding fast_float/ itself makes
+# its subpackages importable as top-level modules, which shadows real pip
+# packages: `fast_float/livekit` would be imported as `livekit` and break the
+# LiveKit RTC SDK (`from livekit import rtc`) with a circular import.
 CURRENT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = CURRENT_DIR.parent
-for path in (str(CURRENT_DIR), str(REPO_ROOT)):
-    if path not in sys.path:
-        sys.path.insert(0, path)
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from fast_float.initialize_env import initialize_environment, initialize_onnx_lib_paths
 
 initialize_environment()
 initialize_onnx_lib_paths()
 
-from fast_float.core.inference_optimized import (
-    InferenceOptions,
-    OptimizedInferenceAgent,
-)
+from fast_float.config.float_settings import load_float_options
+from fast_float.core.inference_optimized import OptimizedInferenceAgent
 from fast_float.core.service import (
     run_inference_batched_blocking,
     run_inference_blocking,
 )
 from fast_float.core.state import app_state
+from fast_float.livekit import selftest
+from fast_float.livekit.settings import LiveKitSettings
 from fast_float.routers import api_router
 from fast_float.utils.gpu import print_gpu_status
 from fast_float.utils.logger import logger
@@ -40,6 +42,7 @@ from fast_float.utils.media import (
     TARGET_IMAGE_SIZE,
     ensure_default_image,
 )
+from fast_float.utils.stun import StunServer
 from fast_float.utils.video_optimizer import VideoSaveOptimizer
 
 # Keep strong references to fire-and-forget tasks so they are not garbage
@@ -55,10 +58,7 @@ PORT = int(os.getenv("PORT", "8000"))
 # thread cannot be killed; we only guarantee that the server stops reporting
 # "warming up" and says what happened.
 WARMUP_TIMEOUT_S = float(os.getenv("WARMUP_TIMEOUT_S", "900"))
-RESULTS_DIR = os.getenv("RESULTS_DIR", "./results")
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "10"))
-OPTIMIZATION_MODE = os.getenv("OPTIMIZATION_MODE", "all")
-USE_FP16 = os.getenv("USE_FP16", "true").lower() in ("true", "1", "yes")
 # Comma-separated list of allowed browser origins, e.g.
 # CORS_ORIGINS=http://localhost:3000,https://studio.example.com
 # localhost and 127.0.0.1 are different origins to a browser, so allow both.
@@ -178,9 +178,36 @@ async def lifespan(app: FastAPI):
     app_state.initialize_runtime()
     app_state.max_concurrent_requests = MAX_CONCURRENT_REQUESTS
 
+    # Model/inference options come from settings.toml [float] (env values are
+    # only fallbacks for boxes without the shared file). Load them before the
+    # model is constructed so architecture, ODE and decode knobs agree.
+    opt = load_float_options()
+    opt.rank = 0
+    app_state.opt = opt
+
+    # Built-in STUN responder for ICE gathering on the raw WebRTC transport.
+    # The API host itself is the STUN endpoint (instead of requiring LiveKit's
+    # coturn or a public Google server); an explicit [webrtc].stun_urls list
+    # disables it. Best effort: a busy UDP port never blocks startup.
+    stun_server: StunServer | None = None
+    ice_settings = LiveKitSettings.from_env()
+    if ice_settings.configured:
+        logger.info(f"🔑 LiveKit: {ice_settings.url} (key {ice_settings.api_key[:6]}…, config: {ice_settings.source})")
+    else:
+        logger.info("🔑 LiveKit: not configured — the SFU live transport is disabled")
+    if ice_settings.stun_enabled and not ice_settings.stun_urls:
+        stun_server = StunServer(port=ice_settings.stun_port)
+        if await stun_server.start():
+            app_state.stun_port = ice_settings.stun_port
+
+    # Probe the SFU in the background so /health and /livekit/status answer
+    # immediately; the result populates the Config checklist's connectivity
+    # row. Best effort — a failure only shows as a warning, never blocks boot.
+    selftest.start_probe(ice_settings)
+
     logger.info("=" * 70)
     logger.info("🚀 Starting FLOAT Fast API - NVENC Optimized v5.1.0")
-    logger.info(f"⚡ Optimization: {OPTIMIZATION_MODE} | FP16: {USE_FP16}")
+    logger.info(f"⚡ Optimization: {opt.optimization_mode} | FP16: {opt.use_fp16}")
     logger.info(f"📐 Target resolution: {TARGET_IMAGE_SIZE}x{TARGET_IMAGE_SIZE}")
 
     # 1. Initialize video optimizer
@@ -192,29 +219,11 @@ async def lifespan(app: FastAPI):
     # 2. Ensure default image exists
     ensure_default_image(DEFAULT_IMAGE_PATH, TARGET_IMAGE_SIZE)
 
-    # 3. Initialize inference options
-    orig_argv = sys.argv.copy()
-    sys.argv = [sys.argv[0]]
-
-    opt = InferenceOptions().parse()
-    opt.rank = 0
-    # run_all.sh / run_api.sh export NGPUS (decode GPUs); sys.argv belongs to
-    # hypercorn so the flag can't be passed on the command line.
-    opt.ngpus = int(os.getenv("NGPUS", str(getattr(opt, "ngpus", 1))))
-    opt.res_dir = RESULTS_DIR
-    opt.no_crop = False
-    opt.optimization_mode = OPTIMIZATION_MODE
-    opt.use_fp16 = USE_FP16
-    opt.n_diff_steps = 100
-    opt.diff_schedule = "cosine"
-    opt.diffusion_mode = "sample"
-    sys.argv = orig_argv
-
+    # 3. Prepare runtime directories from the configured options
     os.makedirs(opt.res_dir, exist_ok=True)
-    app_state.opt = opt
 
     # 4. Load FLOAT model
-    logger.info(f"🤖 Loading FLOAT model with {OPTIMIZATION_MODE} optimization...")
+    logger.info(f"🤖 Loading FLOAT model with {opt.optimization_mode} optimization...")
     app_state.agent = OptimizedInferenceAgent(opt)
     logger.info("✅ Model loaded successfully")
 
@@ -246,6 +255,10 @@ async def lifespan(app: FastAPI):
     # Shutdown logic
     logger.info("🛑 Shutting down server...")
     from fast_float.routers.webrtc import _cleanup_peer
+
+    if stun_server is not None:
+        await stun_server.stop()
+        app_state.stun_port = None
 
     for pc in list(app_state.pcs):
         try:

@@ -201,6 +201,12 @@ This guarantees:
 - The GPU decode stream is never blocked waiting for the FFmpeg pipe.
 - Pinned host buffers cycle back to `pool`, applying natural backpressure to the producer.
 
+`_drain_ordered()` implements this loop for the **stream-only** branch; the
+FFmpeg/PyAV/torchcodec writers keep the same reorder pattern inline ahead of
+their own sink. With `video_path=None` the pipeline takes the stream-only
+branch: no encoder is started and `dispatcher.submit()` is the only sink (this
+is how LiveKit consumes frames).
+
 ---
 
 ## 3. `DecodeAutoTuner` — How It Works

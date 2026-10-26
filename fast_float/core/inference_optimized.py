@@ -226,7 +226,7 @@ class OptimizedInferenceAgent:
     @timing_scope("run_inference")
     def run_inference(
         self,
-        res_video_path: str,
+        res_video_path: str | None,
         ref_path: str,
         audio_path: str,
         a_cfg_scale: float = 2.0,
@@ -240,7 +240,7 @@ class OptimizedInferenceAgent:
         benchmark: bool = False,
         video_encoder: str | None = None,
         dispatcher=None,
-    ) -> str:
+    ) -> str | None:
         timings: dict[str, float] = {}
         total_start = time.perf_counter()
 
@@ -266,7 +266,7 @@ class OptimizedInferenceAgent:
                 return torch.autocast("cuda", dtype=torch.float16)
             return contextlib.nullcontext()
 
-        def generate(out_path: str, tap=None) -> str:
+        def generate(out_path: str | None, tap=None) -> str | None:
             """Sampling + decoding + video encoding + audio mux, fully overlapped."""
             with make_amp():
                 return self.G_opt.inference_and_save(
@@ -328,7 +328,7 @@ class OptimizedInferenceAgent:
                 logger.info(f"  Frames:           {frames:>8d}")
                 logger.info(f"  FPS (gen+save):   {frames / gs:>8.2f}")
             logger.info(f"{'=' * 50}")
-            logger.info(f"> Result saved at {res_video_path}")
+            logger.info(f"> Result saved at {res_video_path}" if res_video_path else "> Streamed (no output file)")
 
         return res_video_path
 

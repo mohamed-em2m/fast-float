@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from fast_float.core.state import app_state
 from fast_float.routers.streaming import HEADER
 from fast_float.routers.streaming import router as streaming_router
-from fast_float.streaming.live import CLOSE, LiveStream, LiveStreamDispatcher
+from fast_float.streaming.live import CLOSE, LiveQueue, LiveStream, LiveStreamDispatcher
 from fast_float.streaming.types import StreamMeta
 
 
@@ -87,6 +87,29 @@ def test_live_dispatcher_publishes_frames_with_pts():
     asyncio.run(scenario())
 
 
+def test_live_dispatcher_trims_overlapping_chunk_head():
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        dispatcher = LiveStreamDispatcher("req-trim", loop)
+        dispatcher.bind(StreamMeta(fps=25.0, width=2, height=2, channels=3))
+        q = dispatcher.stream.subscribe()
+
+        dispatcher.begin_chunk(0)
+        dispatcher.submit(np.zeros((4, 2, 2, 3), dtype=np.uint8))
+        # The next chunk overlaps two frames with the previous one; those
+        # frames are already on the wire and must not be published twice.
+        dispatcher.begin_chunk(2)
+        dispatcher.submit(np.zeros((5, 2, 2, 3), dtype=np.uint8))
+
+        items = [await asyncio.wait_for(q.get(), 2.0) for _ in range(7)]
+        assert [item[1] for item in items] == [0, 1, 2, 3, 4, 5, 6]
+        assert dispatcher.stats()["submitted"] == 7
+
+        dispatcher.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_live_dispatcher_configuration():
     async def scenario():
         loop = asyncio.get_running_loop()
@@ -140,7 +163,7 @@ class _FakeStream:
         return self.meta
 
     def subscribe(self, maxsize: int = 64):
-        queue = asyncio.Queue(maxsize=maxsize)
+        queue = LiveQueue(maxsize=maxsize)
         frame = self._frame
 
         async def produce():
@@ -239,3 +262,123 @@ def test_ws_stream_end_to_end_with_dispatcher():
                 assert done["type"] == "done"
     finally:
         app_state.live_streams.pop("e2e", None)
+
+
+def test_live_queue_resize_grows_buffer_for_fast_renders():
+    """Transports subscribe before meta, then grow the queue to fit the clip."""
+
+    async def scenario():
+        q = LiveQueue(maxsize=8)
+        q.resize(128)
+        assert q.maxsize == 128
+        for i in range(100):
+            q.put_nowait(("frame", i, i * 40.0, None))
+        assert q.qsize() == 100
+        assert q.dropped_frames == 0
+
+    asyncio.run(scenario())
+
+
+def test_slow_subscriber_spills_overflow_instead_of_dropping():
+    """A queue smaller than the render buffers the rest on disk, in order."""
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        stream = LiveStream("req-spill", loop)
+        stream.start(StreamMeta(fps=25.0, width=2, height=2, channels=3, request_id="req-spill"))
+        q = stream.subscribe(maxsize=2)
+
+        for i in range(6):
+            stream.publish(("frame", i, i * 40.0, np.zeros((2, 2, 3), np.uint8)))
+
+        # The in-memory window holds two frames; the other four are spooled so
+        # playback does not jump.  Nothing is dropped.
+        assert q.dropped_frames == 0
+        assert q.spilled_frames == 4
+        assert stream.metrics()["subscriber_dropped_frames"] == 0
+        assert stream.metrics()["subscriber_spilled_frames"] == 4
+        assert q.qsize() == 6
+        indices = [(await asyncio.wait_for(q.get(), 1.0))[1] for _ in range(6)]
+        assert indices == list(range(6))
+        assert q.empty()
+        q.dispose()
+        # Metrics survive the transport leaving, so /progress can report how
+        # much of a finished request had to be buffered on disk.
+        stream.unsubscribe(q)
+        assert stream.metrics()["subscriber_spilled_frames"] == 4
+        assert stream.subscriber_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_slow_subscriber_drops_when_spilling_is_disabled():
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        stream = LiveStream("req-drops", loop)
+        stream.start(StreamMeta(fps=25.0, width=2, height=2, channels=3, request_id="req-drops"))
+        q = stream.subscribe(maxsize=2)
+        q._spill_enabled = False
+
+        for i in range(6):
+            stream.publish(("frame", i, i * 40.0, np.zeros((2, 2, 3), np.uint8)))
+
+        # Without a spool the old near-live policy applies: keep the newest
+        # two frames and account for the four older ones.
+        assert q.dropped_frames == 4
+        assert q.last_dropped_idx == 3
+        assert stream.metrics()["subscriber_dropped_frames"] == 4
+        assert (await asyncio.wait_for(q.get(), 1.0))[1] == 4
+        assert (await asyncio.wait_for(q.get(), 1.0))[1] == 5
+        q.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_live_queue_reuses_and_releases_the_spool():
+    async def scenario():
+        q = LiveQueue(maxsize=2)
+        frame = np.zeros((4, 4, 3), np.uint8)
+        for i in range(6):
+            q.put_nowait(("frame", i, i * 40.0, frame))
+        assert q.spilled_frames == 4
+        assert [q.get_nowait()[1] for _ in range(6)] == list(range(6))
+        # Draining the spool truncates it and returns to the in-memory path.
+        assert q._spool_bytes == 0
+        q.put_nowait(("frame", 6, 240.0, frame))
+        assert q.qsize() == 1
+        assert q.get_nowait()[1] == 6
+        # dispose() releases the temp file immediately.
+        q.put_nowait(("frame", 7, 280.0, frame))
+        q.put_nowait(("frame", 8, 320.0, frame))
+        q.put_nowait(("frame", 9, 360.0, frame))
+        assert q.spilled_frames == 5
+        q.dispose()
+        assert q._spool is None
+        assert q.empty()
+
+    asyncio.run(scenario())
+
+
+def test_spill_preserves_gap_and_close_order():
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        stream = LiveStream("req-spill-order", loop)
+        stream.start(StreamMeta(fps=25.0, width=2, height=2, channels=3, request_id="req-spill-order"))
+        q = stream.subscribe(maxsize=1)
+        frame = np.zeros((2, 2, 3), np.uint8)
+
+        stream.publish(("frame", 0, 0.0, frame))
+        stream.publish(("frame", 1, 40.0, frame))
+        stream.publish(("gap", 2, 4, "dropped"))
+        stream.publish(("frame", 4, 160.0, frame))
+        stream.finish()
+
+        items = [await asyncio.wait_for(q.get(), 1.0) for _ in range(5)]
+        assert items[0][1] == 0
+        assert items[1][1] == 1
+        assert items[2] == ("gap", 2, 4, "dropped")
+        assert items[3][1] == 4
+        assert items[4] is CLOSE
+        q.dispose()
+
+    asyncio.run(scenario())
