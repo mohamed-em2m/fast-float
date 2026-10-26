@@ -240,12 +240,12 @@ class FloatVideoGenerator:
         self._idle_event = asyncio.Event()
         self._idle_event.set()
 
-        # Silence / idle loop: a pre-rendered list of (frame_array, audio_bytes)
-        # pairs that keep the video track alive between speech segments. Generated
-        # once by prepare_silence() and then looped in __aiter__ whenever the
-        # avatar is idle. None means "not yet generated"; empty list means
-        # generation failed. Both cases fall back to blocking on the frame queue.
-        self._silence_frames: list[tuple[np.ndarray, bytes]] | None = None
+        # Silence / idle loop: pre-rendered and pre-encoded frames.
+        # Generated once by prepare_silence() and looped in __aiter__ when idle.
+        # Holds ready-to-yield objects:
+        #   - Under LiveKit RTC: list[tuple[rtc.VideoFrame, rtc.AudioFrame]]
+        #   - Without RTC: list[tuple[int, np.ndarray, float]]
+        self._silence_frames: list[Any] | None = None
         self._silence_idx = 0  # round-robin cursor into _silence_frames
 
     # --------------------------------------------------- silence / idle frames
@@ -366,8 +366,30 @@ class FloatVideoGenerator:
             logger.warning(f"[livekit-gen] silence executor error: {exc}")
 
         if captured:
-            self._silence_frames = captured
-            logger.info(f"[livekit-gen] silence loop ready: {len(captured)} frames")
+            # Pre-construct and cache the ready-to-yield VideoFrame and AudioFrame objects
+            # once so the __aiter__ idle loop performs zero allocations, zero bytes copies,
+            # and zero conversions at runtime.
+            _silence_audio_len = SAMPLES_PER_FRAME * 2
+            prebuilt: list[Any] = []
+            for i, (arr, audio) in enumerate(captured):
+                if RTC_AVAILABLE:
+                    h, w, c = arr.shape
+                    if c == 4:
+                        arr = arr[:, :, :3]
+                    vf = rtc.VideoFrame(
+                        w,
+                        h,
+                        rtc.VideoBufferType.RGB24,
+                        np.ascontiguousarray(arr).tobytes(),
+                    )
+                    padded = (audio + bytes(_silence_audio_len))[:_silence_audio_len]
+                    af = rtc.AudioFrame(padded, self.sample_rate, 1, SAMPLES_PER_FRAME)
+                    prebuilt.append((vf, af))
+                else:
+                    prebuilt.append((i, arr, 0.0))
+
+            self._silence_frames = prebuilt
+            logger.info(f"[livekit-gen] silence loop ready: {len(prebuilt)} pre-encoded frames")
         else:
             self._silence_frames = []  # failed — keep empty, no idle loop
             logger.warning("[livekit-gen] silence loop generation produced no frames; avatar will freeze when idle")
@@ -734,25 +756,11 @@ class FloatVideoGenerator:
             if not self._frame_queue.empty():
                 item = await self._frame_queue.get()
             elif not self._stop_pending and self._silence_frames:
-                # Frame queue is empty: emit a silence/idle frame to keep the video
-                # track alive, then wait at most one frame period for a real frame.
-                sil = self._silence_frames
-                sil_arr, sil_audio = sil[self._silence_idx % len(sil)]
+                # Frame queue is empty: emit pre-encoded silence/idle frame directly.
+                # Zero allocation, zero numpy/bytes copy during idle loop.
+                item = self._silence_frames[self._silence_idx % len(self._silence_frames)]
                 self._silence_idx += 1
-
-                if RTC_AVAILABLE:
-                    h, w, c = sil_arr.shape
-                    video_frame = rtc.VideoFrame(
-                        w,
-                        h,
-                        rtc.VideoBufferType.RGB24,
-                        np.ascontiguousarray(sil_arr).tobytes(),
-                    )
-                    padded = (sil_audio + bytes(_silence_audio_len))[:_silence_audio_len]
-                    audio_frame = rtc.AudioFrame(padded, self.sample_rate, 1, SAMPLES_PER_FRAME)
-                    yield (video_frame, audio_frame)
-                else:
-                    yield (self._silence_idx, sil_arr, 0.0)
+                yield item
 
                 # Wait for real speech frames or next idle tick
                 try:
