@@ -455,14 +455,37 @@ export default function AudioEngine({
     }
   };
 
+  const seekTo = (seconds) => {
+    const el = audioElementRef.current;
+    const duration = el?.duration;
+    if (!el || !Number.isFinite(duration) || duration <= 0) return;
+    el.currentTime = Math.min(duration, Math.max(0, seconds));
+    setPlaybackTime(el.currentTime);
+  };
+
   const handleSeek = (event) => {
     const el = audioElementRef.current;
     const duration = el?.duration;
     if (!el || !Number.isFinite(duration) || duration <= 0) return;
     const box = event.currentTarget.getBoundingClientRect();
     const ratio = Math.min(1, Math.max(0, (event.clientX - box.left) / box.width));
-    el.currentTime = ratio * duration;
-    setPlaybackTime(el.currentTime);
+    seekTo(ratio * duration);
+  };
+
+  // Keyboard equivalent of clicking the timeline (slider pattern).
+  const handleSeekKeyDown = (event) => {
+    const duration = audioElementRef.current?.duration;
+    if (!Number.isFinite(duration) || duration <= 0) return;
+    const step = Math.max(1, duration / 20);
+    const current = audioElementRef.current?.currentTime || 0;
+    let next = null;
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowDown') next = current - step;
+    else if (event.key === 'ArrowRight' || event.key === 'ArrowUp') next = current + step;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = duration;
+    if (next === null) return;
+    event.preventDefault();
+    seekTo(next);
   };
 
   const handleClearAudio = () => {
@@ -618,6 +641,15 @@ export default function AudioEngine({
             const file = e.dataTransfer.files && e.dataTransfer.files[0];
             if (file) handleFileUpload(file);
           }}
+          onKeyDown={(e) => {
+            if (loading) return;
+            if (e.key !== 'Enter' && e.key !== ' ') return;
+            e.preventDefault();
+            fileInputRef.current?.click();
+          }}
+          role="button"
+          tabIndex={loading ? -1 : 0}
+          aria-label="Choose an audio file, or drop one here"
           aria-busy={loading === 'upload'}
         >
           <input
@@ -684,12 +716,15 @@ export default function AudioEngine({
             <div
               className="audio-progress-bar"
               onClick={handleSeek}
-              role="progressbar"
+              onKeyDown={handleSeekKeyDown}
+              role="slider"
+              tabIndex={0}
               aria-label="Audio preview position"
               aria-valuemin={0}
               aria-valuemax={Math.round(audioDuration || 0)}
               aria-valuenow={Math.round(playbackTime || 0)}
-              title="Click to seek"
+              aria-valuetext={`${formatSeconds(playbackTime)} of ${formatSeconds(audioDuration || recordDuration)}`}
+              title="Click or use the arrow keys to seek"
             >
               <div
                 className="audio-progress-fill"

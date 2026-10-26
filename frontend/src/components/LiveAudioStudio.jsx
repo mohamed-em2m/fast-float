@@ -523,7 +523,12 @@ export default function LiveAudioStudio({
   const seconds = String(Math.floor(elapsed % 60)).padStart(2, '0');
 
   return (
-    <main className="live-workspace">
+    <main
+      className="live-workspace"
+      id="mode-panel-live"
+      role="tabpanel"
+      aria-labelledby="mode-tab-live"
+    >
       <aside className="live-sidebar">
         {portraitPicker || (
           <section className="glass-panel live-pick-card">
@@ -783,8 +788,10 @@ export default function LiveAudioStudio({
             className={`btn-secondary ${muted ? 'is-muted' : ''}`}
             onClick={toggleMute}
             disabled={!isLive}
+            aria-pressed={muted}
+            aria-label={muted ? 'Unmute microphone' : 'Mute microphone'}
           >
-            {muted ? <MicOff size={16} /> : <Mic size={16} />}
+            {muted ? <MicOff size={16} aria-hidden="true" /> : <Mic size={16} aria-hidden="true" />}
             {muted ? 'Unmute' : 'Mute'}
           </button>
           <button
@@ -793,7 +800,7 @@ export default function LiveAudioStudio({
             onClick={interrupt}
             disabled={!isLive}
           >
-            <CircleStop size={16} />
+            <CircleStop size={16} aria-hidden="true" />
             Interrupt
           </button>
           <button
@@ -802,7 +809,7 @@ export default function LiveAudioStudio({
             onClick={() => endSession()}
             disabled={!isLive && phase !== 'starting'}
           >
-            <Sparkles size={16} />
+            <Sparkles size={16} aria-hidden="true" />
             End &amp; clear
           </button>
           <span className="live-controls-hint">

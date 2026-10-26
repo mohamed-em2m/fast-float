@@ -206,10 +206,11 @@ export default function App() {
       {toast && (
         <div
           className={`toast-notification toast-${toast.type}`}
-          role="status"
-          aria-live="polite"
+          // Errors interrupt; success/info wait their turn.
+          role={toast.type === 'error' ? 'alert' : 'status'}
+          aria-live={toast.type === 'error' ? 'assertive' : 'polite'}
         >
-          <ToastIcon size={17} className="toast-icon" />
+          <ToastIcon size={17} className="toast-icon" aria-hidden="true" />
           <span>{toast.message}</span>
           <button
             type="button"
@@ -217,7 +218,7 @@ export default function App() {
             onClick={() => setToast(null)}
             aria-label="Dismiss notification"
           >
-            <X size={14} />
+            <X size={14} aria-hidden="true" />
           </button>
         </div>
       )}
@@ -244,7 +245,12 @@ export default function App() {
           />
         </Suspense>
       ) : (
-        <main className="studio-workspace">
+        <main
+          className="studio-workspace"
+          id="mode-panel-studio"
+          role="tabpanel"
+          aria-labelledby="mode-tab-studio"
+        >
           <aside className="studio-composer">
             {portraitCard}
 

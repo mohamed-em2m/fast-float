@@ -157,7 +157,8 @@ export default function PortraitCanvas({
         )}
       </div>
 
-      {/* Drag & Drop Canvas */}
+      {/* Drag & Drop Canvas. Without a portrait it is also the "browse"
+          control, so it is focusable and opens the picker from the keyboard. */}
       <div
         className={`portrait-dropzone ${imagePreview ? 'has-image' : ''} ${isDragging ? 'is-dragging' : ''}`}
         onDragOver={(e) => {
@@ -174,6 +175,15 @@ export default function PortraitCanvas({
         }}
         onDrop={handleDrop}
         onClick={() => !imagePreview && !busy && fileInputRef.current?.click()}
+        role={imagePreview ? undefined : 'button'}
+        tabIndex={imagePreview || busy ? -1 : 0}
+        aria-label={imagePreview ? undefined : 'Choose a portrait image'}
+        onKeyDown={(e) => {
+          if (imagePreview || busy) return;
+          if (e.key !== 'Enter' && e.key !== ' ') return;
+          e.preventDefault();
+          fileInputRef.current?.click();
+        }}
         aria-busy={busy}
       >
         <input

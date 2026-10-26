@@ -26,6 +26,7 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
     liveKit: liveKitStatus,
     online: isOnline,
     offline,
+    checking,
   } = useBackendStatus();
   const [showSettings, setShowSettings] = useState(false);
   const [apiUrlInput, setApiUrlInput] = useState(getApiUrl());
@@ -39,6 +40,7 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
   const [verifyResult, setVerifyResult] = useState(null);
   const settingsRef = useRef(null);
   const settingsButtonRef = useRef(null);
+  const modeButtonsRef = useRef({ studio: null, live: null });
 
   const activeUrl = getApiUrl();
   const trimmedInput = apiUrlInput.trim();
@@ -210,11 +212,27 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
         </div>
       </div>
 
-      <nav className="mode-switch" role="tablist" aria-label="Workspace mode">
+      <nav
+        className="mode-switch"
+        role="tablist"
+        aria-label="Workspace mode"
+        onKeyDown={(event) => {
+          if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+          event.preventDefault();
+          const next = mode === 'studio' ? 'live' : 'studio';
+          onModeChange?.(next);
+          // Follow the roving tabindex so focus stays on the active tab.
+          modeButtonsRef.current[next]?.focus?.();
+        }}
+      >
         <button
           type="button"
           role="tab"
+          id="mode-tab-studio"
           aria-selected={mode === 'studio'}
+          aria-controls="mode-panel-studio"
+          tabIndex={mode === 'studio' ? 0 : -1}
+          ref={(el) => { modeButtonsRef.current.studio = el; }}
           className={`mode-tab ${mode === 'studio' ? 'is-active' : ''}`}
           onClick={() => onModeChange?.('studio')}
         >
@@ -224,24 +242,32 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
         <button
           type="button"
           role="tab"
+          id="mode-tab-live"
           aria-selected={mode === 'live'}
+          aria-controls="mode-panel-live"
+          tabIndex={mode === 'live' ? 0 : -1}
+          ref={(el) => { modeButtonsRef.current.live = el; }}
           className={`mode-tab ${mode === 'live' ? 'is-active' : ''}`}
           onClick={() => onModeChange?.('live')}
         >
           <AudioLines size={15} />
           <span>Live Audio</span>
-          <span className="mode-live-dot" />
+          <span className="mode-live-dot" aria-hidden="true" />
         </button>
       </nav>
 
       <div className="header-actions">
-        {/* Connection Status Pill */}
+        {/* Connection Status Pill. It re-renders every few seconds, so it is a
+            labelled group rather than a live region: screen readers get the
+            state on focus, not a new announcement on every poll. */}
         <div
           className={`status-pill ${isOnline ? 'status-online' : statusPending ? 'status-standby' : 'status-offline'}`}
+          role="group"
+          aria-label={`Backend ${isOnline ? 'online' : statusPending ? 'connecting' : 'offline'} at ${getApiUrl()}`}
           title={isOnline ? `Backend: ${getApiUrl()}` : statusPending ? 'Contacting the backend…' : 'Backend unreachable'}
         >
-          <span className={isOnline ? 'live-dot' : 'offline-dot'} />
-          <span className="status-label">
+          <span className={isOnline ? 'live-dot' : 'offline-dot'} aria-hidden="true" />
+          <span className="status-label" aria-hidden="true">
             {isOnline
               ? (health?.model_loaded ? 'Model ready' : 'Server online')
               : statusPending
@@ -253,10 +279,12 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
         {/* LiveKit SFU Status Pill */}
         <div
           className={`status-pill ${liveKitStatus?.configured ? 'status-online' : 'status-standby'}`}
+          role="group"
+          aria-label={`LiveKit ${liveKitStatus?.configured ? 'configured' : 'not configured'}`}
           title={liveKitStatus?.configured ? `LiveKit SFU active (${liveKitStatus.url})` : 'LiveKit SFU standby (run docker-compose.livekit.yml)'}
         >
-          <Radio size={13} />
-          <span className="status-label">
+          <Radio size={13} aria-hidden="true" />
+          <span className="status-label" aria-hidden="true">
             {liveKitStatus?.configured ? 'LiveKit' : 'LiveKit off'}
           </span>
         </div>
@@ -264,12 +292,19 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
         {/* GPU Memory Widget */}
         {gpu?.memory && (
           <div className="gpu-widget" title={`GPU: ${gpu.info?.name || 'NVIDIA GPU'}`}>
-            <Cpu size={15} className="gpu-icon" />
+            <Cpu size={15} className="gpu-icon" aria-hidden="true" />
             <div className="gpu-text">
               <span className="gpu-val">
                 {gpu.memory.allocated_gb} / {gpu.memory.total_gb} GB
               </span>
-              <div className="gpu-bar-bg">
+              <div
+                className="gpu-bar-bg"
+                role="progressbar"
+                aria-label="GPU memory in use"
+                aria-valuemin={0}
+                aria-valuemax={100}
+                aria-valuenow={Math.round(Math.min(100, gpu.memory.usage_percent || 0))}
+              >
                 <div
                   className="gpu-bar-fill"
                   style={{ width: `${Math.min(gpu.memory.usage_percent, 100)}%` }}
@@ -277,20 +312,29 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
               </div>
             </div>
             <button
+              type="button"
               className="btn-icon-subtle"
               onClick={handleClearGpu}
               disabled={isClearing}
               title="Clear GPU VRAM cache"
               aria-label="Clear GPU VRAM cache"
             >
-              <Trash2 size={14} className={isClearing ? 'animate-spin' : ''} />
+              <Trash2 size={14} className={isClearing ? 'animate-spin' : ''} aria-hidden="true" />
             </button>
           </div>
         )}
 
         {/* Refresh Status */}
-        <button className="btn-icon" onClick={checkStatus} title="Refresh server status" aria-label="Refresh server status">
-          <RefreshCw size={16} />
+        <button
+          type="button"
+          className="btn-icon"
+          onClick={checkStatus}
+          disabled={checking}
+          title="Refresh server status"
+          aria-label={checking ? 'Refreshing server status' : 'Refresh server status'}
+          aria-busy={checking}
+        >
+          <RefreshCw size={16} className={checking ? 'animate-spin' : ''} aria-hidden="true" />
         </button>
 
         {/* Settings Toggle */}
