@@ -24,6 +24,8 @@ except ImportError:  # pragma: no cover - depends on the environment
 
 
 def test_pcm_framer_splits_into_fixed_frames_and_flushes_the_tail():
+    if not RTC_AVAILABLE:
+        pytest.skip("LiveKit RTC SDK not installed")
     # 16 kHz mono, 100 ms frames = 1600 samples = 3200 bytes.
     framer = _PcmFramer(16000, 1, 100)
     data = np.arange(4000, dtype=np.int16).tobytes()
@@ -38,6 +40,8 @@ def test_pcm_framer_splits_into_fixed_frames_and_flushes_the_tail():
 
 
 def test_pcm_framer_drops_a_dangling_byte():
+    if not RTC_AVAILABLE:
+        pytest.skip("LiveKit RTC SDK not installed")
     framer = _PcmFramer(16000, 1, 100)
     framer.push(b"\x01\x02\x03")
     frames = framer.flush()
