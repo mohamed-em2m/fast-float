@@ -188,7 +188,18 @@ class AgentAvatarRunner:
                     self.video_gen.flush()
                     await self._segment_queue.put(self._epoch)
                 else:
-                    self.video_gen.push_audio(item)
+                    # One poisoned item must not kill the whole audio feed —
+                    # that used to freeze the avatar for the rest of the
+                    # session (e.g. an unsupported frame type from the
+                    # receiver). Log and keep consuming.
+                    try:
+                        self.video_gen.push_audio(item)
+                    except Exception as exc:
+                        logger.warning(
+                            "[agent-avatar] dropping audio item (%s): %s",
+                            type(item).__name__,
+                            exc,
+                        )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

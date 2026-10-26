@@ -147,8 +147,15 @@ class ZmqFloatVideoGenerator:
         self._first_chunk_samples = int(SAMPLE_RATE * first_chunk_sec)
         self._first_chunk_done = False
 
-        # Generation counter — incremented each push_audio cycle.
+        # Generation counter — incremented each push cycle; `_sentinel_gen` is
+        # the last generation the worker finished (its ``is_last`` sentinel).
+        # The idle event mirrors FloatVideoGenerator: it starts set ("nothing
+        # outstanding") and the agent runner's ``wait_until_idle`` awaits it.
         self._gen = 0
+        self._sentinel_gen = 0
+        self._idle_event = asyncio.Event()
+        self._idle_event.set()  # nothing outstanding
+        self._stopped = False
 
         # Frame output queue (filled by _frame_listener_task).
         self._frame_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=256)
@@ -275,12 +282,21 @@ class ZmqFloatVideoGenerator:
     # Audio input
     # ------------------------------------------------------------------
 
-    def push_audio(self, pcm_bytes: bytes) -> None:
-        """Buffer raw PCM16 mono audio from the Gemini bridge.
+    def push_audio(self, audio: Any) -> None:
+        """Buffer a synthesized-audio chunk from the agent bridge.
+
+        Accepts the same payload types as ``FloatVideoGenerator``: raw 16 kHz
+        mono PCM16 bytes (the direct bridge), ``rtc.AudioFrame`` (the
+        ``DataStreamAudioReceiver`` output the Gemini runner pushes — arrives
+        at the agent's sample rate, e.g. 24 kHz) and numpy arrays. Everything
+        is normalized to 16 kHz mono PCM16; a bare ``len()`` on an
+        ``rtc.AudioFrame`` used to kill the runner's audio loop ("object of
+        type 'AudioFrame' has no len()").
 
         When enough audio is accumulated (``chunk_sec`` threshold), an async
         infer request is queued.
         """
+        pcm_bytes = self._to_pcm16_mono(audio)
         self._audio_buf.append(pcm_bytes)
         self._audio_samples += len(pcm_bytes) // 2  # int16 → samples
 
@@ -291,19 +307,74 @@ class ZmqFloatVideoGenerator:
             self._audio_buf.clear()
             self._audio_samples = 0
             self._first_chunk_done = True
-            self._gen += 1
+            self._submit_chunk(chunk_bytes)
 
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = asyncio.get_event_loop()
+    def _submit_chunk(self, chunk_bytes: bytes) -> None:
+        """Send a buffered chunk to the worker as the next generation."""
+        self._gen += 1
+        self._idle_event.clear()  # work now outstanding for the runner
 
-            if loop.is_running():
-                asyncio.run_coroutine_threadsafe(self._dispatch_infer(chunk_bytes, self._gen), loop)
-            else:
-                task = loop.create_task(self._dispatch_infer(chunk_bytes, self._gen))
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(self._dispatch_infer(chunk_bytes, self._gen), loop)
+        else:
+            task = loop.create_task(self._dispatch_infer(chunk_bytes, self._gen))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+    def flush(self) -> None:
+        """Dispatch buffered tail audio even when below the chunk threshold.
+
+        Called at a TTS segment's end (AgentAvatarRunner) so the last chunk is
+        rendered instead of stranded until the next threshold crossing.
+        """
+        if self._stopped or not self._audio_buf:
+            return
+        chunk_bytes = b"".join(self._audio_buf)
+        self._audio_buf.clear()
+        self._audio_samples = 0
+        self._first_chunk_done = True
+        self._submit_chunk(chunk_bytes)
+
+    def _to_pcm16_mono(self, audio: Any) -> bytes:
+        """Normalize an inbound audio item to 16 kHz mono PCM16 bytes.
+
+        Mirrors ``FloatVideoGenerator._to_pcm16_mono``: raw bytes pass through;
+        ``rtc.AudioFrame`` is downmixed (mono-converted) and resampled from the
+        agent's sample rate to the worker's 16 kHz input.
+        """
+        if RTC_AVAILABLE and isinstance(audio, rtc.AudioFrame):
+            samples = np.frombuffer(audio.data, dtype=np.int16)
+            ch, sr = audio.num_channels, audio.sample_rate
+            if ch > 1:
+                samples = samples.reshape(-1, ch).mean(axis=1)
+            if sr != SAMPLE_RATE:
+                samples = self._resample(samples.astype(np.float32), sr)
+            return np.asarray(samples).astype(np.int16).tobytes()
+        if isinstance(audio, (bytes, bytearray, memoryview)):
+            return bytes(audio)
+        if isinstance(audio, np.ndarray):
+            if audio.dtype in (np.float32, np.float64):
+                return (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+            return audio.astype(np.int16).tobytes()
+        raise TypeError(f"Unsupported audio type: {type(audio)}")
+
+    def _resample(self, x: np.ndarray, src_sr: int) -> np.ndarray:
+        """Cheap resample to the worker's SAMPLE_RATE.
+
+        Integer ratios (48k -> 16k) use box-filter decimation, which also
+        low-passes; otherwise fall back to linear interpolation.
+        """
+        if src_sr % SAMPLE_RATE == 0:
+            r = src_sr // SAMPLE_RATE
+            n = len(x) // r * r
+            return x[:n].reshape(-1, r).mean(axis=1)
+        n_out = int(len(x) * SAMPLE_RATE / src_sr)
+        return np.interp(np.linspace(0, len(x) - 1, n_out), np.arange(len(x)), x)
 
     async def _dispatch_infer(self, pcm_bytes: bytes, gen: int) -> None:
         """Send an infer request to the worker for the given audio chunk."""
@@ -404,6 +475,12 @@ class ZmqFloatVideoGenerator:
                 continue
 
             if notif.is_last:
+                # A generation finished rendering server-side. Track the
+                # highest completed generation; the idle event resolves only
+                # when the live queue has drained too (checked here and from
+                # the iterator, which re-runs while the consumer paces).
+                self._sentinel_gen = max(self._sentinel_gen, notif.gen)
+                self._refresh_idle()
                 continue
 
             pair = self._read_frame_pair(notif)
@@ -417,6 +494,32 @@ class ZmqFloatVideoGenerator:
                 with contextlib.suppress(asyncio.QueueEmpty):
                     self._frame_queue.get_nowait()
                 self._frame_queue.put_nowait(pair)
+
+    # ------------------------------------------------------------------
+    # Idle tracking (AgentAvatarRunner.wait_until_idle)
+    # ------------------------------------------------------------------
+
+    def _refresh_idle(self) -> None:
+        """Idle == every submitted generation has rendered and the live queue is drained."""
+        if self._gen == self._sentinel_gen and self._frame_queue.empty():
+            self._idle_event.set()
+        else:
+            self._idle_event.clear()
+
+    async def wait_until_idle(self, timeout: float | None = None) -> bool:
+        """Wait until every pushed sample has been generated and consumed.
+
+        Returns ``True`` when idle, ``False`` on timeout. Used by the agent
+        runner to know when a TTS segment has finished rendering, so it can
+        notify the agent that playback is over. On Python 3.10,
+        ``asyncio.wait_for`` raises ``asyncio.TimeoutError``, which is distinct
+        from the builtin ``TimeoutError`` until 3.11.
+        """
+        try:
+            await asyncio.wait_for(self._idle_event.wait(), timeout)
+        except asyncio.TimeoutError:
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # AsyncIterator — yields (VideoFrame, AudioFrame) pairs
@@ -433,6 +536,10 @@ class ZmqFloatVideoGenerator:
         silence_idx = 0
 
         while True:
+            # The consumer re-enters this loop at 25 fps while pacing, so this
+            # is where idle (queue drained after the last sentinel) resolves.
+            self._refresh_idle()
+
             # Try to get a live frame (non-blocking).
             try:
                 pair = self._frame_queue.get_nowait()

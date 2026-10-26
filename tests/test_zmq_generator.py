@@ -193,3 +193,149 @@ def test_prepare_silence_collects_worker_frames():
             ring.unlink()
 
     asyncio.run(_test())
+
+
+def test_push_audio_accepts_bytes_and_frames():
+    """Regression for the Gemini avatar path: DataStreamAudioReceiver yields
+    rtc.AudioFrame objects; a bare len() on one used to kill the runner's
+    audio loop ('object of type AudioFrame has no len()').
+    """
+
+    if not RTC_AVAILABLE:
+        pytest.skip("RTC SDK not available")
+
+    async def _test():
+        pytest.importorskip("zmq")
+        from fast_float.livekit.zmq_generator import SAMPLE_RATE
+        from livekit import rtc
+
+        gen = ZmqFloatVideoGenerator(
+            ref_image_path="ref.png",
+            nfe=5,
+            chunk_sec=999.0,  # thresholds never crossed: no dispatch, no sockets
+            first_chunk_sec=999.0,
+            shm_name="test_shm_norm",
+            shm_slots=8,
+        )
+
+        # Raw 16 kHz mono bytes pass through unchanged: 0.5 s.
+        gen.push_audio(b"\x00\x00" * 8000)
+        assert gen._audio_samples == 8000
+        gen._audio_buf.clear()
+        gen._audio_samples = 0
+
+        # An rtc.AudioFrame at the agent's rate (24 kHz, the Gemini Live TTS
+        # rate) is resampled down to 16 kHz: 24000 -> 16000 samples.
+        gen.push_audio(rtc.AudioFrame(b"\x00\x00" * 24000, 24000, 1, 24000))
+        assert gen._audio_samples == SAMPLE_RATE * 1  # one second
+        gen._audio_buf.clear()
+        gen._audio_samples = 0
+
+        # A stereo frame is downmixed to mono before counting: 3000 stereo
+        # samples = 3000 mono samples.
+        gen.push_audio(rtc.AudioFrame(b"\x00\x00" * 6000, 16000, 2, 3000))
+        assert gen._audio_samples == 3000
+        gen._audio_buf.clear()
+        gen._audio_samples = 0
+
+        # float arrays are quantized to int16.
+        gen.push_audio(np.zeros(1600, dtype=np.float32))
+        assert gen._audio_samples == 1600
+        gen._audio_buf.clear()
+        gen._audio_samples = 0
+
+        # Unsupported payload still raises TypeError (same contract as the
+        # builtin generator), which the runner now skips per-item.
+        with pytest.raises(TypeError):
+            gen.push_audio(123)
+
+    asyncio.run(_test())
+
+
+def test_flush_dispatches_buffered_tail():
+    """Segment end must render the sub-threshold tail instead of stranding it."""
+
+    async def _test():
+        pytest.importorskip("zmq")
+        gen = ZmqFloatVideoGenerator(
+            ref_image_path="ref.png",
+            nfe=5,
+            chunk_sec=1.0,
+            first_chunk_sec=1.0,
+            shm_name="test_shm_flush",
+            shm_slots=8,
+        )
+        gen._ensure_connected = AsyncMock()
+        gen._dispatch_infer = AsyncMock()
+
+        # 0.5 s: below the 1 s chunk threshold, nothing dispatched yet.
+        gen.push_audio(b"\x00\x00" * 8000)
+        assert gen._dispatch_infer.call_count == 0
+
+        gen.flush()
+
+        # The dispatch is scheduled on the loop; give it time to run (and be
+        # awaited — that is when the mock records await_args).
+        for _ in range(50):
+            if gen._dispatch_infer.await_args is not None:
+                break
+            await asyncio.sleep(0.01)
+
+        assert gen._dispatch_infer.await_args is not None
+        args = gen._dispatch_infer.await_args.args
+        assert args[0] == b"\x00\x00" * 8000
+        assert args[1] == 1  # generation 1
+        assert gen._audio_samples == 0 and not gen._audio_buf
+        assert gen._first_chunk_done is True
+        # Work is outstanding: idle cleared until the worker's sentinel…
+        assert not gen._idle_event.is_set()
+        # …which resolves idleness once it arrives and the queue drains.
+        gen._sentinel_gen = gen._gen
+        gen._refresh_idle()
+        assert gen._idle_event.is_set()
+
+        # A flush with an empty buffer is a no-op.
+        gen.flush()
+        assert gen._dispatch_infer.call_count == 1
+
+    asyncio.run(_test())
+
+
+def test_wait_until_idle_resolves_on_sentinel_and_drain():
+    async def _test():
+        pytest.importorskip("zmq")
+        gen = ZmqFloatVideoGenerator(
+            ref_image_path="ref.png",
+            nfe=5,
+            chunk_sec=1.0,
+            first_chunk_sec=1.0,
+            shm_name="test_shm_idle",
+            shm_slots=8,
+        )
+        gen._ensure_connected = AsyncMock()
+        gen._dispatch_infer = AsyncMock()
+
+        # Nothing outstanding initially.
+        assert gen._idle_event.is_set()
+        assert await gen.wait_until_idle(timeout=0.1) is True
+
+        # A whole chunk (1 s) crosses the threshold -> generation submitted.
+        gen.push_audio(b"\x00\x00" * 32000)
+        assert gen._gen == 1
+        assert not gen._idle_event.is_set()
+        assert await gen.wait_until_idle(timeout=0.05) is False
+
+        # The worker's is_last sentinel for gen 1 arrived, but the queue still
+        # holds frames -> not idle yet.
+        gen._sentinel_gen = 1
+        await gen._frame_queue.put(object())
+        gen._refresh_idle()
+        assert not gen._idle_event.is_set()
+
+        # Consumer drains -> idle resolves and the runner's wait returns True.
+        gen._frame_queue.get_nowait()
+        gen._refresh_idle()
+        assert gen._idle_event.is_set()
+        assert await gen.wait_until_idle() is True
+
+    asyncio.run(_test())
