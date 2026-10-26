@@ -26,6 +26,10 @@ const SAMPLE_AUDIO = {
 // Base64 inflates the file by ~33%; keep the JSON request within reason.
 const MAX_AUDIO_BYTES = 30 * 1024 * 1024;
 
+// Cap a single microphone take. Long clips make the render take minutes and
+// were the most common cause of a "stuck" generation; auto-stop with a toast.
+const MAX_RECORD_SECONDS = 60;
+
 const AUDIO_ACCEPT =
   'audio/wav,audio/mpeg,audio/mp4,audio/ogg,audio/webm,audio/flac,.wav,.mp3,.m4a,.mp4,.ogg,.opus,.webm,.flac,.aac';
 
@@ -167,6 +171,12 @@ export default function AudioEngine({
     const analyser = analyserRef.current;
     const bufferLength = analyser.frequencyBinCount;
     const dataArray = new Uint8Array(bufferLength);
+    // The gradient only depends on the canvas size; rebuilding it for every
+    // bar on every animation frame was needless work at 60 fps.
+    const gradient = ctx.createLinearGradient(0, canvas.height, 0, 0);
+    gradient.addColorStop(0, '#6366f1');
+    gradient.addColorStop(0.6, '#06b6d4');
+    gradient.addColorStop(1, '#f43f5e');
     if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
 
     const render = () => {
@@ -178,17 +188,10 @@ export default function AudioEngine({
       const barWidth = (canvas.width / bufferLength) * 2.2;
       let x = 0;
 
+      ctx.fillStyle = gradient;
       for (let i = 0; i < bufferLength; i += 1) {
         const barHeight = (dataArray[i] / 255) * canvas.height * 0.9;
-
-        const gradient = ctx.createLinearGradient(0, canvas.height, 0, 0);
-        gradient.addColorStop(0, '#6366f1');
-        gradient.addColorStop(0.6, '#06b6d4');
-        gradient.addColorStop(1, '#f43f5e');
-
-        ctx.fillStyle = gradient;
         ctx.fillRect(x, canvas.height - barHeight, barWidth - 1, barHeight);
-
         x += barWidth;
       }
     };
@@ -229,7 +232,13 @@ export default function AudioEngine({
       analyserRef.current = analyser;
 
       const source = audioCtx.createMediaStreamSource(stream);
+      // An AnalyserNode is only pulled when it reaches the destination. A
+      // zero-gain sink keeps the meter running without echoing the mic.
+      const analyserSink = audioCtx.createGain();
+      analyserSink.gain.value = 0;
       source.connect(analyser);
+      analyser.connect(analyserSink);
+      analyserSink.connect(audioCtx.destination);
 
       // Setup MediaRecorder
       let mimeType = 'audio/webm';
@@ -296,10 +305,18 @@ export default function AudioEngine({
       setIsStarting(false);
       setRecordDuration(0);
 
-      // Start duration timer
+      // Start duration timer (4 Hz is enough for a tenths-place readout).
       timerIntervalRef.current = setInterval(() => {
-        setRecordDuration((Date.now() - startTimeRef.current) / 1000);
-      }, 100);
+        const elapsed = (Date.now() - startTimeRef.current) / 1000;
+        setRecordDuration(elapsed);
+        if (elapsed >= MAX_RECORD_SECONDS) {
+          onToast?.(
+            `Recording stopped at ${MAX_RECORD_SECONDS}s. Keep takes short for a fast render.`,
+            'info'
+          );
+          stopRecording();
+        }
+      }, 250);
 
       // Start canvas waveform visualizer loop
       drawLiveWaveform();

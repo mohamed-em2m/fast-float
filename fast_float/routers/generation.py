@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import time
 import uuid
 
 from fastapi import APIRouter, HTTPException
@@ -90,6 +91,8 @@ async def generate(request: GenerationRequest):
         stage="queued",
         percent=0.0,
         message="Waiting for a free GPU slot",
+        started_at=time.time(),
+        elapsed_s=0.0,
     )
 
     live_dispatcher = None

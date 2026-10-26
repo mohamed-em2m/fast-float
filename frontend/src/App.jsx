@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { CheckCircle2, Info, TriangleAlert, X } from 'lucide-react';
 import Header from './components/Header';
+import OfflineBanner from './components/OfflineBanner';
 import PortraitCanvas from './components/PortraitCanvas';
 import AudioEngine from './components/AudioEngine';
 import ParameterControls from './components/ParameterControls';
@@ -8,6 +9,7 @@ import StudioStage from './components/StudioStage';
 import InsightsPanel from './components/InsightsPanel';
 import LiveAudioStudio from './components/LiveAudioStudio';
 import { generateVideo, blobToBase64, alignUrlToApi, fetchProgress } from './services/api';
+import { getStored, setStored } from './services/storage';
 
 const DEFAULT_PORTRAIT = '/samples/portrait1.jpg';
 const PROGRESS_POLL_MS = 1000;
@@ -21,13 +23,9 @@ const TOAST_ICON = {
 
 export default function App() {
   // Workspace mode: async studio render vs. live microphone avatar.
-  const [mode, setMode] = useState(() => {
-    try {
-      return localStorage.getItem(MODE_KEY) === 'live' ? 'live' : 'studio';
-    } catch {
-      return 'studio';
-    }
-  });
+  const [mode, setMode] = useState(() => (
+    getStored(MODE_KEY) === 'live' ? 'live' : 'studio'
+  ));
 
   // Input State
   const [imagePreview, setImagePreview] = useState(DEFAULT_PORTRAIT);
@@ -59,6 +57,7 @@ export default function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [progress, setProgress] = useState(null);
   const [generationResult, setGenerationResult] = useState(null);
+  const [generationError, setGenerationError] = useState(null);
   const [history, setHistory] = useState([]);
   const [toast, setToast] = useState(null);
   // 'auto' streams the finished file; live transports stream frames live.
@@ -78,11 +77,7 @@ export default function App() {
   useEffect(() => stopProgressPolling, []);
 
   useEffect(() => {
-    try {
-      localStorage.setItem(MODE_KEY, mode);
-    } catch {
-      /* private mode */
-    }
+    setStored(MODE_KEY, mode);
   }, [mode]);
 
   const showToast = (message, type = 'info') => {
@@ -130,6 +125,7 @@ export default function App() {
     }
 
     setIsGenerating(true);
+    setGenerationError(null);
     // A client id lets us poll /progress while the long POST is still open.
     const clientRequestId =
       (typeof crypto !== 'undefined' && crypto.randomUUID)
@@ -139,10 +135,13 @@ export default function App() {
     const live = transport !== 'mp4';
     setLiveRequestId(live ? clientRequestId : null);
     stopProgressPolling();
-    progressTimerRef.current = setInterval(async () => {
+    const timer = setInterval(async () => {
       const p = await fetchProgress(clientRequestId);
+      // Ignore a poll that resolved after the request finished/unmounted.
+      if (progressTimerRef.current !== timer) return;
       if (p) setProgress(p);
     }, PROGRESS_POLL_MS);
+    progressTimerRef.current = timer;
 
     try {
       const payload = {
@@ -180,7 +179,9 @@ export default function App() {
       showToast(`Talking portrait ready in ${result.performance?.total_time ?? '—'}s${chunkNote}.`, 'success');
     } catch (err) {
       console.error('Generation failed', err);
-      showToast(err.message || 'Generation failed. Check that the server is running.', 'error');
+      const message = err?.message || 'Generation failed. Check that the server is running.';
+      setGenerationError(message);
+      showToast(message, 'error');
       // A failed live request must not leave a dead preview attached.
       if (live) setLiveRequestId(null);
     } finally {
@@ -229,6 +230,7 @@ export default function App() {
       )}
 
       <Header onToast={showToast} mode={mode} onModeChange={handleModeChange} />
+      <OfflineBanner />
 
       {mode === 'live' ? (
         <LiveAudioStudio
@@ -260,8 +262,10 @@ export default function App() {
           <div className="studio-stage-column">
             <StudioStage
               onGenerate={handleGenerate}
+              onRetry={handleGenerate}
               isGenerating={isGenerating}
               progress={progress}
+              generationError={generationError}
               generationResult={generationResult}
               hasAudio={Boolean(audioBase64)}
               onToast={showToast}

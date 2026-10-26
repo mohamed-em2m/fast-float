@@ -7,6 +7,9 @@
  * breaks every remote browser: there, `localhost` is the *user's* machine.
  */
 
+import { fetchJson, fetchWithTimeout, HttpError } from './http';
+import { getStored, removeStored, setStored } from './storage';
+
 /** Path prefix proxied to the FastAPI backend by Vite (and any prod proxy). */
 const API_PROXY_PATH = '/api';
 
@@ -17,9 +20,13 @@ function isLoopbackHost(hostname) {
   return LOOPBACK_HOSTS.includes(hostname);
 }
 
+function pageOrigin() {
+  return typeof window !== 'undefined' ? window.location.origin : 'http://localhost';
+}
+
 export function isLoopbackUrl(value) {
   try {
-    return isLoopbackHost(new URL(value, window.location.origin).hostname);
+    return isLoopbackHost(new URL(value, pageOrigin()).hostname);
   } catch {
     return false;
   }
@@ -27,6 +34,7 @@ export function isLoopbackUrl(value) {
 
 /** True when the browser tab itself is served from a loopback host. */
 export function isPageOnLoopback() {
+  if (typeof window === 'undefined') return false;
   return isLoopbackHost(window.location.hostname);
 }
 
@@ -68,7 +76,7 @@ function resolveInitialApiUrl() {
       const urlParam = params.get('api') || params.get('backend');
       if (urlParam) {
         const clean = urlParam.trim().replace(/\/$/, '');
-        localStorage.setItem('float_api_url', clean);
+        setStored('float_api_url', clean);
         // Remove the ?api= param from the browser URL so it never leaks into
         // subsequent candidate generation or loopback-fallback logic.
         try { window.history.replaceState({}, '', window.location.pathname); } catch { /* ignore */ }
@@ -78,18 +86,18 @@ function resolveInitialApiUrl() {
       /* ignore */
     }
   }
-  const stored = localStorage.getItem('float_api_url');
+  const stored = getStored('float_api_url');
   // Reject a stored value that looks like a full page URL (e.g. the user
   // accidentally pasted http://localhost:3000/?api=https://... into the
   // Config modal). Fall back to the default so the UI isn't permanently stuck.
   if (stored && looksLikePageUrl(stored)) {
-    localStorage.removeItem('float_api_url');
+    removeStored('float_api_url');
     return DEFAULT_API_URL;
   }
   // Drop a stale loopback URL when the page is served from a public host —
   // it can only ever point back at the user's own machine.
-  if (stored && isLoopbackUrl(stored) && !isLoopbackHost(window.location.hostname)) {
-    localStorage.removeItem('float_api_url');
+  if (stored && isLoopbackUrl(stored) && !isPageOnLoopback()) {
+    removeStored('float_api_url');
     return DEFAULT_API_URL;
   }
   return stored || DEFAULT_API_URL;
@@ -104,7 +112,7 @@ export function getApiUrl() {
 /** Join a backend path onto an API base, preserving any base path prefix. */
 function joinApiBase(base, path) {
   try {
-    const api = new URL(base, window.location.origin);
+    const api = new URL(base, pageOrigin());
     const prefix = api.pathname.replace(/\/$/, '');
     return `${api.origin}${prefix}${path.startsWith('/') ? path : `/${path}`}`;
   } catch {
@@ -121,7 +129,7 @@ function joinApiBase(base, path) {
 export function alignUrlToApi(url) {
   if (!url) return url;
   try {
-    const target = new URL(url, window.location.origin);
+    const target = new URL(url, pageOrigin());
     if (isLoopbackHost(target.hostname)) {
       return joinApiBase(currentApiUrl, `${target.pathname}${target.search}`);
     }
@@ -133,7 +141,7 @@ export function alignUrlToApi(url) {
 
 export function setApiUrl(url) {
   currentApiUrl = url.replace(/\/$/, '');
-  localStorage.setItem('float_api_url', currentApiUrl);
+  setStored('float_api_url', currentApiUrl);
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('float:api_url_changed', { detail: currentApiUrl }));
   }
@@ -141,7 +149,7 @@ export function setApiUrl(url) {
 
 /** Forget any stored override and fall back to the default (proxy) base. */
 export function resetApiUrl() {
-  localStorage.removeItem('float_api_url');
+  removeStored('float_api_url');
   currentApiUrl = DEFAULT_API_URL;
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('float:api_url_changed', { detail: currentApiUrl }));
@@ -165,7 +173,7 @@ export async function testApiUrl(base) {
 
   let parsed;
   try {
-    parsed = new URL(normalized, window.location.origin);
+    parsed = new URL(normalized, pageOrigin());
   } catch {
     throw new Error('That is not a valid URL.');
   }
@@ -177,8 +185,9 @@ export async function testApiUrl(base) {
   try {
     res = await fetchWithTimeout(`${normalized}/health`, {}, 8000);
   } catch (err) {
+    const timedOut = err.name === 'TimeoutError' || err.name === 'AbortError';
     throw new Error(
-      err.name === 'AbortError' ? 'Timed out — no response in 8s.' : `Could not connect (${err.message}).`
+      timedOut ? 'Timed out — no response in 8s.' : `Could not connect (${err.message}).`
     );
   }
   if (!res.ok) throw new Error(`Endpoint replied HTTP ${res.status}.`);
@@ -195,11 +204,11 @@ export function getApiCandidates() {
   // reset it so we don't generate broken loopback candidates.
   if (looksLikePageUrl(currentApiUrl)) {
     currentApiUrl = DEFAULT_API_URL;
-    localStorage.removeItem('float_api_url');
+    removeStored('float_api_url');
   }
   const ordered = [currentApiUrl];
   try {
-    const u = new URL(currentApiUrl, window.location.origin);
+    const u = new URL(currentApiUrl, pageOrigin());
     if (isLoopbackHost(u.hostname)) {
       for (const host of LOOPBACK_HOSTS) {
         if (host === u.hostname) continue;
@@ -212,17 +221,6 @@ export function getApiCandidates() {
     // Malformed URL — just try it as-is.
   }
   return [...new Set(ordered)];
-}
-
-/** fetch with a timeout so a dead host fails fast instead of hanging. */
-async function fetchWithTimeout(url, init = {}, timeoutMs = 8000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...init, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 /**
@@ -243,7 +241,7 @@ async function ensureBackend() {
       }
       errors.push(`${base}: HTTP ${res.status}`);
     } catch (err) {
-      errors.push(`${base}: ${err.name === 'AbortError' ? 'timeout' : err.message}`);
+      errors.push(`${base}: ${err.name === 'TimeoutError' || err.name === 'AbortError' ? 'timeout' : err.message}`);
     }
   }
   console.error(`[api] backend unreachable on all candidates: ${errors.join(' | ')}`);
@@ -392,7 +390,7 @@ export async function fetchHealth() {
       }
       return await res.json();
     } catch (err) {
-      errors.push(`${base}: ${err.name === 'AbortError' ? 'timeout' : err.message}`);
+      errors.push(`${base}: ${err.name === 'TimeoutError' || err.name === 'AbortError' ? 'timeout' : err.message}`);
     }
   }
   console.error(`[api] GET /health failed on all candidates: ${errors.join(' | ')}`);
@@ -403,7 +401,11 @@ export async function fetchHealth() {
 export async function fetchProgress(requestId) {
   if (!requestId) return null;
   try {
-    const res = await fetch(`${currentApiUrl}/progress/${encodeURIComponent(requestId)}`);
+    const res = await fetchWithTimeout(
+      `${currentApiUrl}/progress/${encodeURIComponent(requestId)}`,
+      {},
+      5000
+    );
     if (!res.ok) return null;
     return await res.json();
   } catch {
@@ -411,36 +413,31 @@ export async function fetchProgress(requestId) {
   }
 }
 
-/** Get live GPU telemetry */
+/** Get live GPU telemetry. A missing endpoint (no CUDA) is not an error. */
 export async function fetchGpuMetrics() {
-  let res;
   try {
-    res = await fetch(`${currentApiUrl}/gpu`);
+    return await fetchJson(`${currentApiUrl}/gpu`, {}, { timeoutMs: 8000 });
   } catch (err) {
-    logApiError('GET', '/gpu', err);
-    throw new Error(`Cannot reach backend at ${currentApiUrl} — is it running?`);
+    // 404/503 simply mean this deployment has no GPU endpoint; the widgets
+    // hide themselves and the shared poller must not spam the console.
+    const expected = err instanceof HttpError && (err.status === 404 || err.status === 503);
+    if (!expected) logApiError('GET', '/gpu', err instanceof HttpError ? null : err, err.status);
+    throw err;
   }
-  if (!res.ok) {
-    logApiError('GET', '/gpu', null, res.status);
-    throw new Error(`GPU metrics failed: ${res.status} ${res.statusText}`);
-  }
-  return await res.json();
 }
 
 /** Clear GPU CUDA memory cache */
 export async function clearGpuMemory() {
-  let res;
   try {
-    res = await fetch(`${currentApiUrl}/gpu/clear`, { method: 'POST' });
+    return await fetchJson(
+      `${currentApiUrl}/gpu/clear`,
+      { method: 'POST' },
+      { timeoutMs: 10000 }
+    );
   } catch (err) {
-    logApiError('POST', '/gpu/clear', err);
-    throw new Error(`Cannot reach backend at ${currentApiUrl} — is it running?`);
+    logApiError('POST', '/gpu/clear', err instanceof HttpError ? null : err, err.status);
+    throw err;
   }
-  if (!res.ok) {
-    logApiError('POST', '/gpu/clear', null, res.status);
-    throw new Error(`Clear GPU cache failed: ${res.status} ${res.statusText}`);
-  }
-  return await res.json();
 }
 
 /**
@@ -450,14 +447,9 @@ export async function clearGpuMemory() {
  */
 export async function fetchPerfMatrix() {
   try {
-    const res = await fetch(`${currentApiUrl}/perf/matrix`);
-    if (!res.ok) {
-      logApiError('GET', '/perf/matrix', null, res.status);
-      return null;
-    }
-    return await res.json();
+    return await fetchJson(`${currentApiUrl}/perf/matrix`, {}, { timeoutMs: 8000 });
   } catch (err) {
-    logApiError('GET', '/perf/matrix', err);
+    logApiError('GET', '/perf/matrix', err instanceof HttpError ? null : err, err.status);
     return null;
   }
 }
@@ -469,14 +461,9 @@ export async function fetchPerfMatrix() {
  */
 export async function fetchPerfRequests() {
   try {
-    const res = await fetch(`${currentApiUrl}/perf/requests`);
-    if (!res.ok) {
-      logApiError('GET', '/perf/requests', null, res.status);
-      return null;
-    }
-    return await res.json();
+    return await fetchJson(`${currentApiUrl}/perf/requests`, {}, { timeoutMs: 8000 });
   } catch (err) {
-    logApiError('GET', '/perf/requests', err);
+    logApiError('GET', '/perf/requests', err instanceof HttpError ? null : err, err.status);
     return null;
   }
 }
@@ -486,24 +473,21 @@ export async function fetchPerfRequests() {
  * behind it), so the panel warns before the call. Returns the initial status.
  */
 export async function startPerfBenchmark(options = {}) {
-  let res;
   try {
-    res = await fetch(`${currentApiUrl}/perf/benchmark`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(options),
-    });
+    return await fetchJson(
+      `${currentApiUrl}/perf/benchmark`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(options),
+      },
+      { timeoutMs: 15000 }
+    );
   } catch (err) {
-    logApiError('POST', '/perf/benchmark', err);
+    logApiError('POST', '/perf/benchmark', err instanceof HttpError ? null : err, err.status);
+    if (err instanceof HttpError) throw err;
     throw new Error(`Cannot reach backend at ${currentApiUrl} — is it running?`);
   }
-  if (!res.ok) {
-    const errorData = await res.json().catch(() => ({}));
-    const detail = errorData.detail || `Benchmark failed: ${res.status}`;
-    logApiError('POST', '/perf/benchmark', null, res.status);
-    throw new Error(detail);
-  }
-  return await res.json();
 }
 
 /** Generate talking portrait video */
@@ -559,7 +543,7 @@ function alignIceUrl(url) {
   let host = match[2].replace(/^\[|\]$/g, '');
   if (isLoopbackHost(host)) {
     try {
-      const apiHost = new URL(currentApiUrl, window.location.origin).hostname;
+      const apiHost = new URL(currentApiUrl, pageOrigin()).hostname;
       if (apiHost && !isLoopbackHost(apiHost)) host = apiHost;
     } catch {
       /* keep the loopback host */

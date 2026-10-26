@@ -6,7 +6,7 @@
  * low-passes), converted to PCM16 and posted by `LiveAudioStudio`.
  */
 
-import { pushConversationAudio } from './livekit';
+import { pushConversationAudio } from './livekitHttp';
 
 const TARGET_RATE = 16000;
 const CHUNK_SAMPLES = 3200; // 200 ms at 16 kHz

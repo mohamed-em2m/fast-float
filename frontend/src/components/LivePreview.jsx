@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import { Play } from 'lucide-react';
 import { attachRemoteTrack, createWebRtcSession } from '../services/api';
 import { openLiveSocket } from '../services/live';
-import { connectLiveKitSession, fetchLiveKitPublishStatus } from '../services/livekit';
+import { connectLiveKitSession } from '../services/livekit';
+import { fetchLiveKitPublishStatus } from '../services/livekitHttp';
 
 const STATUS_LABEL = {
   idle: 'Idle',
@@ -59,6 +60,9 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
 
     if (transport === 'ws') {
       let meta = null;
+      let sawMeta = false;
+      const WS_CONNECT_TIMEOUT_MS = 15000;
+      let connectTimer = null;
       const draw = ({ bytes }) => {
         const canvas = canvasRef.current;
         if (!canvas || !meta) return;
@@ -79,9 +83,21 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
         ctx.putImageData(new ImageData(rgba, width, height), 0, 0);
       };
 
+      const failSocket = (reason) => {
+        if (cancelled) return;
+        report('error');
+        if (onFallback) onFallback(reason);
+        else onStatusRef.current?.(reason);
+      };
+
       const socket = openLiveSocket(requestId, {
         onMeta: (m) => {
           meta = m;
+          sawMeta = true;
+          if (connectTimer) {
+            clearTimeout(connectTimer);
+            connectTimer = null;
+          }
           // Size the bitmap immediately so the first frame is not drawn into a
           // stale canvas; the state keeps React's props in sync for re-renders.
           const canvas = canvasRef.current;
@@ -101,12 +117,28 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
           report('error');
         },
         onStatus: (s) => {
-          if (s === 'error') report('error');
+          if (s === 'error') {
+            failSocket('the live frame socket failed');
+          } else if (s === 'closed') {
+            // A clean close after frames means the render ended; a close
+            // before the first meta message is a failed handshake.
+            if (sawMeta) report('done');
+            else failSocket('the live frame socket closed before sending frames');
+          }
         },
       });
 
+      // A socket can stay in CONNECTING forever behind a proxy that never
+      // upgrades. Bound the handshake so the stage can fall back to the MP4.
+      connectTimer = setTimeout(() => {
+        if (cancelled || sawMeta) return;
+        failSocket('the live frame socket did not answer in 15s');
+        socket.close();
+      }, WS_CONNECT_TIMEOUT_MS);
+
       return () => {
         cancelled = true;
+        if (connectTimer) clearTimeout(connectTimer);
         socket.close();
       };
     }
@@ -192,28 +224,47 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
     // aiortc keeps the peer open when the live track finishes; the remote
     // MediaStreamTrack's 'ended' event is what tells us the clip is over.
     const watchedTracks = new Set();
+    const trackCleanups = [];
     const watchTrackEnd = () => {
       const media = videoEl?.srcObject;
       for (const track of media?.getTracks?.() || []) {
         if (track.kind !== 'video' || watchedTracks.has(track)) continue;
         watchedTracks.add(track);
-        track.addEventListener('ended', () => report('done'));
+        const onEnded = () => report('done');
+        track.addEventListener('ended', onEnded);
+        trackCleanups.push(() => track.removeEventListener('ended', onEnded));
       }
     };
-    // Some browsers do not fire 'ended' for a remote track, and the peer can
-    // take seconds to report the close: treat a long gap between rendered
-    // frames as the end of the clip so the preview never freezes forever.
-    const VIDEO_STALL_MS = 4000;
-    let lastFrameAt = performance.now();
+    // Some browsers never fire 'ended' for a remote track and the peer can
+    // take seconds to report the close. Watch actual playback progress instead
+    // of assuming requestVideoFrameCallback exists: Safari/Firefox fall back to
+    // currentTime advancing, so a healthy stream is never mistaken for a stall.
+    const VIDEO_STALL_MS = 6000;
+    let lastProgressAt = performance.now();
+    let lastMediaTime = -1;
     const markFrame = () => {
-      lastFrameAt = performance.now();
+      lastProgressAt = performance.now();
       videoEl?.requestVideoFrameCallback?.(markFrame);
     };
-    videoEl?.requestVideoFrameCallback?.(markFrame);
+    if (typeof videoEl?.requestVideoFrameCallback === 'function') {
+      videoEl.requestVideoFrameCallback(markFrame);
+    }
     const stallTimer = setInterval(() => {
-      if (cancelled || fellBack) return;
-      if (!videoEl || videoEl.readyState < 2) return;
-      if (performance.now() - lastFrameAt > VIDEO_STALL_MS) report('done');
+      if (cancelled || fellBack || !videoEl) return;
+      // A paused/buffering element is not a finished clip; restart the clock
+      // so autoplay delays do not trip the watchdog.
+      if (videoEl.paused || videoEl.readyState < 2) {
+        lastProgressAt = performance.now();
+        lastMediaTime = videoEl.currentTime;
+        return;
+      }
+      const mediaTime = videoEl.currentTime;
+      if (mediaTime !== lastMediaTime) {
+        lastMediaTime = mediaTime;
+        lastProgressAt = performance.now();
+        return;
+      }
+      if (performance.now() - lastProgressAt > VIDEO_STALL_MS) report('done');
     }, 1000);
 
     const clearConnectionTimer = () => {
@@ -261,10 +312,12 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
           report('live');
         } else if (state === 'failed') {
           failOver('ICE negotiation failed — no reachable media path');
-        } else if (state === 'disconnected' || state === 'closed') {
+        } else if (state === 'closed') {
           clearConnectionTimer();
           report('done');
         }
+        // 'disconnected' is often transient (ICE restart); the stall watchdog
+        // and the remote track's 'ended' event decide when it is really over.
       },
       { live: true }
     )
@@ -291,6 +344,13 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
       cancelled = true;
       clearInterval(stallTimer);
       clearConnectionTimer();
+      for (const cleanup of trackCleanups) {
+        try {
+          cleanup();
+        } catch {
+          /* track already gone */
+        }
+      }
       try {
         pc?.close();
       } catch {

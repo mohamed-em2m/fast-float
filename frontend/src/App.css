@@ -280,6 +280,45 @@
   color: var(--text-muted);
 }
 
+/* Persistent banner: the shared poller has failed repeatedly. */
+.offline-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid rgba(255, 93, 122, 0.32);
+  background: rgba(255, 93, 122, 0.08);
+  color: var(--text-main);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.offline-banner-icon {
+  flex: 0 0 auto;
+  color: var(--danger);
+}
+
+.offline-banner-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.offline-banner-text strong {
+  color: var(--danger);
+}
+
+@media (max-width: 620px) {
+  .offline-banner {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .offline-banner .btn-secondary {
+    width: 100%;
+  }
+}
+
 .status-label {
   line-height: 1;
 }
@@ -335,6 +374,9 @@
   right: 0;
   z-index: 200;
   max-width: calc(100vw - 32px);
+  max-height: min(calc(100vh - 96px), 760px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 18px;
   display: flex;
   flex-direction: column;
@@ -1390,6 +1432,57 @@
   flex: 0 0 auto;
 }
 
+/* Inline generation failure + retry (shown instead of a toast-only error). */
+.stage-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 13px;
+  border-radius: var(--radius-md);
+  border: 1px solid rgba(255, 93, 122, 0.32);
+  background: rgba(255, 93, 122, 0.08);
+  font-size: 12.5px;
+}
+
+.stage-error-icon {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  color: var(--danger);
+}
+
+.stage-error-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.stage-error-body strong {
+  color: var(--danger);
+}
+
+.stage-error-body span {
+  color: var(--text-muted);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.stage-error .btn-secondary {
+  flex: 0 0 auto;
+}
+
+@media (max-width: 620px) {
+  .stage-error {
+    flex-wrap: wrap;
+  }
+
+  .stage-error .btn-secondary {
+    width: 100%;
+    justify-content: center;
+  }
+}
+
 .stage-viewport {
   position: relative;
   width: 100%;
@@ -1560,6 +1653,35 @@
   height: 100%;
   background: var(--accent-gradient);
   transition: width 0.4s var(--ease);
+}
+
+/* Single-pass renders have no intermediate percentages: animate a sweep
+   instead of leaving the bar frozen at 5% for the whole inference. */
+.progress-track.is-indeterminate .progress-fill-bar {
+  width: 38%;
+  transition: none;
+  animation: progressSweep 1.5s ease-in-out infinite;
+}
+
+@keyframes progressSweep {
+  0% { transform: translateX(-115%); }
+  100% { transform: translateX(270%); }
+}
+
+.stage-progress-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 14px;
+  font-size: 10.5px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-track.is-indeterminate .progress-fill-bar {
+    animation-duration: 3s;
+  }
 }
 
 /* Toolbar */
@@ -3112,4 +3234,68 @@
     top: 10px;
     font-size: 12.5px;
   }
+}
+
+/* --------------------------------------------------------------------------
+   Crash fallback (ErrorBoundary)
+   -------------------------------------------------------------------------- */
+.crash-overlay {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.crash-panel {
+  width: min(620px, 100%);
+  padding: 28px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 14px;
+  border-color: rgba(255, 93, 122, 0.32);
+}
+
+.crash-icon {
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md);
+  background: rgba(255, 93, 122, 0.12);
+  color: var(--danger);
+}
+
+.crash-title {
+  font-size: 20px;
+}
+
+.crash-copy {
+  color: var(--text-muted);
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+
+.crash-detail {
+  width: 100%;
+  max-height: 180px;
+  overflow: auto;
+  margin: 0;
+  padding: 11px 13px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-subtle);
+  background: rgba(0, 0, 0, 0.32);
+  color: var(--danger);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.crash-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
 }

@@ -11,19 +11,22 @@ import {
   RefreshCw,
   Sparkles,
 } from 'lucide-react';
-import { fetchLiveKitStatus, getLiveKitUrlOverride, setLiveKitUrlOverride, getGeminiApiKey, setGeminiApiKey, getGeminiModel, setGeminiModel } from '../services/livekit';
-import { fetchHealth, fetchGpuMetrics, clearGpuMemory, getApiUrl, setApiUrl, resetApiUrl, isDefaultApiUrl, testApiUrl, isLoopbackUrl, isPageOnLoopback, DEFAULT_API_URL } from '../services/api';
+import { fetchLiveKitStatus, getLiveKitUrlOverride, setLiveKitUrlOverride, getGeminiApiKey, setGeminiApiKey, getGeminiModel, setGeminiModel } from '../services/livekitHttp';
+import { clearGpuMemory, getApiUrl, setApiUrl, resetApiUrl, isDefaultApiUrl, testApiUrl, isLoopbackUrl, isPageOnLoopback, DEFAULT_API_URL } from '../services/api';
+import { refreshBackendStatus, useBackendStatus } from '../services/telemetry';
 
-// Consecutive failed polls before the pill flips to Disconnected. A single
-// failed poll (e.g. one slow tick while a big upload/generation is in
-// flight) must not flap the UI offline.
-const OFFLINE_AFTER_FAILURES = 3;
-
+// The pill needs a stable state while the very first poll is in flight; the
+// shared poller flips `online` after one successful /health, and offline only
+// after several consecutive failures (see services/telemetry.js).
 export default function Header({ onToast, mode = 'studio', onModeChange }) {
-  const [health, setHealth] = useState(null);
-  const [gpu, setGpu] = useState(null);
-  const [isOnline, setIsOnline] = useState(false);
-  const [liveKitStatus, setLiveKitStatus] = useState(null);
+  // The shared poller owns /health, /gpu and /livekit/status for the whole app.
+  const {
+    health,
+    gpu,
+    liveKit: liveKitStatus,
+    online: isOnline,
+    offline,
+  } = useBackendStatus();
   const [showSettings, setShowSettings] = useState(false);
   const [apiUrlInput, setApiUrlInput] = useState(getApiUrl());
   const [liveKitUrlInput, setLiveKitUrlInput] = useState(getLiveKitUrlOverride());
@@ -32,44 +35,57 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
   const [configError, setConfigError] = useState(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
-  const failuresRef = useRef(0);
+  // Result of the explicit "Verify" probe; the periodic status may lag behind.
+  const [verifyResult, setVerifyResult] = useState(null);
+  const settingsRef = useRef(null);
+  const settingsButtonRef = useRef(null);
 
   const activeUrl = getApiUrl();
   const trimmedInput = apiUrlInput.trim();
   const loopbackWarning =
     trimmedInput && isLoopbackUrl(trimmedInput) && !isPageOnLoopback();
   const hasOverride = !isDefaultApiUrl();
+  const liveKitDetails = verifyResult ?? liveKitStatus;
+  const statusPending = !isOnline && !offline;
 
-  const checkStatus = async () => {
-    try {
-      const hData = await fetchHealth();
-      fetchLiveKitStatus().then((lk) => setLiveKitStatus(lk)).catch(() => setLiveKitStatus({ configured: false }));
-      setHealth(hData);
-      failuresRef.current = 0;
-      setIsOnline(true);
-      try {
-        const gData = await fetchGpuMetrics();
-        setGpu(gData);
-      } catch (e) {
-        // GPU endpoint optional or no GPU
-      }
-    } catch (err) {
-      failuresRef.current += 1;
-      console.warn(`[health] poll failed (${failuresRef.current}/${OFFLINE_AFTER_FAILURES}): ${err.message}`);
-      if (failuresRef.current >= OFFLINE_AFTER_FAILURES) {
-        setIsOnline((prev) => {
-          if (prev && onToast) onToast(`Backend unreachable at ${getApiUrl()} — check connection or Config.`, 'error');
-          return false;
-        });
-      }
+  const checkStatus = () => refreshBackendStatus({ forceLiveKit: true }).catch(() => {});
+
+  const closeSettings = ({ restoreFocus = true } = {}) => {
+    setShowSettings(false);
+    if (restoreFocus) {
+      // Wait for the popover to leave the DOM before moving focus back.
+      setTimeout(() => settingsButtonRef.current?.focus?.(), 0);
     }
   };
 
+  // Escape / outside click dismiss the popover, matching every other modal in
+  // the app. Focus moves into the popover on open and back to the gear on close.
   useEffect(() => {
-    checkStatus();
-    const interval = setInterval(checkStatus, 6000);
-    return () => clearInterval(interval);
-  }, []);
+    if (!showSettings) return undefined;
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        closeSettings();
+      }
+    };
+    const onPointerDown = (event) => {
+      if (settingsRef.current?.contains(event.target)) return;
+      if (settingsButtonRef.current?.contains(event.target)) return;
+      closeSettings({ restoreFocus: false });
+    };
+    document.addEventListener('keydown', onKeyDown);
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('touchstart', onPointerDown, { passive: true });
+    const focusTimer = setTimeout(() => {
+      settingsRef.current?.querySelector('input, button, select')?.focus?.();
+    }, 0);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('touchstart', onPointerDown);
+      clearTimeout(focusTimer);
+    };
+  }, [showSettings]);
 
   const handleClearGpu = async () => {
     setIsClearing(true);
@@ -95,15 +111,13 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
     setConfigError(null);
     try {
       // Verify before committing so a typo can't strand the whole studio.
-      const hData = await testApiUrl(value);
+      await testApiUrl(value);
       setApiUrl(value);
       setLiveKitUrlOverride(liveKitUrlInput);
       setGeminiApiKey(geminiKeyInput);
       setGeminiModel(geminiModelInput);
-      failuresRef.current = 0;
-      if (hData && typeof hData === 'object') setHealth(hData);
-      setIsOnline(true);
-      setShowSettings(false);
+      setVerifyResult(null);
+      closeSettings();
       if (onToast) onToast(`Connected to ${value}`, 'success');
       checkStatus();
     } catch (err) {
@@ -128,8 +142,8 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
     setLiveKitUrlOverride(liveKitUrlInput);
     setGeminiApiKey(geminiKeyInput);
     setGeminiModel(geminiModelInput);
-    failuresRef.current = 0;
-    setShowSettings(false);
+    setVerifyResult(null);
+    closeSettings();
     if (onToast) onToast(`Saved direct endpoint: ${value}`, 'info');
     checkStatus();
   };
@@ -147,7 +161,7 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
     setIsSaving(true);
     try {
       const lk = await fetchLiveKitStatus({ verify: true });
-      setLiveKitStatus(lk);
+      setVerifyResult(lk);
       const bad = (lk?.warnings || []).length;
       if (onToast) {
         onToast(
@@ -157,6 +171,8 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
           bad === 0 ? 'success' : 'error'
         );
       }
+      // The backend caches the fresh probe; pull it into the shared snapshot.
+      checkStatus();
     } catch (err) {
       setConfigError(err?.message || 'Verification failed.');
     } finally {
@@ -174,7 +190,7 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
     setGeminiKeyInput('');
     setGeminiModelInput('');
     setConfigError(null);
-    failuresRef.current = 0;
+    setVerifyResult(null);
     if (onToast) onToast('Reset to default endpoint', 'info');
     checkStatus();
   };
@@ -221,14 +237,16 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
       <div className="header-actions">
         {/* Connection Status Pill */}
         <div
-          className={`status-pill ${isOnline ? 'status-online' : 'status-offline'}`}
-          title={isOnline ? `Backend: ${getApiUrl()}` : 'Backend unreachable'}
+          className={`status-pill ${isOnline ? 'status-online' : statusPending ? 'status-standby' : 'status-offline'}`}
+          title={isOnline ? `Backend: ${getApiUrl()}` : statusPending ? 'Contacting the backend…' : 'Backend unreachable'}
         >
           <span className={isOnline ? 'live-dot' : 'offline-dot'} />
           <span className="status-label">
             {isOnline
               ? (health?.model_loaded ? 'Model ready' : 'Server online')
-              : 'Disconnected'}
+              : statusPending
+                ? 'Connecting…'
+                : 'Disconnected'}
           </span>
         </div>
 
@@ -277,10 +295,13 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
 
         {/* Settings Toggle */}
         <button
+          ref={settingsButtonRef}
           className="btn-icon"
-          onClick={openSettings}
+          onClick={() => (showSettings ? closeSettings() : openSettings())}
           title="Server & network settings"
           aria-label="Server and network settings"
+          aria-haspopup="dialog"
+          aria-expanded={showSettings}
         >
           <Settings size={16} />
         </button>
@@ -288,8 +309,15 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
 
       {/* Settings Modal Popover */}
       {showSettings && (
-        <div className="settings-popover glass-panel" style={{ width: '380px' }}>
-          <h3 className="settings-title">Server & Network Configuration</h3>
+        <div
+          ref={settingsRef}
+          className="settings-popover glass-panel"
+          style={{ width: '380px' }}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="settings-title"
+        >
+          <h3 className="settings-title" id="settings-title">Server &amp; Network Configuration</h3>
 
           <div className="settings-active">
             <span className="settings-label">
@@ -485,9 +513,9 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
                   {isSaving ? 'Verifying…' : 'Verify'}
                 </button>
               </div>
-              {liveKitStatus?.checks?.length ? (
+              {liveKitDetails?.checks?.length ? (
                 <ul className="settings-checks-list">
-                  {liveKitStatus.checks.map((check) => (
+                  {liveKitDetails.checks.map((check) => (
                     <li key={check.name} className={`settings-check settings-check--${check.status || 'skip'}`}>
                       {check.status === 'ok' ? <ShieldCheck size={13} /> : <TriangleAlert size={13} />}
                       <span>
@@ -522,7 +550,7 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
                 type="button"
                 className="btn-secondary btn-sm"
                 disabled={isSaving}
-                onClick={() => setShowSettings(false)}
+                onClick={() => closeSettings()}
               >
                 Cancel
               </button>

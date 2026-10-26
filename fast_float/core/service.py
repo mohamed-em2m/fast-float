@@ -36,6 +36,15 @@ from fast_float.utils.timing import timed, timing_run
 ALLOWED_IMAGE_FORMATS = {"jpg", "jpeg", "png", "webp"}
 
 
+def _progress_elapsed_s(state: Any, request_id: str) -> float:
+    """Seconds since the request was queued, read from its progress record."""
+    record = state.get_progress(request_id) or {}
+    started = record.get("started_at")
+    if not started:
+        return 0.0
+    return round(max(0.0, time.time() - float(started)), 2)
+
+
 def _probe_frame_count(video_path: str) -> int:
     """Best-effort frame count probe for fps reporting. Returns 0 on failure."""
     try:
@@ -195,7 +204,14 @@ async def generate_video(
 
     try:
         logger.info(f"[{request_id}] 🚀 Starting video generation")
-        state.set_progress(request_id, status="processing", stage="preprocessing", percent=1.0)
+        state.set_progress(
+            request_id,
+            status="processing",
+            stage="preprocessing",
+            percent=1.0,
+            started_at=total_start_time,
+            elapsed_s=0.0,
+        )
 
         # 1. Audio processing
         preprocess_start = time.time()
@@ -242,6 +258,13 @@ async def generate_video(
         chunk_seconds = float(request_data.get("chunk_seconds", 0.0) or 0.0)
         overlap_seconds = float(request_data.get("chunk_overlap_seconds", 0.5) or 0.0)
         duration = get_audio_duration_seconds(audio_path)
+        # Report the clip length as soon as it is known: the Studio uses it for
+        # the elapsed/remaining readout even on a single-pass render.
+        state.set_progress(
+            request_id,
+            audio_seconds=round(max(0.0, duration), 3),
+            elapsed_s=round(time.time() - total_start_time, 2),
+        )
 
         inference_start = time.time()
         num_chunks = 1
@@ -274,6 +297,8 @@ async def generate_video(
                         total_chunks=1,
                         completed_chunks=0,
                         percent=5.0,
+                        audio_seconds=round(max(0.0, duration), 3),
+                        elapsed_s=round(time.time() - total_start_time, 2),
                     )
                     output_path = await loop.run_in_executor(
                         state.executor,
@@ -334,6 +359,7 @@ async def generate_video(
             percent=100.0,
             total_chunks=num_chunks,
             completed_chunks=num_chunks,
+            elapsed_s=round(time.time() - total_start_time, 2),
         )
 
         # 6. Clean temporary files
@@ -361,13 +387,20 @@ async def generate_video(
             stage="done",
             percent=100.0,
             message=f"{num_chunks} chunk(s)",
+            elapsed_s=round(time.time() - total_start_time, 2),
         )
 
         return output_path, timings
 
     except Exception as e:
         logger.error(f"[{request_id}] ❌ Generation failed: {e!s}", exc_info=True)
-        state.set_progress(request_id, status="error", stage="error", message=str(e))
+        state.set_progress(
+            request_id,
+            status="error",
+            stage="error",
+            message=str(e),
+            elapsed_s=round(time.time() - total_start_time, 2),
+        )
         for temp_file in temp_files:
             try:
                 if os.path.exists(temp_file):
@@ -410,6 +443,7 @@ async def _generate_chunked(
         completed_chunks=0,
         percent=0.0,
         message=f"0/{num_chunks} chunks",
+        elapsed_s=_progress_elapsed_s(state, request_id),
     )
     logger.info(f"[{request_id}] 🧩 Chunked generation: {num_chunks} chunks")
 
@@ -436,6 +470,7 @@ async def _generate_chunked(
             completed_chunks=done,
             percent=round(done / num_chunks * 90, 1),
             message=f"{done}/{num_chunks} chunks{batch_note}",
+            elapsed_s=_progress_elapsed_s(state, request_id),
         )
         if len(g) == 1 and batch_size <= 1:
             ch = g[0]
@@ -512,6 +547,7 @@ async def _generate_chunked(
         completed_chunks=num_chunks,
         percent=92.0,
         message="Merging chunks",
+        elapsed_s=_progress_elapsed_s(state, request_id),
     )
 
     merged_path = os.path.join(res_dir, f"{stamp}_{request_id}.mp4")
