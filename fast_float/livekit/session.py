@@ -341,10 +341,7 @@ class ConversationSession:
         # Uses the same GPU semaphore as live inference — runs first (before any
         # audio arrives) then frees the slot for real speech chunks.
         silence_sec = getattr(self.settings, "livekit_silence_sec", 2.0)
-        try:
-            await self.generator.prepare_silence(duration_sec=silence_sec)
-        except TypeError:
-            await self.generator.prepare_silence()
+        await self.generator.prepare_silence(duration_sec=silence_sec)
 
         if self.agent_backend == "gemini":
             await self._start_external_agent()

@@ -483,8 +483,8 @@ class InferenceWorker:
                 error_msg="no ref_image_path available for prepare_silence",
             )
 
-        # Silence is a WAV of zeros at the configured duration.
-        silence_sec = getattr(self._cfg, "livekit_silence_sec", 10.0)
+        # Silence is a WAV of zeros at the requested duration.
+        silence_sec = _resolve_silence_sec(req, self._cfg)
         n_samples = int(silence_sec * SAMPLE_RATE)
         silence_pcm = np.zeros(n_samples, dtype="<i2")
 
@@ -554,6 +554,24 @@ class InferenceWorker:
 # ---------------------------------------------------------------------------
 # WAV helper
 # ---------------------------------------------------------------------------
+
+
+def _resolve_silence_sec(req: IPCRequest, cfg: Any) -> float:
+    """Idle-loop length (seconds) for a ``prepare_silence`` request.
+
+    An explicit ``duration_sec`` from the caller wins (checked against a sane
+    range — the session already clamps it, but never trust the wire). Legacy
+    senders that leave it at 0 fall back to the worker's own
+    ``livekit_silence_sec`` configuration.
+    """
+    try:
+        requested = float(getattr(req, "duration_sec", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        requested = 0.0
+    if requested > 0.0:
+        return min(30.0, max(0.5, requested))
+    fallback = float(getattr(cfg, "livekit_silence_sec", 10.0) or 10.0)
+    return min(30.0, max(0.5, fallback))
 
 
 def _write_wav(path: str, pcm_int16: np.ndarray, sample_rate: int) -> None:

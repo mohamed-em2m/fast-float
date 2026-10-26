@@ -19,6 +19,10 @@ class IPCRequest:
     nfe: int = 5
     ref_image_path: str = ""
     gen: int = 0
+    # ``prepare_silence`` only: idle-loop duration in seconds. 0 means "use the
+    # worker's ``livekit_silence_sec`` configuration" (keeps older senders and
+    # workers compatible).
+    duration_sec: float = 0.0
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))

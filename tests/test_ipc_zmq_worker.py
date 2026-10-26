@@ -24,12 +24,14 @@ def test_ipc_messages_serialization():
         nfe=5,
         ref_image_path="test.png",
         gen=1,
+        duration_sec=2.0,
     )
     req_json = req.to_json()
     req_recovered = IPCRequest.from_json(req_json)
     assert req_recovered.cmd == "infer"
     assert req_recovered.session_id == "sess-123"
     assert req_recovered.nfe == 5
+    assert req_recovered.duration_sec == 2.0
 
     resp = IPCResponse(
         status="ok",
@@ -108,3 +110,30 @@ def test_shm_frame_dispatcher():
 
     ring.close()
     ring.unlink()
+
+
+def test_resolve_silence_sec_prefers_request_duration():
+    from types import SimpleNamespace
+
+    from fast_float.workers.inference_worker import _resolve_silence_sec
+
+    empty_cfg = SimpleNamespace()
+    assert _resolve_silence_sec(IPCRequest(cmd="prepare_silence", duration_sec=4.0), empty_cfg) == 4.0
+
+    # Checked against a sane range, never trust the wire.
+    assert _resolve_silence_sec(IPCRequest(cmd="prepare_silence", duration_sec=999.0), empty_cfg) == 30.0
+    assert _resolve_silence_sec(IPCRequest(cmd="prepare_silence", duration_sec=0.01), empty_cfg) == 0.5
+
+
+def test_resolve_silence_sec_falls_back_to_worker_config():
+    from types import SimpleNamespace
+
+    from fast_float.workers.inference_worker import _resolve_silence_sec
+
+    # duration_sec=0 / missing / garbage → the worker's configuration.
+    cfg = SimpleNamespace(livekit_silence_sec=12.0)
+    default_cfg = SimpleNamespace()
+    assert _resolve_silence_sec(IPCRequest(cmd="prepare_silence"), cfg) == 12.0
+    assert _resolve_silence_sec(IPCRequest(cmd="prepare_silence"), default_cfg) == 10.0
+    # Duck-typed older sender without the field must not break the resolve.
+    assert _resolve_silence_sec(SimpleNamespace(cmd="prepare_silence"), cfg) == 12.0

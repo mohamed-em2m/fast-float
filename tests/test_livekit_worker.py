@@ -495,6 +495,11 @@ def test_conversation_session_wiring():
                 patch.object(ConversationalAgent, "connect", AsyncMock()) as agent_connect,
                 patch("fast_float.livekit.session.rtc") as rtc_mod,
                 patch("fast_float.core.service.run_inference_blocking", _slow_inference),
+                # The [ipc] switch is read from the shared settings.toml, not
+                # from this test's settings object. Force it off so the test
+                # exercises the builtin generator even on dual-process boxes
+                # (otherwise a real ZMQ generator would dial 127.0.0.1:5555).
+                patch("fast_float.config.dynamic.load_settings", return_value={}),
             ):
                 rtc_mod.Room.return_value = fake_room
                 session = sess.ConversationSession(

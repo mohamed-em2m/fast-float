@@ -38,10 +38,13 @@ flowchart TD
 
 When you click **"Go Live"** and the backend starts the session in [`fast_float/livekit/session.py`](file:///c:/Users/emam2/tech_projects/float-fast/fast_float/livekit/session.py):
 
-* `FloatVideoGenerator.prepare_silence()` is called **once**.
-* It runs FLOAT inference conditioning on **2 seconds (50 frames) of pure silent audio** (`0` PCM samples) with the chosen portrait.
-* The 50 output frames (which show natural, subtle breathing/idle head motion without lip movement) and silent audio slices are saved in an in-memory list: `self._silence_frames`.
+* `prepare_silence(duration_sec=...)` is called **once** on the active generator — the local GPU generator (`FloatVideoGenerator`) or the IPC generator (`ZmqFloatVideoGenerator`).
+* The duration is the `[float].livekit_silence_sec` operator setting (default 2.0 s, range 0.5–30 s).
+* The generator runs FLOAT inference conditioning on that many seconds of pure silent audio (`0` PCM samples) with the chosen portrait.
+* The output frames (which show natural, subtle breathing/idle head motion without lip movement) and silent audio slices are saved in an in-memory list: `self._silence_frames`.
 * Because it's cached in memory, **zero GPU compute** is used during silence thereafter.
+
+In the dual-process (IPC) mode the render happens in the FLOAT worker (Process 1). The worker publishes each frame over ZeroMQ with an `is_last` sentinel at the end; the backend's frame listener is the **single reader** of that socket and routes the replay into the silence bucket while the `prepare_silence` request is in flight, then the backend caches the loop locally.
 
 #### 2. Generator Loop (`__aiter__`)
 

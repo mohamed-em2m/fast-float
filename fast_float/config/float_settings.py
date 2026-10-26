@@ -11,7 +11,7 @@ tables is applied to the matching
 destination), so ``[float.ode].nfe`` sets ``opt.nfe``. Nested table names are
 only documentation; the loader flattens them. Two subtables are special:
 ``[float.request]`` feeds :func:`request_default` (the HTTP schema defaults) and
-``[float].livekit_nfe`` is read by the LiveKit renderer.
+the ``[float].livekit_*`` keys are read by the LiveKit renderer settings.
 
 Precedence (highest first):
 
@@ -67,8 +67,16 @@ _ENV_FALLBACKS: dict[str, tuple[str, type, Any]] = {
 
 #: ``[float]`` subtables that are not model options.
 _NON_OPT_TABLES = {"livekit", "request"}
-#: Top-level ``[float]`` keys that are not model options.
-_NON_OPT_KEYS = {"livekit_nfe"}
+#: Top-level ``[float]`` keys that are not model options. Everything
+#: ``livekit_*`` is read by :mod:`fast_float.livekit.settings`
+#: (``LiveKitSettings.from_env``) and must not trip the unknown-keys warning.
+_NON_OPT_KEYS = {
+    "livekit_nfe",
+    "livekit_first_chunk_sec",
+    "livekit_chunk_sec",
+    "livekit_silence_sec",
+    "livekit_max_streams",
+}
 
 #: Defaults for :class:`~fast_float.schemas.generation.GenerationRequest`
 #: fields: ``name -> (default, type, minimum, maximum, choices)``.

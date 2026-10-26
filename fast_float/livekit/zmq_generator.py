@@ -157,6 +157,16 @@ class ZmqFloatVideoGenerator:
         self._silence_frames: list[Any] = []
         self._silence_ready = asyncio.Event()
 
+        # Silence collection state. While ``_collecting`` is True the frame
+        # listener routes THIS session's gen-0 notifications into
+        # ``_silence_collected`` instead of the live queue; ``_silence_done``
+        # fires on the ``is_last`` sentinel. The SUB socket must have exactly
+        # one reader — a second receiver (e.g. an inline loop here) would steal
+        # messages from the listener and starve one side into a timeout.
+        self._collecting = False
+        self._silence_collected: list[Any] = []
+        self._silence_done = asyncio.Event()
+
         # Background tasks
         self._listener_task: asyncio.Task | None = None
         self._background_tasks: set[asyncio.Task] = set()
@@ -208,48 +218,58 @@ class ZmqFloatVideoGenerator:
     # Silence pre-rendering
     # ------------------------------------------------------------------
 
-    async def prepare_silence(self) -> None:
+    async def prepare_silence(self, duration_sec: float = 2.0) -> None:
         """Ask the worker to pre-render a silence loop and cache the frames.
 
         Must be called once per session before the first ``push_audio()`` /
-        ``__aiter__`` usage to populate ``_silence_frames``.
+        ``__aiter__`` usage to populate ``_silence_frames``. Idempotent — a
+        repeated call after a successful prepare is a no-op.
+
+        ``duration_sec`` is the idle-loop length the worker renders. Frames
+        arriving while the request is in flight are collected by the frame
+        listener (the SUB socket's single reader): collection mode is switched
+        on BEFORE the request is sent, so no notification can be misrouted.
         """
         await self._ensure_connected()
-
-        req = IPCRequest(
-            cmd="prepare_silence",
-            session_id=self._session_id,
-            req_id=str(uuid.uuid4()),
-            ref_image_path=self._ref_image_path,
-            gen=0,
-        )
-        resp = await self._send_request(req)
-        if resp.status != "ok":
-            logger.warning("[zmq-gen] prepare_silence failed: %s", resp.error_msg)
+        if self._silence_ready.is_set():
             return
 
-        # Collect the published frames.
-        silence_frames: list[Any] = []
-        for _ in range(resp.total_frames + 1):  # +1 for the is_last sentinel
-            try:
-                raw = await asyncio.wait_for(self._sub_sock.recv_string(), timeout=30.0)
-            except TimeoutError:
-                logger.warning("[zmq-gen] timeout waiting for silence frame")
-                break
-            notif = IPCFrameNotification.from_json(raw)
-            if notif.is_last:
-                break
-            if self._ring is None:
-                continue
-            _, _, img_arr, audio_bytes = self._ring.read_frame(notif.slot_idx)
-            vf = _make_video_frame(img_arr)
-            af = _make_audio_frame(audio_bytes)
-            if vf is not None and af is not None:
-                silence_frames.append((vf, af))
+        self._silence_collected.clear()
+        self._silence_done.clear()
+        self._collecting = True
+        try:
+            req = IPCRequest(
+                cmd="prepare_silence",
+                session_id=self._session_id,
+                req_id=str(uuid.uuid4()),
+                ref_image_path=self._ref_image_path,
+                gen=0,
+                duration_sec=max(0.0, float(duration_sec or 0.0)),
+            )
+            resp = await self._send_request(req)
+            if resp.status != "ok":
+                logger.warning("[zmq-gen] prepare_silence failed: %s", resp.error_msg)
+                return
 
-        self._silence_frames = silence_frames
+            # The ``is_last`` sentinel (published by the worker) fires
+            # ``_silence_done`` through the frame listener.
+            # NOTE: catch ``asyncio.TimeoutError``, *not* the builtin
+            # ``TimeoutError`` — they are distinct classes on Python 3.10, so
+            # ``except TimeoutError`` would let the session restart crash.
+            try:
+                await asyncio.wait_for(self._silence_done.wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[zmq-gen] timeout waiting for silence frames (got %d/%d)",
+                    len(self._silence_collected),
+                    resp.total_frames,
+                )
+        finally:
+            self._collecting = False
+
+        self._silence_frames = list(self._silence_collected)
         self._silence_ready.set()
-        logger.info("[zmq-gen] %d silence frames cached", len(silence_frames))
+        logger.info("[zmq-gen] %d silence frames cached", len(self._silence_frames))
 
     # ------------------------------------------------------------------
     # Audio input
@@ -336,8 +356,24 @@ class ZmqFloatVideoGenerator:
     # Frame listener (background async task)
     # ------------------------------------------------------------------
 
+    def _read_frame_pair(self, notif: IPCFrameNotification) -> tuple[Any, Any] | None:
+        """Load a (VideoFrame, AudioFrame) pair for a notification from SHM."""
+        if self._ring is None:
+            return None
+        _, _, img_arr, audio_bytes = self._ring.read_frame(notif.slot_idx)
+        vf = _make_video_frame(img_arr)
+        af = _make_audio_frame(audio_bytes)
+        if vf is None or af is None:
+            return None
+        return vf, af
+
     async def _frame_listener(self) -> None:
-        """Receive IPCFrameNotifications from the PUB socket and enqueue frames."""
+        """Receive IPCFrameNotifications from the PUB socket and enqueue frames.
+
+        Sole consumer of ``_sub_sock`` — a second reader would siphon off
+        messages nondeterministically, e.g. swallow the ``is_last`` sentinel
+        that ends silence pre-rendering.
+        """
         while True:
             try:
                 raw = await self._sub_sock.recv_string()
@@ -354,25 +390,33 @@ class ZmqFloatVideoGenerator:
             # Skip notifications from other sessions.
             if notif.session_id != self._session_id:
                 continue
+
+            # Silence pre-render: while collecting, route the worker's gen-0
+            # replay into the silence bucket instead of the live queue.
+            if self._collecting and notif.gen == 0:
+                if notif.is_last:
+                    self._collecting = False
+                    self._silence_done.set()
+                    continue
+                pair = self._read_frame_pair(notif)
+                if pair is not None:
+                    self._silence_collected.append(pair)
+                continue
+
             if notif.is_last:
                 continue
 
-            if self._ring is None:
-                continue
-
-            _, _, img_arr, audio_bytes = self._ring.read_frame(notif.slot_idx)
-            vf = _make_video_frame(img_arr)
-            af = _make_audio_frame(audio_bytes)
-            if vf is None or af is None:
+            pair = self._read_frame_pair(notif)
+            if pair is None:
                 continue
 
             try:
-                self._frame_queue.put_nowait((vf, af))
+                self._frame_queue.put_nowait(pair)
             except asyncio.QueueFull:
                 # Drop the oldest to maintain latency.
                 with contextlib.suppress(asyncio.QueueEmpty):
                     self._frame_queue.get_nowait()
-                self._frame_queue.put_nowait((vf, af))
+                self._frame_queue.put_nowait(pair)
 
     # ------------------------------------------------------------------
     # AsyncIterator — yields (VideoFrame, AudioFrame) pairs
