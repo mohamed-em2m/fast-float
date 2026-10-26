@@ -66,21 +66,37 @@
 
 html {
   color-scheme: dark;
+  background-color: var(--bg-dark);
 }
 
 body {
   font-family: var(--font-sans);
-  background-color: var(--bg-dark);
+  /* Painted by .app-shell::before so the gradient is a fixed layer. */
+  background-color: transparent;
   color: var(--text-main);
   min-height: 100vh;
   overflow-x: hidden;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+}
+
+/*
+ * The ambient gradient used to be `background-attachment: fixed` on <body>,
+ * which forces a full-viewport repaint on every scroll frame. A fixed,
+ * non-interactive layer behind the app paints the same picture once and is
+ * then composited, so scrolling stays cheap.
+ */
+.app-shell::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-color: var(--bg-dark);
   background-image:
     radial-gradient(circle at 12% 6%, rgba(109, 124, 255, 0.11) 0%, transparent 38%),
     radial-gradient(circle at 88% 10%, rgba(45, 212, 232, 0.075) 0%, transparent 34%),
     radial-gradient(circle at 55% 100%, rgba(255, 107, 138, 0.055) 0%, transparent 42%);
-  background-attachment: fixed;
 }
 
 ::selection {

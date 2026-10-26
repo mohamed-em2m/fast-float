@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback, lazy, Suspense } from 'react';
 import { CheckCircle2, Info, TriangleAlert, X } from 'lucide-react';
 import Header from './components/Header';
 import OfflineBanner from './components/OfflineBanner';
@@ -7,12 +7,22 @@ import AudioEngine from './components/AudioEngine';
 import ParameterControls from './components/ParameterControls';
 import StudioStage from './components/StudioStage';
 import InsightsPanel from './components/InsightsPanel';
-import LiveAudioStudio from './components/LiveAudioStudio';
-import { generateVideo, blobToBase64, alignUrlToApi, fetchProgress } from './services/api';
+import { generateVideo, blobToBase64, alignUrlToApi } from './services/api';
 import { getStored, setStored } from './services/storage';
 
+// The live workspace pulls in the whole livekit-client SDK. Loading it on
+// demand keeps the initial Studio bundle (portrait, audio, parameters) small;
+// users who never open Live never download it.
+const LiveAudioStudio = lazy(() => import('./components/LiveAudioStudio'));
+
+// Static siblings only change when their own props change (portrait, params,
+// audio, result), not when a toast or an unrelated mode flag changes.
+const MemoPortraitCanvas = React.memo(PortraitCanvas);
+const MemoAudioEngine = React.memo(AudioEngine);
+const MemoParameterControls = React.memo(ParameterControls);
+const MemoInsightsPanel = React.memo(InsightsPanel);
+
 const DEFAULT_PORTRAIT = '/samples/portrait1.jpg';
-const PROGRESS_POLL_MS = 1000;
 const MODE_KEY = 'float_mode';
 
 const TOAST_ICON = {
@@ -55,7 +65,10 @@ export default function App() {
 
   // Generation & Output State
   const [isGenerating, setIsGenerating] = useState(false);
-  const [progress, setProgress] = useState(null);
+  // Only the request id lives here; the polling timer and the progress value
+  // live inside StudioStage, so a 1 Hz progress update does not re-render the
+  // portrait/audio/parameter panels.
+  const [progressRequestId, setProgressRequestId] = useState(null);
   const [generationResult, setGenerationResult] = useState(null);
   const [generationError, setGenerationError] = useState(null);
   const [history, setHistory] = useState([]);
@@ -63,29 +76,18 @@ export default function App() {
   // 'auto' streams the finished file; live transports stream frames live.
   const [transport, setTransport] = useState('auto');
   const [liveRequestId, setLiveRequestId] = useState(null);
-  const progressTimerRef = useRef(null);
   const toastTimerRef = useRef(null);
-
-  const stopProgressPolling = () => {
-    if (progressTimerRef.current) {
-      clearInterval(progressTimerRef.current);
-      progressTimerRef.current = null;
-    }
-  };
-
-  // Clear any in-flight progress polling on unmount.
-  useEffect(() => stopProgressPolling, []);
 
   useEffect(() => {
     setStored(MODE_KEY, mode);
   }, [mode]);
 
-  const showToast = (message, type = 'info') => {
+  const showToast = useCallback((message, type = 'info') => {
     if (!message) return;
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     setToast({ message, type });
     toastTimerRef.current = setTimeout(() => setToast(null), 4500);
-  };
+  }, []);
 
   useEffect(() => () => {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
@@ -126,22 +128,14 @@ export default function App() {
 
     setIsGenerating(true);
     setGenerationError(null);
-    // A client id lets us poll /progress while the long POST is still open.
+    // A client id lets StudioStage poll /progress while the long POST is open.
     const clientRequestId =
       (typeof crypto !== 'undefined' && crypto.randomUUID)
         ? crypto.randomUUID()
         : `c${Date.now()}${Math.random().toString(16).slice(2)}`;
-    setProgress({ status: 'queued', stage: 'queued', percent: 0, completed_chunks: 0, total_chunks: 0 });
+    setProgressRequestId(clientRequestId);
     const live = transport !== 'mp4';
     setLiveRequestId(live ? clientRequestId : null);
-    stopProgressPolling();
-    const timer = setInterval(async () => {
-      const p = await fetchProgress(clientRequestId);
-      // Ignore a poll that resolved after the request finished/unmounted.
-      if (progressTimerRef.current !== timer) return;
-      if (p) setProgress(p);
-    }, PROGRESS_POLL_MS);
-    progressTimerRef.current = timer;
 
     try {
       const payload = {
@@ -185,8 +179,7 @@ export default function App() {
       // A failed live request must not leave a dead preview attached.
       if (live) setLiveRequestId(null);
     } finally {
-      stopProgressPolling();
-      setProgress(null);
+      setProgressRequestId(null);
       setIsGenerating(false);
       // Keep `liveRequestId` until the live transport reports 'done': a
       // real-time stream is still playing the frames buffered during render.
@@ -194,7 +187,7 @@ export default function App() {
   };
 
   const portraitCard = (
-    <PortraitCanvas
+    <MemoPortraitCanvas
       imagePreview={imagePreview}
       setImagePreview={setImagePreview}
       setImageBase64={setImageBase64}
@@ -233,20 +226,29 @@ export default function App() {
       <OfflineBanner />
 
       {mode === 'live' ? (
-        <LiveAudioStudio
-          imagePreview={imagePreview}
-          imageBase64={imageBase64}
-          imageFormat={imageFormat}
-          onToast={showToast}
-          onOpenStudio={() => setMode('studio')}
-          portraitPicker={portraitCard}
-        />
+        <Suspense
+          fallback={(
+            <div className="mode-loading" role="status" aria-live="polite">
+              <span className="spinner-dot animate-spin" />
+              <span>Loading the live studio…</span>
+            </div>
+          )}
+        >
+          <LiveAudioStudio
+            imagePreview={imagePreview}
+            imageBase64={imageBase64}
+            imageFormat={imageFormat}
+            onToast={showToast}
+            onOpenStudio={() => setMode('studio')}
+            portraitPicker={portraitCard}
+          />
+        </Suspense>
       ) : (
         <main className="studio-workspace">
           <aside className="studio-composer">
             {portraitCard}
 
-            <AudioEngine
+            <MemoAudioEngine
               audioBlob={audioBlob}
               setAudioBlob={setAudioBlob}
               audioBase64={audioBase64}
@@ -256,7 +258,7 @@ export default function App() {
               onToast={showToast}
             />
 
-            <ParameterControls params={params} setParams={setParams} step={3} />
+            <MemoParameterControls params={params} setParams={setParams} step={3} />
           </aside>
 
           <div className="studio-stage-column">
@@ -264,7 +266,7 @@ export default function App() {
               onGenerate={handleGenerate}
               onRetry={handleGenerate}
               isGenerating={isGenerating}
-              progress={progress}
+              progressRequestId={progressRequestId}
               generationError={generationError}
               generationResult={generationResult}
               hasAudio={Boolean(audioBase64)}
@@ -275,7 +277,7 @@ export default function App() {
               imagePreview={imagePreview}
             />
 
-            <InsightsPanel
+            <MemoInsightsPanel
               latestResult={generationResult}
               history={history}
               onToast={showToast}

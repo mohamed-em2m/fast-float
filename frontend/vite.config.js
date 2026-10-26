@@ -37,6 +37,13 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [react()],
+    build: {
+      // The LiveKit SDK is a dedicated, lazily-loaded chunk (~535 kB) that only
+      // users of the live transports fetch; the initial Studio chunk is ~320 kB.
+      // The warning is about the initial payload, so set the limit just above
+      // the SDK chunk instead of splitting a vendor library arbitrarily.
+      chunkSizeWarningLimit: 600,
+    },
     server: {
       port: frontendPort,
       allowedHosts: true,

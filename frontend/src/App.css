@@ -3299,3 +3299,14 @@
   flex-wrap: wrap;
   gap: 10px;
 }
+
+/* Suspense fallback while the live workspace chunk loads on demand. */
+.mode-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 40vh;
+  color: var(--text-muted);
+  font-size: 13.5px;
+}

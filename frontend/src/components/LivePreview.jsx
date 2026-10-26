@@ -63,24 +63,31 @@ export default function LivePreview({ requestId, transport, onStatus, onFallback
       let sawMeta = false;
       const WS_CONNECT_TIMEOUT_MS = 15000;
       let connectTimer = null;
+      // Frame buffers are reused across frames: at 512x512 a fresh RGBA buffer
+      // plus ImageData per frame allocated ~1 MB at 25 fps and kept the GC busy.
+      let frameBuffer = null;
+      let frameImage = null;
       const draw = ({ bytes }) => {
         const canvas = canvasRef.current;
         if (!canvas || !meta) return;
         const { width, height, channels } = meta;
         const ctx = canvas.getContext('2d');
-        if (channels === 4) {
-          ctx.putImageData(new ImageData(new Uint8ClampedArray(bytes), width, height), 0, 0);
-          return;
-        }
         const pixels = width * height;
-        const rgba = new Uint8ClampedArray(pixels * 4);
-        for (let i = 0, j = 0; i < pixels; i += 1, j += 3) {
-          rgba[i * 4] = bytes[j];
-          rgba[i * 4 + 1] = bytes[j + 1];
-          rgba[i * 4 + 2] = bytes[j + 2];
-          rgba[i * 4 + 3] = 255;
+        if (!frameBuffer || frameBuffer.length !== pixels * 4) {
+          frameBuffer = new Uint8ClampedArray(pixels * 4);
+          frameImage = new ImageData(frameBuffer, width, height);
         }
-        ctx.putImageData(new ImageData(rgba, width, height), 0, 0);
+        if (channels === 4) {
+          frameBuffer.set(bytes.subarray(0, pixels * 4));
+        } else {
+          for (let i = 0, j = 0, k = 0; i < pixels; i += 1, j += 3, k += 4) {
+            frameBuffer[k] = bytes[j];
+            frameBuffer[k + 1] = bytes[j + 1];
+            frameBuffer[k + 2] = bytes[j + 2];
+            frameBuffer[k + 3] = 255;
+          }
+        }
+        ctx.putImageData(frameImage, 0, 0);
       };
 
       const failSocket = (reason) => {

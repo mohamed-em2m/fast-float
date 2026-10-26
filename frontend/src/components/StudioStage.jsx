@@ -1,4 +1,4 @@
-import React, { useCallback, useRef, useState, useEffect } from 'react';
+import React, { Suspense, lazy, useCallback, useRef, useState, useEffect } from 'react';
 import {
   Download,
   Film,
@@ -13,10 +13,23 @@ import {
   Wand2,
   Zap,
 } from 'lucide-react';
-import { getApiUrl, setIceServers } from '../services/api';
+import { fetchProgress, getApiUrl, setIceServers } from '../services/api';
 import { copyText } from '../services/clipboard';
 import { useBackendStatus } from '../services/telemetry';
-import LivePreview from './LivePreview';
+
+// The live preview imports the LiveKit SDK; load it only when a generation
+// actually uses a live transport, so the first paint of the Studio stays light.
+const LivePreview = lazy(() => import('./LivePreview'));
+
+const PROGRESS_POLL_MS = 1000;
+
+const INITIAL_PROGRESS = Object.freeze({
+  status: 'queued',
+  stage: 'queued',
+  percent: 0,
+  completed_chunks: 0,
+  total_chunks: 0,
+});
 
 /** Friendly copy for the backend's machine-readable progress stages. */
 const STAGE_LABELS = {
@@ -53,7 +66,7 @@ export default function StudioStage({
   onGenerate,
   onRetry,
   isGenerating,
-  progress,
+  progressRequestId = null,
   generationError = null,
   generationResult,
   hasAudio,
@@ -63,6 +76,7 @@ export default function StudioStage({
   liveRequestId,
   imagePreview,
 }) {
+  const [progress, setProgress] = useState(null);
   const [isDownloading, setIsDownloading] = useState(false);
   const [endedLiveRequestId, setEndedLiveRequestId] = useState(null);
   const [clockNow, setClockNow] = useState(() => Date.now());
@@ -86,6 +100,59 @@ export default function StudioStage({
     const timer = setInterval(() => setClockNow(Date.now()), 1000);
     return () => clearInterval(timer);
   }, [isGenerating]);
+
+  // Progress polling lives here (not in App) so a 1 Hz update re-renders only
+  // the stage. Polls stop while the tab is hidden — a background tab should
+  // not keep hitting a busy GPU server — and resume on return.
+  useEffect(() => {
+    if (!progressRequestId || !isGenerating) {
+      setProgress(null);
+      return undefined;
+    }
+    let cancelled = false;
+    let timer = null;
+    let inFlight = false;
+    setProgress(INITIAL_PROGRESS);
+
+    const tick = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        const next = await fetchProgress(progressRequestId);
+        if (!cancelled && next) setProgress(next);
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const schedule = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      if (cancelled || document.hidden) return;
+      timer = setTimeout(async () => {
+        await tick();
+        schedule();
+      }, PROGRESS_POLL_MS);
+    };
+
+    tick().then(schedule, schedule);
+
+    const onVisibility = () => {
+      if (document.hidden) {
+        if (timer) clearTimeout(timer);
+        timer = null;
+        return;
+      }
+      tick().then(schedule, schedule);
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [progressRequestId, isGenerating]);
 
   // Feed the deployment's ICE list to the raw WebRTC transport as soon as the
   // shared poller publishes it.
@@ -318,13 +385,24 @@ export default function StudioStage({
 
       <div className={`stage-viewport ${isGenerating ? 'is-generating' : ''}`}>
         {showLivePreview ? (
-          <LivePreview
-            requestId={livePreviewRequestId}
-            transport={activeTransport}
-            onStatus={(message) => onToast?.(message || 'Live stream ended', 'error')}
-            onFallback={handleLiveFallback}
-            onEnded={(id) => setEndedLiveRequestId(id ?? livePreviewRequestId)}
-          />
+          <Suspense
+            fallback={(
+              <div className="stage-empty">
+                <div className="stage-empty-copy">
+                  <h3>Connecting the live preview…</h3>
+                  <p>The MP4 appears here automatically when the render finishes.</p>
+                </div>
+              </div>
+            )}
+          >
+            <LivePreview
+              requestId={livePreviewRequestId}
+              transport={activeTransport}
+              onStatus={(message) => onToast?.(message || 'Live stream ended', 'error')}
+              onFallback={handleLiveFallback}
+              onEnded={(id) => setEndedLiveRequestId(id ?? livePreviewRequestId)}
+            />
+          </Suspense>
         ) : showResult && videoUrl ? (
           <video
             key={videoUrl}
