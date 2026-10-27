@@ -64,6 +64,15 @@ from livekit.agents.voice.avatar import DataStreamAudioOutput
 from livekit.agents.voice.room_io import RoomOptions
 from livekit.plugins import google
 
+try:
+    # Not re-exported by the plugin package; guarded so a plugin layout change
+    # degrades to the stock session instead of breaking the worker import.
+    from livekit.plugins.google.realtime.realtime_api import (
+        RealtimeSession as _GoogleRealtimeSession,
+    )
+except Exception:  # pragma: no cover - depends on the installed plugin layout
+    _GoogleRealtimeSession = None
+
 from fast_float.livekit.gemini.config import AgentConfig, dispatch_config, sanitize_gemini_model
 from fast_float.livekit.gemini.tools import FloatApi
 
@@ -193,6 +202,61 @@ async def _genai_ssl_context() -> ssl.SSLContext:
     return _GENAI_SSL_CONTEXT
 
 
+# Gemini Live can drop an established session with 1011 ("internal error") and
+# the plugin retries automatically. Its retry reuses the session-resumption
+# handle from the session that just died; Google answers that with 1008
+# "BidiGenerateContent session not found or expired" during connect, which the
+# plugin cannot retry (no session exists yet) and surfaces as fatal — the whole
+# AgentSession shuts down even though a fresh session would have worked.
+# Retrying with a fresh session is safe: the plugin replays the chat history
+# into the new connection, so only the dead handle is lost.
+_STALE_SESSION_MARKERS = ("1011", "1008", "session not found or expired")
+
+
+def _is_stale_session_error(error: BaseException | None) -> bool:
+    """True when ``error`` means the resumption handle can no longer be used."""
+    if error is None:
+        return False
+    if getattr(error, "code", None) in (1008, 1011):
+        return True
+    message = str(error).lower()
+    return any(marker in message for marker in _STALE_SESSION_MARKERS)
+
+
+def _resilient_session_class(base: type) -> type:
+    class _FreshRetryRealtimeSession(base):
+        def _mark_restart_needed(self, on_error: bool = False) -> None:
+            if on_error and _is_stale_session_error(getattr(self, "_session_error", None)):
+                logger.warning(
+                    "Gemini Live session expired (%s); discarding its resumption handle "
+                    "and reconnecting with a fresh session",
+                    self._session_error,
+                )
+                self._session_resumption_handle = None
+                self._resumption_chat_ctx = None
+            super()._mark_restart_needed(on_error)
+
+    return _FreshRetryRealtimeSession
+
+
+def _resilient_model_class(base: type, session_base: type) -> type:
+    """Subclass ``base`` so restarts after a dead session start fresh.
+
+    ``base`` is passed in (rather than subclassed at import time) so the class
+    follows whatever ``google.realtime.RealtimeModel`` is active when the model
+    is built, including the one tests monkeypatch.
+    """
+    fresh_session = _resilient_session_class(session_base)
+
+    class _FreshRetryRealtimeModel(base):
+        def session(self, *, turn_detection_disabled: bool = False):
+            sess = fresh_session(self)
+            self._sessions.add(sess)
+            return sess
+
+    return _FreshRetryRealtimeModel
+
+
 def _build_realtime_model(
     api_key: str | None = None, model: str | None = None, ssl_ctx: ssl.SSLContext | None = None
 ) -> google.realtime.RealtimeModel:
@@ -261,7 +325,10 @@ def _build_realtime_model(
             client_args={"verify": ssl_ctx},
             async_client_args={"verify": ssl_ctx, "ssl": ssl_ctx},
         )
-    return google.realtime.RealtimeModel(**kwargs)  # type: ignore[arg-type]
+    model_cls = google.realtime.RealtimeModel
+    if _GoogleRealtimeSession is not None:
+        model_cls = _resilient_model_class(model_cls, _GoogleRealtimeSession)
+    return model_cls(**kwargs)
 
 
 @server.rtc_session(agent_name=config.agent_name)
