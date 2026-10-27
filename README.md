@@ -409,6 +409,15 @@ fallbacks only for keys the file omits.
 |---|---|---|
 | `FLOAT_LOG_LEVEL` | unset | Explicit log level |
 | `FLOAT_DEBUG` / `FLOAT_TIMING` | unset | Per-call timing and debug lines |
+| `FLOAT_LOG_DIR` | `<repo>/logs` | Per-process JSONL logs (`api.log`, `worker.log`, ...) |
+| `FLOAT_LOG_FILE` | `<role>.log` | Override the file name/path (`none` disables) |
+| `FLOAT_LOG_TO_FILE` / `FLOAT_LOG_CONSOLE` | `true` | Toggle the file / console sink |
+| `FLOAT_LOG_JSON` | `true` | JSONL file (`false` = text) |
+| `FLOAT_LOG_SHARED` | `false` | One locked file for several processes (no rotation) |
+| `FLOAT_LOG_TEE` | `1` | Supervisor/scripts also write `logs/combined.log` |
+
+See [docs/LOGGING.md](docs/LOGGING.md) for roles, request correlation, rotation,
+redaction and `jq` recipes.
 
 ---
 

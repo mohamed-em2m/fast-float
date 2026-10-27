@@ -76,6 +76,7 @@ except Exception:  # pragma: no cover - depends on the installed plugin layout
 
 from fast_float.livekit.gemini.config import AgentConfig, dispatch_config, sanitize_gemini_model
 from fast_float.livekit.gemini.tools import FloatApi
+from fast_float.logging_utils import configure_logging, current_log_file
 
 logger = logging.getLogger("float_gemini")
 
@@ -275,9 +276,7 @@ def _resilient_session_class(base: type) -> type:
             # watchdog alongside it so a long pause never leaves a dead socket in
             # front of the next utterance.
             self._note_turn_activity()
-            watchdog = asyncio.create_task(
-                self._idle_refresh_watchdog(), name="gemini-idle-refresh"
-            )
+            watchdog = asyncio.create_task(self._idle_refresh_watchdog(), name="gemini-idle-refresh")
             try:
                 await super()._main_task()
             finally:
@@ -506,14 +505,19 @@ def main() -> None:
     # process is running with. worker_started fires even when registration
     # then fails; the SDK's "registered worker" line confirms the handshake.
     def _log_startup(*_args: object) -> None:
+        # run_app() installs the SDK's handlers before this event fires; attach
+        # ours afterwards so they are not replaced (and so pre-run logs are
+        # not dropped).
+        configure_logging(role="agent")
         logger.info(
-            "worker starting: agent_name=%s url=%s config_dir=%s livekit_credentials=%s gemini_key=%s model=%s",
+            "worker starting: agent_name=%s url=%s config_dir=%s livekit_credentials=%s gemini_key=%s model=%s log_file=%s",
             config.agent_name,
             config.livekit_url or "<missing>",
             config.config_dir,
             bool(config.livekit_url and config.livekit_api_key and config.livekit_api_secret),
             bool(config.google_api_key),
             config.model or "<plugin default>",
+            current_log_file() or "console only",
         )
 
     server.on("worker_started", _log_startup)

@@ -39,6 +39,20 @@ export VITE_API_URL="${VITE_API_URL:-http://localhost:${PORT}}"
 export CORS_ORIGINS="${CORS_ORIGINS:-http://localhost:${FRONTEND_PORT},http://127.0.0.1:${FRONTEND_PORT}}"
 export NGPUS="${NGPUS:-1}"
 export PYTHONUNBUFFERED=1
+# Keep child logs UTF-8 (the console capture decodes UTF-8) so emojis in log
+# lines do not raise UnicodeEncodeError when stdout is a pipe.
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+
+# --- Logging ------------------------------------------------------------------
+# One rotating JSONL file per process (logs/worker.log, logs/api.log, ...) plus
+# an optional interleaved human-readable timeline. This script's stdout is the
+# single writer for combined.log, so no cross-process file lock is needed.
+export FLOAT_LOG_DIR="${FLOAT_LOG_DIR:-${PROJECT_ROOT}/logs}"
+mkdir -p "${FLOAT_LOG_DIR}"
+case "${FLOAT_LOG_TEE:-1}" in
+    0|false|no|off) ;;
+    *) exec > >(tee -a "${FLOAT_LOG_DIR}/combined.log") 2>&1 ;;
+esac
 
 # --- LiveKit SFU (live-transport preview) -------------------------------------
 LIVEKIT_START="${LIVEKIT_START:-auto}"
@@ -135,7 +149,7 @@ elif gemini_worker_ready; then
         AGENT_PID=""
     else
         echo "🤖 Starting Gemini Live worker..."
-        uv run --frozen --no-sync python -m fast_float.livekit.gemini.agent start 2>&1 \
+        FLOAT_PROCESS_ROLE=agent uv run --frozen --no-sync python -m fast_float.livekit.gemini.agent start 2>&1 \
             | sed -u 's/^/[agent] /' &
         AGENT_PID=$!
     fi
@@ -177,7 +191,7 @@ fi
 # --- Process 1: FLOAT GPU Inference Worker -----------------------------------
 echo "🧠 Starting Process 1: FLOAT GPU Inference Worker (ZeroMQ + Shared Memory)..."
 echo "   (tcp://127.0.0.1:${FLOAT_ZMQ_CONTROL_PORT} ctrl, tcp://127.0.0.1:${FLOAT_ZMQ_FRAMES_PORT} frames)"
-uv run "${UV_ENV_ARGS[@]}" --frozen --no-sync python -m fast_float.workers.inference_worker 2>&1 \
+FLOAT_PROCESS_ROLE=worker uv run "${UV_ENV_ARGS[@]}" --frozen --no-sync python -m fast_float.workers.inference_worker 2>&1 \
     | sed -u 's/^/[worker] /' &
 WORKER_PID=$!
 
@@ -186,9 +200,11 @@ sleep 2
 
 # --- Process 2: Streaming Backend (FastAPI / LiveKit) -------------------------
 echo "🚀 Starting Process 2: Streaming Backend → http://localhost:${PORT} (docs: http://localhost:${PORT}/docs)"
-HYPERCORN_STARTUP_TIMEOUT=1200 uv run "${UV_ENV_ARGS[@]}" --frozen --no-sync hypercorn fast_float.main:app \
+FLOAT_PROCESS_ROLE=api HYPERCORN_STARTUP_TIMEOUT=1200 uv run "${UV_ENV_ARGS[@]}" --frozen --no-sync hypercorn fast_float.main:app \
     --bind "0.0.0.0:${PORT}" \
     --worker-class asyncio \
+    --log-config "json:${PROJECT_ROOT}/config/logging.json" \
+    --access-logfile - \
     --log-level info 2>&1 | sed -u 's/^/[api] /' &
 BACKEND_PID=$!
 
@@ -203,6 +219,7 @@ echo "   - GPU Worker PID:        ${WORKER_PID}"
 echo "   - Backend API PID:       ${BACKEND_PID}"
 echo "   - Studio Frontend PID:   ${FRONTEND_PID}"
 [ -n "${AGENT_PID}" ] && echo "   - Gemini Worker PID:     ${AGENT_PID}"
+echo "   - Logs:                  ${FLOAT_LOG_DIR} (api.log, worker.log, combined.log)"
 echo ""
 echo "   Open http://localhost:${FRONTEND_PORT} in your browser. Press Ctrl+C to stop all."
 echo ""

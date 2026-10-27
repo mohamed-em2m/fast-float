@@ -51,6 +51,8 @@ from typing import Any
 
 import numpy as np
 
+from fast_float.logging_utils import configure_logging, current_log_file, log_context
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -343,7 +345,12 @@ class InferenceWorker:
                 continue
 
             try:
-                resp = self._handle(req, pub)
+                with log_context(
+                    req_id=req.req_id,
+                    session_id=req.session_id,
+                    gen=getattr(req, "gen", 0),
+                ):
+                    resp = self._handle(req, pub)
             except Exception as exc:
                 logger.exception("[worker] unhandled error during %s", req.cmd)
                 resp = IPCResponse(
@@ -608,10 +615,8 @@ def _build_cfg():
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    configure_logging(role="worker")
+    logger.info("[worker] logging: file=%s", current_log_file())
 
     # Read IPC settings from env / defaults.
     control_port = int(os.environ.get("FLOAT_ZMQ_CONTROL_PORT", DEFAULT_CONTROL_PORT))

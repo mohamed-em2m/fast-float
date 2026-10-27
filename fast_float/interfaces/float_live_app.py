@@ -47,10 +47,10 @@ from pathlib import Path
 # logging during its import, we re-attach via setup_logger() which uses
 # propagate=False — making our named logger immune to root-logger rewiring.
 try:
-    from fast_float.utils.logger import set_log_level, setup_logger
+    from fast_float.utils.logger import configure_logging, set_log_level, setup_logger
 except ImportError:
     try:
-        from utils.logger import set_log_level, setup_logger
+        from utils.logger import configure_logging, set_log_level, setup_logger
     except ImportError:
         # Fallback: self-contained logger that doesn't rely on the root logger.
         def setup_logger(name="float_fast", **_):
@@ -68,6 +68,9 @@ except ImportError:
             _log.propagate = False
             return _log
 
+        def configure_logging(**_kwargs):
+            return logging.INFO
+
         def set_log_level(level):
             logging.getLogger().setLevel(level)
 
@@ -78,6 +81,7 @@ import soundfile as sf
 
 # Re-create the logger AFTER gradio is imported so our handler is attached
 # last and propagate=False keeps it safe from any further root-logger changes.
+configure_logging(role="gradio", extra_loggers=("float_live_app",), force=True)
 logger = setup_logger("float_live_app")
 
 try:

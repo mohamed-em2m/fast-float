@@ -39,6 +39,16 @@ export CORS_ORIGINS="${CORS_ORIGINS:-http://localhost:${FRONTEND_PORT},http://12
 export NGPUS="${NGPUS:-1}"
 # Unbuffered Python so backend errors appear in the combined log immediately.
 export PYTHONUNBUFFERED=1
+# Keep child logs UTF-8 (the console capture decodes UTF-8).
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+
+# --- Logging ------------------------------------------------------------------
+export FLOAT_LOG_DIR="${FLOAT_LOG_DIR:-${PROJECT_ROOT}/logs}"
+mkdir -p "${FLOAT_LOG_DIR}"
+case "${FLOAT_LOG_TEE:-1}" in
+    0|false|no|off) ;;
+    *) exec > >(tee -a "${FLOAT_LOG_DIR}/combined.log") 2>&1 ;;
+esac
 
 # --- LiveKit SFU (live-transport preview) -------------------------------------
 # The backend reads LIVEKIT_URL/KEY/SECRET (LiveKitSettings.from_env) from the
@@ -158,7 +168,7 @@ elif gemini_worker_ready; then
         AGENT_PID=""
     else
         echo "🤖 Starting Gemini Live worker (separate process, shared config)..."
-        uv run --frozen --no-sync python -m fast_float.livekit.gemini.agent start 2>&1 \
+        FLOAT_PROCESS_ROLE=agent uv run --frozen --no-sync python -m fast_float.livekit.gemini.agent start 2>&1 \
             | sed -u 's/^/[agent] /' &
         AGENT_PID=$!
     fi
@@ -228,9 +238,11 @@ UV_ENV_ARGS=()
 if [ -f "${PROJECT_ROOT}/.env" ]; then
     UV_ENV_ARGS=(--env-file "${PROJECT_ROOT}/.env")
 fi
-HYPERCORN_STARTUP_TIMEOUT=1200 uv run "${UV_ENV_ARGS[@]}" --frozen --no-sync hypercorn fast_float.main:app \
+FLOAT_PROCESS_ROLE=api HYPERCORN_STARTUP_TIMEOUT=1200 uv run "${UV_ENV_ARGS[@]}" --frozen --no-sync hypercorn fast_float.main:app \
     --bind "0.0.0.0:${PORT}" \
     --worker-class asyncio \
+    --log-config "json:${PROJECT_ROOT}/config/logging.json" \
+    --access-logfile - \
     --log-level info 2>&1 | sed -u 's/^/[api] /' &
 
 BACKEND_PID=$!

@@ -278,3 +278,22 @@ zmq_control_endpoint = "tcp://127.0.0.1:5555"
 zmq_frames_endpoint = "tcp://127.0.0.1:5556"
 shm_name = "float_frame_ring"
 shm_ring_size = 64
+
+[logging]
+# Operator defaults for fast_float.logging_utils. Environment variables win
+# (FLOAT_LOG_LEVEL / FLOAT_LOG_DIR / FLOAT_LOG_FILE / FLOAT_LOG_JSON /
+# FLOAT_LOG_CONSOLE / FLOAT_LOG_TO_FILE / FLOAT_LOG_MAX_BYTES /
+# FLOAT_LOG_BACKUPS / FLOAT_LOG_RATE_LIMIT / FLOAT_LOG_UNIFY_SERVERS);
+# see docs/LOGGING.md. Empty values mean "use the built-in default".
+#
+# One rotating JSONL file per process: logs/<role>.log (api, worker, agent...).
+# The console stays human-readable; FLOAT_LOG_JSON=false writes the file as text.
+level = ""            # "" -> FLOAT_LOG_LEVEL -> FLOAT_DEBUG -> INFO
+dir = ""              # "" -> <repo>/logs
+file = true           # false -> console only
+json = true           # JSONL file; false -> text file
+console = true        # false -> file only
+max_bytes = 52428800  # 50 MiB per file
+backup_count = 5      # keep 5 rotated files
+rate_limit = true     # collapse repeated console warnings (file keeps all)
+unify_servers = true  # hypercorn/uvicorn logs use the app format

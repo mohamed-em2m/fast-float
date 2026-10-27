@@ -25,6 +25,16 @@ from fast_float.initialize_env import initialize_environment, initialize_onnx_li
 initialize_environment()
 initialize_onnx_lib_paths()
 
+from fast_float.logging_utils import (
+    RequestContextMiddleware,
+    configure_logging,
+    current_log_file,
+    install_asyncio_exception_handler,
+    reroute_server_loggers,
+)
+
+configure_logging(role="api")
+
 from fast_float.config.float_settings import load_float_options
 from fast_float.core.inference_optimized import OptimizedInferenceAgent
 from fast_float.core.service import (
@@ -175,6 +185,10 @@ async def _run_boot_warmups():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle manager for model loading, warmup, and resource cleanup."""
+    # Unify hypercorn/uvicorn loggers with the app sinks (the servers create
+    # their log config lazily, after the app import).
+    reroute_server_loggers()
+    install_asyncio_exception_handler(asyncio.get_running_loop())
     app_state.initialize_runtime()
     app_state.max_concurrent_requests = MAX_CONCURRENT_REQUESTS
 
@@ -207,6 +221,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("=" * 70)
     logger.info("🚀 Starting FLOAT Fast API - NVENC Optimized v5.1.0")
+    logger.info(f"🪵 Logs: role=api file={current_log_file() or 'console only'}")
     logger.info(f"⚡ Optimization: {opt.optimization_mode} | FP16: {opt.use_fp16}")
     logger.info(f"📐 Target resolution: {TARGET_IMAGE_SIZE}x{TARGET_IMAGE_SIZE}")
 
@@ -291,6 +306,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Outermost: every request (including CORS preflights) gets a request id and
+# a bound logging context, and the id is echoed back in X-Request-ID.
+app.add_middleware(RequestContextMiddleware)
 
 # Mount modular routers
 app.include_router(api_router)
@@ -312,9 +330,26 @@ if __name__ == "__main__":
     from hypercorn.asyncio import serve
     from hypercorn.config import Config
 
+    from fast_float.logging_utils.config import HEALTH_PATHS
+    from fast_float.logging_utils.uvicorn_logging import create_hypercorn_log_config
+
     config = Config()
     config.bind = [f"0.0.0.0:{PORT}"]
     config.loglevel = "info"
+    # Hypercorn disables access logs when ``accesslog`` is None (its default).
+    # "-" makes it create the ``hypercorn.access`` logger, which the log config
+    # below routes through our formatters/handlers (health checks filtered).
+    config.accesslog = "-"
     config.startup_timeout = 600
+
+    # Hypercorn builds its Logger lazily (after this import), which would
+    # overwrite the handlers installed by configure_logging(). Apply the
+    # unified config explicitly; server records get their own rotating file so
+    # they never race the app's logs/api.log.
+    server_log = current_log_file()
+    config.logconfig_dict = create_hypercorn_log_config(
+        excluded_paths=list(HEALTH_PATHS),
+        log_file=str(server_log.with_name("server.log")) if server_log else None,
+    )
 
     asyncio.run(serve(app, config))

@@ -1,6 +1,29 @@
 """Unit tests for fast-float CLI argument parsing and dispatch."""
 
-from fast_float.cli import build_parser
+import io
+
+from fast_float.cli import _stream_process_output, build_parser
+
+
+def test_supervisor_tee_prefixes_and_normalizes_crlf(monkeypatch):
+    """Windows children emit CRLF; the tee must not write "\\r\\r\\n"."""
+
+    class _Proc:
+        stdout = io.BytesIO(b"alpha\r\n\r\nbeta\n")
+
+    written: list[str] = []
+    monkeypatch.setattr("sys.stdout", io.StringIO())
+
+    class _Sink:
+        def write(self, text: str) -> None:
+            written.append(text)
+
+        def flush(self) -> None:
+            pass
+
+    _stream_process_output(_Proc(), "[api]", _Sink()).join(timeout=10)  # type: ignore[union-attr]
+    assert "".join(written) == "[api] alpha\n[api] \n[api] beta\n"
+    assert "\r" not in "".join(written)
 
 
 def test_cli_parser_defaults():

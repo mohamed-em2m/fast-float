@@ -14,8 +14,14 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+
+# Serializes writes to the optional combined log from the per-process reader
+# threads (one thread per child). This is a single-writer design: the
+# supervisor owns the file, so no OS-level lock and no rotation races.
+_TEE_LOCK = threading.Lock()
 
 
 def _repo_root() -> Path:
@@ -71,9 +77,11 @@ def _run_agent(args: argparse.Namespace) -> int:
     return 0
 
 
-def _stream_process_output(proc: subprocess.Popen, prefix: str) -> None:
-    """Read lines from proc.stdout and print with prefix."""
-    import threading
+def _stream_process_output(proc: subprocess.Popen, prefix: str, sink=None) -> threading.Thread:
+    """Read lines from proc.stdout and print with prefix (optionally tee).
+
+    Returns the reader thread so callers/tests can join it.
+    """
 
     def _reader():
         assert proc.stdout is not None
@@ -82,24 +90,65 @@ def _stream_process_output(proc: subprocess.Popen, prefix: str) -> None:
                 decoded = line.decode("utf-8", errors="replace")
             except Exception:
                 decoded = str(line)
-            sys.stdout.write(f"{prefix} {decoded}")
-            sys.stdout.flush()
+            # Children on Windows end lines with CRLF; normalize so the tee
+            # file (opened with newline="") does not end up with "\r\r\n".
+            decoded = decoded.rstrip("\r\n") + "\n"
+            text = f"{prefix} {decoded}"
+            with _TEE_LOCK:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+                if sink is not None:
+                    try:
+                        sink.write(text)
+                        sink.flush()
+                    except Exception:
+                        pass
 
     t = threading.Thread(target=_reader, daemon=True)
     t.start()
+    return t
 
 
 def _serve_supervisor(args: argparse.Namespace) -> int:
     """Start and supervise the multi-process stack."""
+    from fast_float.logging_utils import configure_logging, current_log_file
+
     repo = _repo_root()
     procs: list[tuple[str, subprocess.Popen]] = []
+
+    configure_logging(role="supervisor")
+    log_file = current_log_file()
+    log_dir = log_file.parent if log_file is not None else repo / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
 
     # Configure environment
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     env["PORT"] = str(args.port)
+    env["FLOAT_LOG_DIR"] = str(log_dir)
     if args.ngpus:
         env["NGPUS"] = str(args.ngpus)
+
+    # Single-writer combined view of every child's console output. Each
+    # process still writes its own JSONL file (logs/<role>.log); this file is
+    # the interleaved human-readable timeline and needs no cross-process lock.
+    tee_file = None
+    tee_enabled = os.environ.get("FLOAT_LOG_TEE", "1").strip().lower() not in {"0", "false", "no", "off"}
+    if tee_enabled:
+        try:
+            tee_file = open(  # noqa: SIM115 - closed in _shutdown()
+                log_dir / "combined.log",
+                "a",
+                encoding="utf-8",
+                buffering=1,
+                errors="backslashreplace",
+                # Lines are normalized to "\n" above; keep the file LF-only so
+                # tee'd text does not gain a second CR on Windows.
+                newline="",
+            )
+        except OSError as exc:
+            print(f"⚠️  could not open {log_dir / 'combined.log'}: {exc}", file=sys.stderr)
 
     if args.dual_process:
         env["FLOAT_IPC_ENABLED"] = "true"
@@ -116,6 +165,7 @@ def _serve_supervisor(args: argparse.Namespace) -> int:
     print("🚀 fast-float inference server")
     print(f"   API Address:      http://{args.host}:{args.port}")
     print(f"   Dual Process:     {'Enabled (ZeroMQ + SHM)' if args.dual_process else 'Disabled (Single Process)'}")
+    print(f"   Log directory:    {log_dir}")
     if args.frontend:
         print(f"   Studio Frontend:  http://localhost:{args.frontend_port}")
     print("=" * 60)
@@ -123,15 +173,16 @@ def _serve_supervisor(args: argparse.Namespace) -> int:
     # 1. Start Worker if dual_process is enabled
     if args.dual_process:
         print("🧠 [1/3] Starting FLOAT GPU Inference Worker...")
+        worker_env = dict(env, FLOAT_PROCESS_ROLE="worker")
         worker_cmd = [sys.executable, "-m", "fast_float.workers.inference_worker"]
         p_worker = subprocess.Popen(
             worker_cmd,
             cwd=repo,
-            env=env,
+            env=worker_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
-        _stream_process_output(p_worker, "[worker]")
+        _stream_process_output(p_worker, "[worker]", tee_file)
         procs.append(("worker", p_worker))
         # Wait a moment for worker socket initialization
         time.sleep(2)
@@ -146,11 +197,11 @@ def _serve_supervisor(args: argparse.Namespace) -> int:
             p_ui = subprocess.Popen(
                 ui_cmd,
                 cwd=frontend_dir,
-                env=env,
+                env=dict(env, FLOAT_PROCESS_ROLE="web"),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
             )
-            _stream_process_output(p_ui, "[web]   ")
+            _stream_process_output(p_ui, "[web]   ", tee_file)
             procs.append(("frontend", p_ui))
         except FileNotFoundError:
             print("⚠️  npm not found; skipping frontend", file=sys.stderr)
@@ -169,7 +220,14 @@ def _serve_supervisor(args: argparse.Namespace) -> int:
             "asyncio",
             "--log-level",
             "info",
+            # "-" enables hypercorn's access logger; config/logging.json routes
+            # it to logs/server.log and drops health-check noise.
+            "--access-logfile",
+            "-",
         ]
+        log_config = repo / "config" / "logging.json"
+        if log_config.exists():
+            server_cmd += ["--log-config", f"json:{log_config.as_posix()}"]
     else:
         server_cmd = [
             sys.executable,
@@ -187,11 +245,11 @@ def _serve_supervisor(args: argparse.Namespace) -> int:
     p_server = subprocess.Popen(
         server_cmd,
         cwd=repo,
-        env=env,
+        env=dict(env, FLOAT_PROCESS_ROLE="api"),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-    _stream_process_output(p_server, "[api]   ")
+    _stream_process_output(p_server, "[api]   ", tee_file)
     procs.append(("backend", p_server))
 
     print("\n✅ All components running. Press Ctrl+C to terminate cleanly.\n")
@@ -205,6 +263,12 @@ def _serve_supervisor(args: argparse.Namespace) -> int:
                     p.terminate()
                 else:
                     p.send_signal(signal.SIGTERM)
+            except Exception:
+                pass
+        if tee_file is not None:
+            try:
+                tee_file.flush()
+                tee_file.close()
             except Exception:
                 pass
         sys.exit(0)

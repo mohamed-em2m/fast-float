@@ -11,6 +11,11 @@ export NGPUS="${NGPUS:-1}"
 # Startup timeout via env (honored where hypercorn maps env -> config).
 # Harmless otherwise: startup is fast since warmup runs in the background.
 export HYPERCORN_STARTUP_TIMEOUT="${HYPERCORN_STARTUP_TIMEOUT:-1200}"
+# Per-process JSONL log file (logs/api.log) + combined console capture.
+export FLOAT_PROCESS_ROLE="${FLOAT_PROCESS_ROLE:-api}"
+export FLOAT_LOG_DIR="${FLOAT_LOG_DIR:-${PROJECT_ROOT}/logs}"
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+mkdir -p "${FLOAT_LOG_DIR}"
 # --no-sync: the lock pins the portable CPU onnxruntime, while setup.sh /
 # convert_to_onnx.sh layer onnx + onnxruntime-gpu + TensorRT on top. A plain
 # `uv run` re-syncs the venv and the server boots without a CUDA/TensorRT EP.
@@ -24,5 +29,7 @@ fi
 exec uv run "${ENV_ARGS[@]}" --frozen --no-sync hypercorn fast_float.main:app \
     --bind "0.0.0.0:${PORT}" \
     --worker-class asyncio \
+    --log-config "json:${PROJECT_ROOT}/config/logging.json" \
+    --access-logfile - \
     --log-level info \
     "$@"

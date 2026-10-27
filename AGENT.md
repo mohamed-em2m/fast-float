@@ -820,15 +820,30 @@ When editing or extending the codebase, follow these design patterns:
 
 ### 7. Logging & timing (debug mode)
 
-- **One logging entry point**: `fast_float/utils/logger.py`. Importing it installs a
-  coloured stderr handler on the `fast_float` logger (`propagate=False`, so
-  Gradio/Jupyter root rewiring can't swallow our records). Module loggers
-  (`getLogger(__name__)` under `fast_float.*`) inherit its level.
+- **One logging engine**: `fast_float/logging_utils/` (`configure_logging`,
+  formatters, filters, handlers, crash hooks). `fast_float/utils/logger.py` is a
+  backwards-compatible facade, so `from fast_float.utils.logger import logger`
+  still works. Entry points call `configure_logging(role=...)` once
+  (`api`, `worker`, `agent`, `gradio`, `supervisor`) — see `docs/LOGGING.md`.
+- **Sinks**: human-readable stderr (colors only on a TTY) + one rotating JSONL
+  file per process (`logs/<role>.log`, 50 MiB x 5). The CLI supervisor or the
+  shell scripts tee children into `logs/combined.log`; that file has a single
+  writer (one `threading.Lock`), so no cross-process lock is needed. Hypercorn
+  gets `--log-config json:config/logging.json` (`logs/server.log`).
 - **Env-driven levels** — never hard-code `setLevel` in modules:
   `FLOAT_LOG_LEVEL` (name, e.g. `DEBUG`) → else `FLOAT_DEBUG`/`FLOAT_TIMING`
   (truthy) → else `INFO`. `set_log_level(level)` / `configure_logging(debug=True)`
   flip **every** managed logger at once (this is what `--debug` calls — the old
   code set the *root* logger, which did nothing because we `propagate=False`).
+- **Correlation**: `RequestContextMiddleware` binds `X-Request-ID`/`X-Session-ID`
+  per HTTP request (and echoes `X-Request-ID`); the worker binds the same ids
+  from `IPCRequest` with `log_context(...)`. Every record carries
+  `req_id`/`session_id`/`gen`/`room` (console `[req=… sess=…]`, JSON fields).
+- **Redaction** happens in both formatters (`api_key=`, `token=`,
+  `Authorization: Bearer …`, query credentials, `AIza…`); other knobs:
+  `FLOAT_LOG_DIR`, `FLOAT_LOG_TO_FILE`, `FLOAT_LOG_JSON`, `FLOAT_LOG_CONSOLE`,
+  `FLOAT_LOG_MAX_BYTES`, `FLOAT_LOG_BACKUPS`, `FLOAT_LOG_SHARED` (opt-in locked
+  shared file, no rotation), `FLOAT_LOG_TEE=0` (no combined log).
 - **Per-stage timing**: `fast_float/utils/timing.py`. Open a run with
   `with timing_run("name"):` (re-entrant: the outermost scope owns the collector
   and prints one summary table) and wrap blocks with
