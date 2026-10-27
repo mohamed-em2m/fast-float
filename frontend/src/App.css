@@ -129,13 +129,12 @@
   position: sticky;
   top: 12px;
   z-index: 100;
-  /* Three equal-weight zones keep the mode switch centred on the page, not
-     merely in the gap left over by the two side groups. */
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 18px;
   padding: 12px 16px;
+  flex-wrap: wrap;
   background: rgba(11, 13, 21, 0.82);
 }
 
@@ -144,7 +143,6 @@
   align-items: center;
   gap: 12px;
   min-width: 0;
-  justify-self: start;
 }
 
 .brand-logo {
@@ -201,7 +199,6 @@
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-full);
-  justify-self: center;
 }
 
 .mode-tab {
@@ -247,7 +244,6 @@
   gap: 8px;
   flex-wrap: wrap;
   justify-content: flex-end;
-  justify-self: end;
   min-width: 0;
 }
 
@@ -522,11 +518,9 @@
    -------------------------------------------------------------------------- */
 .studio-workspace {
   display: grid;
-  /* Balanced spread: the composer and the stage carry comparable weight
-     instead of a narrow rail beside a very wide canvas. */
-  grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
+  grid-template-columns: minmax(340px, 410px) minmax(0, 1fr);
   gap: 20px;
-  align-items: stretch;
+  align-items: start;
 }
 
 .studio-composer {
@@ -541,7 +535,6 @@
   flex-direction: column;
   gap: 16px;
   min-width: 0;
-  height: 100%;
 }
 
 /* Cards */
@@ -721,9 +714,7 @@
 .portrait-preview-img {
   width: 100%;
   height: 100%;
-  /* Track the column width so the portrait keeps a photo-like crop instead of
-     turning into a letterboxed banner on wide screens. */
-  max-height: clamp(240px, 22vw, 360px);
+  max-height: 260px;
   object-fit: cover;
   display: block;
 }
@@ -1410,9 +1401,6 @@
   display: flex;
   flex-direction: column;
   gap: 14px;
-  /* The stage fills the height of the column so its bottom edge lines up with
-     the composer, and the toolbar stays anchored to that edge. */
-  flex: 1;
 }
 
 .stage-head {
@@ -1533,7 +1521,6 @@
 .stage-viewport {
   position: relative;
   width: 100%;
-  flex: 1 1 auto;
   min-height: clamp(300px, 42vh, 480px);
   background:
     radial-gradient(circle at 50% 46%, rgba(109, 124, 255, 0.09), transparent 58%),
@@ -2466,11 +2453,9 @@
    -------------------------------------------------------------------------- */
 .live-workspace {
   display: grid;
-  /* Same balanced split as the Studio so switching modes does not shift the
-     reading axis of the page. */
-  grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
+  grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
   gap: 20px;
-  align-items: stretch;
+  align-items: start;
 }
 
 .live-sidebar {
@@ -2478,7 +2463,6 @@
   flex-direction: column;
   gap: 16px;
   min-width: 0;
-  height: 100%;
 }
 
 .live-pick-card {
@@ -2649,8 +2633,6 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
-  /* Push the tip card to the bottom edge so both columns end together. */
-  margin-top: auto;
 }
 
 .live-tips-title {
@@ -2735,7 +2717,6 @@
   flex-direction: column;
   gap: 14px;
   min-width: 0;
-  flex: 1;
 }
 
 .live-stage-header {
@@ -3055,7 +3036,6 @@
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  margin-top: auto;
 }
 
 .live-controls .btn-secondary.is-muted {
@@ -3118,13 +3098,9 @@
   }
 }
 
-@media (max-width: 1080px) {
-  /* The three-zone grid needs room for both side groups; below this the
-     header stacks into a centred column instead of overflowing. */
+@media (max-width: 860px) {
   .app-header {
     position: static;
-    display: flex;
-    flex-wrap: wrap;
     justify-content: center;
   }
 
@@ -3141,9 +3117,7 @@
     width: 100%;
     justify-content: center;
   }
-}
 
-@media (max-width: 860px) {
   .stage-head {
     flex-direction: column;
   }
