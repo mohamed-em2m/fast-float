@@ -49,7 +49,7 @@ export default defineConfig(({ mode }) => {
       allowedHosts: true,
       proxy,
     },
-    // `npm run preview` serves the production build; without a proxy there,
+    // `pnpm preview` serves the production build; without a proxy there,
     // the built Studio could not reach the API at all.
     preview: {
       port: frontendPort,

@@ -144,6 +144,7 @@ PY
 gemini_worker_running() {
     # pgrep -f matches full command lines, including this script's own whenever
     # the pattern appears in it — split the string so it can never self-match.
+    # shellcheck disable=SC2140
     pgrep -f "fast_float.livekit.gemini.age"nt" start" >/dev/null 2>&1
 }
 
@@ -177,28 +178,23 @@ fi
 # check the real requirement up front and point at setup.sh (which installs
 # Node 22 when the system Node is too old).
 command -v node >/dev/null 2>&1 || { echo "❌ 'node' not found on PATH (Node 20.19+ / 22.12+ required). Run ./scripts/setup.sh."; exit 1; }
-node_version_ok() {
-    local mm major minor
-    mm="$(node -p 'process.versions.node.split(".").slice(0,2).join(".")' 2>/dev/null)" || return 1
-    major="${mm%%.*}"
-    minor="${mm##*.}"
-    [ "${major}" -gt 22 ] && return 0
-    [ "${major}" -eq 22 ] && [ "${minor}" -ge 12 ] && return 0
-    [ "${major}" -eq 20 ] && [ "${minor}" -ge 19 ] && return 0
-    return 1
-}
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/_frontend_env.sh"
 if ! node_version_ok; then
     echo "❌ Node $(node -v) is too old for Vite 8 — need 20.19+ or 22.12+ (rolldown needs node:util.styleText)."
     echo "   Fix: re-run ./scripts/setup.sh (it upgrades Node when the system Node is too old)."
     exit 1
 fi
-command -v npm >/dev/null 2>&1 || { echo "❌ 'npm' not found on PATH."; exit 1; }
 
-if [ ! -d "${PROJECT_ROOT}/frontend/node_modules" ]; then
-    echo "📦 frontend/node_modules missing — installing..."
-    # npm ci (not install): rebuilds exactly from the committed lockfile,
-    # including the platform-native optional deps npm can silently skip.
-    (cd "${PROJECT_ROOT}/frontend" && npm ci)
+# pnpm is provisioned by Corepack at the version pinned in package.json.
+# `ensure_pnpm` is a no-op on every start after setup has done it once.
+ensure_pnpm || { echo "❌ pnpm could not be enabled. Run ./scripts/setup.sh first."; exit 1; }
+
+if ! pnpm_deps_current; then
+    echo "📦 frontend dependencies missing or stale — installing with pnpm..."
+    # --frozen-lockfile: the committed pnpm-lock.yaml is authoritative, so the
+    # launcher can never silently install a different tree than setup.sh.
+    pnpm_install
 fi
 
 # shellcheck source=/dev/null
@@ -241,7 +237,7 @@ BACKEND_PID=$!
 
 # --- Frontend ------------------------------------------------------------------
 echo "🎨 Starting frontend →  http://localhost:${FRONTEND_PORT} (api: ${VITE_API_URL})"
-(cd "${PROJECT_ROOT}/frontend" && npm run dev -- --host 0.0.0.0 --port "${FRONTEND_PORT}") 2>&1 | sed -u 's/^/[web] /' &
+(cd "${PROJECT_ROOT}/frontend" && pnpm run dev --host 0.0.0.0 --port "${FRONTEND_PORT}") 2>&1 | sed -u 's/^/[web] /' &
 FRONTEND_PID=$!
 
 echo ""

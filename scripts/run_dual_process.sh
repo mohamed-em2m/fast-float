@@ -141,13 +141,20 @@ elif gemini_worker_ready; then
     fi
 fi
 
-# --- Node / npm frontend setup -----------------------------------------------
-command -v node >/dev/null 2>&1 || { echo "❌ 'node' not found on PATH. Run ./scripts/setup.sh."; exit 1; }
-command -v npm >/dev/null 2>&1 || { echo "❌ 'npm' not found on PATH."; exit 1; }
+# --- Node / pnpm frontend setup ----------------------------------------------
+command -v node >/dev/null 2>&1 || { echo "❌ 'node' not found on PATH (Node 20.19+ / 22.12+ required). Run ./scripts/setup.sh."; exit 1; }
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/_frontend_env.sh"
+if ! node_version_ok; then
+    echo "❌ Node $(node -v) is too old for Vite 8 — need 20.19+ or 22.12+."
+    echo "   Fix: re-run ./scripts/setup.sh (it upgrades Node when needed)."
+    exit 1
+fi
+ensure_pnpm || { echo "❌ pnpm could not be enabled. Run ./scripts/setup.sh first."; exit 1; }
 
-if [ ! -d "${PROJECT_ROOT}/frontend/node_modules" ]; then
-    echo "📦 frontend/node_modules missing — installing..."
-    (cd "${PROJECT_ROOT}/frontend" && npm ci)
+if ! pnpm_deps_current; then
+    echo "📦 frontend dependencies missing or stale — installing with pnpm..."
+    pnpm_install
 fi
 
 # shellcheck source=/dev/null
@@ -187,7 +194,7 @@ BACKEND_PID=$!
 
 # --- Process 3: React Studio Frontend -----------------------------------------
 echo "🎨 Starting Process 3: Studio Frontend  → http://localhost:${FRONTEND_PORT} (api: ${VITE_API_URL})"
-(cd "${PROJECT_ROOT}/frontend" && npm run dev -- --host 0.0.0.0 --port "${FRONTEND_PORT}") 2>&1 | sed -u 's/^/[web] /' &
+(cd "${PROJECT_ROOT}/frontend" && pnpm run dev --host 0.0.0.0 --port "${FRONTEND_PORT}") 2>&1 | sed -u 's/^/[web] /' &
 FRONTEND_PID=$!
 
 echo ""

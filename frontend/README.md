@@ -1,5 +1,26 @@
 # React + Vite
 
+## Quick start
+
+The frontend uses **pnpm** (pinned through Corepack in `package.json`), so the
+lockfile and the installed tree are reproducible without a global install:
+
+```bash
+corepack enable pnpm        # one-time; setup.sh does this automatically
+pnpm install --frozen-lockfile
+pnpm dev                    # http://localhost:3000, proxies /api -> :8000
+```
+
+`pnpm install` reuses pnpm's content-addressable store, so reruns and extra
+worktrees hardlink existing packages instead of downloading them again.
+
+```bash
+pnpm test        # Vitest + Testing Library
+pnpm lint        # oxlint
+pnpm build       # production build in dist/
+pnpm preview     # serve the build through the same /api proxy
+```
+
 This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
 
 Currently, two official plugins are available:

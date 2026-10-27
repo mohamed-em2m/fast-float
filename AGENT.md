@@ -368,8 +368,8 @@ uv run --frozen --no-sync hypercorn fast_float.main:app --bind 0.0.0.0:8000 --lo
 ### 2. Launch React Studio Frontend
 
 ```bash
-# Using npm directly inside frontend/
-cd frontend && npm run dev
+# Using pnpm directly inside frontend/ (Corepack provides the pinned version)
+cd frontend && pnpm dev
 
 # Or using the root launcher script
 ./scripts/run_frontend.sh
