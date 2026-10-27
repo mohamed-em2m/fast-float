@@ -207,6 +207,22 @@ def _build_realtime_model(
         "voice": config.voice,
         "input_audio_transcription": genai_types.AudioTranscriptionConfig(),
         "output_audio_transcription": genai_types.AudioTranscriptionConfig(),
+        # The avatar's voice is played back through the browser (the mic track
+        # still hears some of it even with echoCancellation). Gemini's
+        # server-side activity detection used to flag that spill-over as the
+        # user barging in and STOPped replies mid-sentence ("counting to 10,
+        # cut at 6" — the agent even logs lk.clear_buffer / "playback
+        # interrupted"). Trigger-happy defaults: make start-of-speech harder
+        # to commit (LOW sensitivity + 200 ms required speech) so a short
+        # echo burst cannot truncate an utterance; real barge-ins (actual
+        # user speech, >0.5 s in one burst) still get through.
+        "realtime_input_config": genai_types.RealtimeInputConfig(
+            automatic_activity_detection=genai_types.AutomaticActivityDetection(
+                start_of_speech_sensitivity=genai_types.StartSensitivity.START_SENSITIVITY_LOW,
+                end_of_speech_sensitivity=genai_types.EndSensitivity.END_SENSITIVITY_HIGH,
+                prefix_padding_ms=200,
+            ),
+        ),
     }
     # The dispatch model name is free text from a Studio box; keep a bad value
     # from setting up the whole session, then falling over on the Gemini
