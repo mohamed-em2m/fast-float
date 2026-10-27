@@ -134,6 +134,11 @@ export default function AudioEngine({
 
   // Clean up audio context, recorder and stream on unmount.
   useEffect(() => {
+    // React StrictMode runs mount → cleanup → mount in development. Without
+    // clearing the flag on (re)mount the second mount would leave it stuck at
+    // `true`, and every async selection (upload / sample / recording) would be
+    // discarded — so the Generate button never unlocked in `npm run dev`.
+    unmountedRef.current = false;
     const element = audioElementRef.current;
     return () => {
       unmountedRef.current = true;
