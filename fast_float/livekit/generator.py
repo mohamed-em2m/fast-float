@@ -239,6 +239,12 @@ class FloatVideoGenerator:
         # report `lk.playback_finished` after a TTS segment has fully rendered.
         self._idle_event = asyncio.Event()
         self._idle_event.set()
+        # While paused, ``__aiter__`` stops emitting pre-rendered silence frames
+        # and just waits for the next real one. The agent runner pauses the idle
+        # loop while it drains `AVSynchronizer`, otherwise the endless silence
+        # frames keep the playout queue non-empty and `wait_for_playout()` can
+        # only time out.
+        self._idle_paused = False
 
         # Silence / idle loop: pre-rendered and pre-encoded frames.
         # Generated once by prepare_silence() and looped in __aiter__ when idle.
@@ -470,6 +476,19 @@ class FloatVideoGenerator:
         except asyncio.TimeoutError:
             return False
         return True
+
+    def pause_idle(self) -> None:
+        """Stop emitting silence frames so the playout queue can drain.
+
+        Only the idle loop is affected: real rendered frames queued in
+        ``_frame_queue`` are still yielded immediately, so a new utterance
+        that starts while paused is never blocked.
+        """
+        self._idle_paused = True
+
+    def resume_idle(self) -> None:
+        """Resume emitting silence frames (undo :meth:`pause_idle`)."""
+        self._idle_paused = False
 
     # ------------------------------------------------------------- scheduling
 
@@ -755,7 +774,7 @@ class FloatVideoGenerator:
             # without delay to ensure immediate lip-sync with audio.
             if not self._frame_queue.empty():
                 item = await self._frame_queue.get()
-            elif not self._stop_pending and self._silence_frames:
+            elif not self._stop_pending and self._silence_frames and not self._idle_paused:
                 # Frame queue is empty: emit pre-encoded silence/idle frame directly.
                 # Zero allocation, zero numpy/bytes copy during idle loop.
                 item = self._silence_frames[self._silence_idx % len(self._silence_frames)]
@@ -768,7 +787,8 @@ class FloatVideoGenerator:
                 except asyncio.TimeoutError:
                     continue
             else:
-                # No silence clip ready yet and queue is empty: wait for real frame
+                # No silence clip ready (or the idle loop is paused) and the queue
+                # is empty: wait for a real frame without feeding the A/V queues.
                 try:
                     item = await asyncio.wait_for(self._frame_queue.get(), timeout=_silence_frame_sec)
                 except asyncio.TimeoutError:

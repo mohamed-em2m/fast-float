@@ -267,6 +267,15 @@ class AgentAvatarRunner:
                 if epoch != self._epoch:
                     continue
                 if self._av_sync is not None:
+                    # Silence the idle loop while draining. It emits pre-rendered
+                    # silence audio/video forever, which keeps AVSynchronizer's
+                    # queues non-empty, so `wait_for_playout()` could only ever
+                    # return via the 30 s timeout — and the agent only learns
+                    # playback finished when this notification is sent.
+                    pause_idle = getattr(self.video_gen, "pause_idle", None)
+                    resume_idle = getattr(self.video_gen, "resume_idle", None)
+                    if pause_idle is not None:
+                        pause_idle()
                     try:
                         await asyncio.wait_for(
                             self._av_sync.wait_for_playout(),
@@ -274,6 +283,9 @@ class AgentAvatarRunner:
                         )
                     except asyncio.TimeoutError:
                         logger.warning("[agent-avatar] playout drain timed out")
+                    finally:
+                        if resume_idle is not None:
+                            resume_idle()
                 if epoch != self._epoch:
                     continue
                 position = self._segment_audio_s

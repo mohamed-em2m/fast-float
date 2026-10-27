@@ -25,6 +25,7 @@ and publishes both tracks.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import ssl
@@ -212,6 +213,14 @@ async def _genai_ssl_context() -> ssl.SSLContext:
 # into the new connection, so only the dead handle is lost.
 _STALE_SESSION_MARKERS = ("1011", "1008", "session not found or expired")
 
+# Google closes an idle Live session after ~2 minutes without turn activity,
+# usually without sending a `goAway` first. The next utterance then hits a dead
+# socket: the plugin reconnects, dropping any audio already queued for it, and
+# the user has to repeat themselves. Restart the session ourselves after a
+# shorter idle window so the reconnect happens between turns instead.
+_IDLE_REFRESH_SEC = 60.0
+_IDLE_REFRESH_TICK_SEC = 5.0
+
 
 def _is_stale_session_error(error: BaseException | None) -> bool:
     """True when ``error`` means the resumption handle can no longer be used."""
@@ -235,6 +244,75 @@ def _resilient_session_class(base: type) -> type:
                 self._session_resumption_handle = None
                 self._resumption_chat_ctx = None
             super()._mark_restart_needed(on_error)
+
+        # -------------------------------------------------- idle refresh
+        def _note_turn_activity(self) -> None:
+            """Reset the idle clock; called on every turn/user-speech event."""
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:  # no loop (tests / sync construction)
+                return
+            self._last_turn_at = loop.time()
+
+        def _start_new_generation(self) -> None:
+            self._note_turn_activity()
+            super()._start_new_generation()
+
+        def _mark_current_generation_done(self) -> None:
+            self._note_turn_activity()
+            super()._mark_current_generation_done()
+
+        def _handle_input_speech_started(self) -> None:
+            self._note_turn_activity()
+            super()._handle_input_speech_started()
+
+        def _handle_input_speech_stopped(self) -> None:
+            self._note_turn_activity()
+            super()._handle_input_speech_stopped()
+
+        async def _main_task(self) -> None:
+            # The stock loop reconnects on `_session_should_close`; run the idle
+            # watchdog alongside it so a long pause never leaves a dead socket in
+            # front of the next utterance.
+            self._note_turn_activity()
+            watchdog = asyncio.create_task(
+                self._idle_refresh_watchdog(), name="gemini-idle-refresh"
+            )
+            try:
+                await super()._main_task()
+            finally:
+                watchdog.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watchdog
+
+        async def _idle_refresh_watchdog(self) -> None:
+            loop = asyncio.get_running_loop()
+            while True:
+                await asyncio.sleep(_IDLE_REFRESH_TICK_SEC)
+                should_close = getattr(self, "_session_should_close", None)
+                if should_close is None or should_close.is_set():
+                    continue
+                generation = getattr(self, "_current_generation", None)
+                if generation is not None and not getattr(generation, "_done", False):
+                    # A response is still streaming; that is activity, not idleness.
+                    self._note_turn_activity()
+                    continue
+                last = getattr(self, "_last_turn_at", None)
+                if last is None:
+                    last = self._last_turn_at = loop.time()
+                    continue
+                idle_for = loop.time() - last
+                if idle_for < _IDLE_REFRESH_SEC:
+                    continue
+                logger.info(
+                    "Gemini Live session idle for %.0fs; restarting it with the "
+                    "resumption handle before Google drops the connection",
+                    idle_for,
+                )
+                self._note_turn_activity()
+                # A clean restart (unlike an error) keeps the handle, so the
+                # plugin reconnects and the conversation context survives.
+                should_close.set()
 
     return _FreshRetryRealtimeSession
 

@@ -171,6 +171,11 @@ class ZmqFloatVideoGenerator:
         # Pre-encoded silence frames (list of (rtc.VideoFrame, rtc.AudioFrame)).
         self._silence_frames: list[Any] = []
         self._silence_ready = asyncio.Event()
+        # While paused, ``__aiter__`` stops emitting silence frames and waits for
+        # the next real one. The agent runner pauses the idle loop while it drains
+        # `AVSynchronizer`: continuous idle frames keep the playout queue non-empty,
+        # so ``wait_for_playout()`` could only ever time out.
+        self._idle_paused = False
 
         # Silence collection state. While ``_collecting`` is True the frame
         # listener routes THIS session's gen-0 notifications into
@@ -584,6 +589,18 @@ class ZmqFloatVideoGenerator:
             return False
         return True
 
+    def pause_idle(self) -> None:
+        """Stop emitting silence frames so the playout queue can drain.
+
+        Real frames queued by the worker are still yielded immediately; only
+        the idle loop is suspended.
+        """
+        self._idle_paused = True
+
+    def resume_idle(self) -> None:
+        """Resume emitting silence frames (undo :meth:`pause_idle`)."""
+        self._idle_paused = False
+
     # ------------------------------------------------------------------
     # AsyncIterator — yields (VideoFrame, AudioFrame) pairs
     # ------------------------------------------------------------------
@@ -610,6 +627,16 @@ class ZmqFloatVideoGenerator:
                 continue
             except asyncio.QueueEmpty:
                 pass
+
+            if self._idle_paused:
+                # Idle loop paused (playout drain in progress): block until a real
+                # frame arrives instead of feeding silence to AVSynchronizer.
+                try:
+                    pair = await asyncio.wait_for(self._frame_queue.get(), timeout=frame_interval)
+                except asyncio.TimeoutError:
+                    continue
+                yield pair
+                continue
 
             # No live frame — yield silence if available.
             if self._silence_frames:

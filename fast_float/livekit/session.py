@@ -315,8 +315,8 @@ class ConversationSession:
             self.generator = ZmqFloatVideoGenerator(
                 ref_image_path=self.image_path,
                 nfe=self.settings.livekit_nfe,
-                first_chunk_sec=getattr(self.settings, "livekit_first_chunk_sec", 5.0),
-                chunk_sec=getattr(self.settings, "livekit_chunk_sec", 5.0),
+                first_chunk_sec=getattr(self.settings, "livekit_first_chunk_sec", 2.0),
+                chunk_sec=getattr(self.settings, "livekit_chunk_sec", 2.0),
                 control_endpoint=ipc_cfg.get("zmq_control_endpoint", "tcp://127.0.0.1:5555"),
                 frames_endpoint=ipc_cfg.get("zmq_frames_endpoint", "tcp://127.0.0.1:5556"),
                 shm_name=ipc_cfg.get("shm_name", "float_frame_ring"),
