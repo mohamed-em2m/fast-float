@@ -44,7 +44,7 @@ from fast_float.livekit.receiver import DataStreamAudioReceiver
 from fast_float.livekit.settings import LiveKitSettings
 from fast_float.livekit.tokens import issue_token
 from fast_float.livekit.worker import AvatarOptions, AvatarRunner
-from fast_float.utils.gpu import auto_detect_max_streams
+from fast_float.utils.gpu import estimate_stream_capacity
 from fast_float.utils.media import ensure_default_image
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,7 @@ def get_render_semaphore(max_streams: int | None = None) -> asyncio.Semaphore:
     """Get or configure the GPU inference concurrency semaphore.
 
     If max_streams is not specified or 0, automatically determines the optimal
-    parallel streams based on GPU VRAM.
+    parallel streams from the free VRAM and the measured decode footprint.
     """
     global _render_semaphore, _current_max_streams
     if max_streams is None:
@@ -67,12 +67,13 @@ def get_render_semaphore(max_streams: int | None = None) -> asyncio.Semaphore:
         cfg = LiveKitSettings.from_env()
         max_streams = getattr(cfg, "livekit_max_streams", 0)
 
-    target_streams = auto_detect_max_streams(max_streams)
+    capacity = estimate_stream_capacity(config_val=max_streams)
+    target_streams = capacity.recommended
 
     if _render_semaphore is None or _current_max_streams != target_streams:
         _current_max_streams = target_streams
         _render_semaphore = asyncio.Semaphore(target_streams)
-        logger.info(f"[session] GPU parallel streams capacity set to {target_streams}")
+        logger.info(f"[session] GPU parallel streams capacity: {capacity.summary()}")
 
     return _render_semaphore
 

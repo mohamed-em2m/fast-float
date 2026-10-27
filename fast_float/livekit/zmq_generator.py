@@ -39,6 +39,9 @@ from typing import Any
 
 import numpy as np
 
+from fast_float.core.state import app_state
+from fast_float.utils.gpu import estimate_stream_capacity
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -176,6 +179,11 @@ class ZmqFloatVideoGenerator:
         # `AVSynchronizer`: continuous idle frames keep the playout queue non-empty,
         # so ``wait_for_playout()`` could only ever time out.
         self._idle_paused = False
+
+        # Last real-time factor reported by the worker (render seconds per
+        # audio second), used once to report the measured stream capacity.
+        self.last_rtf: float | None = None
+        self._capacity_logged = False
 
         # Silence collection state. While ``_collecting`` is True the frame
         # listener routes THIS session's gen-0 notifications into
@@ -444,16 +452,38 @@ class ZmqFloatVideoGenerator:
             return
 
         if resp.status == "ok":
+            rtf = float(getattr(resp, "rtf", 0.0) or 0.0)
             logger.info(
                 "[zmq-gen] infer ok (gen=%d frames=%s rtf=%.2fx)",
                 gen,
                 getattr(resp, "total_frames", -1) or -1,
-                float(getattr(resp, "rtf", 0.0) or 0.0),
+                rtf,
             )
+            if rtf > 0:
+                self._record_rtf(rtf)
         else:
             logger.warning(
                 "[zmq-gen] infer failed (gen=%d): %s", gen, resp.error_msg
             )
+
+    def _record_rtf(self, rtf: float) -> None:
+        """Remember the worker's measured render speed and report capacity once.
+
+        The first real render is the only honest measurement of how many
+        streams this GPU can sustain: VRAM alone says 8, but a stream that
+        renders slower than real time cannot be served at all. The estimate is
+        published in ``app_state`` so ``GET /gpu`` can report it without
+        importing the LiveKit stack.
+        """
+        self.last_rtf = float(rtf)
+        app_state.live_rtf = float(rtf)
+        if self._capacity_logged:
+            return
+        self._capacity_logged = True
+        logger.info(
+            "[zmq-gen] measured live capacity: %s",
+            estimate_stream_capacity(observed_rtf=rtf).summary(),
+        )
 
     def _account_failed_gen(self, gen: int) -> None:
         """Treat a generation that will never produce a sentinel as completed.

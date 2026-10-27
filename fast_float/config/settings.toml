@@ -140,7 +140,13 @@ livekit_chunk_sec = 2.0
 # at session start (default 2.0s). Looped while the avatar is idle.
 livekit_silence_sec = 10.0
 # Maximum concurrent live avatar streams allowed to render in parallel on the GPU.
-# 0 = auto-detect based on available GPU VRAM (recommended).
+# 0 = auto (recommended): min(memory, compute), capped at 8, where
+#   memory  = usable VRAM / measured per-stream footprint (decode tuner, else 2 GiB)
+#   compute = 0.85 / measured real-time factor (render seconds per audio second)
+# On an RTX A6000 (~47 GiB, RTF ~0.2) that is typically 4-5 streams even though
+# VRAM alone would allow 8. Set 1..32 to override the estimate.
+# NOTE: with [ipc] enabled the single inference worker serializes renders, so this
+# value gates only the in-process renderer; the live ceiling is the measured RTF.
 livekit_max_streams = 0
 
 [float.checkpoint]
