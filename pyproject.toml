@@ -191,3 +191,6 @@ addopts = "-ra"
     "D",    # If docstring rules are added later
     "F841",
 ]
+
+[project.scripts]
+fast-float = "fast_float.cli:main"
