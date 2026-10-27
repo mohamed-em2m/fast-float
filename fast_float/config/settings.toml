@@ -121,21 +121,22 @@ autodispatch = true
 # The file /generate path uses [float.request].nfe instead.
 livekit_nfe = 5
 # Audio buffer threshold (seconds) before launching the avatar's FIRST render chunk.
-# Keep this equal to livekit_chunk_sec: a shorter first chunk starts the reply
-# earlier, but the next full-size chunk cannot start until another
-# livekit_chunk_sec of audio has arrived, leaving an audible gap after the short
-# first chunk. 2.0 s is FLOAT's minimum (internal) window and the lowest latency
-# that still plays gaplessly. Range: 0.2..10 s.
+# 2.0 s is FLOAT's minimum (internal) window and the lowest latency that still
+# plays gaplessly — this is what makes a reply start quickly after silence.
+# It may be lower than livekit_chunk_sec: the next full-size chunk then waits for
+# another livekit_chunk_sec of audio, and the idle loop covers that gap.
+# Range: 0.2..10 s.
 livekit_first_chunk_sec = 2.0
 # Ongoing chunk window (seconds) — how much audio to collect between render groups.
 # FLOAT accepts the full window and automatically iterates its internal 2 s sub-windows
 # with smooth seam blending across them:
 #   2.0 = fire a render after every 2 s of audio (lowest latency).
 #   5.0 = buffer 5 s of speech, then pass all 5 s directly to FLOAT in one render pass
-#         for cohesive sentence pacing and better temporal continuity, at the cost of
-#         ~3 s extra delay before the avatar starts moving (very noticeable after a pause).
+#         for cohesive sentence pacing and better temporal continuity. With a 2 s
+#         first chunk this only adds delay from the second chunk onward; the idle
+#         loop runs during the wait, so keep the first chunk short to start fast.
 # Range: 2.0..10 s (values below 2 are clamped to 2 — the model's minimum window).
-livekit_chunk_sec = 2.0
+livekit_chunk_sec = 5.0
 # Duration (seconds) of the pre-rendered silence/idle loop video generated once
 # at session start (default 2.0s). Looped while the avatar is idle.
 livekit_silence_sec = 10.0
