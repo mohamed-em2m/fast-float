@@ -11,6 +11,7 @@ import {
   Music,
   CheckCircle2,
   Loader2,
+  TriangleAlert,
 } from 'lucide-react';
 import {
   audioFormatFromFile,
@@ -33,6 +34,8 @@ const MAX_RECORD_SECONDS = 60;
 const AUDIO_ACCEPT =
   'audio/wav,audio/mpeg,audio/mp4,audio/ogg,audio/webm,audio/flac,.wav,.mp3,.m4a,.mp4,.ogg,.opus,.webm,.flac,.aac';
 
+const AUDIO_TABS = ['mic', 'upload', 'samples'];
+
 export default function AudioEngine({
   audioBlob,
   setAudioBlob,
@@ -54,6 +57,16 @@ export default function AudioEngine({
   // null | 'upload' | 'sample'
   const [loading, setLoading] = useState(null);
   const [selectedSample, setSelectedSample] = useState(null);
+
+  // getUserMedia is only exposed on secure origins (HTTPS or localhost). A
+  // remote HTTP deployment would otherwise fail with a confusing permission
+  // error after the click; say so up front and point at the upload tab.
+  const micSupported =
+    typeof navigator !== 'undefined'
+    && typeof navigator.mediaDevices?.getUserMedia === 'function';
+  const insecureContext =
+    typeof window !== 'undefined' && window.isSecureContext === false;
+  const micAvailable = micSupported && !insecureContext;
 
   const mediaRecorderRef = useRef(null);
   const audioContextRef = useRef(null);
@@ -207,6 +220,15 @@ export default function AudioEngine({
   // Start live microphone recording
   const startRecording = async () => {
     if (isRecording || isStarting || loading) return;
+    if (!micAvailable) {
+      onToast?.(
+        insecureContext
+          ? 'Microphone access needs HTTPS (or localhost). Upload a clip or use the sample instead.'
+          : 'This browser does not expose microphone input. Upload a clip or use the sample instead.',
+        'error'
+      );
+      return;
+    }
     const token = ++selectionRef.current;
     setSelectedSample(null);
     setIsStarting(true);
@@ -362,6 +384,22 @@ export default function AudioEngine({
   const switchTab = (next) => {
     if (next !== 'mic' && isRecording) stopRecording();
     setActiveTab(next);
+  };
+
+  // Standard tablist keyboard contract: arrows move between tabs, Home/End
+  // jump to the first/last one, and focus follows the newly selected tab.
+  const handleTabKeyDown = (event) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const current = AUDIO_TABS.indexOf(activeTab);
+    let nextIndex = current;
+    if (event.key === 'ArrowLeft') nextIndex = (current - 1 + AUDIO_TABS.length) % AUDIO_TABS.length;
+    else if (event.key === 'ArrowRight') nextIndex = (current + 1) % AUDIO_TABS.length;
+    else if (event.key === 'Home') nextIndex = 0;
+    else nextIndex = AUDIO_TABS.length - 1;
+    const next = AUDIO_TABS[nextIndex];
+    switchTab(next);
+    requestAnimationFrame(() => document.getElementById(`audio-tab-${next}`)?.focus());
   };
 
   // File Upload Handler
@@ -541,8 +579,19 @@ export default function AudioEngine({
       </div>
 
       {/* Tabs */}
-      <div className="audio-tab-nav">
+      <div
+        className="audio-tab-nav"
+        role="tablist"
+        aria-label="Audio input source"
+        onKeyDown={handleTabKeyDown}
+      >
         <button
+          type="button"
+          role="tab"
+          id="audio-tab-mic"
+          aria-selected={activeTab === 'mic'}
+          aria-controls="audio-panel-mic"
+          tabIndex={activeTab === 'mic' ? 0 : -1}
           className={`tab-btn ${activeTab === 'mic' ? 'active' : ''}`}
           onClick={() => switchTab('mic')}
         >
@@ -550,6 +599,12 @@ export default function AudioEngine({
           <span>Microphone</span>
         </button>
         <button
+          type="button"
+          role="tab"
+          id="audio-tab-upload"
+          aria-selected={activeTab === 'upload'}
+          aria-controls="audio-panel-upload"
+          tabIndex={activeTab === 'upload' ? 0 : -1}
           className={`tab-btn ${activeTab === 'upload' ? 'active' : ''}`}
           onClick={() => switchTab('upload')}
         >
@@ -557,6 +612,12 @@ export default function AudioEngine({
           <span>Upload File</span>
         </button>
         <button
+          type="button"
+          role="tab"
+          id="audio-tab-samples"
+          aria-selected={activeTab === 'samples'}
+          aria-controls="audio-panel-samples"
+          tabIndex={activeTab === 'samples' ? 0 : -1}
           className={`tab-btn ${activeTab === 'samples' ? 'active' : ''}`}
           onClick={() => switchTab('samples')}
         >
@@ -567,7 +628,12 @@ export default function AudioEngine({
 
       {/* TAB 1: LIVE MICROPHONE RECORDING */}
       {activeTab === 'mic' && (
-        <div className="mic-record-panel">
+        <div
+          className="mic-record-panel"
+          id="audio-panel-mic"
+          role="tabpanel"
+          aria-labelledby="audio-tab-mic"
+        >
           {/* Canvas Waveform Display */}
           <div className="waveform-canvas-box">
             <canvas
@@ -579,11 +645,28 @@ export default function AudioEngine({
             />
             {!isRecording && !audioBlob && (
               <div className="waveform-idle-overlay">
-                <p>Tap record and speak naturally</p>
-                <span>16 kHz mono · up to 60 s recommended</span>
+                {micAvailable ? (
+                  <>
+                    <p>Tap record and speak naturally</p>
+                    <span>16 kHz mono · up to 60 s recommended</span>
+                  </>
+                ) : (
+                  <p>Microphone unavailable — upload a clip or use the sample</p>
+                )}
               </div>
             )}
           </div>
+
+          {!micAvailable && (
+            <p className="audio-inline-note" role="status">
+              <TriangleAlert size={14} aria-hidden="true" />
+              <span>
+                {insecureContext
+                  ? 'Microphone recording needs HTTPS (or localhost). Upload a clip or use the sample instead.'
+                  : 'This browser does not expose microphone input. Upload a clip or use the sample instead.'}
+              </span>
+            </p>
+          )}
 
           {/* Controls Bar */}
           <div className="record-controls-row">
@@ -592,7 +675,7 @@ export default function AudioEngine({
                 type="button"
                 className="btn-record"
                 onClick={startRecording}
-                disabled={Boolean(loading) || isStarting}
+                disabled={!micAvailable || Boolean(loading) || isStarting}
               >
                 {loading || isStarting ? (
                   <Loader2 size={16} className="spin" />
@@ -625,65 +708,77 @@ export default function AudioEngine({
       {/* TAB 2: UPLOAD AUDIO */}
       {activeTab === 'upload' && (
         <div
-          className={`audio-dropzone ${isDragging ? 'is-dragging' : ''}`}
-          onClick={() => !loading && fileInputRef.current?.click()}
-          onDragOver={(e) => {
-            e.preventDefault();
-            setIsDragging(true);
-          }}
-          onDragEnter={() => {
-            dragDepthRef.current += 1;
-            setIsDragging(true);
-          }}
-          onDragLeave={() => {
-            dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
-            if (!dragDepthRef.current) setIsDragging(false);
-          }}
-          onDrop={(e) => {
-            e.preventDefault();
-            dragDepthRef.current = 0;
-            setIsDragging(false);
-            const file = e.dataTransfer.files && e.dataTransfer.files[0];
-            if (file) handleFileUpload(file);
-          }}
-          onKeyDown={(e) => {
-            if (loading) return;
-            if (e.key !== 'Enter' && e.key !== ' ') return;
-            e.preventDefault();
-            fileInputRef.current?.click();
-          }}
-          role="button"
-          tabIndex={loading ? -1 : 0}
-          aria-label="Choose an audio file, or drop one here"
-          aria-busy={loading === 'upload'}
+          className="audio-tab-panel"
+          id="audio-panel-upload"
+          role="tabpanel"
+          aria-labelledby="audio-tab-upload"
         >
-          <input
-            type="file"
-            ref={fileInputRef}
-            accept={AUDIO_ACCEPT}
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              // Reset first so choosing the same file twice still fires.
-              e.target.value = '';
-              handleFileUpload(file);
+          <div
+            className={`audio-dropzone ${isDragging ? 'is-dragging' : ''}`}
+            onClick={() => !loading && fileInputRef.current?.click()}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setIsDragging(true);
             }}
-            style={{ display: 'none' }}
-          />
-          {loading === 'upload' ? (
-            <Loader2 size={28} className="upload-audio-icon spin" />
-          ) : (
-            <FileAudio size={28} className="upload-audio-icon" />
-          )}
-          <p className="upload-hint-main">
-            {loading === 'upload' ? 'Reading audio…' : 'Click or drop an audio file here'}
-          </p>
-          <p className="upload-hint-sub">WAV, MP3, M4A, OGG, WebM, FLAC · 16 kHz mono works best</p>
+            onDragEnter={() => {
+              dragDepthRef.current += 1;
+              setIsDragging(true);
+            }}
+            onDragLeave={() => {
+              dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+              if (!dragDepthRef.current) setIsDragging(false);
+            }}
+            onDrop={(e) => {
+              e.preventDefault();
+              dragDepthRef.current = 0;
+              setIsDragging(false);
+              const file = e.dataTransfer.files && e.dataTransfer.files[0];
+              if (file) handleFileUpload(file);
+            }}
+            onKeyDown={(e) => {
+              if (loading) return;
+              if (e.key !== 'Enter' && e.key !== ' ') return;
+              e.preventDefault();
+              fileInputRef.current?.click();
+            }}
+            role="button"
+            tabIndex={loading ? -1 : 0}
+            aria-label="Choose an audio file, or drop one here"
+            aria-busy={loading === 'upload'}
+          >
+            <input
+              type="file"
+              ref={fileInputRef}
+              accept={AUDIO_ACCEPT}
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                // Reset first so choosing the same file twice still fires.
+                e.target.value = '';
+                handleFileUpload(file);
+              }}
+              style={{ display: 'none' }}
+            />
+            {loading === 'upload' ? (
+              <Loader2 size={28} className="upload-audio-icon spin" />
+            ) : (
+              <FileAudio size={28} className="upload-audio-icon" />
+            )}
+            <p className="upload-hint-main">
+              {loading === 'upload' ? 'Reading audio…' : 'Click or drop an audio file here'}
+            </p>
+            <p className="upload-hint-sub">WAV, MP3, M4A, OGG, WebM, FLAC · 16 kHz mono works best</p>
+          </div>
         </div>
       )}
 
       {/* TAB 3: SAMPLES */}
       {activeTab === 'samples' && (
-        <div className="sample-audio-list">
+        <div
+          className="sample-audio-list"
+          id="audio-panel-samples"
+          role="tabpanel"
+          aria-labelledby="audio-tab-samples"
+        >
           <div className={`sample-audio-card ${selectedSample ? 'is-selected' : ''}`}>
             <div className="sample-audio-info">
               <span className="sample-audio-name">{SAMPLE_AUDIO.label}</span>

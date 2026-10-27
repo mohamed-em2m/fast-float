@@ -349,6 +349,7 @@ export default function StudioStage({
           className="btn-primary btn-generate"
           onClick={onGenerate}
           disabled={isGenerating || !hasAudio}
+          aria-describedby={!hasAudio ? 'stage-audio-hint' : undefined}
           title={!hasAudio ? 'Add voice audio first' : 'Generate the talking portrait'}
         >
           {isGenerating ? (
@@ -365,10 +366,12 @@ export default function StudioStage({
         </button>
       </div>
 
-      {!hasAudio && !generationResult && (
-        <div className="stage-hint">
-          <span className="stage-hint-dot" />
-          Record or upload a voice clip to unlock generation.
+      {!hasAudio && (
+        <div className="stage-hint" id="stage-audio-hint">
+          <span className="stage-hint-dot" aria-hidden="true" />
+          {generationResult
+            ? 'Add a voice clip to generate another take.'
+            : 'Record or upload a voice clip to unlock generation.'}
         </div>
       )}
 

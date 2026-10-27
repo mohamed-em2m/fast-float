@@ -23,6 +23,7 @@ export default function InsightsPanel({ latestResult, history, onToast }) {
         className="insights-toggle"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
+        aria-controls="insights-body"
       >
         <span className="insights-title">
           <Gauge size={16} className="text-cyan" />
@@ -39,14 +40,16 @@ export default function InsightsPanel({ latestResult, history, onToast }) {
       </button>
 
       {open && (
-        <div className="insights-body">
+        <div className="insights-body" id="insights-body">
           <div className="insights-tabs" role="tablist" aria-label="Insight views">
             {TABS.map(({ id, label, icon: Icon }) => (
               <button
                 key={id}
                 type="button"
                 role="tab"
+                id={`insights-tab-${id}`}
                 aria-selected={tab === id}
+                aria-controls={`insights-panel-${id}`}
                 className={`insights-tab ${tab === id ? 'is-active' : ''}`}
                 onClick={() => setTab(id)}
               >
@@ -56,11 +59,17 @@ export default function InsightsPanel({ latestResult, history, onToast }) {
             ))}
           </div>
 
-          {tab === 'session' ? (
-            <TelemetryDashboard latestResult={latestResult} history={history} embedded />
-          ) : (
-            <PerfMatrixPanel onToast={onToast} embedded />
-          )}
+          <div
+            role="tabpanel"
+            id={`insights-panel-${tab}`}
+            aria-labelledby={`insights-tab-${tab}`}
+          >
+            {tab === 'session' ? (
+              <TelemetryDashboard latestResult={latestResult} history={history} embedded />
+            ) : (
+              <PerfMatrixPanel onToast={onToast} embedded />
+            )}
+          </div>
         </div>
       )}
     </section>

@@ -32,7 +32,7 @@ function pickFile(name, type, bytes = [1, 2, 3, 4]) {
 describe('AudioEngine', () => {
   it('publishes an uploaded clip so generation can start (StrictMode)', async () => {
     const props = renderEngine();
-    fireEvent.click(screen.getByRole('button', { name: /upload file/i }));
+    fireEvent.click(screen.getByRole('tab', { name: /upload file/i }));
 
     pickFile('voice.wav', 'audio/wav');
 
@@ -52,7 +52,7 @@ describe('AudioEngine', () => {
     );
     const props = renderEngine();
 
-    fireEvent.click(screen.getByRole('button', { name: /sample speech/i }));
+    fireEvent.click(screen.getByRole('tab', { name: /sample speech/i }));
     fireEvent.click(screen.getByRole('button', { name: /use sample/i }));
 
     await waitFor(() => expect(props.setAudioBase64).toHaveBeenCalled());
@@ -63,7 +63,7 @@ describe('AudioEngine', () => {
 
   it('rejects an unsupported file without touching the selection', async () => {
     const props = renderEngine();
-    fireEvent.click(screen.getByRole('button', { name: /upload file/i }));
+    fireEvent.click(screen.getByRole('tab', { name: /upload file/i }));
 
     pickFile('notes.txt', 'text/plain');
 

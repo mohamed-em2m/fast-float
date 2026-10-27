@@ -174,12 +174,12 @@ export default function PortraitCanvas({
           if (!dragDepthRef.current) setIsDragging(false);
         }}
         onDrop={handleDrop}
-        onClick={() => !imagePreview && !busy && fileInputRef.current?.click()}
-        role={imagePreview ? undefined : 'button'}
-        tabIndex={imagePreview || busy ? -1 : 0}
-        aria-label={imagePreview ? undefined : 'Choose a portrait image'}
+        onClick={() => !busy && fileInputRef.current?.click()}
+        role="button"
+        tabIndex={busy ? -1 : 0}
+        aria-label={imagePreview ? 'Change portrait image' : 'Choose a portrait image'}
         onKeyDown={(e) => {
-          if (imagePreview || busy) return;
+          if (busy) return;
           if (e.key !== 'Enter' && e.key !== ' ') return;
           e.preventDefault();
           fileInputRef.current?.click();

@@ -89,6 +89,13 @@ export default function App() {
     toastTimerRef.current = setTimeout(() => setToast(null), 4500);
   }, []);
 
+  // Changing the voice clip invalidates a previous failure: dismiss the error
+  // banner (and its Retry button) instead of leaving stale advice on screen.
+  const applyAudioBase64 = useCallback((value) => {
+    setAudioBase64(value);
+    setGenerationError(null);
+  }, []);
+
   useEffect(() => () => {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
   }, []);
@@ -258,7 +265,7 @@ export default function App() {
               audioBlob={audioBlob}
               setAudioBlob={setAudioBlob}
               audioBase64={audioBase64}
-              setAudioBase64={setAudioBase64}
+              setAudioBase64={applyAudioBase64}
               setAudioFormat={setAudioFormat}
               step={2}
               onToast={showToast}

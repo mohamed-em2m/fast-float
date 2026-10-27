@@ -129,12 +129,13 @@
   position: sticky;
   top: 12px;
   z-index: 100;
-  display: flex;
+  /* Three equal-weight zones keep the mode switch centred on the page, not
+     merely in the gap left over by the two side groups. */
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
-  justify-content: space-between;
   gap: 18px;
   padding: 12px 16px;
-  flex-wrap: wrap;
   background: rgba(11, 13, 21, 0.82);
 }
 
@@ -143,6 +144,7 @@
   align-items: center;
   gap: 12px;
   min-width: 0;
+  justify-self: start;
 }
 
 .brand-logo {
@@ -199,6 +201,7 @@
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-full);
+  justify-self: center;
 }
 
 .mode-tab {
@@ -244,6 +247,7 @@
   gap: 8px;
   flex-wrap: wrap;
   justify-content: flex-end;
+  justify-self: end;
   min-width: 0;
 }
 
@@ -518,9 +522,11 @@
    -------------------------------------------------------------------------- */
 .studio-workspace {
   display: grid;
-  grid-template-columns: minmax(340px, 410px) minmax(0, 1fr);
+  /* Balanced spread: the composer and the stage carry comparable weight
+     instead of a narrow rail beside a very wide canvas. */
+  grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
   gap: 20px;
-  align-items: start;
+  align-items: stretch;
 }
 
 .studio-composer {
@@ -535,6 +541,7 @@
   flex-direction: column;
   gap: 16px;
   min-width: 0;
+  height: 100%;
 }
 
 /* Cards */
@@ -714,7 +721,9 @@
 .portrait-preview-img {
   width: 100%;
   height: 100%;
-  max-height: 260px;
+  /* Track the column width so the portrait keeps a photo-like crop instead of
+     turning into a letterboxed banner on wide screens. */
+  max-height: clamp(240px, 22vw, 360px);
   object-fit: cover;
   display: block;
 }
@@ -733,6 +742,22 @@
 .portrait-preview-container:hover .portrait-overlay,
 .portrait-preview-container:focus-within .portrait-overlay {
   opacity: 1;
+}
+
+/* Touch devices have no hover: keep the change affordance permanently
+   visible (and out of the way of the face) instead of hiding the only
+   control behind a hover state that can never happen. */
+@media (hover: none) {
+  .portrait-overlay {
+    opacity: 1;
+    align-items: flex-end;
+    padding-bottom: 10px;
+    background: linear-gradient(180deg, transparent 55%, rgba(5, 6, 10, 0.78));
+  }
+
+  .portrait-focus-ring {
+    display: none;
+  }
 }
 
 .portrait-focus-ring {
@@ -1042,6 +1067,25 @@
 .sample-audio-desc {
   font-size: 11px;
   color: var(--text-faint);
+}
+
+/* Microphone availability warning (insecure origin / unsupported browser). */
+.audio-inline-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(245, 180, 85, 0.22);
+  background: rgba(245, 180, 85, 0.07);
+  color: var(--warning);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.audio-inline-note svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
 }
 
 .audio-preview-row {
@@ -1366,6 +1410,9 @@
   display: flex;
   flex-direction: column;
   gap: 14px;
+  /* The stage fills the height of the column so its bottom edge lines up with
+     the composer, and the toolbar stays anchored to that edge. */
+  flex: 1;
 }
 
 .stage-head {
@@ -1486,6 +1533,7 @@
 .stage-viewport {
   position: relative;
   width: 100%;
+  flex: 1 1 auto;
   min-height: clamp(300px, 42vh, 480px);
   background:
     radial-gradient(circle at 50% 46%, rgba(109, 124, 255, 0.09), transparent 58%),
@@ -2418,9 +2466,11 @@
    -------------------------------------------------------------------------- */
 .live-workspace {
   display: grid;
-  grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
+  /* Same balanced split as the Studio so switching modes does not shift the
+     reading axis of the page. */
+  grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
   gap: 20px;
-  align-items: start;
+  align-items: stretch;
 }
 
 .live-sidebar {
@@ -2428,6 +2478,7 @@
   flex-direction: column;
   gap: 16px;
   min-width: 0;
+  height: 100%;
 }
 
 .live-pick-card {
@@ -2598,6 +2649,8 @@
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* Push the tip card to the bottom edge so both columns end together. */
+  margin-top: auto;
 }
 
 .live-tips-title {
@@ -2682,6 +2735,7 @@
   flex-direction: column;
   gap: 14px;
   min-width: 0;
+  flex: 1;
 }
 
 .live-stage-header {
@@ -3001,6 +3055,7 @@
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+  margin-top: auto;
 }
 
 .live-controls .btn-secondary.is-muted {
@@ -3063,9 +3118,13 @@
   }
 }
 
-@media (max-width: 860px) {
+@media (max-width: 1080px) {
+  /* The three-zone grid needs room for both side groups; below this the
+     header stacks into a centred column instead of overflowing. */
   .app-header {
     position: static;
+    display: flex;
+    flex-wrap: wrap;
     justify-content: center;
   }
 
@@ -3082,7 +3141,9 @@
     width: 100%;
     justify-content: center;
   }
+}
 
+@media (max-width: 860px) {
   .stage-head {
     flex-direction: column;
   }
