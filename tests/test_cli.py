@@ -10,7 +10,7 @@ def test_cli_parser_defaults():
     assert args.host == "0.0.0.0"
     assert args.port == 8000
     assert args.server_type == "hypercorn"
-    assert not args.dual_process
+    assert args.dual_process is True
     assert not args.frontend
     assert args.frontend_port == 3000
     assert args.control_port == 5555
@@ -26,7 +26,6 @@ def test_cli_parser_custom_options():
             "127.0.0.1",
             "--port",
             "9000",
-            "--dual-process",
             "--frontend",
             "--frontend-port",
             "3001",
@@ -40,10 +39,17 @@ def test_cli_parser_custom_options():
     assert args.host == "127.0.0.1"
     assert args.port == 9000
     assert args.server_type == "uvicorn"
-    assert args.dual_process is True
+    assert args.dual_process is True  # default
     assert args.frontend is True
     assert args.frontend_port == 3001
     assert args.ngpus == 2
+
+
+def test_cli_parser_no_dual_process():
+    """--no-dual-process opts out of the default dual-process mode."""
+    parser = build_parser()
+    args = parser.parse_args(["serve", "--no-dual-process"])
+    assert args.dual_process is False
 
 
 def test_cli_parser_worker_subcommand():

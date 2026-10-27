@@ -243,8 +243,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_serve.add_argument(
         "--dual-process",
-        action="store_true",
-        help="Enable dual-process architecture (separate GPU worker via ZeroMQ/SHM)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable dual-process architecture (default: enabled). Use --no-dual-process for legacy single-process mode.",
     )
     p_serve.add_argument(
         "--frontend",
