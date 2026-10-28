@@ -8,6 +8,7 @@ import {
   Sparkles,
   Zap,
 } from 'lucide-react';
+import GenerateAction from './GenerateAction';
 
 const EMOTIONS = [
   { id: 'S2E', label: 'Auto', icon: '✨', hint: 'Read the mood from the voice' },
@@ -25,7 +26,15 @@ const QUALITY_PRESETS = [
   { id: 'cinematic', label: 'Cinematic', nfe: 16, hint: 'Best detail' },
 ];
 
-export default function ParameterControls({ params, setParams, step = 3 }) {
+export default function ParameterControls({
+  params,
+  setParams,
+  step = 3,
+  onGenerate,
+  isGenerating = false,
+  hasAudio = false,
+  hasResult = false,
+}) {
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const updateParam = (key, val) => {
@@ -323,6 +332,17 @@ export default function ParameterControls({ params, setParams, step = 3 }) {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Same shape as the Live tab: the last input card ends on the primary
+          action, so the canvas stays a preview. */}
+      {onGenerate && (
+        <GenerateAction
+          onGenerate={onGenerate}
+          isGenerating={isGenerating}
+          hasAudio={hasAudio}
+          hasResult={hasResult}
+        />
       )}
     </div>
   );

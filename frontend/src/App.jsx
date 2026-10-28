@@ -274,13 +274,20 @@ export default function App() {
               onToast={showToast}
             />
 
-            <MemoParameterControls params={params} setParams={setParams} step={3} />
+            <MemoParameterControls
+              params={params}
+              setParams={setParams}
+              step={3}
+              onGenerate={handleGenerate}
+              isGenerating={isGenerating}
+              hasAudio={Boolean(audioBase64)}
+              hasResult={Boolean(generationResult)}
+            />
           </aside>
 
           {/* Same structure as the Live tab: the right column is exactly one
               stage panel (canvas + its controls), nothing else. */}
           <StudioStage
-            onGenerate={handleGenerate}
             onRetry={handleGenerate}
             isGenerating={isGenerating}
             progressRequestId={progressRequestId}

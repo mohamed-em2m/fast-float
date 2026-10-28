@@ -1518,32 +1518,19 @@
   background: var(--success);
 }
 
-/* Primary CTA: under the canvas, where the eye lands after the preview. */
-.stage-cta {
-  display: flex;
-  justify-content: center;
-  padding: 2px 0;
-}
-
-.stage-cta-stack {
+/* Primary CTA: the last card of the composer ends on it, mirroring the Live
+   tab where `Go Live` closes the microphone card. */
+.generate-action {
   display: flex;
   flex-direction: column;
-  align-items: center;
   gap: 9px;
-  width: 100%;
-  max-width: 460px;
-}
-
-.stage-cta .btn-generate {
-  width: 100%;
 }
 
 .btn-generate {
   width: 100%;
-  max-width: 460px;
   min-height: var(--control-h-lg);
-  padding: 0 22px;
-  font-size: 14.5px;
+  padding: 0 16px;
+  font-size: 14px;
   border-radius: var(--radius-md);
   white-space: nowrap;
   /* Moving highlight layered over the brand gradient. */

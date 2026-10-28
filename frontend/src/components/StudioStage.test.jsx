@@ -29,7 +29,6 @@ const RESULT = {
 function renderStage(props = {}) {
   return render(
     <StudioStage
-      onGenerate={() => {}}
       isGenerating={false}
       hasAudio
       onToast={() => {}}
@@ -179,21 +178,5 @@ describe('StudioStage output', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('CUDA out of memory');
     screen.getByRole('button', { name: /retry/i }).click();
     expect(onRetry).toHaveBeenCalledTimes(1);
-  });
-
-  it('explains why generation is locked when no voice clip is available', () => {
-    renderStage({ hasAudio: false });
-
-    const button = screen.getByRole('button', { name: /generate video/i });
-    expect(button).toBeDisabled();
-    expect(button).toHaveAttribute('aria-describedby', 'stage-audio-hint');
-    expect(screen.getByText(/record or upload a voice clip/i)).toBeInTheDocument();
-  });
-
-  it('keeps the hint after a result when the audio is cleared', () => {
-    renderStage({ hasAudio: false, generationResult: RESULT });
-
-    expect(screen.getByText(/add a voice clip to generate another take/i)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /generate another/i })).toBeDisabled();
   });
 });

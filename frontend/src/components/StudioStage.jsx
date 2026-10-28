@@ -8,7 +8,6 @@ import {
   Play,
   Radio,
   RefreshCw,
-  Sparkles,
   TriangleAlert,
   Wand2,
   Zap,
@@ -63,7 +62,6 @@ const TRANSPORTS = [
 ];
 
 export default function StudioStage({
-  onGenerate,
   onRetry,
   isGenerating,
   progressRequestId = null,
@@ -466,40 +464,6 @@ export default function StudioStage({
             )}
           </div>
         )}
-      </div>
-
-      <div className="stage-cta">
-        <div className="stage-cta-stack">
-          <button
-            type="button"
-            className={`btn-primary btn-generate ${isGenerating ? 'is-busy' : ''}`}
-            onClick={onGenerate}
-            disabled={isGenerating || !hasAudio}
-            aria-describedby={!hasAudio ? 'stage-audio-hint' : undefined}
-            title={!hasAudio ? 'Add voice audio first' : 'Generate the talking portrait'}
-          >
-            {isGenerating ? (
-              <>
-                <span className="spinner-dot animate-spin" />
-                <span>Generating…</span>
-              </>
-            ) : (
-              <>
-                <Sparkles size={18} />
-                <span>{generationResult ? 'Generate another' : 'Generate video'}</span>
-              </>
-            )}
-          </button>
-
-          {!hasAudio && (
-            <div className="stage-hint" id="stage-audio-hint">
-              <span className="stage-hint-dot" aria-hidden="true" />
-              {generationResult
-                ? 'Add a voice clip to generate another take.'
-                : 'Record or upload a voice clip to unlock generation.'}
-            </div>
-          )}
-        </div>
       </div>
 
       <div className="stage-toolbar">
