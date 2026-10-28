@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import functools
 import logging
+import os
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -81,6 +83,11 @@ BYTES_PER_FRAME = SAMPLES_PER_FRAME * 2  # 1280 bytes PCM16
 DEFAULT_CHUNK_SEC = 5.0
 DEFAULT_FIRST_CHUNK_SEC = 5.0
 
+# How long to wait for the worker's shared-memory ring at attach time (sec).
+# The worker creates it only after loading the model, so a backend that is
+# already serving can be up before it.
+DEFAULT_SHM_WAIT_S = 15.0
+
 _SILENCE_SENTINEL = object()
 
 
@@ -121,6 +128,7 @@ class ZmqFloatVideoGenerator:
         shm_name: str = "float_frame_ring",
         shm_slots: int = 64,
         session_id: str = "",
+        shm_wait_s: float | None = None,
     ) -> None:
         if zmq is None:
             raise RuntimeError("pyzmq is required: pip install pyzmq")
@@ -134,6 +142,17 @@ class ZmqFloatVideoGenerator:
         self._shm_name = shm_name
         self._shm_slots = shm_slots
         self._session_id = session_id or str(uuid.uuid4())
+
+        # How long to wait for the worker's segment to appear. The worker owns
+        # it and creates it only after loading the model, so a backend that is
+        # already up races with a worker that is still booting.
+        if shm_wait_s is None:
+            raw_wait = os.environ.get("FLOAT_SHM_WAIT_S", "").strip()
+            try:
+                shm_wait_s = float(raw_wait) if raw_wait else DEFAULT_SHM_WAIT_S
+            except ValueError:
+                shm_wait_s = DEFAULT_SHM_WAIT_S
+        self._shm_wait_s = max(0.0, float(shm_wait_s))
 
         # Asyncio + ZMQ context (created in _ensure_connected)
         self._zmq_ctx: Any = None
@@ -204,27 +223,53 @@ class ZmqFloatVideoGenerator:
     # ------------------------------------------------------------------
 
     async def _ensure_connected(self) -> None:
-        """Lazily create ZMQ context, sockets, and SHM attachment."""
+        """Lazily create ZMQ context, sockets, and SHM attachment.
+
+        Every resource is built locally and committed at the end. A failed
+        attach (worker not started, still loading, or crashed) must not leave
+        ``_zmq_ctx`` set: the old code assigned it first, so the *next* call
+        returned early with no ring, no sockets and no frame listener while
+        looking "connected".
+        """
         if self._zmq_ctx is not None:
             return
 
-        self._zmq_ctx = azmq.Context()
+        ctx = azmq.Context()
+        req = sub = None
 
-        # REQ socket for synchronous control commands.
-        self._req_sock = self._zmq_ctx.socket(zmq.REQ)
-        self._req_sock.connect(self._control_ep)
+        try:
+            # REQ socket for synchronous control commands.
+            req = ctx.socket(zmq.REQ)
+            req.connect(self._control_ep)
 
-        # SUB socket for per-frame notifications from the worker.
-        self._sub_sock = self._zmq_ctx.socket(zmq.SUB)
-        self._sub_sock.connect(self._frames_ep)
-        self._sub_sock.setsockopt(zmq.SUBSCRIBE, b"")  # receive all topics
+            # SUB socket for per-frame notifications from the worker.
+            sub = ctx.socket(zmq.SUB)
+            sub.connect(self._frames_ep)
+            sub.setsockopt(zmq.SUBSCRIBE, b"")  # receive all topics
 
-        # Attach to the shared-memory ring (worker must already own it).
-        self._ring = FrameRingBuffer(
-            name=self._shm_name,
-            num_slots=self._shm_slots,
-            create=False,
-        )
+            # Attach to the shared-memory ring (the worker owns it). Blocking
+            # poll, so run it off the loop: it can wait for a booting worker.
+            ring = await asyncio.to_thread(
+                functools.partial(
+                    FrameRingBuffer.attach,
+                    name=self._shm_name,
+                    num_slots=self._shm_slots,
+                    timeout=self._shm_wait_s,
+                )
+            )
+        except BaseException:
+            with contextlib.suppress(Exception):
+                if req is not None:
+                    req.close(linger=0)
+                if sub is not None:
+                    sub.close(linger=0)
+                ctx.term()
+            raise
+
+        self._zmq_ctx = ctx
+        self._req_sock = req
+        self._sub_sock = sub
+        self._ring = ring
 
         # Start the background frame-listener.
         self._listener_task = asyncio.create_task(self._frame_listener(), name="zmq-frame-listener")

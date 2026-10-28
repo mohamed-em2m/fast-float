@@ -160,6 +160,11 @@ def _serve_supervisor(args: argparse.Namespace) -> int:
             env["FLOAT_SHM_NAME"] = str(args.shm_name)
         if args.shm_slots:
             env["FLOAT_SHM_SLOTS"] = str(args.shm_slots)
+    else:
+        # No worker is started here, so the API must not build a ZMQ generator
+        # because settings.toml has [ipc] enabled = true. The override also
+        # reaches the child: nothing else mutates settings.toml.
+        env["FLOAT_IPC_ENABLED"] = "false"
 
     print("=" * 60)
     print("🚀 fast-float inference server")

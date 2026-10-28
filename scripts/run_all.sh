@@ -225,6 +225,13 @@ trap cleanup INT TERM EXIT
 # --- Backend ------------------------------------------------------------------
 echo "🚀 Starting backend  →  http://localhost:${PORT} (docs: http://localhost:${PORT}/docs)"
 echo "   (model load + warmup can take several minutes on first start)"
+# This launcher runs inference inside the API process: it never starts the
+# ZeroMQ worker. settings.toml ships [ipc] enabled = true for the dual-process
+# stack, so force the override off here — otherwise every live conversation
+# builds a ZMQ generator and dies attaching `/float_frame_ring`
+# (`FileNotFoundError: /float_frame_ring`). Use ./scripts/run_dual_process.sh
+# for the worker + API split.
+export FLOAT_IPC_ENABLED="${FLOAT_IPC_ENABLED:-false}"
 # Pin to the lockfile: a floating `uv run` re-resolves on a stale lock and can
 # drag in phantom deps (seen: onnxruntime==1.24.3 with no cp310 wheel).
 # `--no-sync` is required: the lock pins the *portable* stack (onnx<1.17 + the

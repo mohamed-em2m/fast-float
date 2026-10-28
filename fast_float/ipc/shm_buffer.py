@@ -15,11 +15,36 @@ from __future__ import annotations
 import contextlib
 import logging
 import struct
+import time
 from multiprocessing import shared_memory
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+class WorkerUnavailable(RuntimeError):
+    """The inference worker has not published its shared-memory ring.
+
+    Raised by :meth:`FrameRingBuffer.attach` when the consumer (the API) looks
+    for the worker's segment and it does not exist: the worker is not running,
+    is still loading its weights, or died. It subclasses ``RuntimeError`` on
+    purpose so the HTTP layer maps it to a readable 503 (``/livekit/...``
+    already converts ``RuntimeError`` into one) instead of an ASGI 500 with a
+    bare ``FileNotFoundError``.
+    """
+
+
+def segment_exists(name: str) -> bool:
+    """Whether shared-memory segment ``name`` is currently published."""
+    try:
+        shm = shared_memory.SharedMemory(name=name)
+    except (FileNotFoundError, OSError):
+        return False
+    with contextlib.suppress(Exception):
+        shm.close()
+    return True
+
 
 # Header struct: frame_idx(q), pts_ms(d), width(i), height(i), audio_len(i)
 HEADER_FORMAT = "<qdi i i"
@@ -63,6 +88,45 @@ class FrameRingBuffer:
             self.shm = shared_memory.SharedMemory(name=self.name)
 
         self._buf = self.shm.buf
+
+    @classmethod
+    def attach(
+        cls,
+        name: str,
+        num_slots: int = 64,
+        width: int = 512,
+        height: int = 512,
+        timeout: float = 0.0,
+        poll_interval: float = 0.25,
+    ) -> FrameRingBuffer:
+        """Attach to the worker-owned ring, waiting up to ``timeout`` seconds.
+
+        The worker creates the segment only *after* it has loaded the model, so
+        an API that is already serving when the worker boots (or restarts)
+        races with it. Polling here turns that race into a short wait instead
+        of a hard failure, and an empty segment into an actionable
+        :class:`WorkerUnavailable` instead of a bare ``FileNotFoundError``.
+        """
+        delay = max(0.01, float(poll_interval))
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            try:
+                return cls(name=name, num_slots=num_slots, width=width, height=height, create=False)
+            except FileNotFoundError:
+                if time.monotonic() >= deadline:
+                    raise WorkerUnavailable(cls._missing_message(name, timeout)) from None
+                time.sleep(delay)
+
+    @staticmethod
+    def _missing_message(name: str, waited: float) -> str:
+        waited_txt = f" (waited {waited:.0f}s)" if waited and waited > 0 else ""
+        return (
+            f"FLOAT inference worker is not running: shared-memory segment {name!r} "
+            f"does not exist{waited_txt}. Live conversations render through that worker, "
+            "so start both processes with ./scripts/run_dual_process.sh, or run the API "
+            "in single-process mode by setting FLOAT_IPC_ENABLED=false "
+            "(./scripts/run_all.sh does that automatically)."
+        )
 
     def _slot_offset(self, slot_idx: int) -> int:
         return (slot_idx % self.num_slots) * self.slot_size

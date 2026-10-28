@@ -242,6 +242,32 @@ async def lifespan(app: FastAPI):
     app_state.agent = OptimizedInferenceAgent(opt)
     logger.info("✅ Model loaded successfully")
 
+    # 4b. Dual-process health check. Live conversations render through the
+    # worker's shared-memory ring; warn at boot instead of failing the first
+    # conversation with an opaque FileNotFoundError inside the request.
+    try:
+        from fast_float.config.dynamic import load_settings
+        from fast_float.ipc import ipc_enabled, segment_exists
+
+        ipc_cfg = load_settings().get("ipc", {})
+        ipc_cfg = ipc_cfg if isinstance(ipc_cfg, dict) else {}
+        if ipc_enabled(ipc_cfg):
+            shm_name = str(ipc_cfg.get("shm_name", "float_frame_ring"))
+            if segment_exists(shm_name):
+                logger.info(f"🧵 IPC worker detected (shm={shm_name}) — live rendering runs in the worker")
+            else:
+                logger.warning(
+                    "⚠️  [ipc] enabled but shared memory %r is not published: the inference "
+                    "worker is not running, so live conversations will return 503. Start the "
+                    "full stack with ./scripts/run_dual_process.sh, or set FLOAT_IPC_ENABLED=false "
+                    "to render in-process (./scripts/run_all.sh does that automatically).",
+                    shm_name,
+                )
+        else:
+            logger.info("🧵 IPC worker not used (FLOAT_IPC_ENABLED / [ipc] enabled) — live rendering is in-process")
+    except Exception as exc:  # pragma: no cover - diagnostics must never block boot
+        logger.debug(f"IPC boot check skipped: {exc}")
+
     # 5. Boot warmup runs AFTER startup (background task) so /health answers
     # immediately. Set SKIP_WARMUP=1 to disable. /generate returns 503
     # while app_state.warming_up is True.

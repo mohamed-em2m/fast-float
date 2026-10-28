@@ -308,9 +308,12 @@ class ConversationSession:
             self.image_path = ensure_default_image()
 
         from fast_float.config.dynamic import load_settings
+        from fast_float.ipc import ipc_enabled
 
         ipc_cfg = load_settings().get("ipc", {})
-        if isinstance(ipc_cfg, dict) and ipc_cfg.get("enabled", False):
+        if not isinstance(ipc_cfg, dict):
+            ipc_cfg = {}
+        if ipc_enabled(ipc_cfg):
             from fast_float.livekit.zmq_generator import ZmqFloatVideoGenerator
 
             self.generator = ZmqFloatVideoGenerator(
