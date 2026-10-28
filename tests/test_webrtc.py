@@ -11,6 +11,7 @@ works without needing UDP connectivity.
 from __future__ import annotations
 
 import asyncio
+from typing import ClassVar
 
 import numpy as np
 import pytest
@@ -235,9 +236,7 @@ def test_live_offer_returns_404_when_stream_never_registers(monkeypatch):
 
     monkeypatch.setattr(app_state, "wait_for_live_stream", no_stream)
 
-    response = asyncio.run(
-        _post_offer({"sdp": "v=0", "type": "offer", "stream_id": "late", "live": True})
-    )
+    response = asyncio.run(_post_offer({"sdp": "v=0", "type": "offer", "stream_id": "late", "live": True}))
 
     assert response.status_code == 404
 
@@ -246,9 +245,7 @@ def test_live_offer_returns_504_when_metadata_times_out():
     stream = _FakeLiveStream(meta=None)
     app_state.live_streams["req"] = stream
 
-    response = asyncio.run(
-        _post_offer({"sdp": "v=0", "type": "offer", "stream_id": "req", "live": True})
-    )
+    response = asyncio.run(_post_offer({"sdp": "v=0", "type": "offer", "stream_id": "req", "live": True}))
 
     assert response.status_code == 504
     assert stream.unsubscribed == stream.queues
@@ -260,9 +257,7 @@ def test_live_offer_returns_502_when_the_stream_failed():
     stream = _FakeLiveStream(meta=None, error="render exploded")
     app_state.live_streams["req"] = stream
 
-    response = asyncio.run(
-        _post_offer({"sdp": "v=0", "type": "offer", "stream_id": "req", "live": True})
-    )
+    response = asyncio.run(_post_offer({"sdp": "v=0", "type": "offer", "stream_id": "req", "live": True}))
 
     assert response.status_code == 502
     assert response.json()["detail"] == "render exploded"
@@ -318,9 +313,7 @@ def test_live_offer_cleans_up_when_negotiation_fails(monkeypatch):
     pc.setRemoteDescription = boom
     monkeypatch.setattr(webrtc_router, "_new_peer_connection", lambda request: pc)
 
-    response = asyncio.run(
-        _post_offer({"sdp": "v=0", "type": "offer", "stream_id": "req", "live": True})
-    )
+    response = asyncio.run(_post_offer({"sdp": "v=0", "type": "offer", "stream_id": "req", "live": True}))
 
     assert response.status_code == 500
     assert pc.closed
@@ -380,7 +373,7 @@ class _FakeTrack:
 
 
 class _FakePlayer:
-    instances: list[_FakePlayer] = []
+    instances: ClassVar[list[_FakePlayer]] = []
 
     def __init__(self, path: str, loop: bool = False) -> None:
         self.path = path
@@ -399,9 +392,7 @@ def test_file_offer_attaches_media_player_tracks(monkeypatch, tmp_path):
     monkeypatch.setattr(webrtc_router, "MediaPlayer", _FakePlayer)
     monkeypatch.setattr(webrtc_router, "_new_peer_connection", lambda request: pc)
 
-    response = asyncio.run(
-        _post_offer({"sdp": "v=0", "type": "offer", "stream_id": "req"})
-    )
+    response = asyncio.run(_post_offer({"sdp": "v=0", "type": "offer", "stream_id": "req"}))
 
     assert response.status_code == 200
     body = response.json()
@@ -417,7 +408,8 @@ def test_file_offer_attaches_media_player_tracks(monkeypatch, tmp_path):
     assert candidate_pc is pc
 
     webrtc_router._cleanup_peer(pc)
-    assert player.video.stopped and player.audio.stopped
+    assert player.video.stopped
+    assert player.audio.stopped
     assert webrtc_router._pending_peers == {}
 
 
@@ -436,9 +428,7 @@ def test_file_offer_rejects_media_without_playable_tracks(monkeypatch, tmp_path)
     monkeypatch.setattr(webrtc_router, "MediaPlayer", VideoOnlylessPlayer)
     monkeypatch.setattr(webrtc_router, "_new_peer_connection", lambda request: pc)
 
-    response = asyncio.run(
-        _post_offer({"sdp": "v=0", "type": "offer", "stream_id": "req"})
-    )
+    response = asyncio.run(_post_offer({"sdp": "v=0", "type": "offer", "stream_id": "req"}))
 
     assert response.status_code == 500
     assert "playable" in response.json()["detail"]
@@ -671,7 +661,8 @@ def test_cleanup_peer_stops_everything_it_owns():
         assert webrtc_router._live_subs == {}
         assert webrtc_router._live_end_tasks == {}
         assert app_state.pcs == set()
-        assert player.video.stopped and player.audio.stopped
+        assert player.video.stopped
+        assert player.audio.stopped
         assert stream.unsubscribed == [queue]
         assert feed.closed
         assert track._stopped
@@ -725,9 +716,7 @@ def test_real_aiortc_live_offer_answers_and_delivers_frames(monkeypatch, tmp_pat
 
     async def scenario():
         offer_sdp = await _client_offer_sdp()
-        response = await _post_offer(
-            {"sdp": offer_sdp, "type": "offer", "stream_id": "live-1", "live": True}
-        )
+        response = await _post_offer({"sdp": offer_sdp, "type": "offer", "stream_id": "live-1", "live": True})
         assert response.status_code == 200, response.text
         body = response.json()
         assert body["type"] == "answer"
@@ -798,9 +787,7 @@ def test_real_aiortc_peer_closes_cleanly_when_the_stream_ends():
 
     async def scenario():
         offer_sdp = await _client_offer_sdp()
-        response = await _post_offer(
-            {"sdp": offer_sdp, "type": "offer", "stream_id": "done", "live": True}
-        )
+        response = await _post_offer({"sdp": offer_sdp, "type": "offer", "stream_id": "done", "live": True})
         assert response.status_code == 200, response.text
         body = response.json()
         pc = webrtc_router._pending_peers[body["peer_id"]]
