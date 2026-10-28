@@ -8,6 +8,7 @@ import ParameterControls from './components/ParameterControls';
 import StudioStage from './components/StudioStage';
 import InsightsPanel from './components/InsightsPanel';
 import { generateVideo, blobToBase64, alignUrlToApi } from './services/api';
+import { DEFAULT_PORTRAIT_URL } from './services/samplePortraits';
 import { getStored, setStored } from './services/storage';
 
 // The live workspace pulls in the whole livekit-client SDK. Loading it on
@@ -22,7 +23,6 @@ const MemoAudioEngine = React.memo(AudioEngine);
 const MemoParameterControls = React.memo(ParameterControls);
 const MemoInsightsPanel = React.memo(InsightsPanel);
 
-const DEFAULT_PORTRAIT = '/samples/portrait1.jpg';
 const MODE_KEY = 'float_mode';
 
 const TOAST_ICON = {
@@ -37,8 +37,10 @@ export default function App() {
     getStored(MODE_KEY) === 'live' ? 'live' : 'studio'
   ));
 
-  // Input State
-  const [imagePreview, setImagePreview] = useState(DEFAULT_PORTRAIT);
+  // Input State — the first discovered sample doubles as the default portrait,
+  // so the Studio always starts with a real image (or none when the folder is
+  // empty, in which case the picker placeholder shows instead).
+  const [imagePreview, setImagePreview] = useState(DEFAULT_PORTRAIT_URL);
   const [imageBase64, setImageBase64] = useState(null);
   // Container hint for image_base64; portrait uploads set the real format.
   const [imageFormat, setImageFormat] = useState('jpg');
@@ -112,10 +114,11 @@ export default function App() {
   // Preload the default sample portrait so the preview the user SEES is the
   // image the backend RECEIVES.
   useEffect(() => {
+    if (!DEFAULT_PORTRAIT_URL) return undefined;
     let cancelled = false;
     (async () => {
       try {
-        const res = await fetch(DEFAULT_PORTRAIT);
+        const res = await fetch(DEFAULT_PORTRAIT_URL);
         if (!res.ok) return;
         const blob = await res.blob();
         const base64 = await blobToBase64(blob);

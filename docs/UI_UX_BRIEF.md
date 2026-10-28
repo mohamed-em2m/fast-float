@@ -64,7 +64,10 @@ steps, seeds, chunking, batch sizes, guidance scales, and encoder quality.
 - Drag-and-drop / click-to-browse upload (PNG, JPG, WebP). Default portrait preloaded.
 - Large preview with a "face focus" affordance; **Change Photo** and **Clear**.
 - **Auto face crop & centering** toggle (recommended for non-aligned photos) — maps to `no_crop`.
-- **Quick samples** (thumbnail pills) to load a demo portrait instantly.
+- **Quick samples** (thumbnail pills) to load a demo portrait instantly. The list is
+  discovered from `frontend/src/assets/samples/` at build time (`import.meta.glob`), so a new
+  photo becomes a button by being dropped in — no code edit, and a deleted file leaves no dead
+  button. The first sample (by file name) is the preloaded default.
 
 ### 3.2 Driving speech audio (three input modes)
 

@@ -5,11 +5,7 @@ import {
   formatBytes,
   imageFormatFromFile,
 } from '../services/api';
-
-const SAMPLE_PORTRAITS = [
-  { id: 'sam', name: 'Sam Altman', url: '/samples/portrait1.jpg' },
-  { id: 'avatar', name: 'Studio Avatar', url: '/samples/portrait2.jpg' },
-];
+import { SAMPLE_PORTRAITS } from '../services/samplePortraits';
 
 // Keep the JSON payload sane: base64 is ~33% larger than the file, and the
 // backend decodes the whole thing in memory.
@@ -250,28 +246,33 @@ export default function PortraitCanvas({
         <span className="crop-info-hint">Recommended for non-aligned photos</span>
       </div>
 
-      {/* Sample Presets */}
-      <div className="samples-row">
-        <span className="samples-label">Quick Samples:</span>
-        <div className="samples-pill-list">
-          {SAMPLE_PORTRAITS.map((sample) => (
-            <button
-              key={sample.id}
-              type="button"
-              className={`sample-pill ${imagePreview === sample.url ? 'active' : ''}`}
-              onClick={() => handleSelectSample(sample)}
-              disabled={busy}
-            >
-              {loading === sample.id ? (
-                <Loader2 size={14} className="spin" />
-              ) : (
-                <img src={sample.url} alt="" className="sample-thumbnail" />
-              )}
-              <span>{sample.name}</span>
-            </button>
-          ))}
+      {/* Sample Presets — discovered from src/assets/samples/, so a new photo
+          needs no code change (and a removed one leaves no dead button). */}
+      {SAMPLE_PORTRAITS.length > 0 && (
+        <div className="samples-row">
+          <span className="samples-label">Quick Samples:</span>
+          <div className="samples-pill-list">
+            {SAMPLE_PORTRAITS.map((sample) => (
+              <button
+                key={sample.id}
+                type="button"
+                className={`sample-pill ${imagePreview === sample.url ? 'active' : ''}`}
+                onClick={() => handleSelectSample(sample)}
+                disabled={busy}
+                title={`Use ${sample.name}`}
+                aria-pressed={imagePreview === sample.url}
+              >
+                {loading === sample.id ? (
+                  <Loader2 size={14} className="spin" />
+                ) : (
+                  <img src={sample.url} alt="" className="sample-thumbnail" loading="lazy" />
+                )}
+                <span>{sample.name}</span>
+              </button>
+            ))}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }
