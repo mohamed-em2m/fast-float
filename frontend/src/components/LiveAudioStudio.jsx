@@ -792,6 +792,7 @@ export default function LiveAudioStudio({
         </div>
 
         <div className="live-controls">
+          <div className="live-controls-group">
           <button
             type="button"
             className={`btn-secondary ${muted ? 'is-muted' : ''}`}
@@ -821,6 +822,7 @@ export default function LiveAudioStudio({
             <Sparkles size={16} aria-hidden="true" />
             End &amp; clear
           </button>
+          </div>
           <span className="live-controls-hint">
             {isLive && activeEngine === 'gemini'
               ? 'Gemini Live owns the voice — the avatar only renders it.'

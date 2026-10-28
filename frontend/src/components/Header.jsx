@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import logoUrl from '../assets/logo.png';
 import {
   AudioLines,
   Clapperboard,
@@ -201,7 +202,7 @@ export default function Header({ onToast, mode = 'studio', onModeChange }) {
     <header className="app-header glass-panel">
       <div className="header-brand">
         <div className="brand-logo">
-          <Sparkles className="brand-icon" size={20} />
+          <img src={logoUrl} alt="FLOAT Logo" className="brand-logo-img" />
         </div>
         <div>
           <div className="brand-title-wrap">
