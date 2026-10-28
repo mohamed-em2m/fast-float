@@ -51,7 +51,7 @@ ffmpeg -version | head -n 1
 
 ```bash
 git clone https://github.com/mohamed-em2m/fast-float.git
-cd float-fast
+cd fast-float
 ./scripts/setup.sh
 ```
 

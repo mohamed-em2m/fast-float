@@ -2,7 +2,7 @@
 
 **A serving and inference stack for FLOAT — audio-driven talking-portrait generation (ICCV 2025).**
 
-[![License: CC BY-NC-ND 4.0](https://img.shields.io/badge/License-CC%20BY--NC--ND%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-nd/4.0/) #
+[![License: CC BY-NC-ND 4.0](https://img.shields.io/badge/License-CC%20BY--NC--ND%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-nd/4.0/)
 [![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)](https://www.python.org/downloads/release/python-3100/)
 [![PyTorch 2.7.1](https://img.shields.io/badge/pytorch-2.7.1-ee4c2c.svg)](https://pytorch.org/)
 [![FastAPI](https://img.shields.io/badge/API-FastAPI-009688.svg)](https://fastapi.tiangolo.com/)
@@ -45,6 +45,7 @@ FLOAT Fast wraps the FLOAT generator in production-friendly interfaces and perfo
 - **LiveKit avatar transport** — FLOAT publishes synchronized avatar video + audio into LiveKit rooms for conversational sessions, with raw WebRTC and WebSocket fallbacks. See [`docs/LIVEKIT_INTEGRATION.md`](docs/LIVEKIT_INTEGRATION.md) and [`docs/LIVEKIT_GENERATOR.md`](docs/LIVEKIT_GENERATOR.md).
 - **Gemini Live voice agent** — a [LiveKit Agents](https://docs.livekit.io/agents/) worker (`fast_float/livekit/gemini/`) drives the live avatar conversation with Gemini speech-to-speech, exposes FLOAT voice tools, and streams its voice to the avatar for lip-sync. It runs as its own process but shares the project venv, lockfile and config. See [`docs/LIVEKIT_GEMINI_AGENT.md`](docs/LIVEKIT_GEMINI_AGENT.md).
 - **Per-component ONNX / TensorRT acceleration** — each module can run `eager`, `compile`, or `onnx` (TensorRT → CUDA → CPU), selected from a config generated **on the target box** after parity + benchmark checks. See [Backends](#per-component-backends-onnx--tensorrt).
+- **Unified multi-process logging** — one rotating JSONL file per process (`logs/api.log`, `logs/worker.log`, …) plus a single-writer `logs/combined.log`, request/session correlation across the API and the GPU worker, credential redaction and crash dumps. See [`docs/LOGGING.md`](docs/LOGGING.md).
 
 ---
 
@@ -66,8 +67,8 @@ API calls, live preview, conversational avatar, logs and troubleshooting.
 ### Setup
 
 ```bash
-git clone https://github.com/mohamed-em2m/float-fast.git
-cd float-fast
+git clone https://github.com/mohamed-em2m/fast-float.git
+cd fast-float
 ./scripts/setup.sh          # apt deps + Node 22 + uv + uv sync + checkpoints + ONNX toolchain
 ```
 
@@ -124,7 +125,8 @@ The Wav2Vec2-based models are [wav2vec2-base-960h](https://huggingface.co/facebo
 | FastAPI / WebRTC / WebSocket server only | `./scripts/run_api.sh` | `:8000` |
 | React Studio only | `./scripts/run_frontend.sh` | `:3000` |
 | Gradio batch app | `./scripts/run_gradio.sh` | `:7860` |
-| Gradio live (mic) app | `./scripts/run_live.sh` | `:7860` |
+| Gradio live (+batch) app | `./scripts/run_live.sh` | `:7860` |
+| Container | `docker build -t float-fast . && docker run --gpus all -p 8080:8080 float-fast` | `:8080` |
 
 The server starts warming up the model on boot; `GET /health` reports `warmup_stage` until it is ready.
 
@@ -146,6 +148,13 @@ Interactive docs: `http://localhost:8000/docs`.
 | `GET` | `/stream/{request_id}` | Stream the MP4 with HTTP `Range` support |
 | `WS` | `/ws/stream/{request_id}` | Live frames while the video is generated (see [Live streaming](#live-streaming)) |
 | `POST` | `/offer` | WebRTC SDP negotiation (finished file, or `"live": true`) |
+| `POST` | `/offer/candidate` | Trickle ICE candidate for an existing peer |
+| `GET` | `/livekit/status` | SFU configuration, source and connectivity |
+| `POST` | `/livekit/token` | Mint a room join token for the browser |
+| `POST`/`GET` | `/livekit/publish/{request_id}` | Publish (and inspect) a live/finished render in a room |
+| `POST` | `/livekit/conversation/start` | Start a conversational avatar session |
+| `GET` | `/livekit/conversation/status?room=` | Session state for a room |
+| `POST` | `/livekit/conversation/audio` · `/interrupt` · `/speak` · `/stop` | Feed mic PCM, barge in, TTS, stop |
 
 ### `POST /generate`
 
@@ -157,6 +166,7 @@ Interactive docs: `http://localhost:8000/docs`.
   "channels": 1,
   "sample_width": 2,
   "image_base64": null,
+  "image_format": "jpg",
   "emotion": "S2E",
   "nfe": 10,
   "seed": 25,
@@ -177,11 +187,13 @@ Interactive docs: `http://localhost:8000/docs`.
 | `audio_format` | `pcm` | `pcm`, `wav`, `mp3`, … |
 | `sample_rate` | `16000` | 8 000–48 000 Hz |
 | `image_base64` | `null` | Omit to use the built-in default portrait |
+| `image_format` | `jpg` | Container hint for `image_base64` (`jpg`, `png`, `webp`, `bmp`) |
 | `emotion` | `S2E` | `S2E` infers emotion from audio; or `neutral`/`happy`/`sad`/`angry`/`surprise`/`disgust` |
 | `nfe` | `10` | ODE solver steps, 5–25 |
 | `chunk_seconds` / `chunk_overlap_seconds` | `0` / `0.5` | Split long audio into independently generated windows and merge |
 | `chunk_batch_size` / `chunk_pad_seconds` | `1` / `2.0` | Sample several chunks in one model batch (pads short chunks with silence) |
 | `decode_batch_size` | `0` | Frames per decode micro-batch; `0` lets the VRAM tuner choose |
+| `quality` | `balanced` | Encoder preset: `fast`, `balanced`, `high` |
 | `client_request_id` | `null` | Lets the browser poll `/progress/{id}` before the long-running call returns |
 | `live` | `false` | Also publish frames to `/ws/stream/{id}` and to live `/offer` peers |
 
@@ -344,8 +356,9 @@ See [`docs/BACKEND_SELECTION.md`](docs/BACKEND_SELECTION.md) for the measurement
 | Variable | Default | Purpose |
 |---|---|---|
 | `PORT` | `8000` | API port |
-| `FRONTEND_PORT` | `3000` | Studio dev port (`run_all.sh`) |
-| `VITE_API_URL` | `http://localhost:${PORT}` | Backend URL used by the frontend |
+| `FRONTEND_PORT` | `3000` | Studio dev port (`run_all.sh` / `run_frontend.sh`) |
+| `VITE_API_URL` | unset | Only wins when it points at a **non-loopback** host; otherwise the Studio calls its own origin's `/api` proxy |
+| `VITE_API_PROXY_TARGET` | `http://localhost:${PORT}` | Dev/preview proxy target for `/api` (`pnpm dev` / `pnpm preview`) |
 | `CORS_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | Comma-separated allowed origins |
 | `NGPUS` | `1` | Fallback for `[float.runtime].ngpus` (GPUs used for parallel decoding) |
 | `MAX_CONCURRENT_REQUESTS` | `10` | Request semaphore |
@@ -468,25 +481,31 @@ See [`AGENT.md`](AGENT.md) for the architecture guide and [`docs/UI_UX_BRIEF.md`
 float-fast/
 ├── pyproject.toml              # metadata, deps, uv indexes, ruff/pytest config
 ├── uv.lock                     # pinned lockfile
-├── Dockerfile                  # container build (CUDA 12.1 base)
+├── Dockerfile                  # container build (CUDA 12.6 base, runs fast_float/main.py)
 ├── config/
 │   ├── api.json                # optional public URL overrides
-│   └── backends.yaml           # committed backend default (all eager)
+│   ├── backends.yaml           # committed backend default (all eager)
+│   └── logging.json            # hypercorn/uvicorn log config (logs/server.log)
 ├── scripts/                    # setup, run, ONNX conversion, TensorRT install
 ├── checkpoints/                # model weights (downloaded)
-├── docs/                       # backend selection, batch decoding, streaming, UI notes
+├── docs/                       # usage, logging, backends, decoding, streaming, LiveKit, UI
 ├── frontend/                   # React + Vite Studio (components, services/live.js)
 ├── tests/                      # pytest suite (no GPU required for most tests)
 └── fast_float/
     ├── main.py                 # FastAPI entrypoint (routers, CORS, lifespan)
+    ├── cli.py                  # `fast-float serve|worker|ui|agent` supervisor
     ├── core/                   # request pipeline, service, shared app state
-    ├── routers/                # generation, health, streaming (WS), webrtc
+    ├── routers/                # generation, health, streaming (WS), webrtc, livekit
     ├── schemas/                # Pydantic v2 request/response models
     ├── streaming/              # frame dispatcher, live fan-out, stream types
+    ├── workers/                # dual-process GPU worker (ZeroMQ + shared memory)
+    ├── builders/               # per-component artifact builders (ONNX / dynamo)
     ├── runtimes/               # runtime backends (ONNX session selection)
     ├── onnx/                   # export, parity, dispatch, backend config
-    ├── utils/                  # GPU, media, logging, timing, video optimizer, tuner
+    ├── logging_utils/          # logging engine (JSONL sinks, context, redaction, crash)
+    ├── utils/                  # GPU, media, timing, video optimizer, tuner, STUN
     ├── models/float/           # FLOAT generator, FMT, style decoder, encoders
+    ├── livekit/                # avatar transport + Gemini Live worker
     ├── interfaces/             # Gradio live app
     └── legacy/                 # upstream CLI (generate.py) + batch Gradio app
 ```
