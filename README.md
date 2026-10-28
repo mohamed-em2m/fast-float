@@ -325,27 +325,9 @@ ORT_ARGS="--trt-max-batch 16" ./scripts/convert_to_onnx.sh
 
 See [`docs/BACKEND_SELECTION.md`](docs/BACKEND_SELECTION.md) for the measurement methodology and [`docs/BUILD_RUNTIME_SESSIONS.md`](docs/BUILD_RUNTIME_SESSIONS.md) for session construction. Partial acceleration is always safe: any component that is missing, fails parity, or fails to load falls back to PyTorch.
 
-> The decoder is frequently *not* worth exporting: the ONNX decoder runs at **0.16× eager** on an
-> A6000 (the CUDA EP has no fast kernel for the modulated-conv stack, so its convolutions fall back),
-> while `fmt` gained 2.6× on TensorRT FP16. Always trust the generated config over intuition.
->
-> TensorRT is also opt-in for this converter (`--trt`) and off by default. On a T4 the TRT engine for the decoder ran at **0.09× eager** with `max_abs=4.375` / `cosine=0.983` versus eager: ORT partitions the graph across TRT-FP16 and CUDA-FP32, which is both slow and visibly wrong. The converter gates parity in uint8 frames (≤2 LSB max, ≤0.5 LSB mean) and writes `<model>.onnx.no_trt` so the runtime uses the same provider it validated. The install-time self-test applies the same gate, so a wrong artifact on a box without the marker also falls back to eager.
->
-> Both gates compare **the same computation on both sides**: the exporter pins torch and ORT to fp32
-> (TF32 alone moves this 22-conv stack by ~40 uint8 levels, which would drown the graph's own error),
-> and the runtime self-test — where the provider is TF32 and cannot be pinned — judges the *provider*
-> by the mean (≤2 LSB) plus a cosine floor (≥0.999) and reports the max as information. A
-> structurally wrong graph (cosine 0.983) still fails both.
->
-> The exported graph must be the *deployed* model: the converter traces the model as it runs and
-> gates the artifact against a snapshot of that model, never against the module it traced. The
-> decoder's graph is the dense modulated conv the model actually uses — an earlier export
-> substituted a grouped variant, which the ORT CUDA EP serves only through a fallback kernel that
-> drifts ~90 uint8 LSB and is not reproducible.
->
-> The float parity gate treats `min_cosine`/`max_mean` as **hard floors**: a loose `atol` (TRT FP16 relaxes it 40×) can no longer skip the structural check. That OR was exactly how the 0.983-cosine graph was reported as PASS.
->
-> The decode path reads the artifact as NCHW float frames, so the runtime rejects an artifact whose output is not 4D NCHW with 3-4 channels at session build; a wrongly formatted graph falls back to eager instead of rendering scrambled frames.
+> The decoder is frequently *not* worth exporting: on an A6000 the CUDA EP runs it at **0.16× eager**
+> (it has no fast kernel for the modulated-conv stack), while `fmt` gained 2.6× on TensorRT FP16.
+> Always trust the generated config over intuition.
 
 ---
 

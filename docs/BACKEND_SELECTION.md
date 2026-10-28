@@ -218,6 +218,12 @@ and `fast_float/onnx/dispatch.py` (`apply_backends`).
   silently drops to the CUDA EP. The config `provider` key stays **advisory**
   (what won, for logging/health) — it does not gate provider selection.
   `max_batch` defaults to `$FLOAT_TRT_MAX_BATCH` (16).
+- **An artifact that failed its TRT gate carries a veto.** A converter that had to validate a
+  graph on the CUDA EP writes `<model>.onnx.no_trt` next to it, and `export.trt_vetoed` drops
+  TensorRT for that artifact at load time (`make_session_from_args` deliberately ignores the
+  sidecar, so the converter can still build a TRT session to re-validate the EP and clear a stale
+  marker). Both the selector and the runtime must honour it, otherwise the selector benchmarks an
+  engine the deployment never loads.
 - `FLOAT_DISABLE_BACKENDS=1` disables the whole dispatch pass.
 
 ## Runtime overrides
