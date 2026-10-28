@@ -1,6 +1,7 @@
 <div align="center">
 
 # FLOAT Fast
+<img src="assets/logo.png" alt="FLOAT Fast Logo" width="120" style="border-radius: 20px; margin-bottom: 12px;" />
 
 High-performance, hardware-accelerated serving and inference stack for audio-driven talking portrait generation (FLOAT, ICCV 2025).
 
@@ -14,7 +15,6 @@ High-performance, hardware-accelerated serving and inference stack for audio-dri
 
 </div>
 
-<img src="assets/logo.png" alt="FLOAT Fast Logo" width="120" style="border-radius: 20px; margin-bottom: 12px;" />
 
 ---
 
