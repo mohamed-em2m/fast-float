@@ -566,6 +566,94 @@ def test_realtime_model_passes_tls_context_to_httpx_and_aiohttp(monkeypatch):
     assert http_options.async_client_args["ssl"] is ctx
 
 
+# ---------------------------------------------------------------------------
+# Gemini session resumption: a dead session's handle must not be replayed into
+# the retry. The plugin retried a 1011 with the old handle, Google rejected the
+# reconnect with 1008 ("session not found or expired"), and the plugin treats
+# connect-time failures as fatal — the whole AgentSession shut down.
+# ---------------------------------------------------------------------------
+
+
+class _FakeRealtimeSession:
+    def _mark_restart_needed(self, on_error: bool = False) -> None:
+        self.restarted = on_error
+
+
+def _make_op_error(code: int) -> Exception:
+    error = RuntimeError(f"{code} None. Internal error encountered.")
+    error.code = code  # type: ignore[attr-defined]
+    return error
+
+
+def test_stale_gemini_session_error_drops_resumption_handle():
+    from fast_float.livekit.gemini import agent as gemini_agent
+
+    for error in (
+        RuntimeError("1011 None. Internal error encountered."),
+        RuntimeError("1008 None. BidiGenerateContent session not found or expired"),
+        _make_op_error(1011),
+        _make_op_error(1008),
+    ):
+        assert gemini_agent._is_stale_session_error(error)
+        sess = gemini_agent._resilient_session_class(_FakeRealtimeSession)()
+        sess._session_error = error
+        sess._session_resumption_handle = "resume-handle"
+        sess._resumption_chat_ctx = object()
+        sess._mark_restart_needed(on_error=True)
+
+        assert sess._session_resumption_handle is None
+        assert sess._resumption_chat_ctx is None
+        assert sess.restarted is True  # the stock restart still runs
+
+
+def test_live_gemini_restart_keeps_resumption_handle():
+    from fast_float.livekit.gemini import agent as gemini_agent
+
+    # A clean server-initiated restart (goAway, option update) must still resume:
+    # the handle is what preserves the conversation server-side.
+    sess = gemini_agent._resilient_session_class(_FakeRealtimeSession)()
+    sess._session_error = RuntimeError("1011 None. Internal error encountered.")
+    sess._session_resumption_handle = "resume-handle"
+    sess._resumption_chat_ctx = "ctx"
+    sess._mark_restart_needed(on_error=False)
+    assert sess._session_resumption_handle == "resume-handle"
+    assert sess._resumption_chat_ctx == "ctx"
+
+    # Errors unrelated to the session lifetime keep the handle too.
+    sess._session_error = RuntimeError("connection reset by peer")
+    sess._mark_restart_needed(on_error=True)
+    assert sess._session_resumption_handle == "resume-handle"
+
+    assert gemini_agent._is_stale_session_error(None) is False
+    assert gemini_agent._is_stale_session_error(RuntimeError("quota exceeded")) is False
+
+
+def test_build_realtime_model_returns_resilient_session(monkeypatch):
+    from fast_float.livekit.gemini import agent as gemini_agent
+
+    class _FakeRealtimeModel:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self._sessions = set()
+
+    class _FakeSession(_FakeRealtimeSession):
+        def __init__(self, model):
+            self.model = model
+
+    monkeypatch.setattr(gemini_agent.google.realtime, "RealtimeModel", _FakeRealtimeModel)
+    monkeypatch.setattr(gemini_agent, "_GoogleRealtimeSession", _FakeSession)
+
+    model = gemini_agent._build_realtime_model(api_key="AI-test")
+    sess = model.session()
+    assert isinstance(sess, _FakeSession)
+    assert sess in model._sessions
+
+    # If the plugin layout changes, fall back to the stock model rather than
+    # failing the worker import.
+    monkeypatch.setattr(gemini_agent, "_GoogleRealtimeSession", None)
+    assert type(gemini_agent._build_realtime_model(api_key="AI-test")) is _FakeRealtimeModel
+
+
 def test_sanitize_gemini_model_drops_free_text():
     from fast_float.livekit.gemini.config import sanitize_gemini_model
 

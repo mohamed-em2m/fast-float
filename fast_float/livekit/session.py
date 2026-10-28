@@ -44,7 +44,7 @@ from fast_float.livekit.receiver import DataStreamAudioReceiver
 from fast_float.livekit.settings import LiveKitSettings
 from fast_float.livekit.tokens import issue_token
 from fast_float.livekit.worker import AvatarOptions, AvatarRunner
-from fast_float.utils.gpu import auto_detect_max_streams
+from fast_float.utils.gpu import estimate_stream_capacity
 from fast_float.utils.media import ensure_default_image
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,7 @@ def get_render_semaphore(max_streams: int | None = None) -> asyncio.Semaphore:
     """Get or configure the GPU inference concurrency semaphore.
 
     If max_streams is not specified or 0, automatically determines the optimal
-    parallel streams based on GPU VRAM.
+    parallel streams from the free VRAM and the measured decode footprint.
     """
     global _render_semaphore, _current_max_streams
     if max_streams is None:
@@ -67,12 +67,13 @@ def get_render_semaphore(max_streams: int | None = None) -> asyncio.Semaphore:
         cfg = LiveKitSettings.from_env()
         max_streams = getattr(cfg, "livekit_max_streams", 0)
 
-    target_streams = auto_detect_max_streams(max_streams)
+    capacity = estimate_stream_capacity(config_val=max_streams)
+    target_streams = capacity.recommended
 
     if _render_semaphore is None or _current_max_streams != target_streams:
         _current_max_streams = target_streams
         _render_semaphore = asyncio.Semaphore(target_streams)
-        logger.info(f"[session] GPU parallel streams capacity set to {target_streams}")
+        logger.info(f"[session] GPU parallel streams capacity: {capacity.summary()}")
 
     return _render_semaphore
 
@@ -306,16 +307,37 @@ class ConversationSession:
         if self.image_path is None:
             self.image_path = ensure_default_image()
 
-        semaphore = get_render_semaphore(getattr(self.settings, "livekit_max_streams", 0))
+        from fast_float.config.dynamic import load_settings
+        from fast_float.ipc import ipc_enabled
 
-        self.generator = FloatVideoGenerator(
-            agent=engine,
-            image_path=self.image_path,
-            semaphore=semaphore,
-            nfe=self.settings.livekit_nfe,
-            first_chunk_sec=getattr(self.settings, "livekit_first_chunk_sec", 0.4),
-            chunk_sec=getattr(self.settings, "livekit_chunk_sec", 2.0),
-        )
+        ipc_cfg = load_settings().get("ipc", {})
+        if not isinstance(ipc_cfg, dict):
+            ipc_cfg = {}
+        if ipc_enabled(ipc_cfg):
+            from fast_float.livekit.zmq_generator import ZmqFloatVideoGenerator
+
+            self.generator = ZmqFloatVideoGenerator(
+                ref_image_path=self.image_path,
+                nfe=self.settings.livekit_nfe,
+                first_chunk_sec=getattr(self.settings, "livekit_first_chunk_sec", 2.0),
+                chunk_sec=getattr(self.settings, "livekit_chunk_sec", 2.0),
+                control_endpoint=ipc_cfg.get("zmq_control_endpoint", "tcp://127.0.0.1:5555"),
+                frames_endpoint=ipc_cfg.get("zmq_frames_endpoint", "tcp://127.0.0.1:5556"),
+                shm_name=ipc_cfg.get("shm_name", "float_frame_ring"),
+                shm_slots=ipc_cfg.get("shm_ring_size", 64),
+                session_id=self.room_name,
+            )
+        else:
+            semaphore = get_render_semaphore(getattr(self.settings, "livekit_max_streams", 0))
+
+            self.generator = FloatVideoGenerator(
+                agent=engine,
+                image_path=self.image_path,
+                semaphore=semaphore,
+                nfe=self.settings.livekit_nfe,
+                first_chunk_sec=getattr(self.settings, "livekit_first_chunk_sec", 0.4),
+                chunk_sec=getattr(self.settings, "livekit_chunk_sec", 2.0),
+            )
 
         # Pre-render the silence idle loop once: FLOAT on silence audio (duration
         # configured via settings.toml [float].livekit_silence_sec, default 2.0s) so
@@ -499,7 +521,11 @@ class ConversationSession:
             return
         self._stopped = True
         if self.generator is not None:
-            self.generator.stop()
+            if hasattr(self.generator, "stop"):
+                self.generator.stop()
+            elif hasattr(self.generator, "close"):
+                with contextlib.suppress(Exception):
+                    await self.generator.close()
         if self.runner is not None:
             with contextlib.suppress(Exception):
                 await self.runner.stop()

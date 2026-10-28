@@ -39,6 +39,16 @@ export CORS_ORIGINS="${CORS_ORIGINS:-http://localhost:${FRONTEND_PORT},http://12
 export NGPUS="${NGPUS:-1}"
 # Unbuffered Python so backend errors appear in the combined log immediately.
 export PYTHONUNBUFFERED=1
+# Keep child logs UTF-8 (the console capture decodes UTF-8).
+export PYTHONIOENCODING="${PYTHONIOENCODING:-utf-8}"
+
+# --- Logging ------------------------------------------------------------------
+export FLOAT_LOG_DIR="${FLOAT_LOG_DIR:-${PROJECT_ROOT}/logs}"
+mkdir -p "${FLOAT_LOG_DIR}"
+case "${FLOAT_LOG_TEE:-1}" in
+    0|false|no|off) ;;
+    *) exec > >(tee -a "${FLOAT_LOG_DIR}/combined.log") 2>&1 ;;
+esac
 
 # --- LiveKit SFU (live-transport preview) -------------------------------------
 # The backend reads LIVEKIT_URL/KEY/SECRET (LiveKitSettings.from_env) from the
@@ -144,6 +154,7 @@ PY
 gemini_worker_running() {
     # pgrep -f matches full command lines, including this script's own whenever
     # the pattern appears in it — split the string so it can never self-match.
+    # shellcheck disable=SC2140
     pgrep -f "fast_float.livekit.gemini.age"nt" start" >/dev/null 2>&1
 }
 
@@ -157,7 +168,7 @@ elif gemini_worker_ready; then
         AGENT_PID=""
     else
         echo "🤖 Starting Gemini Live worker (separate process, shared config)..."
-        uv run --frozen --no-sync python -m fast_float.livekit.gemini.agent start 2>&1 \
+        FLOAT_PROCESS_ROLE=agent uv run --frozen --no-sync python -m fast_float.livekit.gemini.agent start 2>&1 \
             | sed -u 's/^/[agent] /' &
         AGENT_PID=$!
     fi
@@ -177,28 +188,23 @@ fi
 # check the real requirement up front and point at setup.sh (which installs
 # Node 22 when the system Node is too old).
 command -v node >/dev/null 2>&1 || { echo "❌ 'node' not found on PATH (Node 20.19+ / 22.12+ required). Run ./scripts/setup.sh."; exit 1; }
-node_version_ok() {
-    local mm major minor
-    mm="$(node -p 'process.versions.node.split(".").slice(0,2).join(".")' 2>/dev/null)" || return 1
-    major="${mm%%.*}"
-    minor="${mm##*.}"
-    [ "${major}" -gt 22 ] && return 0
-    [ "${major}" -eq 22 ] && [ "${minor}" -ge 12 ] && return 0
-    [ "${major}" -eq 20 ] && [ "${minor}" -ge 19 ] && return 0
-    return 1
-}
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/_frontend_env.sh"
 if ! node_version_ok; then
     echo "❌ Node $(node -v) is too old for Vite 8 — need 20.19+ or 22.12+ (rolldown needs node:util.styleText)."
     echo "   Fix: re-run ./scripts/setup.sh (it upgrades Node when the system Node is too old)."
     exit 1
 fi
-command -v npm >/dev/null 2>&1 || { echo "❌ 'npm' not found on PATH."; exit 1; }
 
-if [ ! -d "${PROJECT_ROOT}/frontend/node_modules" ]; then
-    echo "📦 frontend/node_modules missing — installing..."
-    # npm ci (not install): rebuilds exactly from the committed lockfile,
-    # including the platform-native optional deps npm can silently skip.
-    (cd "${PROJECT_ROOT}/frontend" && npm ci)
+# pnpm is provisioned by Corepack at the version pinned in package.json.
+# `ensure_pnpm` is a no-op on every start after setup has done it once.
+ensure_pnpm || { echo "❌ pnpm could not be enabled. Run ./scripts/setup.sh first."; exit 1; }
+
+if ! pnpm_deps_current; then
+    echo "📦 frontend dependencies missing or stale — installing with pnpm..."
+    # --frozen-lockfile: the committed pnpm-lock.yaml is authoritative, so the
+    # launcher can never silently install a different tree than setup.sh.
+    pnpm_install
 fi
 
 # shellcheck source=/dev/null
@@ -219,6 +225,13 @@ trap cleanup INT TERM EXIT
 # --- Backend ------------------------------------------------------------------
 echo "🚀 Starting backend  →  http://localhost:${PORT} (docs: http://localhost:${PORT}/docs)"
 echo "   (model load + warmup can take several minutes on first start)"
+# This launcher runs inference inside the API process: it never starts the
+# ZeroMQ worker. settings.toml ships [ipc] enabled = true for the dual-process
+# stack, so force the override off here — otherwise every live conversation
+# builds a ZMQ generator and dies attaching `/float_frame_ring`
+# (`FileNotFoundError: /float_frame_ring`). Use ./scripts/run_dual_process.sh
+# for the worker + API split.
+export FLOAT_IPC_ENABLED="${FLOAT_IPC_ENABLED:-false}"
 # Pin to the lockfile: a floating `uv run` re-resolves on a stale lock and can
 # drag in phantom deps (seen: onnxruntime==1.24.3 with no cp310 wheel).
 # `--no-sync` is required: the lock pins the *portable* stack (onnx<1.17 + the
@@ -232,16 +245,23 @@ UV_ENV_ARGS=()
 if [ -f "${PROJECT_ROOT}/.env" ]; then
     UV_ENV_ARGS=(--env-file "${PROJECT_ROOT}/.env")
 fi
-HYPERCORN_STARTUP_TIMEOUT=1200 uv run "${UV_ENV_ARGS[@]}" --frozen --no-sync hypercorn fast_float.main:app \
+# Access logs are opt-in (FLOAT_ACCESS_LOG=1); one line per request is noise.
+ACCESS_LOG_ARGS=()
+case "${FLOAT_ACCESS_LOG:-}" in
+    [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Oo][Nn] | 1) ACCESS_LOG_ARGS=(--access-logfile -) ;;
+esac
+FLOAT_PROCESS_ROLE=api HYPERCORN_STARTUP_TIMEOUT=1200 uv run "${UV_ENV_ARGS[@]}" --frozen --no-sync hypercorn fast_float.main:app \
     --bind "0.0.0.0:${PORT}" \
     --worker-class asyncio \
+    --log-config "json:${PROJECT_ROOT}/config/logging.json" \
+    ${ACCESS_LOG_ARGS[@]+"${ACCESS_LOG_ARGS[@]}"} \
     --log-level info 2>&1 | sed -u 's/^/[api] /' &
 
 BACKEND_PID=$!
 
 # --- Frontend ------------------------------------------------------------------
 echo "🎨 Starting frontend →  http://localhost:${FRONTEND_PORT} (api: ${VITE_API_URL})"
-(cd "${PROJECT_ROOT}/frontend" && npm run dev -- --host 0.0.0.0 --port "${FRONTEND_PORT}") 2>&1 | sed -u 's/^/[web] /' &
+(cd "${PROJECT_ROOT}/frontend" && pnpm run dev --host 0.0.0.0 --port "${FRONTEND_PORT}") 2>&1 | sed -u 's/^/[web] /' &
 FRONTEND_PID=$!
 
 echo ""

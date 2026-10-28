@@ -385,17 +385,19 @@ import numpy as np
 
 from fast_float.livekit.generator import FloatVideoGenerator
 
+
 async def main() -> None:
     gen = FloatVideoGenerator(agent=engine, image_path="images/portrait.jpg")
 
     # Called from the event-loop thread, e.g. from a TTS callback.
     gen.push_audio(np.zeros(16_000, dtype=np.int16).tobytes())  # 1.0 s
-    gen.flush()                                                 # end of utterance
+    gen.flush()  # end of utterance
 
     async for item in gen:
         video_frame, audio_frame = item
         # hand both to rtc.AVSynchronizer / your own publisher
         ...
+
 
 asyncio.run(main())
 ```
@@ -510,3 +512,47 @@ The generator was also exercised against a real LiveKit Cloud room: a
 and a second participant subscribed to both tracks, receiving video and audio
 frames. For a GPU-backed check, use the conversational session on a machine
 with the model loaded and watch `last_chunk_rtf` in the logs.
+
+## Examples
+
+A conversational session end to end:
+
+```bash
+# 1. Is the SFU configured (and from where)?
+curl -s localhost:8000/livekit/status | jq
+
+# 2. Start a session for a room (built-in agent echoes the browser mic)
+curl -s -X POST localhost:8000/livekit/conversation/start \
+  -H 'Content-Type: application/json' \
+  -d '{"room":"demo","image_path":"checkpoints/portrait.jpg"}' | jq
+
+# 3. Join token for the browser
+curl -s -X POST localhost:8000/livekit/token \
+  -H 'Content-Type: application/json' \
+  -d '{"room":"demo","identity":"alice","publish_mic":true}' | jq
+
+# 4. Push ~200 ms of 16 kHz int16 PCM; flush at the end of an utterance
+curl -s -X POST localhost:8000/livekit/conversation/audio \
+  -H 'Content-Type: application/json' \
+  -d '{"room":"demo","audio_base64":"<pcm>","sample_rate":16000,"flush":true}' | jq
+
+# 5. Barge-in, speak, stop
+curl -s -X POST localhost:8000/livekit/conversation/interrupt \
+  -H 'Content-Type: application/json' -d '{"room":"demo"}' | jq
+curl -s -X POST localhost:8000/livekit/conversation/speak \
+  -H 'Content-Type: application/json' -d '{"room":"demo","text":"Hello."}' | jq
+curl -s -X POST localhost:8000/livekit/conversation/stop \
+  -H 'Content-Type: application/json' -d '{"room":"demo"}' | jq
+```
+
+Publish an existing render instead of a live conversation:
+
+```bash
+curl -s -X POST localhost:8000/livekit/publish/demo-001 \
+  -H 'Content-Type: application/json' -d '{"room":"demo"}' | jq
+curl -s localhost:8000/livekit/publish/demo-001 | jq   # publisher status
+```
+
+On a box without the model, construct the generator with `agent=None` to render
+the test pattern - enough to verify the SFU path. Full run modes:
+[USAGE.md](USAGE.md).

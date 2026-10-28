@@ -121,23 +121,33 @@ autodispatch = true
 # The file /generate path uses [float.request].nfe instead.
 livekit_nfe = 5
 # Audio buffer threshold (seconds) before launching the avatar's FIRST render chunk.
-# Lower values (e.g. 0.4s) cut latency — the avatar starts moving almost immediately.
-# Higher values (e.g. 5.0s) collect a longer utterance before the avatar begins
-# responding (better sentence pacing). Range: 0.2..10 s.
-livekit_first_chunk_sec = 5.0
+# 2.0 s is FLOAT's minimum (internal) window and the lowest latency that still
+# plays gaplessly — this is what makes a reply start quickly after silence.
+# It may be lower than livekit_chunk_sec: the next full-size chunk then waits for
+# another livekit_chunk_sec of audio, and the idle loop covers that gap.
+# Range: 0.2..10 s.
+livekit_first_chunk_sec = 2.0
 # Ongoing chunk window (seconds) — how much audio to collect between render groups.
 # FLOAT accepts the full window and automatically iterates its internal 2 s sub-windows
 # with smooth seam blending across them:
 #   2.0 = fire a render after every 2 s of audio (lowest latency).
 #   5.0 = buffer 5 s of speech, then pass all 5 s directly to FLOAT in one render pass
-#         for cohesive sentence pacing and better temporal continuity.
+#         for cohesive sentence pacing and better temporal continuity. With a 2 s
+#         first chunk this only adds delay from the second chunk onward; the idle
+#         loop runs during the wait, so keep the first chunk short to start fast.
 # Range: 2.0..10 s (values below 2 are clamped to 2 — the model's minimum window).
 livekit_chunk_sec = 5.0
 # Duration (seconds) of the pre-rendered silence/idle loop video generated once
 # at session start (default 2.0s). Looped while the avatar is idle.
 livekit_silence_sec = 10.0
 # Maximum concurrent live avatar streams allowed to render in parallel on the GPU.
-# 0 = auto-detect based on available GPU VRAM (recommended).
+# 0 = auto (recommended): min(memory, compute), capped at 8, where
+#   memory  = usable VRAM / measured per-stream footprint (decode tuner, else 2 GiB)
+#   compute = 0.85 / measured real-time factor (render seconds per audio second)
+# On an RTX A6000 (~47 GiB, RTF ~0.2) that is typically 4-5 streams even though
+# VRAM alone would allow 8. Set 1..32 to override the estimate.
+# NOTE: with [ipc] enabled the single inference worker serializes renders, so this
+# value gates only the in-process renderer; the live ceiling is the measured RTF.
 livekit_max_streams = 0
 
 [float.checkpoint]
@@ -261,3 +271,29 @@ r_cfg_scale = 1.0
 e_cfg_scale = 1.0
 no_crop = false
 decode_batch_size = 0
+
+[ipc]
+enabled = true
+zmq_control_endpoint = "tcp://127.0.0.1:5555"
+zmq_frames_endpoint = "tcp://127.0.0.1:5556"
+shm_name = "float_frame_ring"
+shm_ring_size = 64
+
+[logging]
+# Operator defaults for fast_float.logging_utils. Environment variables win
+# (FLOAT_LOG_LEVEL / FLOAT_LOG_DIR / FLOAT_LOG_FILE / FLOAT_LOG_JSON /
+# FLOAT_LOG_CONSOLE / FLOAT_LOG_TO_FILE / FLOAT_LOG_MAX_BYTES /
+# FLOAT_LOG_BACKUPS / FLOAT_LOG_RATE_LIMIT / FLOAT_LOG_UNIFY_SERVERS);
+# see docs/LOGGING.md. Empty values mean "use the built-in default".
+#
+# One rotating JSONL file per process: logs/<role>.log (api, worker, agent...).
+# The console stays human-readable; FLOAT_LOG_JSON=false writes the file as text.
+level = ""            # "" -> FLOAT_LOG_LEVEL -> FLOAT_DEBUG -> INFO
+dir = ""              # "" -> <repo>/logs
+file = true           # false -> console only
+json = true           # JSONL file; false -> text file
+console = true        # false -> file only
+max_bytes = 52428800  # 50 MiB per file
+backup_count = 5      # keep 5 rotated files
+rate_limit = true     # collapse repeated console warnings (file keeps all)
+unify_servers = true  # hypercorn/uvicorn logs use the app format

@@ -178,6 +178,31 @@ def test_unknown_keys_are_ignored(config_dir):
     assert not hasattr(opt, "not_a_real_option")
 
 
+def test_livekit_keys_are_known_and_silent(config_dir, caplog):
+    """The ``[float].livekit_*`` knobs are read by LiveKitSettings, not by the
+    model pipeline — they must be skipped, not reported as unknown."""
+    import logging
+
+    _write(
+        config_dir,
+        """
+[float]
+livekit_nfe = 5
+livekit_first_chunk_sec = 5.0
+livekit_chunk_sec = 5.0
+livekit_silence_sec = 10.0
+livekit_max_streams = 0
+""",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="fast_float.config.float_settings"):
+        opt = load_float_options()
+
+    # livekit_nfe is a renderer knob and must NOT leak into the model options.
+    assert opt.nfe == 10
+    assert not any("unknown keys" in record.message for record in caplog.records)
+
+
 def test_options_do_not_read_sys_argv(config_dir, monkeypatch):
     _write(config_dir, "[float.ode]\nnfe = 7\n")
     monkeypatch.setattr("sys.argv", ["api", "--nfe", "25"])

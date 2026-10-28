@@ -59,6 +59,10 @@ class AppState:
         # TTFF, latency percentiles, jitter, drops). Bounded, so a long-lived
         # server does not grow it without limit.
         self.perf_requests: RequestAccumulator = RequestAccumulator(maxlen=200)
+        # Real-time factor measured by the live (IPC) avatar renderer: render
+        # seconds per second of audio. ``None`` until the first chunk finishes.
+        # Used by GET /gpu to estimate the sustainable stream count.
+        self.live_rtf: float | None = None
 
     def record_request_sample(self, sample: RequestSample) -> None:
         """Add one finished request to the rolling performance window."""

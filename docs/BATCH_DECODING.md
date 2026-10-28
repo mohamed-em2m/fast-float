@@ -28,13 +28,12 @@ The method [`FLOAT.get_optimal_decode_batch_size(device)`](file:///c:/Users/emam
 > [!NOTE]
 > If `opt.decode_batch_size` is explicitly configured in `self.opt`, it takes absolute precedence over automatic detection.
 
-> [!NOTE]
-> When the **ONNX decoder** backend is active the tuner is also capped by the
-> largest static batch that shipped. `convert_decoder.py` exports a *set*
-> (`decoder_v1.onnx` + `decoder_v1_b<N>.onnx`), so the cap is the largest
-> sibling (16 by default) rather than whichever graph the selector measured.
-> Each micro-batch is padded to the **smallest** session that covers it and
-> trimmed back, so a 4-frame chunk never pays for a 16-frame graph.
+**ONNX decoder cap.** When the **ONNX decoder** backend is active the tuner is
+also capped by the largest static batch that shipped. `convert_decoder.py`
+exports a *set* (`decoder_v1.onnx` + `decoder_v1_b<N>.onnx`), so the cap is the
+largest sibling (16 by default) rather than whichever graph the selector
+measured. Each micro-batch is padded to the **smallest** session that covers it
+and trimmed back, so a 4-frame chunk never pays for a 16-frame graph.
 
 ---
 
@@ -124,7 +123,7 @@ video_tensors = model.decode_latent_into_image(
     r_d=latents_3d,
     batch_size=4,
 )
-# Output shape: [2, 25, 3, 256, 256]
+# Output shape: [2, 25, 3, S, S]  (S = input_size; 512 for the released checkpoint)
 ```
 
 ### Configuring via Options
@@ -151,3 +150,36 @@ Verified test results:
 - `[PASS] User override decode_batch_size=4 verified`
 - `[PASS] Batched decode (9 frames chunked into 4, 4, 1) passed`
 - `[PASS] 3D [B=2, T=5] batched decode (10 frames chunked into 4, 4, 2) passed`
+
+## 6. Examples
+
+Let the VRAM tuner pick the batch (default):
+
+```json
+{ "audio_base64": "...", "audio_format": "wav", "decode_batch_size": 0 }
+```
+
+Pin it - to A/B a device, or to keep VRAM flat next to another stream:
+
+```json
+{
+  "audio_base64": "...",
+  "audio_format": "wav",
+  "decode_batch_size": 4,
+  "chunk_seconds": 5
+}
+```
+
+Inspect and control the tuner from the running server:
+
+```bash
+curl -s localhost:8000/gpu | jq '.capacity'      # chosen batch / stream count
+curl -s localhost:8000/health | jq '.performance_stats'
+
+FLOAT_DECODE_TUNE_CACHE=0 ./scripts/run_api.sh              # re-measure every boot
+FLOAT_DECODE_TUNE_CACHE=/tmp/tune.json ./scripts/run_api.sh # alternate cache
+FLOAT_DECODE_CHANNELS_LAST=1 ./scripts/run_api.sh           # measure before keeping
+```
+
+Run modes and the rest of the API: [USAGE.md](USAGE.md). Pipeline view:
+[STREAMING_PIPELINE.md](STREAMING_PIPELINE.md).

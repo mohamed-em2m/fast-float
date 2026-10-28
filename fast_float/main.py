@@ -25,6 +25,16 @@ from fast_float.initialize_env import initialize_environment, initialize_onnx_li
 initialize_environment()
 initialize_onnx_lib_paths()
 
+from fast_float.logging_utils import (
+    RequestContextMiddleware,
+    configure_logging,
+    current_log_file,
+    install_asyncio_exception_handler,
+    reroute_server_loggers,
+)
+
+configure_logging(role="api")
+
 from fast_float.config.float_settings import load_float_options
 from fast_float.core.inference_optimized import OptimizedInferenceAgent
 from fast_float.core.service import (
@@ -39,7 +49,6 @@ from fast_float.utils.gpu import print_gpu_status
 from fast_float.utils.logger import logger
 from fast_float.utils.media import (
     DEFAULT_IMAGE_PATH,
-    TARGET_IMAGE_SIZE,
     ensure_default_image,
 )
 from fast_float.utils.stun import StunServer
@@ -175,6 +184,10 @@ async def _run_boot_warmups():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle manager for model loading, warmup, and resource cleanup."""
+    # Unify hypercorn/uvicorn loggers with the app sinks (the servers create
+    # their log config lazily, after the app import).
+    reroute_server_loggers()
+    install_asyncio_exception_handler(asyncio.get_running_loop())
     app_state.initialize_runtime()
     app_state.max_concurrent_requests = MAX_CONCURRENT_REQUESTS
 
@@ -207,8 +220,9 @@ async def lifespan(app: FastAPI):
 
     logger.info("=" * 70)
     logger.info("🚀 Starting FLOAT Fast API - NVENC Optimized v5.1.0")
+    logger.info(f"🪵 Logs: role=api file={current_log_file() or 'console only'}")
     logger.info(f"⚡ Optimization: {opt.optimization_mode} | FP16: {opt.use_fp16}")
-    logger.info(f"📐 Target resolution: {TARGET_IMAGE_SIZE}x{TARGET_IMAGE_SIZE}")
+    logger.info(f"📐 Target resolution: {opt.input_size}x{opt.input_size}")
 
     # 1. Initialize video optimizer
     app_state.video_optimizer = VideoSaveOptimizer()
@@ -216,8 +230,9 @@ async def lifespan(app: FastAPI):
     print_gpu_status()
     logger.info("=" * 70)
 
-    # 2. Ensure default image exists
-    ensure_default_image(DEFAULT_IMAGE_PATH, TARGET_IMAGE_SIZE)
+    # 2. Ensure default image exists (at the model's own resolution, so the
+    # placeholder is not upscaled by the preprocess transform)
+    ensure_default_image(DEFAULT_IMAGE_PATH, int(opt.input_size))
 
     # 3. Prepare runtime directories from the configured options
     os.makedirs(opt.res_dir, exist_ok=True)
@@ -226,6 +241,32 @@ async def lifespan(app: FastAPI):
     logger.info(f"🤖 Loading FLOAT model with {opt.optimization_mode} optimization...")
     app_state.agent = OptimizedInferenceAgent(opt)
     logger.info("✅ Model loaded successfully")
+
+    # 4b. Dual-process health check. Live conversations render through the
+    # worker's shared-memory ring; warn at boot instead of failing the first
+    # conversation with an opaque FileNotFoundError inside the request.
+    try:
+        from fast_float.config.dynamic import load_settings
+        from fast_float.ipc import ipc_enabled, segment_exists
+
+        ipc_cfg = load_settings().get("ipc", {})
+        ipc_cfg = ipc_cfg if isinstance(ipc_cfg, dict) else {}
+        if ipc_enabled(ipc_cfg):
+            shm_name = str(ipc_cfg.get("shm_name", "float_frame_ring"))
+            if segment_exists(shm_name):
+                logger.info(f"🧵 IPC worker detected (shm={shm_name}) — live rendering runs in the worker")
+            else:
+                logger.warning(
+                    "⚠️  [ipc] enabled but shared memory %r is not published: the inference "
+                    "worker is not running, so live conversations will return 503. Start the "
+                    "full stack with ./scripts/run_dual_process.sh, or set FLOAT_IPC_ENABLED=false "
+                    "to render in-process (./scripts/run_all.sh does that automatically).",
+                    shm_name,
+                )
+        else:
+            logger.info("🧵 IPC worker not used (FLOAT_IPC_ENABLED / [ipc] enabled) — live rendering is in-process")
+    except Exception as exc:  # pragma: no cover - diagnostics must never block boot
+        logger.debug(f"IPC boot check skipped: {exc}")
 
     # 5. Boot warmup runs AFTER startup (background task) so /health answers
     # immediately. Set SKIP_WARMUP=1 to disable. /generate returns 503
@@ -291,6 +332,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Outermost: every request (including CORS preflights) gets a request id and
+# a bound logging context, and the id is echoed back in X-Request-ID.
+app.add_middleware(RequestContextMiddleware)
 
 # Mount modular routers
 app.include_router(api_router)
@@ -312,9 +356,28 @@ if __name__ == "__main__":
     from hypercorn.asyncio import serve
     from hypercorn.config import Config
 
+    from fast_float.logging_utils.config import HEALTH_PATHS, access_log_enabled
+    from fast_float.logging_utils.uvicorn_logging import create_hypercorn_log_config
+
     config = Config()
     config.bind = [f"0.0.0.0:{PORT}"]
     config.loglevel = "info"
+    # Access logs are opt-in (``FLOAT_ACCESS_LOG=1``). Hypercorn disables them
+    # when ``accesslog`` is None (its default); "-" makes it create the
+    # ``hypercorn.access`` logger, which the log config below routes through our
+    # formatters/handlers (health checks filtered). Leave it off unless asked -
+    # one line per request, including every /progress poll.
+    config.accesslog = "-" if access_log_enabled() else None
     config.startup_timeout = 600
+
+    # Hypercorn builds its Logger lazily (after this import), which would
+    # overwrite the handlers installed by configure_logging(). Apply the
+    # unified config explicitly; server records get their own rotating file so
+    # they never race the app's logs/api.log.
+    server_log = current_log_file()
+    config.logconfig_dict = create_hypercorn_log_config(
+        excluded_paths=list(HEALTH_PATHS),
+        log_file=str(server_log.with_name("server.log")) if server_log else None,
+    )
 
     asyncio.run(serve(app, config))

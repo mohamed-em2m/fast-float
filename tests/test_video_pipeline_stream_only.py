@@ -14,7 +14,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from fast_float.models.float.video_pipeline import (  # noqa: E402
+from fast_float.models.float.video_pipeline import (
     SaveVideoPipeline,
     StreamingVideoSaver,
     _drain_ordered,

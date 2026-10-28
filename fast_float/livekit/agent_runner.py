@@ -185,14 +185,40 @@ class AgentAvatarRunner:
                 if item is SEGMENT_END:
                     # The agent flushed this TTS segment: render the tail, then
                     # let the segment watcher report playback_finished.
-                    self.video_gen.flush()
-                    await self._segment_queue.put(self._epoch)
+                    try:
+                        self.video_gen.flush()
+                        await self._segment_queue.put(self._epoch)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # A failed tail flush must not kill the feed the same
+                        # way a poisoned item used to; the segment watcher is
+                        # not queued, so playback_finished for this segment is
+                        # skipped, but later segments keep flowing.
+                        logger.warning(
+                            "[agent-avatar] segment flush failed (%s): %s",
+                            type(item).__name__,
+                            exc,
+                        )
                 else:
-                    self.video_gen.push_audio(item)
+                    # One poisoned item must not kill the whole audio feed —
+                    # that used to freeze the avatar for the rest of the
+                    # session (e.g. an unsupported frame type from the
+                    # receiver). Log and keep consuming.
+                    try:
+                        self.video_gen.push_audio(item)
+                    except Exception as exc:
+                        logger.warning(
+                            "[agent-avatar] dropping audio item (%s): %s",
+                            type(item).__name__,
+                            exc,
+                        )
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
-            logger.warning(f"[agent-avatar] audio receive loop stopped: {exc}")
+        except Exception:
+            # Full stack trace: a bare "{exc}" hid where e.g.
+            # "'AudioFrame' object has no len()" actually fired.
+            logger.exception("[agent-avatar] audio receive loop stopped")
 
     # ------------------------------------------------------------- forwarding
 
@@ -241,6 +267,15 @@ class AgentAvatarRunner:
                 if epoch != self._epoch:
                     continue
                 if self._av_sync is not None:
+                    # Silence the idle loop while draining. It emits pre-rendered
+                    # silence audio/video forever, which keeps AVSynchronizer's
+                    # queues non-empty, so `wait_for_playout()` could only ever
+                    # return via the 30 s timeout — and the agent only learns
+                    # playback finished when this notification is sent.
+                    pause_idle = getattr(self.video_gen, "pause_idle", None)
+                    resume_idle = getattr(self.video_gen, "resume_idle", None)
+                    if pause_idle is not None:
+                        pause_idle()
                     try:
                         await asyncio.wait_for(
                             self._av_sync.wait_for_playout(),
@@ -248,6 +283,9 @@ class AgentAvatarRunner:
                         )
                     except asyncio.TimeoutError:
                         logger.warning("[agent-avatar] playout drain timed out")
+                    finally:
+                        if resume_idle is not None:
+                            resume_idle()
                 if epoch != self._epoch:
                     continue
                 position = self._segment_audio_s

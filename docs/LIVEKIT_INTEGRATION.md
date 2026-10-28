@@ -422,3 +422,34 @@ The plan is fully implemented and tested across backend and frontend:
   - `tests/test_webrtc_trickle.py`: trickle ICE and graceful degradation.
   - `tests/test_live_stream.py`: live fan-out, PTS, and overlap-head trimming in chunked live generation.
   - `tests/test_frame_dispatcher.py`: ordered delivery, gaps, and backpressure policy.
+
+---
+
+## Examples
+
+```bash
+# Configuration + connectivity, and where the settings came from
+curl -s localhost:8000/livekit/status | jq
+
+# Browser join token
+curl -s -X POST localhost:8000/livekit/token \
+  -H 'Content-Type: application/json' \
+  -d '{"room":"demo","identity":"alice","name":"Alice","publish_mic":true}' | jq
+
+# Publish an in-flight live stream / finished MP4 into a room
+curl -s -X POST localhost:8000/livekit/publish/demo-001 \
+  -H 'Content-Type: application/json' -d '{"room":"demo"}' | jq
+curl -s localhost:8000/livekit/publish/demo-001 | jq
+
+# Conversational session
+curl -s -X POST localhost:8000/livekit/conversation/start \
+  -H 'Content-Type: application/json' -d '{"room":"demo"}' | jq
+curl -s 'localhost:8000/livekit/conversation/status?room=demo' | jq
+curl -s -X POST localhost:8000/livekit/conversation/stop \
+  -H 'Content-Type: application/json' -d '{"room":"demo"}' | jq
+```
+
+Fallback ladder the Studio walks when LiveKit is unavailable: LiveKit SFU ->
+raw WebRTC (`POST /offer` with `"live": true`) -> WebSocket
+(`/ws/stream/{request_id}`) -> finished MP4. Run modes and ports:
+[USAGE.md](USAGE.md).

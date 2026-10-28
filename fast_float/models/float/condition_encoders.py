@@ -12,6 +12,32 @@ from fast_float.models.wav2vec2 import Wav2VecModel, load_pretrained_with_weight
 
 logger = logging.getLogger(__name__)
 
+# Shortest waveform wav2vec2's conv front-end can consume. With the standard
+# kernels (10, 3, 3, 3, 3, 2, 2) and strides (5, 2, 2, 2, 2, 2, 2), 399 samples
+# shrink to a length-1 feature map before the final kernel-2 conv, which raises
+# "Kernel size can't be greater than actual input size". 400 is the minimum.
+MIN_WAV2VEC_SAMPLES = 400
+
+
+def _pad_short_waveform(a: torch.Tensor) -> torch.Tensor:
+    """Extend a too-short waveform so wav2vec2's conv stack stays valid.
+
+    Streaming callers can hand us tiny tail chunks (``flush()`` dispatches a
+    TTS segment's remainder even when it is only a few milliseconds). The
+    conv front-end cannot process those, so pad with the last sample rather
+    than dropping the chunk and losing playback frames.
+    """
+    n = a.shape[-1]
+    if n >= MIN_WAV2VEC_SAMPLES:
+        return a
+    if n == 0:
+        return torch.zeros(
+            (*a.shape[:-1], MIN_WAV2VEC_SAMPLES),
+            dtype=a.dtype,
+            device=a.device,
+        )
+    return F.pad(a, (0, MIN_WAV2VEC_SAMPLES - n), mode="replicate")
+
 
 class AudioEncoder(BaseModel):
     """Audio condition encoder that transforms audio waveforms into motion latent conditioning features.
@@ -243,6 +269,8 @@ class Audio2Emotion(nn.Module):
             if prev_a.ndim == 1:
                 prev_a = prev_a.unsqueeze(0)
             a = torch.cat([prev_a, a], dim=1)
+
+        a = _pad_short_waveform(a)
 
         if self._onnx_backend is not None:
             # ONNX graph already outputs softmax probabilities.

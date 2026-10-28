@@ -57,17 +57,35 @@ export default function PerfMatrixPanel({ onToast, embedded = false }) {
 
   useEffect(() => {
     let cancelled = false;
+    let timer = null;
     const poll = async () => {
+      // A hidden tab does not need a 3 s benchmark/telemetry poll.
+      if (document.hidden) return;
       const [matrix, recent] = await Promise.all([fetchPerfMatrix(), fetchPerfRequests()]);
       if (cancelled) return;
       if (matrix) setState(matrix);
       if (recent) setRequests(recent);
     };
+    const start = () => {
+      if (timer) clearInterval(timer);
+      timer = setInterval(poll, POLL_MS);
+    };
     poll();
-    const timer = setInterval(poll, POLL_MS);
+    start();
+    const onVisibility = () => {
+      if (document.hidden) {
+        if (timer) clearInterval(timer);
+        timer = null;
+        return;
+      }
+      poll();
+      start();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
     return () => {
       cancelled = true;
-      clearInterval(timer);
+      if (timer) clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibility);
     };
   }, []);
 
@@ -139,23 +157,29 @@ export default function PerfMatrixPanel({ onToast, embedded = false }) {
             onChange={(event) => setLevels(event.target.value)}
             placeholder="1,4,8,16"
             title="Stream counts to sweep"
+            aria-label="Concurrent stream counts to sweep, comma separated"
+            inputMode="numeric"
             disabled={running}
           />
           <button
+            type="button"
             className="btn-primary btn-sm perf-run"
             onClick={runBenchmark}
             disabled={running}
             title="Measure the matrix on this GPU"
+            aria-busy={running}
           >
-            {running ? <Loader2 size={14} className="spin" /> : <Play size={14} />}
+            {running
+              ? <Loader2 size={14} className="spin" aria-hidden="true" />
+              : <Play size={14} aria-hidden="true" />}
             {running ? 'Measuring' : 'Measure'}
           </button>
         </div>
       </div>
 
       {status === 'error' && (
-        <div className="perf-notice perf-notice-error">
-          <AlertTriangle size={14} />
+        <div className="perf-notice perf-notice-error" role="alert">
+          <AlertTriangle size={14} aria-hidden="true" />
           <span>{state?.error || 'The benchmark failed.'}</span>
         </div>
       )}
@@ -285,15 +309,16 @@ export default function PerfMatrixPanel({ onToast, embedded = false }) {
           </h3>
           <div className="perf-table-wrap">
             <table className="perf-data-table">
+              <caption className="visually-hidden">Concurrency sweep results</caption>
               <thead>
                 <tr>
-                  <th>streams</th>
-                  <th>aggregate fps</th>
-                  <th>per-stream fps</th>
-                  <th>worst stream</th>
-                  <th>rtf</th>
-                  <th>model share</th>
-                  <th>dropped</th>
+                  <th scope="col">streams</th>
+                  <th scope="col">aggregate fps</th>
+                  <th scope="col">per-stream fps</th>
+                  <th scope="col">worst stream</th>
+                  <th scope="col">rtf</th>
+                  <th scope="col">model share</th>
+                  <th scope="col">dropped</th>
                 </tr>
               </thead>
               <tbody>
@@ -380,13 +405,13 @@ export default function PerfMatrixPanel({ onToast, embedded = false }) {
                 <table className="perf-data-table">
                   <thead>
                     <tr>
-                      <th>finished</th>
-                      <th>frames</th>
-                      <th>model fps</th>
-                      <th>e2e fps</th>
-                      <th>rtf</th>
-                      <th>ttff</th>
-                      <th>dropped</th>
+                      <th scope="col">finished</th>
+                      <th scope="col">frames</th>
+                      <th scope="col">model fps</th>
+                      <th scope="col">e2e fps</th>
+                      <th scope="col">rtf</th>
+                      <th scope="col">ttff</th>
+                      <th scope="col">dropped</th>
                     </tr>
                   </thead>
                   <tbody>

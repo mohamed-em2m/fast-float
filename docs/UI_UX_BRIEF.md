@@ -64,7 +64,10 @@ steps, seeds, chunking, batch sizes, guidance scales, and encoder quality.
 - Drag-and-drop / click-to-browse upload (PNG, JPG, WebP). Default portrait preloaded.
 - Large preview with a "face focus" affordance; **Change Photo** and **Clear**.
 - **Auto face crop & centering** toggle (recommended for non-aligned photos) — maps to `no_crop`.
-- **Quick samples** (thumbnail pills) to load a demo portrait instantly.
+- **Quick samples** (thumbnail pills) to load a demo portrait instantly. The list is
+  discovered from `frontend/src/assets/samples/` at build time (`import.meta.glob`), so a new
+  photo becomes a button by being dropped in — no code edit, and a deleted file leaves no dead
+  button. The first sample (by file name) is the preloaded default.
 
 ### 3.2 Driving speech audio (three input modes)
 
@@ -251,3 +254,26 @@ All calls go through the same-origin `/api` proxy; a user-configurable base URL 
 5. Acceptance: a first-time user can go photo → audio → Generate → download without
    instructions; every async action has a visible state; the interface stays legible and
    responsive on a 13" laptop and a phone.
+
+## Examples
+
+```bash
+# Backend + Studio (recommended for development)
+./scripts/run_all.sh                       # http://localhost:3000
+
+# Custom ports - the Vite proxy follows PORT
+PORT=9000 FRONTEND_PORT=3100 ./scripts/run_all.sh
+
+# Studio only, pointed at a remote or tunnelled backend
+VITE_API_PROXY_TARGET=https://my-host.example ./scripts/run_frontend.sh
+
+# Production build of the same UI
+cd frontend && pnpm install --frozen-lockfile && pnpm build && pnpm preview
+```
+
+Browser code calls `/api/*`; the dev/preview proxy rewrites it to `/*` and
+forwards to `http://localhost:${PORT}`. Transport ladder: LiveKit SFU -> raw
+WebRTC (`POST /offer`, `"live": true`) -> WebSocket (`/ws/stream/{id}`) -> MP4.
+
+Run modes and API calls: [USAGE.md](USAGE.md). Streaming protocol:
+[STREAMING_PIPELINE.md](STREAMING_PIPELINE.md).

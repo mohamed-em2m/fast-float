@@ -21,8 +21,8 @@ from fast_float.utils.media import (
     TARGET_IMAGE_SIZE,
     convert_pcm_to_wav,
     ensure_default_image,
+    normalize_image,
     process_audio_format,
-    resize_image_to_256,
 )
 from fast_float.utils.pyav_writer import (
     PyAVVideoWriter,
@@ -67,9 +67,9 @@ __all__ = [
     "is_pyav_available",
     "is_torchcodec_available",
     "logger",
+    "normalize_image",
     "print_gpu_status",
     "process_audio_format",
-    "resize_image_to_256",
     "save_video_pyav",
     "save_video_torchcodec",
     "set_log_level",

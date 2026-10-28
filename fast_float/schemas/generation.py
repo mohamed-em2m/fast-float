@@ -131,6 +131,17 @@ class GenerationProgress(BaseModel):
     completed_chunks: int = 0
     percent: float = 0.0
     message: str = ""
+    # Progress timing for an accurate elapsed/ETA readout in the Studio.
+    # `audio_seconds` is the decoded clip length (0 while unknown).
+    audio_seconds: float = 0.0
+    started_at: float | None = Field(
+        None,
+        description="Unix timestamp when the request entered the queue",
+    )
+    elapsed_s: float = Field(
+        0.0,
+        description="Seconds elapsed since started_at at the last update",
+    )
     # Delivery-side metrics of a live stream (TTFF, p50/p95/p99 latency,
     # jitter, dropped frames). None when the request is not streaming.
     delivery_metrics: dict[str, Any] | None = None

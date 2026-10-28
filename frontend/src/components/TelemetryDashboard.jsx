@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import {
   Activity,
   Cpu,
@@ -9,32 +9,14 @@ import {
   Download,
   RotateCw
 } from 'lucide-react';
-import { fetchGpuMetrics, fetchHealth } from '../services/api';
+import { refreshBackendStatus, useBackendStatus } from '../services/telemetry';
 
 export default function TelemetryDashboard({ latestResult, history = [], embedded = false }) {
-  const [gpu, setGpu] = useState(null);
-  const [health, setHealth] = useState(null);
+  // Shared poller: the header already keeps /health + /gpu warm, so this panel
+  // no longer runs a second 5s interval against the same endpoints.
+  const { gpu, health } = useBackendStatus();
 
-  const refreshTelemetry = async () => {
-    try {
-      const g = await fetchGpuMetrics();
-      setGpu(g);
-    } catch (e) {
-      // GPU info might not be available if no CUDA
-    }
-    try {
-      const h = await fetchHealth();
-      setHealth(h);
-    } catch (e) {
-      // Health check
-    }
-  };
-
-  useEffect(() => {
-    refreshTelemetry();
-    const interval = setInterval(refreshTelemetry, 5000);
-    return () => clearInterval(interval);
-  }, []);
+  const refreshTelemetry = () => refreshBackendStatus({ forceLiveKit: false }).catch(() => {});
 
   const perf = latestResult?.performance || {
     preprocess_time: 0,

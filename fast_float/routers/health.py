@@ -5,6 +5,7 @@ from fast_float.core.state import app_state
 from fast_float.schemas.generation import HealthResponse
 from fast_float.utils.gpu import (
     clear_gpu_memory,
+    estimate_stream_capacity,
     get_current_gpu_memory,
     get_gpu_info,
 )
@@ -38,11 +39,32 @@ async def health():
 
 @router.get("/gpu")
 async def gpu_status():
-    """Get detailed GPU metrics and memory utilization."""
+    """Get detailed GPU metrics, memory utilization and stream capacity."""
+    rtf = app_state.live_rtf
+    if rtf is None:
+        # No live avatar has rendered yet; fall back to the rolling window of
+        # finished /generate requests (p50 ignores warmup outliers).
+        sample = app_state.perf_requests.summary().get("rtf", {})
+        p50 = float(sample.get("p50") or 0.0)
+        rtf = p50 if p50 > 0 else None
+    capacity = estimate_stream_capacity(
+        config_val=_configured_max_streams(), observed_rtf=rtf
+    )
     return {
         "info": get_gpu_info(),
         "memory": get_current_gpu_memory(),
+        "capacity": capacity.as_dict(),
     }
+
+
+def _configured_max_streams() -> int:
+    """``livekit_max_streams`` from the shared config (0 = auto)."""
+    try:
+        from fast_float.livekit.settings import LiveKitSettings
+
+        return int(getattr(LiveKitSettings.from_env(), "livekit_max_streams", 0) or 0)
+    except Exception:
+        return 0
 
 
 @router.post("/gpu/clear")

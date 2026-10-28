@@ -460,6 +460,53 @@ def test_spawn_live_publish_task_dedupes():
     asyncio.run(_test())
 
 
+def test_agent_runner_audio_loop_survives_bad_items():
+    """Regression: one poisoned audio item must not stop the receive loop.
+
+    It used to log 'audio receive loop stopped' and freeze the avatar for the
+    rest of the session (unsupported frame type from pushed by the runner).
+    """
+
+    async def _test():
+        from fast_float.livekit.agent_runner import AgentAvatarRunner
+        from fast_float.livekit.receiver import SEGMENT_END
+
+        class _FakeReceiver:
+            def __init__(self, items: list[Any]) -> None:
+                self._items = list(items)
+
+            def __aiter__(self) -> "_FakeReceiver":
+                return self
+
+            async def __anext__(self) -> Any:
+                if not self._items:
+                    raise StopAsyncIteration
+                return self._items.pop(0)
+
+        item_bad = object()  #unhandled type — push_audio raises
+        item_ok = b"\x00\x00"
+        video_gen = MagicMock()
+        video_gen.push_audio.side_effect = [TypeError("object of type 'AudioFrame' has no len()"), None]
+        video_gen.flush = MagicMock()
+
+        runner = AgentAvatarRunner.__new__(AgentAvatarRunner)
+        runner.receiver = _FakeReceiver([item_bad, item_ok, SEGMENT_END])
+        runner.video_gen = video_gen
+        runner._running = True
+        runner._epoch = 0
+        runner._segment_queue = asyncio.Queue()
+
+        await runner._read_audio_loop()
+
+        # The bad item is skipped (attempted once), the loop kept going, and
+        # the good item was processed too.
+        assert video_gen.push_audio.call_count == 2
+        video_gen.flush.assert_called_once()
+        assert runner._segment_queue.empty() is False  # SEGMENT_END queued the epoch
+
+    asyncio.run(_test())
+
+
 def test_conversation_session_wiring():
     if not RTC_AVAILABLE:
         pytest.skip("RTC SDK not available")
@@ -495,6 +542,11 @@ def test_conversation_session_wiring():
                 patch.object(ConversationalAgent, "connect", AsyncMock()) as agent_connect,
                 patch("fast_float.livekit.session.rtc") as rtc_mod,
                 patch("fast_float.core.service.run_inference_blocking", _slow_inference),
+                # The [ipc] switch is read from the shared settings.toml, not
+                # from this test's settings object. Force it off so the test
+                # exercises the builtin generator even on dual-process boxes
+                # (otherwise a real ZMQ generator would dial 127.0.0.1:5555).
+                patch("fast_float.config.dynamic.load_settings", return_value={}),
             ):
                 rtc_mod.Room.return_value = fake_room
                 session = sess.ConversationSession(

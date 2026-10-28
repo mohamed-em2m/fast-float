@@ -100,14 +100,23 @@ dependencies = [
     # shared fast_float/config/{settings,secerts}.toml files.
     "python-dotenv>=1.0,<2",
     "pre-commit>=4.6.2",
+    "pyzm>=2.5.6",
+    "pyzmq>=27.2.0",
 ]
 
 [dependency-groups]
-dev = ["pytest>=8.0,<9"]
+dev = [
+    "pytest>=8.0,<9",
+    # Documented as `uv run ruff ...`; keep it in the project env instead of
+    # relying on a global install or pre-commit's isolated hook environment.
+    "ruff>=0.17.1",
+]
 
-# Flat scripts layout (no installable package) — manage the env only.
+# Flat scripts layout, but install the project itself: the `[project.scripts]`
+# entry point (`fast-float`) only exists in the venv when the package is
+# installed, and `uv run --no-sync fast-float ...` is the documented launcher.
 [tool.uv]
-package = false
+package = true
 
 # CUDA 12.6 PyTorch wheels instead of the default PyPI (CUDA-bundled) ones.
 # cu126 (not cu118) so torch and onnxruntime-gpu 1.23 — which dlopens CUDA 12
@@ -189,3 +198,6 @@ addopts = "-ra"
     "D",    # If docstring rules are added later
     "F841",
 ]
+
+[project.scripts]
+fast-float = "fast_float.cli:main"

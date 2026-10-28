@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "disable_existing_loggers": false,
+  "filters": {
+    "access_log_filter": {
+      "()": "fast_float.logging_utils.filters.HealthPathFilter",
+      "excluded_paths": ["/health", "/perf/requests", "/perf/matrix", "/livekit/status", "/favicon.ico"]
+    },
+    "context": {
+      "()": "fast_float.logging_utils.filters.ContextFilter",
+      "role": "api"
+    }
+  },
+  "formatters": {
+    "default": {
+      "()": "fast_float.logging_utils.formatter.ConsoleFormatter",
+      "color": false
+    },
+    "access": {
+      "()": "fast_float.logging_utils.formatter.ConsoleFormatter",
+      "color": false
+    },
+    "json": {
+      "()": "fast_float.logging_utils.formatter.JsonFormatter",
+      "redact": true
+    }
+  },
+  "handlers": {
+    "console": {
+      "formatter": "default",
+      "class": "logging.StreamHandler",
+      "stream": "ext://sys.stderr",
+      "filters": ["context"]
+    },
+    "file": {
+      "formatter": "json",
+      "class": "logging.handlers.RotatingFileHandler",
+      "filename": "logs/server.log",
+      "maxBytes": 20971520,
+      "backupCount": 3,
+      "encoding": "utf-8",
+      "delay": true,
+      "filters": ["context"]
+    }
+  },
+  "loggers": {
+    "hypercorn.error": {
+      "handlers": ["console", "file"],
+      "level": "INFO",
+      "propagate": false
+    },
+    "hypercorn.access": {
+      "handlers": ["console", "file"],
+      "level": "INFO",
+      "propagate": false,
+      "filters": ["access_log_filter"]
+    }
+  }
+}

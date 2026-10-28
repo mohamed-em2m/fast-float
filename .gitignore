@@ -5,6 +5,8 @@ venv/
 /onnx/
 /temp/
 results/
+# Runtime logs (per-process JSONL, combined console capture, crash dumps).
+/logs/
 .antigravitycli
 .ipynb_checkpoints
 experiments/

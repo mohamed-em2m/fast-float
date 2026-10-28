@@ -85,48 +85,62 @@ if ! command -v uv >/dev/null 2>&1; then
 fi
 echo "uv version: $(uv --version)"
 
-echo "=== Ensuring Node for the Studio frontend (Vite 8 needs 20.19+/22.12+) ==="
-# Ubuntu 24.04's `nodejs` is 18.x, which Vite 8 / rolldown cannot run: they
-# import `node:util`'s `styleText` (Node >= 20.12) and die at `vite dev` with a
-# cryptic "does not provide an export named 'styleText'". Distro repos never
-# carry the needed version, so pull LTS 22 from NodeSource when the system Node
-# is missing or too old. Best effort -- a failure only disables the frontend
-# (run_all.sh re-checks and reports it), never the backend/ONNX pipeline.
-node_version_ok() {
-    local mm="" major="" minor=""
-    mm="$(node -p 'process.versions.node.split(".").slice(0,2).join(".")' 2>/dev/null)" || return 1
-    major="${mm%%.*}"
-    minor="${mm##*.}"
-    [ "${major}" -gt 22 ] && return 0
-    [ "${major}" -eq 22 ] && [ "${minor}" -ge 12 ] && return 0
-    [ "${major}" -eq 20 ] && [ "${minor}" -ge 19 ] && return 0
-    return 1
-}
-if command -v node >/dev/null 2>&1 && node_version_ok; then
-    echo "found node $(node -v)"
+# --- React Studio frontend ---------------------------------------------------
+# The API image does not serve the Studio, so skip Node + the frontend tree
+# there: that saves a NodeSource download and a full dependency install on
+# every Docker build. Set FLOAT_INSTALL_FRONTEND=1 to include it (for example
+# when the image is also used to run the dev server).
+if [ "${IS_IT_RUN_IN_DOCKER:-}" = "true" ] && [ "${FLOAT_INSTALL_FRONTEND:-0}" != "1" ]; then
+    echo "=== Skipping Node + Studio frontend deps (API-only Docker image) ==="
 else
-    echo "node $(node -v 2>/dev/null || echo '(missing)') is too old for Vite 8 -> installing Node 22"
-    if curl -fsSL https://deb.nodesource.com/setup_22.x | run_as_root bash - \
-        && run_as_root apt-get install -y nodejs; then
-        # Drop the hashed path entry, otherwise bash keeps resolving the old
-        # binary and the version check below still sees Node 18.
-        hash -r
-        echo "installed node $(node -v)"
+    echo "=== Ensuring Node for the Studio frontend (Vite 8 needs 20.19+/22.12+) ==="
+    # Ubuntu 24.04's `nodejs` is 18.x, which Vite 8 / rolldown cannot run: they
+    # import `node:util`'s `styleText` (Node >= 20.12) and die at `vite dev` with a
+    # cryptic "does not provide an export named 'styleText'". Distro repos never
+    # carry the needed version, so pull LTS 22 from NodeSource when the system Node
+    # is missing or too old. Best effort -- a failure only disables the frontend
+    # (run_all.sh re-checks and reports it), never the backend/ONNX pipeline.
+    # shellcheck source=/dev/null
+    source "${SCRIPT_DIR}/_frontend_env.sh"
+    if command -v node >/dev/null 2>&1 && node_version_ok; then
+        echo "found node $(node -v)"
     else
-        echo "⚠️ Node upgrade failed — the frontend needs Node 20.19+/22.12+; the backend is unaffected."
+        echo "node $(node -v 2>/dev/null || echo '(missing)') is too old for Vite 8 -> installing Node 22"
+        if curl -fsSL https://deb.nodesource.com/setup_22.x | run_as_root bash - \
+            && run_as_root apt-get install -y nodejs; then
+            # Drop the hashed path entry, otherwise bash keeps resolving the old
+            # binary and the version check below still sees Node 18.
+            hash -r
+            echo "installed node $(node -v)"
+        else
+            echo "⚠️ Node upgrade failed — the frontend needs Node 20.19+/22.12+; the backend is unaffected."
+        fi
     fi
-fi
 
-# Refresh the frontend deps after a Node/npm change. npm's optional-dependency
-# bug (npm/cli#4828) leaves platform natives out of an existing node_modules
-# when the npm that wrote it was older, so `vite dev` dies with "Cannot find
-# native binding ... @rolldown/binding-linux-x64-gnu" even though the install
-# "succeeded". `npm ci` rebuilds it from the committed lockfile.
-if [ -f "${PROJECT_ROOT}/frontend/package.json" ] && command -v npm >/dev/null 2>&1; then
-    if node_version_ok; then
-        echo "=== Installing frontend dependencies (npm ci) ==="
-        (cd "${PROJECT_ROOT}/frontend" && npm ci) \
-            || echo "⚠️ npm ci failed — run it in frontend/ before ./scripts/run_all.sh"
+    # One pnpm install replaces the old `npm ci` + `npm install` pair, which
+    # downloaded and extracted the same tree twice. Corepack provides the exact
+    # pnpm pinned in package.json ("packageManager"), and pnpm hardlinks from
+    # its content-addressable store, so repeat setups are seconds, not minutes.
+    if [ -f "${PROJECT_ROOT}/frontend/package.json" ]; then
+        if node_version_ok; then
+            if ensure_pnpm; then
+                # A node_modules written by npm cannot be reused by pnpm.
+                # Remove it first instead of waiting for a purge confirmation.
+                if [ -d "${FRONTEND_DIR}/node_modules" ] \
+                    && [ ! -f "${FRONTEND_DIR}/node_modules/.modules.yaml" ]; then
+                    rm -rf "${FRONTEND_DIR}/node_modules"
+                fi
+                if pnpm_deps_current; then
+                    echo "=== Frontend dependencies already up to date (pnpm) ==="
+                else
+                    echo "=== Installing frontend dependencies (pnpm $(pnpm --version)) ==="
+                    pnpm_install \
+                        || echo "⚠️ pnpm install failed — run 'pnpm install' in frontend/ before ./scripts/run_all.sh"
+                fi
+            else
+                echo "⚠️ pnpm could not be enabled (Corepack/npm unavailable) — the Studio will not start; the backend is unaffected."
+            fi
+        fi
     fi
 fi
 

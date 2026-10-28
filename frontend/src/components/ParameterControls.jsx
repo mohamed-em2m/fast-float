@@ -8,6 +8,7 @@ import {
   Sparkles,
   Zap,
 } from 'lucide-react';
+import GenerateAction from './GenerateAction';
 
 const EMOTIONS = [
   { id: 'S2E', label: 'Auto', icon: '✨', hint: 'Read the mood from the voice' },
@@ -25,7 +26,15 @@ const QUALITY_PRESETS = [
   { id: 'cinematic', label: 'Cinematic', nfe: 16, hint: 'Best detail' },
 ];
 
-export default function ParameterControls({ params, setParams, step = 3 }) {
+export default function ParameterControls({
+  params,
+  setParams,
+  step = 3,
+  onGenerate,
+  isGenerating = false,
+  hasAudio = false,
+  hasResult = false,
+}) {
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const updateParam = (key, val) => {
@@ -56,12 +65,12 @@ export default function ParameterControls({ params, setParams, step = 3 }) {
 
       {/* Emotion Selector */}
       <div className="control-group">
-        <label className="control-label">
+        <div className="control-label">
           <span>Emotion</span>
           <span className="control-val-badge">
             {EMOTIONS.find((emotion) => emotion.id === params.emotion)?.label || params.emotion}
           </span>
-        </label>
+        </div>
         <div className="emotion-grid">
           {EMOTIONS.map((emo) => (
             <button
@@ -72,7 +81,7 @@ export default function ParameterControls({ params, setParams, step = 3 }) {
               title={emo.hint || `Force a ${emo.label.toLowerCase()} expression`}
               aria-pressed={params.emotion === emo.id}
             >
-              <span className="emotion-icon">{emo.icon}</span>
+              <span className="emotion-icon" aria-hidden="true">{emo.icon}</span>
               <span className="emotion-name">{emo.label}</span>
             </button>
           ))}
@@ -85,10 +94,10 @@ export default function ParameterControls({ params, setParams, step = 3 }) {
       {/* Quality Presets */}
       <div className="control-group">
         <div className="control-label-row">
-          <label className="control-label">
+          <div className="control-label">
             <span>Render quality</span>
             <span className="control-val-badge">{params.nfe} steps</span>
-          </label>
+          </div>
         </div>
         <div className="preset-grid">
           {QUALITY_PRESETS.map((preset) => (
@@ -126,10 +135,10 @@ export default function ParameterControls({ params, setParams, step = 3 }) {
           {/* NFE Steps Slider */}
           <div className="control-group">
             <div className="control-label-row">
-              <label className="control-label">
+              <div className="control-label">
                 <span>Sampling steps (NFE)</span>
                 <span className="control-val-badge">{params.nfe}</span>
-              </label>
+              </div>
               <span className="control-subtext">
                 {params.nfe <= 8 ? '⚡ Fastest' : params.nfe <= 15 ? 'Balanced' : 'High fidelity'}
               </span>
@@ -151,10 +160,10 @@ export default function ParameterControls({ params, setParams, step = 3 }) {
 
           {/* Seed Controls */}
           <div className="control-group">
-            <label className="control-label">
+            <div className="control-label">
               <span>Seed</span>
               <span className="control-subtext">Lock a look across takes</span>
-            </label>
+            </div>
             <div className="seed-input-row">
               <input
                 type="number"
@@ -178,12 +187,12 @@ export default function ParameterControls({ params, setParams, step = 3 }) {
           {/* Chunking */}
           <div className="control-group">
             <div className="control-label-row">
-              <label className="control-label">
+              <div className="control-label">
                 <span>Long speech chunking</span>
                 <span className="control-val-badge">
                   {params.chunk_seconds > 0 ? `${params.chunk_seconds}s windows` : 'Off'}
                 </span>
-              </label>
+              </div>
               <button
                 type="button"
                 className={`switch ${params.chunk_seconds > 0 ? 'is-on' : ''}`}
@@ -210,10 +219,10 @@ export default function ParameterControls({ params, setParams, step = 3 }) {
                   <span>30s</span>
                 </div>
                 <div className="control-label-row" style={{ marginTop: '6px' }}>
-                  <label className="control-label">
+                  <div className="control-label">
                     <span>Chunks per batch</span>
                     <span className="control-val-badge">{params.chunk_batch_size}×</span>
-                  </label>
+                  </div>
                 </div>
                 <input
                   type="range"
@@ -233,10 +242,10 @@ export default function ParameterControls({ params, setParams, step = 3 }) {
 
           {/* Guidance Scales */}
           <div className="control-group">
-            <label className="control-label">
+            <div className="control-label">
               <span>Guidance</span>
               <span className="control-val-badge">A / R / E</span>
-            </label>
+            </div>
             <div className="guidance-grid">
               <label>
                 <span>Audio {params.a_cfg_scale.toFixed(1)}</span>
@@ -276,10 +285,10 @@ export default function ParameterControls({ params, setParams, step = 3 }) {
 
           {/* Encoding Quality */}
           <div className="control-group">
-            <label className="control-label">
+            <div className="control-label">
               <span>Encoding</span>
               <span className="control-subtext">NVENC preset</span>
-            </label>
+            </div>
             <div className="quality-radio-group">
               {['fast', 'balanced', 'high'].map((q) => (
                 <button
@@ -298,12 +307,12 @@ export default function ParameterControls({ params, setParams, step = 3 }) {
           {/* Decode Batch Size */}
           <div className="control-group">
             <div className="control-label-row">
-              <label className="control-label">
+              <div className="control-label">
                 <span>Decode batch</span>
                 <span className="control-val-badge">
                   {params.decode_batch_size > 0 ? `${params.decode_batch_size} frames` : 'Auto'}
                 </span>
-              </label>
+              </div>
               <span className="control-subtext">
                 {params.decode_batch_size > 0 ? '⚠ Manual VRAM' : 'VRAM auto-tuned'}
               </span>
@@ -323,6 +332,17 @@ export default function ParameterControls({ params, setParams, step = 3 }) {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Same shape as the Live tab: the last input card ends on the primary
+          action, so the canvas stays a preview. */}
+      {onGenerate && (
+        <GenerateAction
+          onGenerate={onGenerate}
+          isGenerating={isGenerating}
+          hasAudio={hasAudio}
+          hasResult={hasResult}
+        />
       )}
     </div>
   );

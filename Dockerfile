@@ -22,10 +22,11 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
 COPY . .
 ENV IS_IT_RUN_IN_DOCKER=true
 
-# 3) Unified setup: best-effort system packages, Node 22 for the frontend
-#    (only needed if the image is later extended; harmless in the API image),
-#    venv reuse, the ONNX/TensorRT layer, and checkpoints (skipped when the
-#    build context already carries them).
+# 3) Unified setup: best-effort system packages, venv reuse, the ONNX/TensorRT
+#    layer, and checkpoints (skipped when the build context already carries
+#    them). The API image does not serve the Studio, so setup.sh skips Node and
+#    the pnpm install here; set FLOAT_INSTALL_FRONTEND=1 if you want the
+#    frontend tree in the image too.
 RUN chmod +x ./scripts/*.sh && ./scripts/setup.sh
 
 # Cloud Run injects $PORT; plain `docker run` uses 8080.

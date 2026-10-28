@@ -13,6 +13,7 @@ cloudflared-linux-amd64.deb
 # Local development state the app creates/installs itself
 **/__pycache__/
 frontend/node_modules/
+frontend/.pnpm-store/
 frontend/dist/
 results/
 

@@ -25,6 +25,7 @@ and publishes both tracks.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import ssl
@@ -64,8 +65,18 @@ from livekit.agents.voice.avatar import DataStreamAudioOutput
 from livekit.agents.voice.room_io import RoomOptions
 from livekit.plugins import google
 
+try:
+    # Not re-exported by the plugin package; guarded so a plugin layout change
+    # degrades to the stock session instead of breaking the worker import.
+    from livekit.plugins.google.realtime.realtime_api import (
+        RealtimeSession as _GoogleRealtimeSession,
+    )
+except Exception:  # pragma: no cover - depends on the installed plugin layout
+    _GoogleRealtimeSession = None
+
 from fast_float.livekit.gemini.config import AgentConfig, dispatch_config, sanitize_gemini_model
 from fast_float.livekit.gemini.tools import FloatApi
+from fast_float.logging_utils import configure_logging, current_log_file
 
 logger = logging.getLogger("float_gemini")
 
@@ -193,6 +204,136 @@ async def _genai_ssl_context() -> ssl.SSLContext:
     return _GENAI_SSL_CONTEXT
 
 
+# Gemini Live can drop an established session with 1011 ("internal error") and
+# the plugin retries automatically. Its retry reuses the session-resumption
+# handle from the session that just died; Google answers that with 1008
+# "BidiGenerateContent session not found or expired" during connect, which the
+# plugin cannot retry (no session exists yet) and surfaces as fatal — the whole
+# AgentSession shuts down even though a fresh session would have worked.
+# Retrying with a fresh session is safe: the plugin replays the chat history
+# into the new connection, so only the dead handle is lost.
+_STALE_SESSION_MARKERS = ("1011", "1008", "session not found or expired")
+
+# Google closes an idle Live session after ~2 minutes without turn activity,
+# usually without sending a `goAway` first. The next utterance then hits a dead
+# socket: the plugin reconnects, dropping any audio already queued for it, and
+# the user has to repeat themselves. Restart the session ourselves after a
+# shorter idle window so the reconnect happens between turns instead.
+_IDLE_REFRESH_SEC = 60.0
+_IDLE_REFRESH_TICK_SEC = 5.0
+
+
+def _is_stale_session_error(error: BaseException | None) -> bool:
+    """True when ``error`` means the resumption handle can no longer be used."""
+    if error is None:
+        return False
+    if getattr(error, "code", None) in (1008, 1011):
+        return True
+    message = str(error).lower()
+    return any(marker in message for marker in _STALE_SESSION_MARKERS)
+
+
+def _resilient_session_class(base: type) -> type:
+    class _FreshRetryRealtimeSession(base):
+        def _mark_restart_needed(self, on_error: bool = False) -> None:
+            if on_error and _is_stale_session_error(getattr(self, "_session_error", None)):
+                logger.warning(
+                    "Gemini Live session expired (%s); discarding its resumption handle "
+                    "and reconnecting with a fresh session",
+                    self._session_error,
+                )
+                self._session_resumption_handle = None
+                self._resumption_chat_ctx = None
+            super()._mark_restart_needed(on_error)
+
+        # -------------------------------------------------- idle refresh
+        def _note_turn_activity(self) -> None:
+            """Reset the idle clock; called on every turn/user-speech event."""
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:  # no loop (tests / sync construction)
+                return
+            self._last_turn_at = loop.time()
+
+        def _start_new_generation(self) -> None:
+            self._note_turn_activity()
+            super()._start_new_generation()
+
+        def _mark_current_generation_done(self) -> None:
+            self._note_turn_activity()
+            super()._mark_current_generation_done()
+
+        def _handle_input_speech_started(self) -> None:
+            self._note_turn_activity()
+            super()._handle_input_speech_started()
+
+        def _handle_input_speech_stopped(self) -> None:
+            self._note_turn_activity()
+            super()._handle_input_speech_stopped()
+
+        async def _main_task(self) -> None:
+            # The stock loop reconnects on `_session_should_close`; run the idle
+            # watchdog alongside it so a long pause never leaves a dead socket in
+            # front of the next utterance.
+            self._note_turn_activity()
+            watchdog = asyncio.create_task(self._idle_refresh_watchdog(), name="gemini-idle-refresh")
+            try:
+                await super()._main_task()
+            finally:
+                watchdog.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watchdog
+
+        async def _idle_refresh_watchdog(self) -> None:
+            loop = asyncio.get_running_loop()
+            while True:
+                await asyncio.sleep(_IDLE_REFRESH_TICK_SEC)
+                should_close = getattr(self, "_session_should_close", None)
+                if should_close is None or should_close.is_set():
+                    continue
+                generation = getattr(self, "_current_generation", None)
+                if generation is not None and not getattr(generation, "_done", False):
+                    # A response is still streaming; that is activity, not idleness.
+                    self._note_turn_activity()
+                    continue
+                last = getattr(self, "_last_turn_at", None)
+                if last is None:
+                    last = self._last_turn_at = loop.time()
+                    continue
+                idle_for = loop.time() - last
+                if idle_for < _IDLE_REFRESH_SEC:
+                    continue
+                logger.info(
+                    "Gemini Live session idle for %.0fs; restarting it with the "
+                    "resumption handle before Google drops the connection",
+                    idle_for,
+                )
+                self._note_turn_activity()
+                # A clean restart (unlike an error) keeps the handle, so the
+                # plugin reconnects and the conversation context survives.
+                should_close.set()
+
+    return _FreshRetryRealtimeSession
+
+
+def _resilient_model_class(base: type, session_base: type) -> type:
+    """Subclass ``base`` so restarts after a dead session start fresh.
+
+    ``base`` is passed in (rather than subclassed at import time) so the class
+    follows whatever ``google.realtime.RealtimeModel`` is active when the model
+    is built, including the one tests monkeypatch.
+    """
+    fresh_session = _resilient_session_class(session_base)
+
+    class _FreshRetryRealtimeModel(base):
+        def session(self, *, turn_detection_disabled: bool = False):
+            sess = fresh_session(self)
+            self._sessions.add(sess)
+            return sess
+
+    return _FreshRetryRealtimeModel
+
+
 def _build_realtime_model(
     api_key: str | None = None, model: str | None = None, ssl_ctx: ssl.SSLContext | None = None
 ) -> google.realtime.RealtimeModel:
@@ -207,6 +348,22 @@ def _build_realtime_model(
         "voice": config.voice,
         "input_audio_transcription": genai_types.AudioTranscriptionConfig(),
         "output_audio_transcription": genai_types.AudioTranscriptionConfig(),
+        # The avatar's voice is played back through the browser (the mic track
+        # still hears some of it even with echoCancellation). Gemini's
+        # server-side activity detection used to flag that spill-over as the
+        # user barging in and STOPped replies mid-sentence ("counting to 10,
+        # cut at 6" — the agent even logs lk.clear_buffer / "playback
+        # interrupted"). Trigger-happy defaults: make start-of-speech harder
+        # to commit (LOW sensitivity + 200 ms required speech) so a short
+        # echo burst cannot truncate an utterance; real barge-ins (actual
+        # user speech, >0.5 s in one burst) still get through.
+        "realtime_input_config": genai_types.RealtimeInputConfig(
+            automatic_activity_detection=genai_types.AutomaticActivityDetection(
+                start_of_speech_sensitivity=genai_types.StartSensitivity.START_SENSITIVITY_LOW,
+                end_of_speech_sensitivity=genai_types.EndSensitivity.END_SENSITIVITY_HIGH,
+                prefix_padding_ms=200,
+            ),
+        ),
     }
     # The dispatch model name is free text from a Studio box; keep a bad value
     # from setting up the whole session, then falling over on the Gemini
@@ -245,7 +402,10 @@ def _build_realtime_model(
             client_args={"verify": ssl_ctx},
             async_client_args={"verify": ssl_ctx, "ssl": ssl_ctx},
         )
-    return google.realtime.RealtimeModel(**kwargs)  # type: ignore[arg-type]
+    model_cls = google.realtime.RealtimeModel
+    if _GoogleRealtimeSession is not None:
+        model_cls = _resilient_model_class(model_cls, _GoogleRealtimeSession)
+    return model_cls(**kwargs)
 
 
 @server.rtc_session(agent_name=config.agent_name)
@@ -345,14 +505,19 @@ def main() -> None:
     # process is running with. worker_started fires even when registration
     # then fails; the SDK's "registered worker" line confirms the handshake.
     def _log_startup(*_args: object) -> None:
+        # run_app() installs the SDK's handlers before this event fires; attach
+        # ours afterwards so they are not replaced (and so pre-run logs are
+        # not dropped).
+        configure_logging(role="agent")
         logger.info(
-            "worker starting: agent_name=%s url=%s config_dir=%s livekit_credentials=%s gemini_key=%s model=%s",
+            "worker starting: agent_name=%s url=%s config_dir=%s livekit_credentials=%s gemini_key=%s model=%s log_file=%s",
             config.agent_name,
             config.livekit_url or "<missing>",
             config.config_dir,
             bool(config.livekit_url and config.livekit_api_key and config.livekit_api_secret),
             bool(config.google_api_key),
             config.model or "<plugin default>",
+            current_log_file() or "console only",
         )
 
     server.on("worker_started", _log_startup)

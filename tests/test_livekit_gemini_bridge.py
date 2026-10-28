@@ -77,6 +77,26 @@ class _BrokenReader(_FakeReader):
         raise RuntimeError("expected chunk index to be exactly one more than the previous")
 
 
+class _GappyReader(_FakeReader):
+    """A reader that raises MissedChunk once, then keeps delivering chunks.
+
+    The native ByteStreamReader errors on the in-flight chunk when transport
+    loses one, but the stream itself can continue afterwards — the receiver
+    retries the pull instead of aborting the segment.
+    """
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        super().__init__(chunks)
+        self.raised = False
+
+    async def __anext__(self) -> bytes:
+        if not self.raised and self._chunks and len(self._chunks) > 1:
+            self.raised = True
+            self._chunks.pop(0)  # the chunk in flight is lost
+            raise RuntimeError("expected chunk index to be exactly one more than the previous")
+        return await super().__anext__()
+
+
 @pytest.mark.skipif(not RTC_AVAILABLE, reason="LiveKit RTC SDK not installed")
 def test_receiver_emits_frames_then_segment_end():
     async def _test():
@@ -147,6 +167,38 @@ def test_receiver_keeps_partial_audio_after_a_stream_error():
         assert sum(frame.samples_per_channel for frame in frames) == 2000 + 4800
         assert broken.closed
         assert good.closed
+
+    asyncio.run(_test())
+
+
+@pytest.mark.skipif(not RTC_AVAILABLE, reason="LiveKit RTC SDK not installed")
+def test_receiver_recovers_after_a_lost_chunk():
+    """A MissedChunk error must not truncate the rest of the reply.
+
+    One chunk lost in transport used to end the whole segment mid-sentence
+    ("counting 1 to 10 cut at 6"). The reader keeps delivering the chunks
+    after the gap, so the receiver retries the pull and renders the rest.
+    """
+
+    async def _test():
+        receiver = DataStreamAudioReceiver(MagicMock(), sender_identity="agent-1")
+        receiver.agent_identity = "agent-1"
+        # 24 kHz mono: five 100 ms-ish chunks, one lost in the middle.
+        pcm = np.arange(12000, dtype=np.int16).tobytes()
+        chunks = [pcm[i : i + 2400] for i in range(0, 12000, 2400)]
+        reader = _GappyReader(chunks)
+        await receiver._consume_reader(reader)
+
+        items = []
+        while not receiver._queue.empty():
+            items.append(receiver._queue.get_nowait())
+        assert items[-1] is SEGMENT_END
+        frames = items[:-1]
+        assert all(isinstance(frame, rtc.AudioFrame) for frame in frames)
+        # Everything except the one lost chunk (2400 bytes = 1200 samples).
+        total = sum(frame.samples_per_channel for frame in frames)
+        assert total == 6000 - 1200
+        assert reader.closed
 
     asyncio.run(_test())
 

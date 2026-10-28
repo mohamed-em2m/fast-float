@@ -15,18 +15,17 @@ import {
 } from 'lucide-react';
 import { MicStreamer } from '../services/audio';
 import { getApiUrl } from '../services/api';
+import { connectLiveKitSession, createMicrophoneMeter, setRoomMicrophoneMuted } from '../services/livekit';
 import {
-  connectLiveKitSession,
-  createMicrophoneMeter,
   fetchConversationStatus,
-  fetchLiveKitStatus,
   getGeminiApiKey,
   getGeminiModel,
   interruptConversation,
-  setRoomMicrophoneMuted,
   startConversation,
   stopConversation,
-} from '../services/livekit';
+} from '../services/livekitHttp';
+import { getStored, setStored } from '../services/storage';
+import { useBackendStatus } from '../services/telemetry';
 
 const PHASE_LABEL = {
   idle: 'Ready when you are',
@@ -59,11 +58,7 @@ const ENGINES = {
 };
 
 function storedEngine() {
-  try {
-    return localStorage.getItem(ENGINE_STORAGE_KEY) === 'gemini' ? 'gemini' : 'builtin';
-  } catch {
-    return 'builtin';
-  }
+  return getStored(ENGINE_STORAGE_KEY) === 'gemini' ? 'gemini' : 'builtin';
 }
 
 function newRoomName() {
@@ -88,7 +83,7 @@ export default function LiveAudioStudio({
   onOpenStudio,
   portraitPicker,
 }) {
-  const [liveKit, setLiveKit] = useState(null);
+  const { liveKit } = useBackendStatus();
   const [phase, setPhase] = useState('idle');
   const [error, setError] = useState(null);
   const [muted, setMuted] = useState(false);
@@ -107,6 +102,7 @@ export default function LiveAudioStudio({
   const [videoStarted, setVideoStarted] = useState(false);
   // Gemini Live only: whether the worker has actually joined the room.
   const [agentConnected, setAgentConnected] = useState(null);
+  const [agentWarning, setAgentWarning] = useState(null);
   const isLive = phase === 'live';
 
   const videoRef = useRef(null);
@@ -115,6 +111,9 @@ export default function LiveAudioStudio({
   const micRef = useRef(null);
   const micMeterRef = useRef(null);
   const mountedRef = useRef(true);
+  // Aborts a slow /conversation/start when the user ends the session (or
+  // leaves the page) before the server finishes warming up.
+  const startAbortRef = useRef(null);
   // Every start/stop bumps this; a late await from an older start must not
   // resurrect a session the user already ended.
   const sessionRef = useRef(0);
@@ -126,6 +125,8 @@ export default function LiveAudioStudio({
     return () => {
       mountedRef.current = false;
       sessionRef.current += 1;
+      startAbortRef.current?.abort?.();
+      startAbortRef.current = null;
       const activeRoom = roomRef.current;
       roomRef.current = null;
       try {
@@ -145,25 +146,6 @@ export default function LiveAudioStudio({
         /* ignore */
       }
       if (activeRoom) stopConversation(activeRoom).catch(() => {});
-    };
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    const check = () => {
-      fetchLiveKitStatus()
-        .then((status) => {
-          if (!cancelled) setLiveKit(status);
-        })
-        .catch(() => {
-          if (!cancelled) setLiveKit({ configured: false });
-        });
-    };
-    check();
-    window.addEventListener('float:api_url_changed', check);
-    return () => {
-      cancelled = true;
-      window.removeEventListener('float:api_url_changed', check);
     };
   }, []);
 
@@ -206,16 +188,32 @@ export default function LiveAudioStudio({
   useEffect(() => {
     if (phase !== 'live' || activeEngine !== 'gemini') {
       setAgentConnected(null);
+      setAgentWarning(null);
       return undefined;
     }
     let cancelled = false;
     let timer = null;
+    const waitingSince = Date.now();
     const poll = async () => {
       const roomNow = roomRef.current;
       if (!roomNow) return;
       const status = await fetchConversationStatus(roomNow);
       if (cancelled || roomRef.current !== roomNow) return;
-      setAgentConnected(Boolean(status?.active && status?.agent_connected));
+
+      if (status?.active && status?.agent_connected) {
+        setAgentConnected(true);
+        setAgentWarning(null);
+      } else {
+        setAgentConnected(false);
+        // Do not cry wolf on the first poll: warming the worker up is normal.
+        if (Date.now() - waitingSince > 20000) {
+          setAgentWarning(
+            status && status.active === false
+              ? 'The conversation session ended on the server. End and restart the session.'
+              : 'The Gemini agent has not joined the room yet. Check that the livekit-agents worker is running and its logs for errors.'
+          );
+        }
+      }
       timer = setTimeout(poll, 3000);
     };
     poll();
@@ -302,13 +300,23 @@ export default function LiveAudioStudio({
     startingRef.current = false;
     // Invalidate any in-flight start; its late awaits clean themselves up.
     sessionRef.current += 1;
+    startAbortRef.current?.abort?.();
+    startAbortRef.current = null;
     const activeRoom = roomRef.current;
     roomRef.current = null;
     setPhase('stopping');
     setNeedsGesture(false);
     setVideoStarted(false);
-    await teardownLocal({ flush: true });
-    if (activeRoom) await stopConversation(activeRoom).catch(() => {});
+    // Local teardown can wait on a network flush; never leave the UI stuck on
+    // "Ending…" because a chunk POST is timing out. The promises keep running.
+    const bounded = (promise) => Promise.race([
+      promise,
+      new Promise((resolve) => setTimeout(resolve, 3000)),
+    ]);
+    await bounded(Promise.all([
+      teardownLocal({ flush: true }),
+      activeRoom ? stopConversation(activeRoom).catch(() => {}) : Promise.resolve(),
+    ]));
     if (!mountedRef.current) {
       stoppingRef.current = false;
       return;
@@ -320,6 +328,8 @@ export default function LiveAudioStudio({
     setError(null);
     setElapsed(0);
     setActiveEngine('builtin');
+    setAgentConnected(null);
+    setAgentWarning(null);
     stoppingRef.current = false;
     if (!silent) onToast?.('Live session ended.', 'info');
   };
@@ -334,12 +344,15 @@ export default function LiveAudioStudio({
 
     startingRef.current = true;
     const token = ++sessionRef.current;
+    const controller = new AbortController();
+    startAbortRef.current = controller;
     const isActive = () => mountedRef.current && sessionRef.current === token;
     let startedRoom = null;
     setError(null);
+    setAgentConnected(null);
+    setAgentWarning(null);
     setNeedsGesture(false);
     setVideoStarted(false);
-    setAgentConnected(null);
     setPhase('starting');
     const targetRoom = newRoomName();
     try {
@@ -350,6 +363,7 @@ export default function LiveAudioStudio({
         agent: engine,
         geminiApiKey: engine === 'gemini' ? getGeminiApiKey() : null,
         geminiModel: engine === 'gemini' ? getGeminiModel() : null,
+        signal: controller.signal,
       });
       startedRoom = started.room;
       const mode = started.agent === 'gemini' ? 'gemini' : 'builtin';
@@ -381,7 +395,7 @@ export default function LiveAudioStudio({
             // Publisher stopped: tear down the local side, but never loop.
             const endedRoom = roomRef.current;
             roomRef.current = null;
-            teardownLocal({ flush: false });
+            teardownLocal({ flush: false }).catch(() => {});
             setNeedsGesture(false);
             setPhase((current) => {
               if (current === 'starting') return 'error';
@@ -389,9 +403,18 @@ export default function LiveAudioStudio({
               return current;
             });
             setRoom(null);
+            setMuted(false);
+            setElapsed(0);
+            setLevel(0);
+            setActiveEngine('builtin');
+            setAgentConnected(null);
+            setAgentWarning(null);
+            if (status === 'done') {
+              setError(null);
+              onToast?.('The live stream ended.', 'info');
+            }
             // Release the GPU session even if the publisher died on its own.
             if (endedRoom) stopConversation(endedRoom).catch(() => {});
-            if (status === 'done') onToast?.('The live stream ended.', 'info');
           }
         },
       });
@@ -440,6 +463,15 @@ export default function LiveAudioStudio({
       // the session, so autoplay can still be rejected. Surface a retry.
       videoRef.current?.play?.().catch(() => setNeedsGesture(true));
     } catch (err) {
+      // An intentional abort is not a failure: the user pressed End and
+      // endSession already resets the UI.
+      if (controller.signal.aborted && !isActive()) {
+        // The server may still have created the room before the abort landed;
+        // the room name is client-generated, so ask it to shut that room down.
+        if (startedRoom) stopConversation(startedRoom).catch(() => {});
+        else stopConversation(targetRoom).catch(() => {});
+        return;
+      }
       console.error('Live session failed', err);
       if (startedRoom) await stopConversation(startedRoom).catch(() => {});
       if (!isActive()) return;
@@ -452,8 +484,15 @@ export default function LiveAudioStudio({
       await teardownLocal({ flush: false });
       roomRef.current = null;
       if (mountedRef.current) setRoom(null);
+      setMuted(false);
+      setElapsed(0);
+      setLevel(0);
+      setActiveEngine('builtin');
+      setAgentConnected(null);
+      setAgentWarning(null);
       onToast?.(message, 'error');
     } finally {
+      if (startAbortRef.current === controller) startAbortRef.current = null;
       if (sessionRef.current === token) startingRef.current = false;
     }
   };
@@ -461,11 +500,7 @@ export default function LiveAudioStudio({
   const chooseEngine = (next) => {
     if (next === engine || startingRef.current || stoppingRef.current || roomRef.current) return;
     setEngine(next);
-    try {
-      localStorage.setItem(ENGINE_STORAGE_KEY, next);
-    } catch {
-      /* private mode: keep the in-memory choice */
-    }
+    setStored(ENGINE_STORAGE_KEY, next);
   };
 
   const toggleMute = () => {
@@ -497,7 +532,12 @@ export default function LiveAudioStudio({
   const seconds = String(Math.floor(elapsed % 60)).padStart(2, '0');
 
   return (
-    <main className="live-workspace">
+    <main
+      className="live-workspace"
+      id="mode-panel-live"
+      role="tabpanel"
+      aria-labelledby="mode-tab-live"
+    >
       <aside className="live-sidebar">
         {portraitPicker || (
           <section className="glass-panel live-pick-card">
@@ -554,6 +594,14 @@ export default function LiveAudioStudio({
                   {message}
                 </p>
               ))}
+            </div>
+          )}
+          {isLive && activeEngine === 'gemini' && agentWarning && (
+            <div className="live-checks">
+              <p className="inline-warning">
+                <TriangleAlert size={14} />
+                {agentWarning}
+              </p>
             </div>
           )}
 
@@ -636,11 +684,11 @@ export default function LiveAudioStudio({
 
       <section className="glass-panel live-stage-panel">
         <div className="live-stage-header">
-          <div>
-            <div className="live-stage-eyebrow">
+          <div className="live-stage-heading">
+            <span className="live-stage-eyebrow">
               <Radio size={13} />
               Live audio
-            </div>
+            </span>
             <h2 className="live-stage-title">
               {isLive ? 'Your avatar is listening' : 'Real-time talking portrait'}
             </h2>
@@ -730,6 +778,9 @@ export default function LiveAudioStudio({
                 {activeEngine === 'gemini' && agentConnected !== null && (
                   <span
                     className={`live-agent-chip ${agentConnected ? 'is-connected' : 'is-waiting'}`}
+                    title={agentWarning || (agentConnected
+                      ? 'The Gemini Live worker is in the room.'
+                      : 'Waiting for the Gemini Live worker to join the room.')}
                   >
                     {agentConnected ? 'Gemini agent connected' : 'Waiting for the Gemini agent…'}
                   </span>
@@ -741,13 +792,16 @@ export default function LiveAudioStudio({
         </div>
 
         <div className="live-controls">
+          <div className="live-controls-group">
           <button
             type="button"
             className={`btn-secondary ${muted ? 'is-muted' : ''}`}
             onClick={toggleMute}
             disabled={!isLive}
+            aria-pressed={muted}
+            aria-label={muted ? 'Unmute microphone' : 'Mute microphone'}
           >
-            {muted ? <MicOff size={16} /> : <Mic size={16} />}
+            {muted ? <MicOff size={16} aria-hidden="true" /> : <Mic size={16} aria-hidden="true" />}
             {muted ? 'Unmute' : 'Mute'}
           </button>
           <button
@@ -756,7 +810,7 @@ export default function LiveAudioStudio({
             onClick={interrupt}
             disabled={!isLive}
           >
-            <CircleStop size={16} />
+            <CircleStop size={16} aria-hidden="true" />
             Interrupt
           </button>
           <button
@@ -765,9 +819,10 @@ export default function LiveAudioStudio({
             onClick={() => endSession()}
             disabled={!isLive && phase !== 'starting'}
           >
-            <Sparkles size={16} />
+            <Sparkles size={16} aria-hidden="true" />
             End &amp; clear
           </button>
+          </div>
           <span className="live-controls-hint">
             {isLive && activeEngine === 'gemini'
               ? 'Gemini Live owns the voice — the avatar only renders it.'
