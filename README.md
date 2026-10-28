@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.png" alt="FLOAT Fast Logo" width="120" style="border-radius: 20px; margin-bottom: 12px;" />
+<img src="assets/logo.png" alt="FLOAT Fast Logo" width="512" style="border-radius: 20px; margin-bottom: 12px;" />
 
 # FLOAT Fast
 
