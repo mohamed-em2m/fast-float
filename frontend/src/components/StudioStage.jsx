@@ -335,45 +335,16 @@ export default function StudioStage({
             <Wand2 size={13} /> Output
           </span>
           <h2 className="stage-title">Studio canvas</h2>
-          <p className="stage-desc">
-            {isGenerating
-              ? 'Frames appear here as soon as they are decoded.'
-              : generationResult
-                ? 'Your talking portrait is ready. Download it or generate another take.'
-                : 'Your talking portrait will appear here.'}
-          </p>
         </div>
 
-        <button
-          type="button"
-          className="btn-primary btn-generate"
-          onClick={onGenerate}
-          disabled={isGenerating || !hasAudio}
-          aria-describedby={!hasAudio ? 'stage-audio-hint' : undefined}
-          title={!hasAudio ? 'Add voice audio first' : 'Generate the talking portrait'}
+        <span
+          className={`stage-status ${isGenerating ? 'is-live' : generationResult ? 'is-ready' : ''}`}
+          aria-live="polite"
         >
-          {isGenerating ? (
-            <>
-              <span className="spinner-dot animate-spin" />
-              <span>Generating…</span>
-            </>
-          ) : (
-            <>
-              <Sparkles size={18} />
-              <span>{generationResult ? 'Generate another' : 'Generate video'}</span>
-            </>
-          )}
-        </button>
+          <span className="stage-status-dot" aria-hidden="true" />
+          {isGenerating ? 'Rendering' : generationResult ? 'Ready' : 'Standby'}
+        </span>
       </div>
-
-      {!hasAudio && (
-        <div className="stage-hint" id="stage-audio-hint">
-          <span className="stage-hint-dot" aria-hidden="true" />
-          {generationResult
-            ? 'Add a voice clip to generate another take.'
-            : 'Record or upload a voice clip to unlock generation.'}
-        </div>
-      )}
 
       {generationError && !isGenerating && (
         <div className="stage-error" role="alert">
@@ -495,6 +466,40 @@ export default function StudioStage({
             )}
           </div>
         )}
+      </div>
+
+      <div className="stage-cta">
+        <div className="stage-cta-stack">
+          <button
+            type="button"
+            className={`btn-primary btn-generate ${isGenerating ? 'is-busy' : ''}`}
+            onClick={onGenerate}
+            disabled={isGenerating || !hasAudio}
+            aria-describedby={!hasAudio ? 'stage-audio-hint' : undefined}
+            title={!hasAudio ? 'Add voice audio first' : 'Generate the talking portrait'}
+          >
+            {isGenerating ? (
+              <>
+                <span className="spinner-dot animate-spin" />
+                <span>Generating…</span>
+              </>
+            ) : (
+              <>
+                <Sparkles size={18} />
+                <span>{generationResult ? 'Generate another' : 'Generate video'}</span>
+              </>
+            )}
+          </button>
+
+          {!hasAudio && (
+            <div className="stage-hint" id="stage-audio-hint">
+              <span className="stage-hint-dot" aria-hidden="true" />
+              {generationResult
+                ? 'Add a voice clip to generate another take.'
+                : 'Record or upload a voice clip to unlock generation.'}
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="stage-toolbar">
