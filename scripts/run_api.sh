@@ -26,10 +26,16 @@ ENV_ARGS=()
 if [ -f "${PROJECT_ROOT}/.env" ]; then
     ENV_ARGS=(--env-file "${PROJECT_ROOT}/.env")
 fi
+# Access logs are opt-in (FLOAT_ACCESS_LOG=1): one line per request, including
+# every /progress poll, drowns the app's own records in logs/server.log.
+ACCESS_LOG_ARGS=()
+case "${FLOAT_ACCESS_LOG:-}" in
+    [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Oo][Nn] | 1) ACCESS_LOG_ARGS=(--access-logfile -) ;;
+esac
 exec uv run "${ENV_ARGS[@]}" --frozen --no-sync hypercorn fast_float.main:app \
     --bind "0.0.0.0:${PORT}" \
     --worker-class asyncio \
     --log-config "json:${PROJECT_ROOT}/config/logging.json" \
-    --access-logfile - \
+    ${ACCESS_LOG_ARGS[@]+"${ACCESS_LOG_ARGS[@]}"} \
     --log-level info \
     "$@"

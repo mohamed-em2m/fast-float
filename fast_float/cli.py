@@ -208,6 +208,12 @@ def _serve_supervisor(args: argparse.Namespace) -> int:
 
     # 3. Start Backend Server
     print("🌐 [3/3] Starting FastAPI WebRTC API...")
+    # Access logs are opt-in (FLOAT_ACCESS_LOG=1): one line per request, every
+    # /progress poll included, would bury the app's own records.
+    from fast_float.logging_utils.config import access_log_enabled
+
+    want_access_log = access_log_enabled()
+
     if args.server_type == "hypercorn":
         server_cmd = [
             sys.executable,
@@ -222,8 +228,7 @@ def _serve_supervisor(args: argparse.Namespace) -> int:
             "info",
             # "-" enables hypercorn's access logger; config/logging.json routes
             # it to logs/server.log and drops health-check noise.
-            "--access-logfile",
-            "-",
+            *(["--access-logfile", "-"] if want_access_log else []),
         ]
         log_config = repo / "config" / "logging.json"
         if log_config.exists():
@@ -240,6 +245,8 @@ def _serve_supervisor(args: argparse.Namespace) -> int:
             str(args.port),
             "--log-level",
             "info",
+            # uvicorn writes access logs unless told not to; match hypercorn.
+            *([] if want_access_log else ["--no-access-log"]),
         ]
 
     p_server = subprocess.Popen(

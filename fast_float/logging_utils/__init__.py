@@ -21,6 +21,7 @@ from fast_float.logging_utils.asgi import RequestContextMiddleware
 from fast_float.logging_utils.config import (
     DEFAULT_LOG_DIR,
     LoggingState,
+    access_log_enabled,
     coerce_level,
     configure_logging,
     current_log_file,
@@ -77,6 +78,7 @@ __all__ = [
     "LoggingState",
     "RateLimitFilter",
     "RequestContextMiddleware",
+    "access_log_enabled",
     "build_console_handler",
     "build_file_handler",
     "coerce_level",

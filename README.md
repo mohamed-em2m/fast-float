@@ -416,6 +416,7 @@ fallbacks only for keys the file omits.
 | `FLOAT_LOG_JSON` | `true` | JSONL file (`false` = text) |
 | `FLOAT_LOG_SHARED` | `false` | One locked file for several processes (no rotation) |
 | `FLOAT_LOG_TEE` | `1` | Supervisor/scripts also write `logs/combined.log` |
+| `FLOAT_ACCESS_LOG` | unset | Opt in to per-request `hypercorn.access` lines (off: one line per request is noise) |
 
 See [docs/LOGGING.md](docs/LOGGING.md) for roles, request correlation, rotation,
 redaction and `jq` recipes.

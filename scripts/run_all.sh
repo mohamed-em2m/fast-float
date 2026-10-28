@@ -238,11 +238,16 @@ UV_ENV_ARGS=()
 if [ -f "${PROJECT_ROOT}/.env" ]; then
     UV_ENV_ARGS=(--env-file "${PROJECT_ROOT}/.env")
 fi
+# Access logs are opt-in (FLOAT_ACCESS_LOG=1); one line per request is noise.
+ACCESS_LOG_ARGS=()
+case "${FLOAT_ACCESS_LOG:-}" in
+    [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Oo][Nn] | 1) ACCESS_LOG_ARGS=(--access-logfile -) ;;
+esac
 FLOAT_PROCESS_ROLE=api HYPERCORN_STARTUP_TIMEOUT=1200 uv run "${UV_ENV_ARGS[@]}" --frozen --no-sync hypercorn fast_float.main:app \
     --bind "0.0.0.0:${PORT}" \
     --worker-class asyncio \
     --log-config "json:${PROJECT_ROOT}/config/logging.json" \
-    --access-logfile - \
+    ${ACCESS_LOG_ARGS[@]+"${ACCESS_LOG_ARGS[@]}"} \
     --log-level info 2>&1 | sed -u 's/^/[api] /' &
 
 BACKEND_PID=$!

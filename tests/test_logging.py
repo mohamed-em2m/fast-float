@@ -20,6 +20,7 @@ from fast_float.logging_utils import (
     JsonFormatter,
     LockedFileHandler,
     RateLimitFilter,
+    access_log_enabled,
     configure_logging,
     current_context,
     current_log_file,
@@ -108,6 +109,20 @@ def test_level_precedence(monkeypatch, tmp_path):
 
     # And debug=True outranks everything.
     assert configure_logging(debug=True, level="ERROR", role="test", file=False, crash=False) == logging.DEBUG
+
+
+def test_access_logging_is_opt_in(monkeypatch):
+    """Access lines are one record per request, so they must not be the default."""
+    monkeypatch.delenv("FLOAT_ACCESS_LOG", raising=False)
+    assert access_log_enabled() is False
+
+    for off in ("", "0", "false", "no", "off"):
+        monkeypatch.setenv("FLOAT_ACCESS_LOG", off)
+        assert access_log_enabled() is False, off
+
+    for on in ("1", "true", "yes", "on"):
+        monkeypatch.setenv("FLOAT_ACCESS_LOG", on)
+        assert access_log_enabled() is True, on
 
 
 def test_configure_is_idempotent(tmp_path):

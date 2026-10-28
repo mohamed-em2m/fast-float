@@ -81,6 +81,7 @@ Precedence: explicit arguments > environment > `[logging]` in
 | `FLOAT_LOG_UNIFY_SERVERS` | `unify_servers` | `true` | hypercorn/uvicorn share the sinks |
 | `FLOAT_LOG_SHARED` | `shared` | `false` | one locked file for all processes |
 | `FLOAT_LOG_TEE` | — | `1` | supervisor/scripts write `combined.log` (`0`/`false`/`no`/`off` disables) |
+| `FLOAT_ACCESS_LOG` | — | off | truthy -> per-request `hypercorn.access`/`uvicorn.access` lines (see [Server logs](#server-logs)) |
 
 `configure_logging()` is idempotent: repeating it with the same structural
 options only updates the level. Reconfiguring a different role/file/sink closes
@@ -173,10 +174,15 @@ hypercorn fast_float.main:app --log-config json:config/logging.json
 
 `config/logging.json` writes `logs/server.log` (relative to the working
 directory, so run from the repo root) and keeps health-check access lines out of
-both sinks. Access logging is enabled explicitly (`accesslog = "-"` /
-`--access-logfile -`); without it hypercorn never calls its access logger. Do
-not point this config at `logs/api.log`: two `RotatingFileHandler` instances on
-one path race during rollover.
+both sinks. Access logging is **opt-in**: hypercorn only calls its access logger
+when it gets `accesslog = "-"` (`main.py`) or `--access-logfile -` (the CLI and
+the shell scripts), and those flags are only added when `FLOAT_ACCESS_LOG` is
+truthy. Leave it unset for normal runs — one record per request (every
+`/progress` poll, every `/stream` range read) buries the app's own lines, and the
+request middleware already logs what matters. With it on, polling paths
+(`/health`, `/perf/*`, `/livekit/status`, `/favicon.ico`) are still filtered.
+Do not point this config at `logs/api.log`: two `RotatingFileHandler` instances
+on one path race during rollover.
 
 ## Recipes
 
@@ -263,6 +269,7 @@ FLOAT_LOG_CONSOLE=0 ./scripts/run_api.sh         # file only
 FLOAT_LOG_DIR=/var/log/float ./scripts/run_api.sh
 FLOAT_LOG_JSON=false ./scripts/run_api.sh        # text instead of JSONL
 FLOAT_LOG_SHARED=1 ./scripts/run_api.sh          # several writers, one locked file
+FLOAT_ACCESS_LOG=1 ./scripts/run_api.sh          # opt in to per-request access lines
 ```
 
 PowerShell:

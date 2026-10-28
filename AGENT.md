@@ -843,7 +843,9 @@ When editing or extending the codebase, follow these design patterns:
   `Authorization: Bearer …`, query credentials, `AIza…`); other knobs:
   `FLOAT_LOG_DIR`, `FLOAT_LOG_TO_FILE`, `FLOAT_LOG_JSON`, `FLOAT_LOG_CONSOLE`,
   `FLOAT_LOG_MAX_BYTES`, `FLOAT_LOG_BACKUPS`, `FLOAT_LOG_SHARED` (opt-in locked
-  shared file, no rotation), `FLOAT_LOG_TEE=0` (no combined log).
+  shared file, no rotation), `FLOAT_LOG_TEE=0` (no combined log),
+  `FLOAT_ACCESS_LOG=1` (opt-in per-request access lines — off by default, since
+  one record per request buries the app's own logs).
 - **Per-stage timing**: `fast_float/utils/timing.py`. Open a run with
   `with timing_run("name"):` (re-entrant: the outermost scope owns the collector
   and prints one summary table) and wrap blocks with

@@ -100,6 +100,18 @@ def debug_enabled() -> bool:
     return _env_truthy("FLOAT_DEBUG", "FLOAT_TIMING")
 
 
+def access_log_enabled() -> bool:
+    """True when ``FLOAT_ACCESS_LOG`` asks for per-request access lines.
+
+    Off by default: every request (each ``/progress`` poll, each ``/stream``
+    range read) writes one ``hypercorn.access``/``uvicorn.access`` record to
+    the console and ``logs/server.log``, which buries the app's own records
+    for no operational gain - the request middleware already logs the things
+    worth keeping. Health-path polling is filtered even when this is on.
+    """
+    return _env_truthy("FLOAT_ACCESS_LOG")
+
+
 def resolve_level(default: int = logging.INFO) -> int:
     """``FLOAT_LOG_LEVEL`` → ``FLOAT_DEBUG``/``FLOAT_TIMING`` → ``default``."""
     env = os.environ.get("FLOAT_LOG_LEVEL", "").strip()
@@ -587,6 +599,7 @@ def _reset_for_tests() -> None:
 __all__ = [
     "DEFAULT_LOG_DIR",
     "LoggingState",
+    "access_log_enabled",
     "coerce_level",
     "configure_logging",
     "current_context_fields",

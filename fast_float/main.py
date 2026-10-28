@@ -330,16 +330,18 @@ if __name__ == "__main__":
     from hypercorn.asyncio import serve
     from hypercorn.config import Config
 
-    from fast_float.logging_utils.config import HEALTH_PATHS
+    from fast_float.logging_utils.config import HEALTH_PATHS, access_log_enabled
     from fast_float.logging_utils.uvicorn_logging import create_hypercorn_log_config
 
     config = Config()
     config.bind = [f"0.0.0.0:{PORT}"]
     config.loglevel = "info"
-    # Hypercorn disables access logs when ``accesslog`` is None (its default).
-    # "-" makes it create the ``hypercorn.access`` logger, which the log config
-    # below routes through our formatters/handlers (health checks filtered).
-    config.accesslog = "-"
+    # Access logs are opt-in (``FLOAT_ACCESS_LOG=1``). Hypercorn disables them
+    # when ``accesslog`` is None (its default); "-" makes it create the
+    # ``hypercorn.access`` logger, which the log config below routes through our
+    # formatters/handlers (health checks filtered). Leave it off unless asked -
+    # one line per request, including every /progress poll.
+    config.accesslog = "-" if access_log_enabled() else None
     config.startup_timeout = 600
 
     # Hypercorn builds its Logger lazily (after this import), which would
