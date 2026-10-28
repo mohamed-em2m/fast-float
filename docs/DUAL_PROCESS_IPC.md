@@ -126,3 +126,45 @@ A priority scheduler becomes essential when:
 | **P1 (High)** | Live Conversational Audio | Active user speech chunks; lowest latency requirement. |
 | **P2 (Normal)** | Silence / Idle Pre-rendering | Offline preparation of natural resting state expressions. |
 | **P3 (Batch / Low)** | Offline MP4 Generation | `/generate` API requests that can tolerate slight queuing. |
+
+---
+
+## Examples
+
+Dual-process mode is already enabled in `settings.toml` (`[ipc] enabled = true`);
+the scripts also export `FLOAT_IPC_ENABLED`, but Python reads the settings file.
+
+```bash
+# Whole stack: the worker binds :5555/:5556 + shared memory first
+./scripts/run_dual_process.sh
+
+# The two halves in separate terminals, worker first
+uv run --frozen --no-sync python -m fast_float.workers.inference_worker
+uv run --frozen --no-sync hypercorn fast_float.main:app --bind 0.0.0.0:8000
+
+# Through the CLI (serve is dual-process by default)
+uv run --frozen --no-sync fast-float worker
+uv run --frozen --no-sync fast-float serve --no-dual-process
+```
+
+A standalone API (`run_api.sh`, `fast-float serve --no-dual-process`) has no
+worker to talk to, so either start one or set `[ipc] enabled = false` in
+`settings.toml`.
+
+Move the endpoints: the worker binds `FLOAT_ZMQ_*`/`FLOAT_SHM_*`, while the API
+connects to `[ipc]` in `settings.toml`, so both sides must be changed together.
+
+```bash
+export FLOAT_ZMQ_CONTROL_PORT=6555 FLOAT_ZMQ_FRAMES_PORT=6556 FLOAT_SHM_SLOTS=128
+./scripts/run_dual_process.sh
+```
+
+Check the wiring:
+
+```bash
+curl -s localhost:8000/health | jq '{model_loaded, warmup_stage}'
+grep -h 'ipc\|zmq\|shm' logs/worker.log logs/api.log | tail -n 20
+```
+
+Run-mode matrix: [USAGE.md](USAGE.md). Launcher lifecycle:
+[run_dual_process.md](run_dual_process.md).

@@ -223,5 +223,54 @@ repository's `logs/` directory unless they ask for it.
   root handler will double-print. Set `unify`/handlers accordingly.
 * **No colors** — expected when stderr is redirected (CI, `tee`, systemd) or
   `NO_COLOR` is set.
-* **Permission denied on `logs/`** — crash dumps are skipped with a warning; the
+* **Permission denied on `logs/`** - crash dumps are skipped with a warning; the
   console and any writable per-process file keep working.
+
+## Examples
+
+Configure once in the entry point, then use `logging.getLogger(__name__)`:
+
+```python
+import logging
+
+from fast_float.logging_utils import configure_logging, log_context
+
+configure_logging(role="api")  # console + logs/api.log (JSONL)
+log = logging.getLogger(__name__)
+
+log.info("plain line")
+
+with log_context(req_id="abc123", session_id="s1", gen=3):
+    log.info("correlated line")  # console: [req=abc123 sess=s1 gen=3]
+```
+
+Run the stack and read the files it produces:
+
+```bash
+FLOAT_DEBUG=1 ./scripts/run_dual_process.sh
+ls logs/        # api.log worker.log supervisor.log combined.log server.log
+
+jq -c 'select(.req_id == "abc123")' logs/*.log
+jq -r 'select(.level == "ERROR") | "\(.ts) \(.role) \(.msg)"' logs/*.log
+tail -f logs/combined.log
+```
+
+Change behaviour without touching code:
+
+```bash
+FLOAT_LOG_LEVEL=DEBUG ./scripts/run_api.sh       # debug level only
+FLOAT_LOG_CONSOLE=0 ./scripts/run_api.sh         # file only
+FLOAT_LOG_DIR=/var/log/float ./scripts/run_api.sh
+FLOAT_LOG_JSON=false ./scripts/run_api.sh        # text instead of JSONL
+FLOAT_LOG_SHARED=1 ./scripts/run_api.sh          # several writers, one locked file
+```
+
+PowerShell:
+
+```powershell
+Select-String -Path logs\*.log -Pattern '"level":"ERROR"'
+Get-Content logs\combined.log -Wait
+```
+
+`from fast_float.utils.logger import logger` and `set_log_level("DEBUG")` keep
+working through the facade. Run modes and ports: [USAGE.md](USAGE.md).

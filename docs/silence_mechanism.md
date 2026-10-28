@@ -61,3 +61,34 @@ Inside [`FloatVideoGenerator.__aiter__`](file:///c:/Users/emam2/tech_projects/fl
 
 * The frontend `<video>` track in [`LiveAudioStudio.jsx`](file:///c:/Users/emam2/tech_projects/float-fast/frontend/src/components/LiveAudioStudio.jsx) receives a **continuous, unbroken 25 fps video stream** via WebRTC from start to finish.
 * When the avatar is listening or waiting, it appears naturally alive (idle head motion/breathing) instead of freezing like a still photo.
+
+---
+
+### Examples
+
+```bash
+# Session start pre-renders the 2 s idle clip once (prepare_silence)
+curl -s -X POST localhost:8000/livekit/conversation/start \
+  -H 'Content-Type: application/json' -d '{"room":"demo"}' | jq
+
+# Idle: cached frames loop at 25 fps, so the track never freezes
+curl -s 'localhost:8000/livekit/conversation/status?room=demo' | jq
+
+# Speech: push PCM, then flush the buffered tail at the end of the utterance
+curl -s -X POST localhost:8000/livekit/conversation/audio \
+  -H 'Content-Type: application/json' \
+  -d '{"room":"demo","audio_base64":"<pcm>","sample_rate":16000}' | jq
+curl -s -X POST localhost:8000/livekit/conversation/audio \
+  -H 'Content-Type: application/json' \
+  -d '{"room":"demo","audio_base64":"","flush":true}' | jq
+
+# Barge-in drops queued speech frames and returns to the silence loop
+curl -s -X POST localhost:8000/livekit/conversation/interrupt \
+  -H 'Content-Type: application/json' -d '{"room":"demo"}' | jq
+
+curl -s -X POST localhost:8000/livekit/conversation/stop \
+  -H 'Content-Type: application/json' -d '{"room":"demo"}' | jq
+```
+
+Run modes: [USAGE.md](USAGE.md). Generator internals:
+[LIVEKIT_GENERATOR.md](LIVEKIT_GENERATOR.md).

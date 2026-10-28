@@ -51,3 +51,26 @@ If a unit fails parity, report the exact error. Do not skip parity checks.
 - ORT cls.**new** crash → external_data=False (commit da6c4c1)
 - transformers from_pretrained crash → manual load + tie_weights no-op
 - onnxruntime cp310 missing wheel → pin onnxruntime<1.24
+
+## Examples
+
+```bash
+# One shot: deps -> weights -> TensorRT probe -> six units -> selector
+./scripts/convert_to_onnx.sh
+
+# TensorRT must major-match ORT (10.9 for onnxruntime-gpu 1.23)
+./scripts/install_tensorrt.sh
+
+# Verify what this box actually sees
+uv run --frozen --no-sync python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+uv run --frozen --no-sync python -m fast_float.runtimes inspect
+```
+
+Per-unit converters (`./scripts/convert_fmt_to_onnx.sh`,
+`./scripts/convert_wav2vec_to_onnx.sh`) source the same
+`scripts/_onnx_env.sh` helpers, so a fix there applies to all of them. Always
+launch with `uv run --frozen --no-sync`: a plain `uv run` re-syncs the venv and
+trades the GPU `onnxruntime` back for the portable CPU wheel.
+
+Run modes: [USAGE.md](USAGE.md). Export/parity rules:
+[BACKEND_SELECTION.md](BACKEND_SELECTION.md).

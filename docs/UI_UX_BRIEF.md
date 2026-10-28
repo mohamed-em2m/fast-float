@@ -251,3 +251,26 @@ All calls go through the same-origin `/api` proxy; a user-configurable base URL 
 5. Acceptance: a first-time user can go photo → audio → Generate → download without
    instructions; every async action has a visible state; the interface stays legible and
    responsive on a 13" laptop and a phone.
+
+## Examples
+
+```bash
+# Backend + Studio (recommended for development)
+./scripts/run_all.sh                       # http://localhost:3000
+
+# Custom ports - the Vite proxy follows PORT
+PORT=9000 FRONTEND_PORT=3100 ./scripts/run_all.sh
+
+# Studio only, pointed at a remote or tunnelled backend
+VITE_API_PROXY_TARGET=https://my-host.example ./scripts/run_frontend.sh
+
+# Production build of the same UI
+cd frontend && pnpm install --frozen-lockfile && pnpm build && pnpm preview
+```
+
+Browser code calls `/api/*`; the dev/preview proxy rewrites it to `/*` and
+forwards to `http://localhost:${PORT}`. Transport ladder: LiveKit SFU -> raw
+WebRTC (`POST /offer`, `"live": true`) -> WebSocket (`/ws/stream/{id}`) -> MP4.
+
+Run modes and API calls: [USAGE.md](USAGE.md). Streaming protocol:
+[STREAMING_PIPELINE.md](STREAMING_PIPELINE.md).

@@ -234,3 +234,32 @@ and `fast_float/onnx/dispatch.py` (`apply_backends`).
 2. **Greedy combos vs a global `torch.compile`** — add whole-model compile as one
    extra candidate in step 4. Per-component control caps fusion; accept it?
 3. **Min gain threshold** and the e2e bench budget (a full generation is ~50s).
+
+## Examples
+
+```bash
+# Export every unit, gate parity, benchmark, write onnx/backends.generated.yaml
+./scripts/convert_to_onnx.sh
+
+# One unit only
+./scripts/convert_fmt_to_onnx.sh
+./scripts/convert_wav2vec_to_onnx.sh
+
+# Force the CUDA EP (no TensorRT) / strict FP32 / larger TRT batch
+ORT_ARGS="--no-trt" ./scripts/convert_to_onnx.sh
+ORT_ARGS="--trt-fp32" ./scripts/convert_to_onnx.sh
+ORT_ARGS="--trt-max-batch 16" ./scripts/convert_to_onnx.sh
+
+# What the runtime would do right now, on this box
+uv run --frozen --no-sync python -m fast_float.runtimes inspect
+uv run --frozen --no-sync python -m fast_float.runtimes inspect --json
+
+# Debug one component, or ignore the generated plan entirely
+FLOAT_MODE_decoder=eager ./scripts/run_api.sh
+FLOAT_DISABLE_BACKENDS=1 ./scripts/run_api.sh
+FLOAT_BACKENDS_CONFIG=/path/to/backends.yaml ./scripts/run_api.sh
+```
+
+Regenerate after a GPU, driver, ORT or TensorRT change, and delete
+`onnx/trt_cache/` whenever the TensorRT/CUDA versions move. Run modes:
+[USAGE.md](USAGE.md).

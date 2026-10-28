@@ -324,3 +324,41 @@ All tuning parameters can be overridden via `opt` attributes on the inference ca
 | `ngpus`               | `1`            | Number of GPUs to use for decoding |
 | `decode_on_primary`   | `True`         | Whether primary GPU also decodes |
 | `use_nvenc`           | `True`         | Use hardware H.264 encoder if available |
+
+## 5. Examples
+
+Start a live generation with a known id, then consume the frames:
+
+```bash
+# 1. live=true + client_request_id so the id exists up front
+curl -s -X POST localhost:8000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"audio_base64":"...","audio_format":"wav","live":true,"client_request_id":"live-001"}'
+
+# 2. Raw frames: ws://localhost:8000/ws/stream/live-001
+#    (meta -> binary frames -> done; protocol in the README)
+
+# 3. Progress + delivery metrics (drops/gaps show up here)
+curl -s localhost:8000/progress/live-001 \
+  | jq '{status, stage, percent, delivery_metrics}'
+
+# 4. Native video instead of raw frames
+curl -s -X POST localhost:8000/offer \
+  -H 'Content-Type: application/json' \
+  -d '{"sdp":"<offer>","type":"offer","live":true,"stream_id":"live-001"}'
+```
+
+```bash
+# Chunked long render, still reproducible (seed + chunk index)
+curl -s -X POST localhost:8000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"audio_base64":"...","audio_format":"wav","chunk_seconds":5,"seed":25}'
+```
+
+Tuning knobs: `FLOAT_DECODE_TUNE_CACHE` (autotuner cache),
+`FLOAT_SEAM_BLEND` (chunk seam cross-fade, default 3),
+`FLOAT_CUDNN_BENCHMARK=1` (long renders). `live: true` forces
+`chunk_batch_size=1`.
+
+Run modes: [USAGE.md](USAGE.md). Expression-vs-transport split:
+[UI_UX_BRIEF.md](UI_UX_BRIEF.md).

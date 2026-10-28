@@ -186,9 +186,10 @@ A served box must not compile at startup. On cache miss:
 
 ## 9. Tooling
 
-- `python -m fast_float.builders build --components ... --backend onnx|dynamo --out-dir onnx`
-- `python -m fast_float.runtimes inspect` — per-component chosen runtime,
-  providers, device, degradations.
+- `python -m fast_float.runtimes inspect` - per-component chosen runtime,
+  providers, device, degradations (`--config PATH`, `--json`). Artifacts are
+  built by the converters (`./scripts/convert_to_onnx.sh`), which drive the
+  builders; there is no separate build CLI.
 - `select_backends.py` consumes builders/runtimes: it builds each ORT session
   via `OnnxBuilder.runtime()` (provider chain / precision / TRT knobs carried on
   the `BuildSpec`) and records the measured artifact in the cache. (The
@@ -237,3 +238,30 @@ A served box must not compile at startup. On cache miss:
 - Weights fingerprint cost → use ckpt mtime+size, not a content hash.
 - Real export/parity/TRT validation only on the GPU box (local lacks
   onnxruntime/TRT); watch `session.get_providers()` and `[backends:iobinding]`.
+
+## Examples
+
+```bash
+# Per-component decision table for the current config
+uv run --frozen --no-sync python -m fast_float.runtimes inspect
+
+# Machine-readable, for CI or for diffing two boxes
+uv run --frozen --no-sync python -m fast_float.runtimes inspect --json
+
+# Inspect an explicit plan instead of the resolved one
+uv run --frozen --no-sync python -m fast_float.runtimes inspect \
+    --config onnx/backends.generated.yaml
+
+# Rebuild/refresh the artifacts the registry points at
+./scripts/convert_to_onnx.sh
+
+# Runtime overrides while debugging a session
+FLOAT_MODE_decoder=eager ./scripts/run_api.sh
+FLOAT_SKIP_BACKEND_SELFTEST=1 ./scripts/run_api.sh   # benchmarking only
+```
+
+`inspect` follows the runtime resolution order (`$FLOAT_BACKENDS_CONFIG` ->
+`onnx/backends.generated.yaml` -> `config/backends.yaml` -> eager) and reports
+the provider and any degradation per component. Run modes:
+[USAGE.md](USAGE.md). Selection methodology:
+[BACKEND_SELECTION.md](BACKEND_SELECTION.md).

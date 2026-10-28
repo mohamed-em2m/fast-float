@@ -267,3 +267,34 @@ under the agent name on that SFU** — check in this order:
   otherwise warn that it is ignored on every session).
 - The worker uses one Gemini Live session per room job; `AgentServer` isolates
   jobs per process, so concurrent rooms scale across cores.
+
+## Examples
+
+```bash
+# Run the worker (own process, same venv/config as the API)
+./scripts/run_gemini_agent.sh
+# or
+uv run --frozen --no-sync python -m fast_float.livekit.gemini.agent start
+# or through the CLI
+uv run --frozen --no-sync fast-float agent
+
+# Start a session that dispatches to the Gemini worker (not the built-in agent)
+curl -s -X POST localhost:8000/livekit/conversation/start \
+  -H 'Content-Type: application/json' \
+  -d '{"room":"demo","agent":"gemini","image_path":"checkpoints/portrait.jpg"}' | jq
+
+# Watch it, then stop it
+curl -s 'localhost:8000/livekit/conversation/status?room=demo' | jq
+curl -s -X POST localhost:8000/livekit/conversation/stop \
+  -H 'Content-Type: application/json' -d '{"room":"demo"}' | jq
+```
+
+Point both processes at another config directory:
+
+```bash
+FLOAT_CONFIG_DIR=/etc/float ./scripts/run_gemini_agent.sh
+```
+
+Both halves must agree on the LiveKit URL/keys, or the dispatch has no worker to
+reach. Run modes: [USAGE.md](USAGE.md). Transport and fallbacks:
+[LIVEKIT_INTEGRATION.md](LIVEKIT_INTEGRATION.md).

@@ -19,6 +19,7 @@
 - [What this repository adds](#what-this-repository-adds)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
+- [Usage guide](docs/USAGE.md)
 - [API](#api)
 - [Live streaming](#live-streaming)
 - [Per-component backends (ONNX / TensorRT)](#per-component-backends-onnx--tensorrt)
@@ -58,6 +59,9 @@ FLOAT Fast wraps the FLOAT generator in production-friendly interfaces and perfo
 > The upstream `generate.py` CLI still works from [`fast_float/legacy/`](fast_float/legacy), but this fork drives inference through the FastAPI server and Gradio apps.
 
 ## Quick start
+
+New here? [`docs/USAGE.md`](docs/USAGE.md) is the end-to-end guide: run modes,
+API calls, live preview, conversational avatar, logs and troubleshooting.
 
 ### Setup
 
@@ -115,6 +119,8 @@ The Wav2Vec2-based models are [wav2vec2-base-960h](https://huggingface.co/facebo
 | Goal | Command | Default URL |
 |---|---|---|
 | Backend + frontend together | `./scripts/run_all.sh` | API `:8000`, Studio `:3000` |
+| Dual-process stack (worker + API + Studio) | `./scripts/run_dual_process.sh` | API `:8000`, Studio `:3000` |
+| CLI supervisor | `uv run --frozen --no-sync fast-float serve --frontend` | API `:8000`, Studio `:3000` |
 | FastAPI / WebRTC / WebSocket server only | `./scripts/run_api.sh` | `:8000` |
 | React Studio only | `./scripts/run_frontend.sh` | `:3000` |
 | Gradio batch app | `./scripts/run_gradio.sh` | `:7860` |
