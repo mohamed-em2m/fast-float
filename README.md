@@ -5,13 +5,13 @@
 High-performance, hardware-accelerated serving and inference stack for audio-driven talking portrait generation (FLOAT, ICCV 2025).
 
 
-<img src="assets/logo.png" alt="FLOAT Fast Logo" width="512" style="border-radius: 20px; margin-bottom: 12px;" />
 
 [![Build Status](https://img.shields.io/github/actions/workflow/status/mohamed-em2m/float-fast/ci.yml?branch=main)](https://github.com/mohamed-em2m/float-fast/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-v5.2.0-blue.svg)](https://github.com/mohamed-em2m/float-fast/releases)
 
 [Demo](http://localhost:3000) · [Documentation](docs/USAGE.md) · [Report Bug](https://github.com/mohamed-em2m/float-fast/issues) · [Request Feature](https://github.com/mohamed-em2m/float-fast/issues)
+<img src="assets/logo.png" alt="FLOAT Fast Logo" width="120" style="border-radius: 20px; margin-bottom: 12px;" />
 
 </div>
 
