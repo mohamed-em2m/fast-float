@@ -11,9 +11,10 @@ High-performance, hardware-accelerated serving and inference stack for audio-dri
 [![Version](https://img.shields.io/badge/version-v5.2.0-blue.svg)](https://github.com/mohamed-em2m/float-fast/releases)
 
 [Demo](http://localhost:3000) · [Documentation](docs/USAGE.md) · [Report Bug](https://github.com/mohamed-em2m/float-fast/issues) · [Request Feature](https://github.com/mohamed-em2m/float-fast/issues)
-<img src="assets/logo.png" alt="FLOAT Fast Logo" width="120" style="border-radius: 20px; margin-bottom: 12px;" />
 
 </div>
+
+<img src="assets/logo.png" alt="FLOAT Fast Logo" width="120" style="border-radius: 20px; margin-bottom: 12px;" />
 
 ---
 
