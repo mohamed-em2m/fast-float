@@ -530,10 +530,16 @@
   min-width: 0;
 }
 
-.studio-stage-column {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
+/* Mirror of the Live tab: one video panel on the right, pinned while the
+   composer (portrait → voice → parameters) scrolls past it. */
+.studio-workspace > .stage-panel {
+  position: sticky;
+  top: 92px;
+  align-self: start;
+}
+
+.studio-insights-row {
+  grid-column: 1 / -1;
   min-width: 0;
 }
 
@@ -2583,7 +2589,7 @@
    -------------------------------------------------------------------------- */
 .live-workspace {
   display: grid;
-  grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
+  grid-template-columns: minmax(340px, 410px) minmax(0, 1fr);
   gap: 20px;
   align-items: start;
 }
@@ -2846,16 +2852,26 @@
   padding: 18px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 15px;
   min-width: 0;
 }
 
 .live-stage-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
+  min-height: 28px;
+}
+
+.live-stage-heading {
+  display: flex;
+  flex-direction: row;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 9px;
+  min-width: 0;
 }
 
 .live-stage-eyebrow {
@@ -2870,7 +2886,8 @@
 }
 
 .live-stage-title {
-  font-size: 19px;
+  font-size: 15.5px;
+  line-height: 1.2;
 }
 
 .live-state {
@@ -3265,7 +3282,8 @@
 
 /* Workspace cards cascade in instead of appearing all at once. */
 .studio-composer > *,
-.studio-stage-column > *,
+.studio-workspace > .stage-panel,
+.studio-insights-row,
 .live-sidebar > *,
 .live-workspace > * {
   animation: panelRise 0.5s var(--ease) both;
@@ -3281,7 +3299,7 @@
   animation-delay: 0.12s;
 }
 
-.studio-stage-column > :nth-child(2),
+.studio-insights-row,
 .live-workspace > :nth-child(2) {
   animation-delay: 0.06s;
 }
@@ -3403,6 +3421,12 @@
     grid-template-columns: minmax(300px, 340px) minmax(0, 1fr);
   }
 
+  /* The header wraps onto two rows here, so a pinned canvas would slide
+     under it — let the stage scroll with the page instead. */
+  .studio-workspace > .stage-panel {
+    position: static;
+  }
+
   .kpi-grid {
     grid-template-columns: repeat(2, 1fr);
   }
@@ -3412,6 +3436,12 @@
   .studio-workspace,
   .live-workspace {
     grid-template-columns: 1fr;
+  }
+
+  /* Same order as the Live tab: the video panel leads, inputs follow. */
+  .studio-workspace > .stage-panel {
+    order: -1;
+    position: static;
   }
 
   .live-stage-panel {

@@ -277,22 +277,24 @@ export default function App() {
             <MemoParameterControls params={params} setParams={setParams} step={3} />
           </aside>
 
-          <div className="studio-stage-column">
-            <StudioStage
-              onGenerate={handleGenerate}
-              onRetry={handleGenerate}
-              isGenerating={isGenerating}
-              progressRequestId={progressRequestId}
-              generationError={generationError}
-              generationResult={generationResult}
-              hasAudio={Boolean(audioBase64)}
-              onToast={showToast}
-              transport={transport}
-              setTransport={setTransport}
-              liveRequestId={liveRequestId}
-              imagePreview={imagePreview}
-            />
+          {/* Same structure as the Live tab: the right column is exactly one
+              stage panel (canvas + its controls), nothing else. */}
+          <StudioStage
+            onGenerate={handleGenerate}
+            onRetry={handleGenerate}
+            isGenerating={isGenerating}
+            progressRequestId={progressRequestId}
+            generationError={generationError}
+            generationResult={generationResult}
+            hasAudio={Boolean(audioBase64)}
+            onToast={showToast}
+            transport={transport}
+            setTransport={setTransport}
+            liveRequestId={liveRequestId}
+            imagePreview={imagePreview}
+          />
 
+          <div className="studio-insights-row">
             <MemoInsightsPanel
               latestResult={generationResult}
               history={history}

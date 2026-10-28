@@ -684,11 +684,11 @@ export default function LiveAudioStudio({
 
       <section className="glass-panel live-stage-panel">
         <div className="live-stage-header">
-          <div>
-            <div className="live-stage-eyebrow">
+          <div className="live-stage-heading">
+            <span className="live-stage-eyebrow">
               <Radio size={13} />
               Live audio
-            </div>
+            </span>
             <h2 className="live-stage-title">
               {isLive ? 'Your avatar is listening' : 'Real-time talking portrait'}
             </h2>
