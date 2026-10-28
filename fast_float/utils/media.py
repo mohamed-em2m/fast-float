@@ -12,7 +12,10 @@ from pydub import AudioSegment
 from fast_float.utils.logger import logger
 
 DEFAULT_IMAGE_PATH = "./images/img.jpg"
-TARGET_IMAGE_SIZE = 256
+# The model's working resolution (`[float.video].input_size` in settings.toml,
+# 512 for the released checkpoint). Used for the placeholder portrait so it is
+# not upscaled later; the request path keeps the upload's own resolution.
+TARGET_IMAGE_SIZE = 512
 
 
 def ensure_default_image(image_path: str = DEFAULT_IMAGE_PATH, size: int = TARGET_IMAGE_SIZE) -> str:
@@ -35,9 +38,16 @@ def ensure_default_image(image_path: str = DEFAULT_IMAGE_PATH, size: int = TARGE
     return image_path
 
 
-def resize_image_to_256(image_path: str, output_path: str | None = None, size: int = TARGET_IMAGE_SIZE) -> str:
-    """
-    Load image, convert alpha/RGBA to RGB, resize to size x size, and save as JPEG.
+def normalize_image(image_path: str, output_path: str | None = None, quality: int = 95) -> str:
+    """Normalize an uploaded image to RGB JPEG **at its own resolution**.
+
+    The request path used to squash every upload to 256x256 here, before the
+    face crop: a 512x512 model then rendered an upscaled 256x256 source, and a
+    non-square portrait arrived aspect-distorted at the detector. The crop in
+    ``DataProcessor.process_img`` already scales to ``input_size`` from the
+    full-size pixels (``INTER_AREA`` when it downscales), so this step only has
+    to make the container predictable: flatten alpha onto white, convert to RGB,
+    and write a JPEG.
     """
     try:
         if output_path is None:
@@ -54,10 +64,7 @@ def resize_image_to_256(image_path: str, output_path: str | None = None, size: i
         elif img.mode != "RGB":
             img = img.convert("RGB")
 
-        if img.size != (size, size):
-            img = img.resize((size, size), Image.LANCZOS)
-
-        img.save(output_path, "JPEG", quality=95)
+        img.save(output_path, "JPEG", quality=quality)
         return output_path
 
     except Exception as e:

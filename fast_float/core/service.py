@@ -28,8 +28,8 @@ from fast_float.utils.logger import logger
 from fast_float.utils.media import (
     DEFAULT_IMAGE_PATH,
     ensure_default_image,
+    normalize_image,
     process_audio_format,
-    resize_image_to_256,
 )
 from fast_float.utils.timing import timed, timing_run
 
@@ -144,7 +144,11 @@ def _prepare_image(request_data: dict[str, Any], temp_files: list) -> str:
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as _tmp_jpg:
             image_path = _tmp_jpg.name
-        resize_image_to_256(image_path_temp, image_path)
+        # Keep the upload's own resolution (alpha flattened, always RGB/JPEG):
+        # the face crop scales to input_size from the full-size pixels. The old
+        # pre-resize to 256x256 made every render an upscale of a 256 source and
+        # distorted non-square portraits before face detection.
+        normalize_image(image_path_temp, image_path)
         temp_files.append(image_path)
         return image_path
 

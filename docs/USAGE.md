@@ -274,6 +274,15 @@ curl -s -X POST localhost:8000/gpu/clear | jq
 `audio_base64` is required; `image_base64` is optional (omit it to use the
 built-in portrait). A WAV file can be sent as-is with `audio_format: "wav"`.
 
+The output is fixed at **512×512 @ 25 fps** (`[float.video].input_size`; the
+released checkpoint is bound to it). An uploaded portrait keeps its own
+resolution: the default path detects the face and crops a square ~1.6× the face
+box before scaling to 512, so 512 px or larger — square or not — is enough and
+anything smaller is upscaled. The detector must score the face above 0.95, else
+the request fails with `No face detected with confidence > 0.95. Use --no_crop.`
+Setting `no_crop: true` skips detection and squashes the whole image to 512²,
+which is only suitable for images that are already square.
+
 ```bash
 # Linux
 AUDIO=$(base64 -w0 speech.wav)

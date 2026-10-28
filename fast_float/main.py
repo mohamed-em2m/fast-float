@@ -49,7 +49,6 @@ from fast_float.utils.gpu import print_gpu_status
 from fast_float.utils.logger import logger
 from fast_float.utils.media import (
     DEFAULT_IMAGE_PATH,
-    TARGET_IMAGE_SIZE,
     ensure_default_image,
 )
 from fast_float.utils.stun import StunServer
@@ -223,7 +222,7 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Starting FLOAT Fast API - NVENC Optimized v5.1.0")
     logger.info(f"🪵 Logs: role=api file={current_log_file() or 'console only'}")
     logger.info(f"⚡ Optimization: {opt.optimization_mode} | FP16: {opt.use_fp16}")
-    logger.info(f"📐 Target resolution: {TARGET_IMAGE_SIZE}x{TARGET_IMAGE_SIZE}")
+    logger.info(f"📐 Target resolution: {opt.input_size}x{opt.input_size}")
 
     # 1. Initialize video optimizer
     app_state.video_optimizer = VideoSaveOptimizer()
@@ -231,8 +230,9 @@ async def lifespan(app: FastAPI):
     print_gpu_status()
     logger.info("=" * 70)
 
-    # 2. Ensure default image exists
-    ensure_default_image(DEFAULT_IMAGE_PATH, TARGET_IMAGE_SIZE)
+    # 2. Ensure default image exists (at the model's own resolution, so the
+    # placeholder is not upscaled by the preprocess transform)
+    ensure_default_image(DEFAULT_IMAGE_PATH, int(opt.input_size))
 
     # 3. Prepare runtime directories from the configured options
     os.makedirs(opt.res_dir, exist_ok=True)

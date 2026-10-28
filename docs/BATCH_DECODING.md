@@ -123,7 +123,7 @@ video_tensors = model.decode_latent_into_image(
     r_d=latents_3d,
     batch_size=4,
 )
-# Output shape: [2, 25, 3, 256, 256]
+# Output shape: [2, 25, 3, S, S]  (S = input_size; 512 for the released checkpoint)
 ```
 
 ### Configuring via Options

@@ -34,6 +34,21 @@ ACQUIRE_TIMEOUT_S = 5.0
 WARMUP_WAIT_TIMEOUT_S = float(os.getenv("WARMUP_WAIT_TIMEOUT_S", "600"))
 
 
+def _output_resolution(state: object) -> str:
+    """``<input_size>x<input_size>`` — the size the frames are actually decoded at.
+
+    Reported as ``TARGET_IMAGE_SIZE`` before, which is the placeholder size, so
+    every response announced 256x256 while the MP4 was 512x512.
+    """
+    opt = getattr(state, "opt", None)
+    size = getattr(opt, "input_size", None) or TARGET_IMAGE_SIZE
+    try:
+        size = int(size)
+    except (TypeError, ValueError):
+        size = TARGET_IMAGE_SIZE
+    return f"{size}x{size}"
+
+
 def _safe_request_id(client_id: str | None) -> str:
     """Build a pollable request id, sanitizing any client-supplied value."""
     if client_id:
@@ -163,7 +178,7 @@ async def generate(request: GenerationRequest):
                 stream_url=f"{pub_url}/stream/{request_id}",
                 video_path=video_path,
                 file_size_mb=file_size_mb,
-                resolution=f"{TARGET_IMAGE_SIZE}x{TARGET_IMAGE_SIZE}",
+                resolution=_output_resolution(app_state),
                 encoder=encoder_name,
                 performance=PerformanceTimings(
                     preprocess_time=round(timings["preprocess"], 3),

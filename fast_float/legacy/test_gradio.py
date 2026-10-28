@@ -585,7 +585,7 @@ def create_interface(api_url: str = "https://colab.him-world.com", use_local: bo
                     - 🎥 WebRTC real-time streaming
                     - 📊 Performance metrics
                     - 🗜️ Video compression
-                    - 📐 Auto-resize to 256x256
+                    - 📐 Auto-resize to 512x512 output
 
                     ### How to Use
 
