@@ -440,6 +440,10 @@ async def webrtc_offer(request: WebRTCOfferRequest, http_request: Request):
                         detail="Media file has no playable video/audio tracks",
                     )
                 logger.info(f"Attached MediaPlayer tracks for {request.stream_id}")
+            except HTTPException:
+                # A player with no tracks was already cleaned up and raised a
+                # specific 500; do not replace it with the generic message.
+                raise
             except Exception as e:
                 logger.warning(f"Failed to attach media player for {request.stream_id}: {e}")
                 try:
