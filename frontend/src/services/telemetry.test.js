@@ -14,6 +14,7 @@ import {
   pollBackendStatus,
   refreshBackendStatus,
   resetBackendStatusForTests,
+  subscribeBackendStatus,
 } from './telemetry';
 
 beforeEach(() => {
@@ -93,5 +94,26 @@ describe('shared backend poller', () => {
     const snapshot = await pollBackendStatus();
     expect(snapshot.online).toBe(true);
     expect(snapshot.liveKit).toEqual({ configured: false, reachable: false });
+  });
+
+  it('auto-polls from a subscriber and keeps rescheduling', async () => {
+    // Regression: the scheduled tick called an undefined `poll`, so the very
+    // first timer threw and the chain never rescheduled — the Studio only ever
+    // updated on a manual refresh.
+    vi.useFakeTimers();
+    const listener = vi.fn();
+    const unsubscribe = subscribeBackendStatus(listener);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchHealth).toHaveBeenCalledTimes(1);
+      expect(listener).toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(6000);
+      expect(fetchHealth).toHaveBeenCalledTimes(2);
+      expect(fetchLiveKitStatus).toHaveBeenCalledTimes(1); // cached for its TTL
+    } finally {
+      unsubscribe();
+      vi.useRealTimers();
+    }
   });
 });

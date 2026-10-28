@@ -72,7 +72,11 @@ function schedule(delay) {
   if (!started) return;
   timer = setTimeout(() => {
     timer = null;
-    poll()
+    // Must be the exported poller: a bare `poll()` here threw
+    // `ReferenceError: poll is not defined` inside the timer callback, which
+    // killed the chain before `.finally` could reschedule — auto-polling never
+    // ran at all (only manual refreshes updated the Studio).
+    pollBackendStatus()
       .catch(() => {})
       .finally(() => {
         if (started) schedule(nextDelay());
