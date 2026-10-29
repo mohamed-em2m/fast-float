@@ -518,3 +518,77 @@ def test_dispatch_infer_skips_cleared_generation():
         gen._send_request.assert_called_once()
 
     asyncio.run(_test())
+
+
+def test_production_is_paced_to_playout():
+    """Chunks must wait for playout headroom instead of flooding the queue.
+
+    The worker renders faster than real time, so dispatching every chunk as
+    soon as its audio is cut queues the whole reply; the bounded frame queue
+    then drops the OLDEST pairs and the middle of the answer jumps forward
+    ("a chunk comes over the old one"). ``FloatVideoGenerator`` paces
+    production with ``_pump`` — the ZMQ path has to do the same.
+    """
+
+    async def _test():
+        gen = ZmqFloatVideoGenerator(
+            ref_image_path="ref.png",
+            nfe=5,
+            chunk_sec=1.0,
+            first_chunk_sec=1.0,
+            shm_name="test_shm_paced",
+            shm_slots=4,
+        )
+        gen._ensure_connected = AsyncMock()
+        gen._dispatch_infer = AsyncMock()
+        assert gen._max_chunk_frames == 25  # 1 s of audio at 25 fps
+
+        # Playout is behind: only a few slots are free, so the chunk is held.
+        for _ in range(250):
+            gen._frame_queue.put_nowait(("video", "audio"))
+        gen._queue_chunk(b"\x00\x00" * 16000)
+        assert len(gen._pending) == 1
+        assert gen._dispatch_infer.call_count == 0
+        # Outstanding work must keep the runner's wait_until_idle pending.
+        assert not gen._idle_event.is_set()
+        assert gen._pump_retry is not None
+
+        # The consumer drains: the held chunk is dispatched on the next pump.
+        for _ in range(40):
+            gen._frame_queue.get_nowait()
+        gen._pump()
+        assert not gen._pending
+        assert gen._dispatch_infer.call_count == 1
+        assert gen._gen == 1
+        assert gen._valid_frames[1] == 25
+
+        if gen._pump_retry is not None:
+            gen._pump_retry.cancel()
+            gen._pump_retry = None
+
+    asyncio.run(_test())
+
+
+def test_clear_buffer_drops_pending_chunks():
+    """A barge-in must also drop chunks that were cut but not yet dispatched."""
+
+    async def _test():
+        gen = ZmqFloatVideoGenerator(shm_name="test_shm_pending", shm_slots=4)
+        gen._send_interrupt = AsyncMock()
+        gen._ensure_connected = AsyncMock()
+        gen._dispatch_infer = AsyncMock()
+
+        for _ in range(250):
+            gen._frame_queue.put_nowait(("video", "audio"))
+        gen._queue_chunk(b"\x00\x00" * 16000)
+        assert gen._pending
+
+        gen.clear_buffer()
+
+        assert not gen._pending
+        assert gen._pump_retry is None
+        assert gen._frame_queue.empty()
+        # Nothing was rendered for the interrupted sentence.
+        gen._dispatch_infer.assert_not_called()
+
+    asyncio.run(_test())

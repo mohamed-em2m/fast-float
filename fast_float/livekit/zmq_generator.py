@@ -37,6 +37,7 @@ import logging
 import math
 import os
 import uuid
+from collections import deque
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -204,6 +205,18 @@ class ZmqFloatVideoGenerator:
         self._valid_frames: dict[int, int] = {}
         # Frames dropped because the consumer could not keep up (diagnostics).
         self._dropped_frames = 0
+
+        # Chunk audio that has been cut out of the input buffer but not sent to
+        # the worker yet: production is paced to playout (see ``_pump``).
+        self._pending: deque[bytes] = deque()
+        # Largest burst one chunk can add to the frame queue (its real frames;
+        # the padded tail is trimmed in ``_is_live_frame``).
+        self._max_chunk_frames = max(
+            1,
+            math.ceil(max(self._chunk_samples, self._first_chunk_samples) / SAMPLES_PER_FRAME),
+        )
+        self._pump_retry: asyncio.TimerHandle | None = None
+        self._queue_retry_s = 0.04
 
         # Frame output queue (filled by _frame_listener_task).
         self._frame_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=256)
@@ -404,7 +417,50 @@ class ZmqFloatVideoGenerator:
             self._audio_buf.clear()
             self._audio_samples = 0
             self._first_chunk_done = True
-            self._submit_chunk(chunk_bytes)
+            self._queue_chunk(chunk_bytes)
+
+    def _queue_chunk(self, chunk_bytes: bytes) -> None:
+        """Hold a cut chunk until playout has room for it, then dispatch it.
+
+        Same backpressure as ``FloatVideoGenerator._pump``: the worker renders
+        faster than real time, so dispatching every chunk as soon as its audio
+        is buffered queues the whole reply into ``_frame_queue``. That queue
+        drops the OLDEST pairs on overflow, i.e. the middle of the answer jumps
+        forward — heard as "a chunk comes over the old one". Waiting for the
+        consumer keeps playback continuous; the backlog still drains in time
+        because a chunk renders faster than it plays.
+        """
+        self._pending.append(chunk_bytes)
+        self._pump()
+        self._refresh_idle()  # a held chunk is outstanding work
+
+    def _pump(self) -> None:
+        """Dispatch the oldest pending chunk when the frame queue has headroom."""
+        if self._stopped or not self._pending:
+            return
+        maxsize = self._frame_queue.maxsize
+        if maxsize >= self._max_chunk_frames:
+            # One extra chunk of headroom covers the frames the listener has
+            # not copied into the queue yet (they arrive while this chunk is
+            # still rendering).
+            headroom = self._max_chunk_frames + 10
+            if self._frame_queue.qsize() + headroom > maxsize:
+                self._schedule_pump_retry()
+                return
+        self._submit_chunk(self._pending.popleft())
+
+    def _schedule_pump_retry(self) -> None:
+        if self._pump_retry is not None or self._stopped:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+        self._pump_retry = loop.call_later(self._queue_retry_s, self._on_pump_retry)
+
+    def _on_pump_retry(self) -> None:
+        self._pump_retry = None
+        self._pump()
 
     def _submit_chunk(self, chunk_bytes: bytes) -> None:
         """Send a buffered chunk to the worker as the next generation."""
@@ -441,7 +497,7 @@ class ZmqFloatVideoGenerator:
         self._audio_buf.clear()
         self._audio_samples = 0
         self._first_chunk_done = True
-        self._submit_chunk(chunk_bytes)
+        self._queue_chunk(chunk_bytes)
 
     def _to_pcm16_mono(self, audio: Any) -> bytes:
         """Normalize an inbound audio item to 16 kHz mono PCM16 bytes.
@@ -586,6 +642,12 @@ class ZmqFloatVideoGenerator:
         self._cleared_gen = self._gen
         for gen in [g for g in self._valid_frames if g <= self._cleared_gen]:
             del self._valid_frames[gen]
+        # Chunks that were cut but never dispatched belong to the same
+        # interrupted sentence.
+        self._pending.clear()
+        if self._pump_retry is not None:
+            self._pump_retry.cancel()
+            self._pump_retry = None
         dropped = self._drain_frames()
         if dropped:
             logger.info(
@@ -737,8 +799,13 @@ class ZmqFloatVideoGenerator:
     # ------------------------------------------------------------------
 
     def _refresh_idle(self) -> None:
-        """Idle == every submitted generation has rendered and the live queue is drained."""
-        if self._gen == self._sentinel_gen and self._frame_queue.empty():
+        """Idle == every pushed sample has been generated and consumed.
+
+        A chunk that is still waiting for playout headroom counts as
+        outstanding: reporting idle early would tell the agent that playback
+        finished before the tail was even rendered.
+        """
+        if self._gen == self._sentinel_gen and not self._pending and self._frame_queue.empty():
             self._idle_event.set()
         else:
             self._idle_event.clear()
@@ -792,6 +859,8 @@ class ZmqFloatVideoGenerator:
             # Try to get a live frame (non-blocking).
             try:
                 pair = self._frame_queue.get_nowait()
+                # A slot just freed: this is what paces production to playout.
+                self._pump()
                 yield pair
                 continue
             except asyncio.QueueEmpty:
@@ -804,6 +873,7 @@ class ZmqFloatVideoGenerator:
                     pair = await asyncio.wait_for(self._frame_queue.get(), timeout=frame_interval)
                 except asyncio.TimeoutError:
                     continue
+                self._pump()
                 yield pair
                 continue
 

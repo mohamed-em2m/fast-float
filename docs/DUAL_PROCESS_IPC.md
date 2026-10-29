@@ -125,7 +125,15 @@ When `enabled = true`:
      the same with a per-generation `valid_frames` limit, so a chunk's media
      duration equals its audio duration instead of ending in up to 2 s of
      silent video.
-4. **Chunk Batching & Internal Windowing**:
+4. **Production paced to playout**:
+   - The worker renders ~2x real time, so dispatching every chunk as soon as
+     its audio is cut fills the bounded frame queue; its overflow policy drops
+     the **oldest** pairs, which makes the middle of a long answer jump forward
+     ("a chunk comes over the old one"). `ZmqFloatVideoGenerator._pump` holds
+     the chunk in `_pending` until the queue has room for it (one chunk of
+     headroom), exactly like `FloatVideoGenerator._pump`. The backlog still
+     drains in time because a chunk renders faster than it plays.
+5. **Chunk Batching & Internal Windowing**:
    - Audio is buffered up to `chunk_sec` (e.g. 5.0s) and passed directly to FLOAT.
 
 ### Is a Priority-Ordered Scheduler implemented?
