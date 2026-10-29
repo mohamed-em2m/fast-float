@@ -127,14 +127,28 @@ When `enabled = true`:
      the same with a per-generation `valid_frames` limit, so a chunk's media
      duration equals its audio duration instead of ending in up to 2 s of
      silent video.
-4. **Production paced to playout**:
-   - The worker renders ~2x real time, so dispatching every chunk as soon as
+4. **Production paced to playout — one chunk in flight**:
+   - The worker renders ~5x real time, so dispatching every chunk as soon as
      its audio is cut fills the bounded frame queue; its overflow policy drops
      the **oldest** pairs, which makes the middle of a long answer jump forward
      ("a chunk comes over the old one"). `ZmqFloatVideoGenerator._pump` holds
      the chunk in `_pending` until the queue has room for it (one chunk of
      headroom), exactly like `FloatVideoGenerator._pump`. The backlog still
      drains in time because a chunk renders faster than it plays.
+   - The headroom test alone is not enough: a chunk's frames reach the queue
+     only *after* it has been dispatched, so a chunk that is still rendering is
+     invisible to it. `_pump` therefore also refuses to overlap renders — an
+     `_inflight` map of `gen -> dispatch time`, cleared by the chunk's `is_last`
+     sentinel (or by `_account_failed_gen`), mirrors
+     `FloatVideoGenerator._inference_running`. Without it, an answer the agent
+     streams in one burst (every chunk cut within a second) was dispatched
+     wholesale, the queue overflowed, and the log showed it:
+     `[zmq-gen] gen=9 frames: rendered=125 recv=68 … overflow=57 missing=57`.
+   - `_frame_queue` is sized from `_max_chunk_frames`
+     (`max(256, 2 * max_chunk_frames + 16)`), so pacing cannot deadlock at a
+     large `chunk_sec` (a queue smaller than one chunk can only be paced by
+     dropping frames). A sentinel that never arrives (worker died, PUB message
+     lost) is expired after `INFLIGHT_TIMEOUT_S` so the pump cannot freeze.
 5. **Ring flow control + frame accounting**:
    - The SHM ring is only safe with the slot handshake described in §2:
      `write_frame` waits for the consumer to release the slot, so the writer

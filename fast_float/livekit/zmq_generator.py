@@ -36,6 +36,7 @@ import functools
 import logging
 import math
 import os
+import time
 import uuid
 from collections import deque
 from collections.abc import AsyncIterator
@@ -89,6 +90,10 @@ DEFAULT_FIRST_CHUNK_SEC = 5.0
 # The worker creates it only after loading the model, so a backend that is
 # already serving can be up before it.
 DEFAULT_SHM_WAIT_S = 15.0
+
+# A chunk whose ``is_last`` sentinel never arrives (the worker died, or the PUB
+# message was dropped) must not freeze the pump for the rest of the session.
+INFLIGHT_TIMEOUT_S = 60.0
 
 _SILENCE_SENTINEL = object()
 
@@ -223,11 +228,23 @@ class ZmqFloatVideoGenerator:
             1,
             math.ceil(max(self._chunk_samples, self._first_chunk_samples) / SAMPLES_PER_FRAME),
         )
+        # Generations the worker is rendering right now, mapped to the monotonic
+        # time they were dispatched. ``_pump`` refuses to start a second one:
+        # a chunk's frames land in the queue only *after* it is dispatched, so
+        # deciding on the current queue size alone lets a whole reply (streamed
+        # by the agent in a fraction of a second) be dispatched at once. The
+        # queue then overflows, drops the OLDEST pairs, and the avatar skips a
+        # slice of the sentence — the mid-reply jump. This mirrors
+        # ``FloatVideoGenerator._inference_running``.
+        self._inflight: dict[int, float] = {}
         self._pump_retry: asyncio.TimerHandle | None = None
         self._queue_retry_s = 0.04
 
-        # Frame output queue (filled by _frame_listener_task).
-        self._frame_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=256)
+        # Frame output queue (filled by _frame_listener_task). Two chunks of
+        # headroom, so a chunk always fits even at the largest configured
+        # ``chunk_sec`` (a queue smaller than one chunk can only be paced by
+        # dropping frames).
+        self._frame_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=max(256, 2 * self._max_chunk_frames + 16))
 
         # Pre-encoded silence frames (list of (rtc.VideoFrame, rtc.AudioFrame)).
         self._silence_frames: list[Any] = []
@@ -446,6 +463,17 @@ class ZmqFloatVideoGenerator:
         """Dispatch the oldest pending chunk when the frame queue has headroom."""
         if self._stopped or not self._pending:
             return
+        # One chunk at a time. Its frames reach the queue only after it has been
+        # dispatched, so the headroom check below is blind to a chunk that is
+        # still rendering: without this guard every chunk of a reply the agent
+        # streamed in one burst is dispatched immediately, the queue overflows,
+        # and the oldest pairs (the middle of the sentence) are dropped.
+        self._expire_stale_inflight()
+        if self._inflight:
+            # The sentinel normally wakes the pump; the retry is the safety net
+            # for a sentinel that never arrives (``_expire_stale_inflight``).
+            self._schedule_pump_retry()
+            return
         maxsize = self._frame_queue.maxsize
         if maxsize >= self._max_chunk_frames:
             # One extra chunk of headroom covers the frames the listener has
@@ -456,6 +484,21 @@ class ZmqFloatVideoGenerator:
                 self._schedule_pump_retry()
                 return
         self._submit_chunk(self._pending.popleft())
+
+    def _expire_stale_inflight(self) -> None:
+        """Forget a generation whose sentinel never arrived (dead worker)."""
+        if not self._inflight:
+            return
+        now = time.monotonic()
+        for gen, since in list(self._inflight.items()):
+            if now - since < INFLIGHT_TIMEOUT_S:
+                continue
+            del self._inflight[gen]
+            logger.warning(
+                "[zmq-gen] gen=%d produced no completion after %.0fs; unpacing the pump",
+                gen,
+                now - since,
+            )
 
     def _schedule_pump_retry(self) -> None:
         if self._pump_retry is not None or self._stopped:
@@ -480,6 +523,7 @@ class ZmqFloatVideoGenerator:
         # face. ``frame_idx`` is 0-based per chunk (each request gets its own
         # FrameDispatcher, whose cursor starts at ``StreamMeta.first_idx`` = 0).
         self._valid_frames[self._gen] = math.ceil(n_samples / SAMPLES_PER_FRAME) if n_samples else 0
+        self._inflight[self._gen] = time.monotonic()
         self._idle_event.clear()  # work now outstanding for the runner
         logger.debug(
             "[zmq-gen] gen=%d audio=%.2fs offset=%.2fs pending=%d qsize=%d",
@@ -573,8 +617,10 @@ class ZmqFloatVideoGenerator:
         if gen <= self._cleared_gen:
             # A barge-in landed while this chunk was waiting for the control
             # socket: its audio belongs to the interrupted sentence, so there is
-            # nothing to render (and its frames would be dropped anyway).
+            # nothing to render (and its frames would be dropped anyway). Account
+            # it as finished so it does not hold the pump back.
             logger.debug("[zmq-gen] dropping stale infer (gen=%d)", gen)
+            self._account_failed_gen(gen)
             return
 
         req = IPCRequest(
@@ -640,7 +686,11 @@ class ZmqFloatVideoGenerator:
         speech in that chunk is already lost — playback of the rest continues.
         """
         self._sentinel_gen = max(self._sentinel_gen, gen)
+        self._inflight.pop(gen, None)
         self._refresh_idle()
+        # No sentinel will arrive for this gen, so nothing else would wake the
+        # pump: start the next pending chunk here.
+        self._pump()
 
     def clear_buffer(self) -> None:
         """Discard buffered audio and abandon the in-flight generation."""
@@ -832,6 +882,9 @@ class ZmqFloatVideoGenerator:
                 # the iterator, which re-runs while the consumer paces).
                 self._sentinel_gen = max(self._sentinel_gen, notif.gen)
                 self._valid_frames.pop(notif.gen, None)
+                # The chunk is fully accounted for: the pump may start the next
+                # pending one (see ``_pump``).
+                self._inflight.pop(notif.gen, None)
                 stats = self._gen_stats.pop(notif.gen, None)
                 if stats is not None:
                     # ``frame_idx`` on the sentinel is the worker's frame count,
@@ -853,6 +906,10 @@ class ZmqFloatVideoGenerator:
                         stats["overflow"],
                         missing,
                     )
+                # This chunk is done; a chunk that was waiting for headroom can
+                # start now (``_pump`` refuses to overlap renders). Refresh idle
+                # afterwards so the dispatched gen is accounted for.
+                self._pump()
                 self._refresh_idle()
                 continue
 
