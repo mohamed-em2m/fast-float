@@ -180,7 +180,7 @@ class FloatVideoGenerator:
         semaphore: asyncio.Semaphore | None = None,
         first_chunk_sec: float = 0.4,
         chunk_sec: float = 2.0,
-        idle_flush_sec: float | None = 0.25,
+        idle_flush_sec: float | None = 1.5,
         max_queue_frames: int = 256,
         nfe: int | str | None = None,
         executor: ThreadPoolExecutor | None = None,
@@ -590,13 +590,31 @@ class FloatVideoGenerator:
 
     def flush(self) -> None:
         """Generate whatever audio is buffered (end of utterance / idle). Also fine to
-        call from an AudioSegmentEnd handler."""
-        # Also cancels a still-pending idle timer: an explicit flush replaces it,
-        # otherwise the old timer could fire into the next utterance's audio.
+        call from an AudioSegmentEnd handler.
+
+        The idle timer fires after a speech pause. To avoid tiny renders that
+        race the very next word (causing frame-queue overflow and jump-cuts),
+        we refuse the flush when the buffer holds fewer samples than
+        ``_first_chunk_samples``. In that case the idle timer is rearmed so
+        the flush is retried once more audio arrives or the timer fires again
+        with enough samples. An explicit external flush (``flush_requested``
+        already set, or called with audio present from the segment-end handler)
+        still goes through unconditionally.
+        """
+        # Cancel the pending idle timer; we either flush now or rearm below.
         if self._idle_handle:
             self._idle_handle.cancel()
             self._idle_handle = None
         if self._audio_pcm:
+            # Guard: don't flush a tiny sliver of audio (natural inter-word pause).
+            # A premature tiny render finishes faster than real-time, piles its
+            # frames on top of the previous chunk's still-playing frames, and the
+            # consumer has to drop the oldest — that's the jump-cut / overlap.
+            buffered_samples = len(self._audio_pcm) // 2
+            if buffered_samples < self._first_chunk_samples and not self._flush_requested:
+                # Not enough audio yet — rearm and wait for the next push or timer.
+                self._arm_idle_flush()
+                return
             self._flush_requested = True
             self._pump()  # if inference is running, _run_chunk_inference's finally picks it up
         self._refresh_idle()
