@@ -202,6 +202,53 @@ replaced a `MediaPlayer`, which always started at t=0 even when the viewer
 joined a render already in progress, so the soundtrack used to be seconds away
 from the picture.
 
+### Cross-chunk motion continuity
+
+Audio/frame pairing keeps a live stream in sync, but it does not make the
+*picture* continuous: every chunk is a separate `run_inference` call, i.e. a
+separate `sample()`. FLOAT's sampler is autoregressive *inside* one call — the
+next 2 s window is conditioned on the previous window's motion latent
+(`prev_x`/`prev_wa`) and its head is blended into a linear extrapolation of the
+previous window's last two frames. A new call started from scratch: `prev_x`
+and `prev_wa` were zeros and the head was never blended, so the first frames of
+every chunk landed in an unrelated pose. Measured on a 45 s clip split into
+`first_chunk_sec=2` + `chunk_sec=5` chunks: the frame step at a chunk boundary
+was **6.7x the median step** (mean seam peak 16.9 vs 2.5), a one-frame cut
+every 5 s.
+
+The generator therefore threads one mutable dict through every chunk
+(`FloatVideoGenerator._sampler_state` → `run_inference_blocking(...,
+sampler_state=)` → `run_inference` → `inference_and_save` → `sample(...,
+state=)`). After each window the sampler writes:
+
+| key | value |
+| --- | --- |
+| `prev_x` | last `num_prev_frames` motion latents (the conditioning of the next window) |
+| `prev_wa` | the matching audio features |
+| `seam_tail` | last two frames the seam blend extrapolates from |
+
+and the next call adopts them instead of zeros, so a chunk boundary behaves
+exactly like the internal 2 s window seam. Measured with the carry: mean seam
+peak 2.5 / worst 3.3, i.e. ~1.0x the median frame step.
+
+The cross-call seam uses a wider ramp than the interior one
+(`FLOAT_CHUNK_SEAM_BLEND`, default **15** frames = 0.6 s, vs
+`FLOAT_SEAM_BLEND` = 3): the boundary also starts from fresh noise and new
+audio, not just a new window. Sweep on the same clip (median step 2.4): 3
+frames → 4.5, 9 → 2.9, 15 → 2.5 with the head still moving at the median rate,
+25 → 2.3 but the head stalls (1.9 mean, a third of the frames under 1.0), i.e.
+the seam is hidden by freezing the motion. 15 is the last point before that.
+
+Two resets are deliberate:
+
+- `clear_buffer()` (barge-in) and `stop()` clear the state: the next utterance
+  must not continue the pose of the motion that was just cut off;
+- the ZMQ worker (`fast_float/workers/inference_worker.py`) keys the state by
+  `session_id` and clears it on `interrupt`, for the same reason.
+
+A state that does not match the current batch/dim is dropped rather than
+raising, so a stale dict can never break a render.
+
 ---
 
 ## 5. Cancellation and backpressure
@@ -214,6 +261,9 @@ generator.clear_buffer()
 
 - increments the internal generation counter;
 - clears buffered PCM and every queued frame;
+- clears the cross-chunk sampler state (see §4 "Cross-chunk motion
+  continuity"), so the next utterance starts from a clean pose instead of
+  continuing the motion that was just cut off;
 - marks in-flight inference stale: the next `dispatch()` raises the internal
   `_Cancelled` exception. The bridge sets `abort_on_error`, so the dispatcher
   signals the pipeline's stop event and generation aborts instead of running

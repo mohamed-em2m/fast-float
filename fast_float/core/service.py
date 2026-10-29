@@ -65,11 +65,17 @@ def run_inference_blocking(
     audio_path: str,
     request_data: dict[str, Any],
     dispatcher: Any | None = None,
+    sampler_state: dict | None = None,
 ) -> str | None:
     """Synchronous inference runner invoked within ThreadPoolExecutor.
 
     ``video_path_raw=None`` streams frames through ``dispatcher`` without
     writing a file (live transports such as LiveKit).
+
+    ``sampler_state`` is an optional mutable dict carrying the previous live
+    chunk's motion tail into this render (see ``SamplerMixin.sample``); every
+    chunk of a live utterance passes the same dict so the seam between chunks
+    is blended like the seams inside one render.
     """
     return agent.run_inference(
         res_video_path=video_path_raw,
@@ -84,6 +90,7 @@ def run_inference_blocking(
         seed=request_data.get("seed", 25),
         verbose=True,
         dispatcher=dispatcher,
+        sampler_state=sampler_state,
     )
 
 

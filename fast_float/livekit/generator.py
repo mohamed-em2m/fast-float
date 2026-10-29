@@ -231,6 +231,14 @@ class FloatVideoGenerator:
         self._frame_count = 0
         self._first_frame_emitted = False
         self._dropped_frames = 0
+        # Cross-chunk continuity. FLOAT's sampler blends the 2 s windows *inside*
+        # one render, but the live avatar renders every audio chunk with its own
+        # `sample()` call: without this the first window of the next chunk starts
+        # from zero prev-frames and unblended noise, so the pose jumps at every
+        # chunk boundary (measured ~7x a normal frame step). The sampler writes
+        # the motion tail here and reads it back on the next chunk, so the
+        # boundary is blended exactly like an internal window seam.
+        self._sampler_state: dict | None = {}
         self._bg_tasks: set[asyncio.Task[Any]] = set()
         self.on_first_frame: Any | None = None
         self.last_chunk_rtf: float | None = None  # inference_time / audio_time; must stay < 1
@@ -625,6 +633,11 @@ class FloatVideoGenerator:
         self._audio_pcm.clear()
         self._flush_requested = False
         self._segment_started = False
+        # A new utterance must not be rendered as a continuation of the pose
+        # the interrupt cut off: start it from a clean sampler state. Replace
+        # the dict instead of clearing it, so an in-flight chunk (which already
+        # holds the old object) cannot write into the fresh one.
+        self._sampler_state = {}
         if self._idle_handle:
             self._idle_handle.cancel()
             self._idle_handle = None
@@ -713,6 +726,7 @@ class FloatVideoGenerator:
                                 wav_path,
                                 req_data,
                                 bridge,
+                                sampler_state=self._sampler_state,
                             )
                         finally:
                             with contextlib.suppress(Exception):
@@ -762,6 +776,7 @@ class FloatVideoGenerator:
             return
         self._stopped = True
         self._gen += 1
+        self._sampler_state = None
         if self._idle_handle:
             self._idle_handle.cancel()
             self._idle_handle = None

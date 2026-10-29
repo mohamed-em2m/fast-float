@@ -157,6 +157,7 @@ class StreamingVideoSaver:
         seed=None,
         video_encoder=None,
         dispatcher: FrameDispatcher | None = None,
+        sampler_state: dict | None = None,
     ) -> str | None:
         t_start = time.perf_counter()
         encoder_choice = str(video_encoder or getattr(self.opt, "video_encoder", "FFmpeg NVENC")).strip().lower()
@@ -339,6 +340,7 @@ class StreamingVideoSaver:
                     nfe=nfe,
                     seed=seed,
                     s_r=s_r,
+                    state=sampler_state,
                 ):
                     if stop.is_set():
                         return

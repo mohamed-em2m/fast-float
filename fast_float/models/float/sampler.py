@@ -25,6 +25,38 @@ logger = logging.getLogger(__name__)
 # previous chunk (see the seam handling in ``sample``). 0 disables it.
 SEAM_BLEND_FRAMES = int(os.environ.get("FLOAT_SEAM_BLEND", "3"))
 
+# Wider ramp for the seam *between two ``sample`` calls* (live mode renders each
+# audio chunk on its own). That boundary starts from fresh noise and new audio,
+# so 3 frames only trimmed the jump from 6.7x to 4.5x a normal frame step.
+# Measured on a 45 s clip / 9 boundaries (median step ~2.4): 9 frames -> 2.9,
+# 15 -> 2.5 with the head still moving at the median rate, 25 -> 2.3 but the
+# head then stalls (1.9 mean, a third of the frames under 1.0), i.e. the seam
+# is hidden by freezing the motion. 15 is the last point before that. 0 disables.
+CHUNK_SEAM_BLEND_FRAMES = int(os.environ.get("FLOAT_CHUNK_SEAM_BLEND", "15"))
+
+
+def _tail_frames(t: torch.Tensor, want: int) -> torch.Tensor:
+    """Last ``want`` frames of ``t`` along dim 1, left-padded by replication.
+
+    A chunk shorter than ``num_prev_frames`` has fewer tail frames than the
+    FMT expects as ``prev_x``/``prev_wa``; replicating the first one keeps the
+    shape static without inventing motion.
+    """
+    tail = t[:, -want:] if t.shape[1] >= want else t
+    if tail.shape[1] < want:
+        pad = tail[:, :1].expand(-1, want - tail.shape[1], -1)
+        tail = torch.cat([pad, tail], dim=1)
+    return tail
+
+
+def _adopt_carry(t, batch: int, frames: int, dim: int, device) -> torch.Tensor | None:
+    """Validate a carried ``prev_x``/``prev_wa`` tensor, or drop it."""
+    if not torch.is_tensor(t) or t.ndim != 3:
+        return None
+    if t.shape[0] != batch or t.shape[1] < 1 or t.shape[-1] != dim:
+        return None
+    return _tail_frames(t.detach().to(device=device, dtype=torch.float32), frames)
+
 
 def _noise_generator(seed: int, device) -> torch.Generator:
     """Deterministic torch generator for the initial flow-matching noise."""
@@ -90,6 +122,7 @@ class SamplerMixin:
         seed: int | None = None,
         seeds: list[int] | None = None,
         s_r=None,
+        state: dict | None = None,
     ) -> torch.Tensor:
         rank = getattr(self.opt, "rank", 0)
         device = f"cuda:{rank}" if torch.cuda.is_available() else "cpu"
@@ -230,19 +263,42 @@ class SamplerMixin:
 
         prev_seam_tail = None  # [B, 2, dim] last raw frames of the previous chunk
 
+        # Live mode renders every chunk with its own ``sample`` call, so the
+        # first window of chunk N+1 has no memory of chunk N: its ``prev_x``
+        # used to be zeros and its head was never blended, and the avatar
+        # jumped at every chunk boundary (measured 6-8x a normal frame step,
+        # a single-frame cut). ``state`` carries the previous call's motion
+        # tail, conditioning features and seam tail forward, which reproduces
+        # exactly what happens between two windows *inside* one call.
+        carry_x = carry_wa = None
+        if state is not None:
+            carry_x = _adopt_carry(state.get("prev_x"), B, self.num_prev_frames, self.opt.dim_w, device)
+            carry_wa = _adopt_carry(state.get("prev_wa"), B, self.num_prev_frames, self.opt.dim_w, device)
+            if carry_x is None or carry_wa is None:
+                carry_x = carry_wa = None
+            else:
+                prev_seam_tail = _adopt_carry(state.get("seam_tail"), B, 2, self.opt.dim_w, device)
+
         # sampling chunk by chunk
         for t in range(0, math.ceil(T / self.num_frames_for_clip)):
             x0 = _initial_noise(noise_gens, B, self.num_frames_for_clip, self.opt.dim_w, device)
 
             if t == 0:  # should define the previous
-                prev_x_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_w, device=device)
-                prev_wa_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_w, device=device)
+                if carry_x is not None:
+                    prev_x_t = carry_x
+                    prev_wa_t = carry_wa
+                    seam_blend = CHUNK_SEAM_BLEND_FRAMES
+                else:
+                    prev_x_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_w, device=device)
+                    prev_wa_t = torch.zeros(B, self.num_prev_frames, self.opt.dim_w, device=device)
+                    seam_blend = SEAM_BLEND_FRAMES
             else:
                 # sample_t / wa_t come from the previous chunk iteration; the loop
                 # always starts at t == 0 (which takes the branch above), so both
                 # are defined before any use (ruff cannot see this: noqa F821).
                 prev_x_t = sample_t[:, -self.num_prev_frames :]  # noqa: F821
                 prev_wa_t = wa_t[:, -self.num_prev_frames :]  # noqa: F821
+                seam_blend = SEAM_BLEND_FRAMES
 
             wa_t = wa[:, t * self.num_frames_for_clip : (t + 1) * self.num_frames_for_clip]
             if wa_t.shape[1] < self.num_frames_for_clip:  # padding by replicate
@@ -315,16 +371,16 @@ class SamplerMixin:
             samples_len = sample_t_trim.shape[1]
             decoded_length += samples_len
 
-            # Hide the re-synthesis seam at the 2 s chunk boundary. Every chunk
+            # Hide the re-synthesis seam at the chunk boundary. Every chunk
             # starts its ODE from fresh noise, so its first frames can jump in
             # pose even though the model sees prev_x/prev_wa: measured seam
             # deltas were 3-5x a normal frame step (4.8-6.6 vs 1.3 median) and
             # showed up as a visible jolt every 50 frames. Blend the first
             # frames toward a linear extrapolation of the previous chunk's last
             # two frames, which brings the seam back to a normal step.
-            if prev_seam_tail is not None and SEAM_BLEND_FRAMES > 0 and samples_len > 1:
+            if prev_seam_tail is not None and seam_blend > 0 and samples_len > 1:
                 sample_t_trim = sample_t_trim.clone()
-                k = min(SEAM_BLEND_FRAMES, samples_len)
+                k = min(seam_blend, samples_len)
                 vel = prev_seam_tail[:, -1] - prev_seam_tail[:, -2]  # [B, dim]
                 for j in range(k):
                     w = 1.0 - (j + 1) / (k + 1)
@@ -332,7 +388,22 @@ class SamplerMixin:
                         continue
                     pred = prev_seam_tail[:, -1] + (j + 1) * vel
                     sample_t_trim[:, j] = (1.0 - w) * sample_t_trim[:, j] + w * pred
-            prev_seam_tail = sample_t_trim[:, -2:].detach().clone()
+            prev_seam_tail = _tail_frames(sample_t_trim, 2).detach().clone()
+
+            # Hand the tail forward for the next live chunk (in-process dict, so
+            # it survives across the per-chunk ``sample`` calls). The motion
+            # latent and its audio conditioning are the same tensors the loop
+            # above feeds the next 2 s window; the seam tail is what the blend
+            # extrapolates from.
+            if state is not None:
+                try:
+                    state["prev_x"] = _tail_frames(sample_t_trim, self.num_prev_frames).detach().float().clone()
+                    state["prev_wa"] = (
+                        _tail_frames(wa_t[:, :samples_len], self.num_prev_frames).detach().float().clone()
+                    )
+                    state["seam_tail"] = prev_seam_tail.detach().float().clone()
+                except Exception as exc:  # never let bookkeeping break a render
+                    logger.debug("sampler state not carried: %s", exc)
 
             # Add reference and yield chunk
             s_r_b = s_r.unsqueeze(1) if (s_r is not None and s_r.ndim == 2) else s_r

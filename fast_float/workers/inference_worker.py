@@ -270,6 +270,14 @@ class InferenceWorker:
         self._last_audio_pcm: np.ndarray | None = None
         self._slot_counter: int = 0
 
+        # Cross-chunk continuity for live conversations: the sampler's motion
+        # tail of the last rendered chunk, keyed by session. Each chunk arrives
+        # as its own `infer` request, so without this every chunk boundary is a
+        # hard cut. Cleared on interrupt() (barge-in) and when the session
+        # changes.
+        self._sampler_session: str = ""
+        self._sampler_state: dict | None = None
+
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
@@ -373,6 +381,9 @@ class InferenceWorker:
 
         if cmd == "interrupt":
             self._interrupt.set()
+            # Barge-in: the next utterance must start from a clean pose, not as
+            # a continuation of the motion that was just cut off.
+            self._sampler_state = None
             return IPCResponse(status="ok", req_id=req.req_id, session_id=req.session_id)
 
         if cmd == "prepare_silence":
@@ -437,6 +448,14 @@ class InferenceWorker:
 
             t0 = time.perf_counter()
             try:
+                if req.session_id != self._sampler_session:
+                    # A new conversation starts from a clean pose; carrying the
+                    # previous session's tail would drag an unrelated motion
+                    # into its first chunk.
+                    self._sampler_session = req.session_id
+                    self._sampler_state = {}
+                elif self._sampler_state is None:
+                    self._sampler_state = {}
                 self._agent.run_inference(
                     res_video_path=None,
                     ref_path=ref_path,
@@ -444,6 +463,7 @@ class InferenceWorker:
                     nfe=req.nfe,
                     verbose=False,
                     dispatcher=dispatcher,
+                    sampler_state=self._sampler_state,
                 )
             except _Cancelled:
                 logger.info("[worker] inference interrupted (session=%s)", req.session_id)

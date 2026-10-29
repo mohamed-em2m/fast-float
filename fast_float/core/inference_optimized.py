@@ -240,6 +240,7 @@ class OptimizedInferenceAgent:
         benchmark: bool = False,
         video_encoder: str | None = None,
         dispatcher=None,
+        sampler_state: dict | None = None,
     ) -> str | None:
         timings: dict[str, float] = {}
         total_start = time.perf_counter()
@@ -275,6 +276,7 @@ class OptimizedInferenceAgent:
                     audio_path=audio_path,
                     video_encoder=video_encoder,
                     dispatcher=tap,
+                    sampler_state=sampler_state,
                     **gen_kwargs,
                 )
 

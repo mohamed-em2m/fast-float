@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import threading
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
@@ -140,8 +141,9 @@ def test_float_generator_shuts_down_bridge_per_chunk(monkeypatch):
         loop = asyncio.get_running_loop()
         captured = {}
 
-        def fake_inference(agent, video, image, wav_path, request, bridge):
+        def fake_inference(agent, video, image, wav_path, request, bridge, **kwargs):
             captured["bridge"] = bridge
+            captured["sampler_state"] = kwargs.get("sampler_state")
             bridge.bind(StreamMeta(fps=25.0, width=8, height=8, channels=3))
             bridge.submit(np.zeros((25, 8, 8, 3), dtype=np.uint8))
             bridge.submit(np.zeros((25, 8, 8, 3), dtype=np.uint8))
@@ -180,7 +182,7 @@ def test_float_generator_uses_configured_live_nfe(monkeypatch):
         loop = asyncio.get_running_loop()
         captured = {}
 
-        def fake_inference(agent, video, image, wav_path, request, bridge):
+        def fake_inference(agent, video, image, wav_path, request, bridge, **kwargs):
             captured["nfe"] = request["nfe"]
             return "ok"
 
@@ -475,7 +477,7 @@ def test_agent_runner_audio_loop_survives_bad_items():
             def __init__(self, items: list[Any]) -> None:
                 self._items = list(items)
 
-            def __aiter__(self) -> "_FakeReceiver":
+            def __aiter__(self) -> _FakeReceiver:
                 return self
 
             async def __anext__(self) -> Any:
@@ -483,7 +485,7 @@ def test_agent_runner_audio_loop_survives_bad_items():
                     raise StopAsyncIteration
                 return self._items.pop(0)
 
-        item_bad = object()  #unhandled type — push_audio raises
+        item_bad = object()  # unhandled type — push_audio raises
         item_ok = b"\x00\x00"
         video_gen = MagicMock()
         video_gen.push_audio.side_effect = [TypeError("object of type 'AudioFrame' has no len()"), None]

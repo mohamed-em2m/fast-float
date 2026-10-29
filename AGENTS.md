@@ -910,6 +910,28 @@ in its outermost `finally` (so preprocessing failures shut down too).
 `run_inference` / `generate` forward the tap; the batched path warns and ignores
 it.
 
+**Live chunks need the sampler state carried, or every chunk boundary is a
+cut.** The tap above makes a live stream *in sync*; it does not make it
+*continuous*. LiveKit renders each audio chunk with its own `run_inference` →
+`sample()` call, while FLOAT's sampler is autoregressive only *inside* one
+call: the next 2 s window is conditioned on the previous window's motion
+latent (`prev_x`/`prev_wa`) and its head is blended toward an extrapolation of
+the previous window's last two frames. A fresh call started with zero
+`prev_x`/`prev_wa` and an unblended head, so the first frames of every chunk
+landed in an unrelated pose — measured on a 45 s clip (`first_chunk_sec=2` +
+`chunk_sec=5`, NFE=5): the boundary frame step was **6.7x the median step**
+(mean seam peak 16.9 vs 2.5). `sample(..., state=dict)` now adopts and writes
+back `prev_x`, `prev_wa` and `seam_tail`, and `FloatVideoGenerator` /
+`InferenceWorker` pass the same dict to every chunk of an utterance, so a chunk
+boundary behaves exactly like an internal 2 s window seam (measured 2.5 mean /
+3.3 worst, ~1.0x median). The cross-call seam uses a wider ramp than the
+interior one (`FLOAT_CHUNK_SEAM_BLEND`, default 15 frames; 25 hides the seam by
+freezing the head — 1.9 mean step, a third of the frames under 1.0).
+`clear_buffer()`/`stop()`/`interrupt` clear the state, because a new utterance
+must not continue the pose that was just cut off, and an adopted state whose
+batch/dim does not match is dropped instead of raising.
+`tests/test_sampler_chunk_carry.py` pins all of it.
+
 **`LiveStream` fan-out.** `LiveStreamDispatcher.dispatch`/`gap` publish tuples
 `("frame", idx, pts_ms, ndarray)` / `("gap", start, end, reason)`; `finish()` adds
 the `CLOSE` sentinel. Subscribers are `asyncio.Queue`s that drop the oldest item
