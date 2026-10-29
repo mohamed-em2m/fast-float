@@ -17,6 +17,7 @@ Built on [FLOAT](https://github.com/deepbrainai-research/float) (ICCV 2025) · S
 [![React 19](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](frontend/)
 
 [Quick Start](#quick-start) · [Documentation](docs/USAGE.md) · [API](#api) · [Report a Bug](https://github.com/mohamed-em2m/float-fast/issues) · [Request a Feature](https://github.com/mohamed-em2m/float-fast/issues)
+ . [Try it in colab](https://colab.research.google.com/drive/1iMm8X7O63AAA6kByJ-4qgGA37fwNu2_Z?usp=sharing)
 
 </div>
 
@@ -29,12 +30,14 @@ Built on [FLOAT](https://github.com/deepbrainai-research/float) (ICCV 2025) · S
 
 Talking-head models such as FLOAT produce impressive results, but they are heavy and are usually run as offline batch jobs. **FLOAT Fast** turns FLOAT into an interactive service:
 
-- **Dual-process design** – a dedicated GPU worker is isolated from the async API server, linked by ZeroMQ and POSIX shared memory, so inference never blocks the event loop.
+- **Single-process serving** – the API server owns the GPU and runs inference in its thread pool, so one command starts everything.
 - **Streaming first** – frames are pushed over WebSocket, WebRTC, or LiveKit while inference is still running, before the MP4 is finished.
 - **Hardware acceleration** – micro-batched latent decoding, NVENC/QSV/AMF encoding, and per-component PyTorch / `torch.compile` / ONNX / TensorRT backends.
 - **Conversational avatar** – speech-to-speech interaction through Gemini Live and LiveKit Agents, with live lip-sync.
 - **Studio UI** – a React 19 + Vite interface for both batch generation and live audio.
 
+> [!CAUTION]
+> **Dual-process (ZeroMQ + shared memory) mode is currently disabled.** It has known bugs, so every command in this README runs in **single-process** mode. `scripts/run_all.sh` already exports `FLOAT_IPC_ENABLED=false`; for any other launcher do the same (see [Running the System](#running-the-system)).
 > [!IMPORTANT]
 > This project builds on the upstream [FLOAT repository](https://github.com/deepbrainai-research/float). Review its [license](https://github.com/deepbrainai-research/float/blob/main/LICENSE) before using the model weights or architecture, especially for commercial use.
 
@@ -65,13 +68,14 @@ Talking-head models such as FLOAT produce impressive results, but they are heavy
 
 | | Feature | Description |
 |---|---|---|
-| ⚡ | **Dual-process IPC** | GPU worker and API server communicate over ZeroMQ control sockets and a zero-copy shared-memory frame ring. |
+| ⚡ | **Single-process serving** | One process owns the GPU and serves HTTP/WebSocket/WebRTC — no IPC layer required. |
 | 🎞️ | **Fast generation** | Auto-tuned batched latent decoding with NVENC / QSV / AMF encoding. |
 | 📡 | **Live transports** | WebSocket, WebRTC, and LiveKit SFU streaming straight off the decoder. |
 | 🗣️ | **Voice avatar** | Real-time speech-to-speech with Gemini Live and LiveKit Agents (`fast_float/livekit/gemini/`). |
 | 🧩 | **Per-component backends** | Run each model unit on Eager, `torch.compile`, or ONNX/TensorRT, with automated parity checks. |
 | 🖥️ | **Unified Studio** | One React 19 interface for batch generation and interactive live audio. |
-| 🛠️ | **One-command setup** | `scripts/setup.sh` bootstraps everything; the `fast-float` CLI supervises all processes. |
+| 🛠️ | **One-command setup** | `scripts/setup.sh` bootstraps everything; each launcher starts what it needs. |
+| 🧪 | **Dual-process IPC** *(experimental, disabled)* | Optional ZeroMQ + shared-memory split. Currently not supported — see the notice above. |
 
 ## Architecture
 
@@ -79,27 +83,27 @@ Talking-head models such as FLOAT produce impressive results, but they are heavy
 flowchart TB
     Browser["Browser · React 19 Studio"] <-->|"WebSocket / WebRTC / HTTP Range"| API
 
-    subgraph P2["Process 2 · Streaming backend"]
+    subgraph P["API process (single-process mode)"]
         API["FastAPI + Hypercorn<br/>/generate · /stream · /ws/stream · WebRTC signaling"]
-        LK["LiveKit session manager<br/>+ Gemini Live agent"]
-    end
-
-    subgraph P1["Process 1 · GPU inference worker"]
         W["FLOAT flow-matching ODE solver<br/>+ style latent generator"]
         D["Batched latent decoding<br/>VRAM auto-tuned · TensorRT / CUDA"]
+        LK["LiveKit session manager<br/>+ Gemini Live agent"]
+        API --> W
         W --> D
     end
 
-    API <-->|"ZeroMQ control :5555 / frames :5556<br/>+ POSIX shared memory (float_frame_ring)"| W
-    LK <--> API
+    LK --> API
 ```
+
+> A separate GPU worker linked over ZeroMQ (`:5555`/`:5556`) and a shared-memory
+> frame ring exists in the tree but is disabled until its bugs are fixed.
 
 ## Tech Stack
 
 | Layer | Technology |
 |---|---|
 | Language | Python 3.10, JavaScript (ESNext / JSX) |
-| Serving | FastAPI, Hypercorn, Uvicorn, ZeroMQ |
+| Serving | FastAPI, Hypercorn, Uvicorn |
 | Deep learning | PyTorch 2.7.1 (CUDA 12.6), ONNX Runtime GPU 1.23, TensorRT 10.9 |
 | Real-time media | LiveKit SFU & Agents, aiortc (WebRTC), PyAV |
 | Frontend | React 19, Vite 8, Lucide Icons |
@@ -114,7 +118,7 @@ git clone https://github.com/mohamed-em2m/float-fast.git
 cd float-fast
 
 ./scripts/setup.sh        # one-time: dependencies, ONNX/TensorRT, checkpoints
-./scripts/run_dual_process.sh
+./scripts/run_all.sh      # single-process API + Studio (no ZeroMQ)
 ```
 
 Then open:
@@ -126,13 +130,15 @@ Then open:
 
 The first boot warms up for roughly 1–5 minutes (weights, ONNX/TensorRT sessions, decode auto-tuning). Results are cached in `~/.cache/fast_float/`.
 
+`Ctrl+C` stops both servers. To use different ports: `PORT=9000 FRONTEND_PORT=3100 ./scripts/run_all.sh`.
+
 ## Installation
 
 ### Prerequisites
 
 | Requirement | Details |
 |---|---|
-| OS | Linux recommended (NVENC, TensorRT, POSIX shared memory). Windows is supported with limitations. |
+| OS | Linux recommended (NVENC, TensorRT). Windows is supported with limitations. |
 | GPU | NVIDIA GPU with a CUDA 12.6-compatible driver |
 | Python | 3.10, managed by [`uv`](https://docs.astral.sh/uv/) |
 | Node.js | 20.19+ or 22.12+ with [`pnpm`](https://pnpm.io/) |
@@ -197,11 +203,7 @@ The same file is read by the API and the Gemini worker, so a single key serves b
 |---|---|---|
 | `PORT` | API server port | `8000` |
 | `FRONTEND_PORT` | Studio dev-server port | `3000` |
-| `FLOAT_IPC_ENABLED` | Enable dual-process ZeroMQ/SHM mode | `true` |
-| `FLOAT_ZMQ_CONTROL_PORT` | ZeroMQ control port (API ↔ worker) | `5555` |
-| `FLOAT_ZMQ_FRAMES_PORT` | ZeroMQ frame-publishing port | `5556` |
-| `FLOAT_SHM_NAME` | Shared-memory ring buffer name | `float_frame_ring` |
-| `FLOAT_SHM_SLOTS` | Ring buffer capacity (frame slots) | `64` |
+| `FLOAT_IPC_ENABLED` | Enable the experimental ZeroMQ/SHM worker split. **Keep `false`** while dual-process is disabled. | `true` in `settings.toml` (`false` when set by `run_all.sh` / `--no-dual-process`) |
 | `WARMUP_WAIT_TIMEOUT_S` | Max seconds `/generate` waits for warmup | `600` |
 | `LIVEKIT_URL` | LiveKit SFU WebSocket endpoint | set in `settings.toml` |
 | `LIVEKIT_API_KEY` | LiveKit API key | `devkey` (local dev only) |
@@ -215,48 +217,66 @@ The same file is read by the API and the Gemini worker, so a single key serves b
 
 ## Running the System
 
-### Dual-process mode (production)
+> [!CAUTION]
+> **All supported modes below run single-process.** The zero-copy ZeroMQ worker
+> split (`scripts/run_dual_process.sh`, `fast-float serve` without
+> `--no-dual-process`) is disabled until its bugs are fixed.
+
+### Recommended — API + Studio
 
 ```bash
-./scripts/run_dual_process.sh
-
-# Overrides
-PORT=8000 FRONTEND_PORT=3000 NGPUS=1 ./scripts/run_dual_process.sh
-FLOAT_ZMQ_CONTROL_PORT=5555 FLOAT_ZMQ_FRAMES_PORT=5556 ./scripts/run_dual_process.sh
+./scripts/run_all.sh
 ```
 
-Logs are written to `logs/worker.log`, `logs/api.log`, and `logs/combined.log`.
+Starts the FastAPI backend (`:8000`) and the Vite Studio (`:3000`) in one
+process tree, with `FLOAT_IPC_ENABLED=false` already exported. Logs stream to
+`logs/combined.log`; `Ctrl+C` stops everything.
 
-### All-in-one dev runner
+### API only
 
 ```bash
-./scripts/run_all.sh      # single-process API + Studio (no ZeroMQ worker)
+FLOAT_IPC_ENABLED=false ./scripts/run_api.sh
+```
+
+Single process: the API loads the model itself. The `FLOAT_IPC_ENABLED=false`
+prefix is required because `settings.toml` still ships `[ipc] enabled = true`;
+without it the server looks for a worker that is not running.
+
+### Gradio interfaces
+
+```bash
+FLOAT_IPC_ENABLED=false ./scripts/run_gradio.sh   # batch: upload image + audio
+FLOAT_IPC_ENABLED=false ./scripts/run_live.sh     # live microphone streaming
+```
+
+### Studio only
+
+Use this when the API runs separately (e.g. behind a tunnel):
+
+```bash
+./scripts/run_frontend.sh        # Vite dev server on :3000
 ```
 
 ### `fast-float` CLI
 
 ```bash
-# Full supervised stack: worker + backend + frontend
-uv run --frozen --no-sync fast-float serve --port 8000 --dual-process --frontend
+# API + Studio, single process (recommended)
+uv run --frozen --no-sync fast-float serve --no-dual-process --frontend
 
-# Single-process API + Studio
-uv run --frozen --no-sync fast-float serve --port 8000 --no-dual-process --frontend
+# API only
+uv run --frozen --no-sync fast-float serve --no-dual-process
 
-# Individual components
-uv run --frozen --no-sync fast-float worker --control-port 5555 --frames-port 5556
+# Custom ports
+uv run --frozen --no-sync fast-float serve --no-dual-process --frontend \
+    --port 9000 --frontend-port 3100
+
+# Studio only / Gemini Live worker
 uv run --frozen --no-sync fast-float ui --port 3000
 uv run --frozen --no-sync fast-float agent
 ```
 
-### Individual scripts
-
-| Component | Command |
-|---|---|
-| FastAPI backend | `./scripts/run_api.sh` or `uv run --frozen --no-sync hypercorn fast_float.main:app --bind 0.0.0.0:8000` |
-| React Studio | `./scripts/run_frontend.sh` or `cd frontend && pnpm dev` |
-| Gemini Live worker | `./scripts/run_gemini_agent.sh` |
-| Gradio batch UI | `./scripts/run_gradio.sh` |
-| Gradio live audio UI | `./scripts/run_live.sh` |
+`--no-dual-process` is what sets `FLOAT_IPC_ENABLED=false`; do not run the CLI
+without it for now.
 
 ### Verify the boot
 
@@ -351,9 +371,10 @@ Choose a backend per component in `config/backends.yaml`:
 `examples/fast_float.ipynb` is the tested end-to-end path for a fresh GPU machine (verified on Colab T4). On a remote box with no public URL, expose the **Studio** (port 3000, not the API) over HTTPS; browsers require a secure context for microphone access.
 
 ```bash
-uv run --frozen --no-sync fast-float serve --port 8000 --dual-process --frontend
+# terminal 1 — single-process API + Studio
+./scripts/run_all.sh
 
-# second shell
+# terminal 2
 ./scripts/run_tunnel.sh          # prints https://<id>.trycloudflare.com
 ./scripts/run_tunnel.sh url      # re-print the URL
 ./scripts/run_tunnel.sh stop     # stop the tunnel
@@ -378,14 +399,14 @@ float-fast/
 ├── fast_float/              # Python package
 │   ├── cli.py               # `fast-float` supervisor CLI
 │   ├── core/                # Generation orchestrator and pipeline
-│   ├── ipc/                 # ZeroMQ client/server, shared-memory ring buffers
+│   ├── ipc/                 # ZeroMQ client/server, shared-memory ring (disabled)
 │   ├── livekit/             # LiveKit integration, Gemini Live agent
 │   ├── models/              # FLOAT, FMT, Wav2Vec2 architectures
 │   ├── onnx/                # ONNX export, TensorRT runtimes, backend dispatch
 │   ├── routers/             # generation, livekit, webrtc, health
 │   ├── streaming/           # Frame dispatcher, tap queues, live transports
 │   ├── utils/               # GPU tracking, video optimizers, logging
-│   ├── workers/             # Dedicated GPU inference worker
+│   ├── workers/             # Dedicated GPU worker (disabled)
 │   └── main.py              # FastAPI entrypoint
 ├── frontend/                # React 19 + Vite Studio
 ├── scripts/                 # setup, run_*, convert_*, download_checkpoints
@@ -413,17 +434,18 @@ uv run pre-commit run --all-files
 | `/generate` hangs right after startup | The model is still warming up. Check `/health` for `"warming_up": false` (timeout: `WARMUP_WAIT_TIMEOUT_S`). |
 | Microphone does not work remotely | `getUserMedia` needs HTTPS. Tunnel the Studio on port 3000, not the API. |
 | No live LiveKit stream | Leave `[livekit].url` empty to fall back to WebRTC/WebSocket, or verify your keys in `secerts.toml`. |
-| Shared-memory errors | Another instance may hold `float_frame_ring`. Stop it or change `FLOAT_SHM_NAME`. |
+| `FileNotFoundError: /float_frame_ring`, or live conversation hangs | The API is trying to reach the disabled ZeroMQ worker. Start with `./scripts/run_all.sh`, or export `FLOAT_IPC_ENABLED=false` (`--no-dual-process` for the CLI). |
+| `ZMQ` connection/socket errors in the log | Same cause: dual-process mode is disabled. Use a single-process launcher above. |
 
 ## Roadmap
 
 - [x] FastAPI server with NVENC hardware acceleration
-- [x] Dual-process ZeroMQ + shared-memory GPU isolation
 - [x] Real-time frame taps over WebSocket, WebRTC, and LiveKit
 - [x] LiveKit conversational avatar with Gemini Live
 - [x] Per-component ONNX / TensorRT backend selector
 - [x] React 19 Studio with Studio and Live Audio modes
 - [x] One-command setup (`scripts/setup.sh`)
+- [ ] Dual-process ZeroMQ + shared-memory GPU isolation *(implemented, disabled pending bug fixes)*
 - [ ] Multi-speaker audio separation and diarization
 - [ ] Multi-face portrait animation and background stabilization
 
