@@ -1,342 +1,284 @@
 <div align="center">
 
-<p align="center">
-  <img src="assets/logo.png" alt="FLOAT Fast Logo" width="140" style="border-radius: 24px; margin-bottom: 14px;" />
-</p>
+<img src="assets/logo.png" alt="FLOAT Fast logo" width="55%" />
 
 # FLOAT Fast
 
-High-performance, hardware-accelerated serving and inference stack for audio-driven talking portrait generation (FLOAT, ICCV 2025).
+**Real-time, GPU-accelerated serving stack for audio-driven talking portraits.**
 
-[![Build Status](https://img.shields.io/github/actions/workflow/status/mohamed-em2m/float-fast/ci.yml?branch=main)](https://github.com/mohamed-em2m/float-fast/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python: 3.10](https://img.shields.io/badge/Python-3.10-3776AB.svg?logo=python&logoColor=white)](pyproject.toml)
-[![PyTorch: 2.7.1+cu126](https://img.shields.io/badge/PyTorch-2.7.1%2Bcu126-EE4C2C.svg?logo=pytorch&logoColor=white)](https://pytorch.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.122-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![React: 19](https://img.shields.io/badge/React-19-61DAFB.svg?logo=react&logoColor=black)](frontend/)
-[![Version](https://img.shields.io/badge/version-v5.2.0-blue.svg)](https://github.com/mohamed-em2m/float-fast/releases)
+Built on [FLOAT](https://github.com/deepbrainai-research/float) (ICCV 2025) · Stream video while it is still being generated.
 
-[Demo](http://localhost:3000) · [Documentation](docs/USAGE.md) · [Report Bug](https://github.com/mohamed-em2m/float-fast/issues) · [Request Feature](https://github.com/mohamed-em2m/float-fast/issues)
+[![CI](https://img.shields.io/github/actions/workflow/status/mohamed-em2m/float-fast/ci.yml?branch=main&label=CI)](https://github.com/mohamed-em2m/float-fast/actions)
+[![Release](https://img.shields.io/github/v/release/mohamed-em2m/float-fast?label=release)](https://github.com/mohamed-em2m/float-fast/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
+[![Python 3.10](https://img.shields.io/badge/python-3.10-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![PyTorch 2.7.1](https://img.shields.io/badge/PyTorch-2.7.1%20%2B%20cu126-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.122-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![React 19](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](frontend/)
+
+[Quick Start](#quick-start) · [Documentation](docs/USAGE.md) · [API](#api) · [Report a Bug](https://github.com/mohamed-em2m/float-fast/issues) · [Request a Feature](https://github.com/mohamed-em2m/float-fast/issues)
 
 </div>
 
+<!-- TODO: add a demo GIF or screenshot of the Studio here -->
+<!-- <p align="center"><img src="assets/demo.gif" alt="FLOAT Fast Studio demo" width="800" /></p> -->
+
 ---
+
+## Overview
+
+Talking-head models such as FLOAT produce impressive results, but they are heavy and are usually run as offline batch jobs. **FLOAT Fast** turns FLOAT into an interactive service:
+
+- **Dual-process design** – a dedicated GPU worker is isolated from the async API server, linked by ZeroMQ and POSIX shared memory, so inference never blocks the event loop.
+- **Streaming first** – frames are pushed over WebSocket, WebRTC, or LiveKit while inference is still running, before the MP4 is finished.
+- **Hardware acceleration** – micro-batched latent decoding, NVENC/QSV/AMF encoding, and per-component PyTorch / `torch.compile` / ONNX / TensorRT backends.
+- **Conversational avatar** – speech-to-speech interaction through Gemini Live and LiveKit Agents, with live lip-sync.
+- **Studio UI** – a React 19 + Vite interface for both batch generation and live audio.
+
+> [!IMPORTANT]
+> This project builds on the upstream [FLOAT repository](https://github.com/deepbrainai-research/float). Review its [license](https://github.com/deepbrainai-research/float/blob/main/LICENSE) before using the model weights or architecture, especially for commercial use.
 
 ## Table of Contents
 
-- [About](#about)
-- [Key Features](#key-features)
+- [Features](#features)
 - [Architecture](#architecture)
 - [Tech Stack](#tech-stack)
-- [Project Structure](#project-structure)
-- [Getting Started](#getting-started)
-  - [Prerequisites](#prerequisites)
-  - [One-Command Automated Setup (`scripts/setup.sh`)](#one-command-automated-setup-scriptssetupsh)
-  - [Manual Installation](#manual-installation)
+- [Quick Start](#quick-start)
+- [Installation](#installation)
+- [Secrets & Configuration](#secrets--configuration)
 - [Running the System](#running-the-system)
-  - [1. High-Performance Dual-Process Architecture (`scripts/run_dual_process.sh`)](#1-high-performance-dual-process-architecture-scriptsrun_dual_processsh)
-  - [2. All-in-One Dev Runner (`scripts/run_all.sh`)](#2-all-in-one-dev-runner-scriptsrun_allsh)
-  - [3. CLI Supervisor (`fast-float`)](#3-cli-supervisor-fast-float)
-  - [4. Running Individual Components](#4-running-individual-components)
-- [API Usage](#api-usage)
-  - [REST Endpoint Example](#rest-endpoint-example)
-  - [Python Client Example](#python-client-example)
-- [Configuration](#configuration)
-- [Hardware Acceleration & ONNX/TensorRT](#hardware-acceleration--onnxtensorrt)
-- [Testing & Quality Checks](#testing--quality-checks)
+- [API](#api)
+- [Hardware Acceleration (ONNX / TensorRT)](#hardware-acceleration-onnx--tensorrt)
+- [Remote & Colab Usage](#remote--colab-usage)
+- [Project Structure](#project-structure)
+- [Testing](#testing)
+- [Troubleshooting](#troubleshooting)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [License](#license)
+- [Citation & Acknowledgments](#citation--acknowledgments)
 - [Contact](#contact)
 
 ---
 
-## About
+## Features
 
-**FLOAT Fast** is a solo open-source project providing a production-grade inference engine and real-time interactive avatar platform built around **FLOAT (Flow Matching for Audio-Driven Talking Portrait Video Generation, ICCV 2025)**.
-
-Standard talking-head generation models are computationally intensive, slow to render, and traditionally restricted to offline batch video synthesis. **FLOAT Fast** solves these challenges by combining:
-
-1. **Dual-Process Architecture**: Decouples GPU inference execution from async I/O handling via ZeroMQ and POSIX Shared Memory (`shm_buffer`), eliminating event-loop blocking and memory bottlenecks.
-2. **Low-Latency Streaming Pipeline**: Stream video frames in real time over WebSockets, WebRTC, and LiveKit while inference is still in-flight.
-3. **Hardware Acceleration & Batched Decoding**: Micro-batched latent decoding, NVENC hardware encoding, and per-component ONNX/TensorRT execution providers.
-4. **Conversational Live Voice Agent**: Real-time bidirectional voice conversations driven by Gemini Live and LiveKit Agents with instant lip-sync.
-5. **Modern Studio Interface**: A unified React 19 + Vite web studio supporting both batch generation and low-latency interactive live audio streaming.
-
-> [!IMPORTANT]
-> **Upstream Research & License Notice**:
-> Users are advised to review the upstream [FLOAT repository](https://github.com/deepbrainai-research/float) and read the original [FLOAT license](https://github.com/deepbrainai-research/float/blob/main/LICENSE) regarding the underlying model weights and architecture.
-
----
-
-## Key Features
-
-- ✅ **Dual-Process IPC Architecture**: Dedicated GPU worker process linked to the async FastAPI/LiveKit streaming server via ZeroMQ control sockets and zero-copy shared memory frame ring buffers.
-- ✅ **Ultra-Fast Video Generation**: Hardware-accelerated inference with auto-tuned batched latent decoding and NVENC/QSV/AMF encoding.
-- ✅ **Real-Time Live Transports**: Push frames straight off the decoder over WebSocket, WebRTC, or LiveKit SFU before the MP4 file is finished.
-- ✅ **Conversational Voice Avatar**: Live speech-to-speech interaction powered by Gemini Live and LiveKit Agents (`fast_float/livekit/gemini/`).
-- ✅ **Per-Component Backend Optimization**: Run each model unit in PyTorch Eager, `torch.compile`, or ONNX/TensorRT with automated parity verification.
-- ✅ **Unified React 19 Studio**: Synchronized layouts and design language between Studio generation and interactive Live Audio modes.
-- ✅ **Comprehensive Setup & CLI**: Complete single-command installation (`scripts/setup.sh`) and unified CLI supervisor (`fast-float`).
-
----
+| | Feature | Description |
+|---|---|---|
+| ⚡ | **Dual-process IPC** | GPU worker and API server communicate over ZeroMQ control sockets and a zero-copy shared-memory frame ring. |
+| 🎞️ | **Fast generation** | Auto-tuned batched latent decoding with NVENC / QSV / AMF encoding. |
+| 📡 | **Live transports** | WebSocket, WebRTC, and LiveKit SFU streaming straight off the decoder. |
+| 🗣️ | **Voice avatar** | Real-time speech-to-speech with Gemini Live and LiveKit Agents (`fast_float/livekit/gemini/`). |
+| 🧩 | **Per-component backends** | Run each model unit on Eager, `torch.compile`, or ONNX/TensorRT, with automated parity checks. |
+| 🖥️ | **Unified Studio** | One React 19 interface for batch generation and interactive live audio. |
+| 🛠️ | **One-command setup** | `scripts/setup.sh` bootstraps everything; the `fast-float` CLI supervises all processes. |
 
 ## Architecture
 
-```text
-┌────────────────────────────────────────────────────────────────────────┐
-│                        Fast Float Architecture                         │
-└────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    Browser["Browser · React 19 Studio"] <-->|"WebSocket / WebRTC / HTTP Range"| API
 
- [Browser / React 19 Studio] ─── WebSocket / WebRTC / HTTP Range
-             │
-             ▼
- ┌──────────────────────────────────────────────────────────────────────┐
- │ Process 2: Streaming Backend (FastAPI / Hypercorn / LiveKit)        │
- │  - /generate, /stream/{id}, /ws/stream/{id}, WebRTC signaling       │
- │  - LiveKit SFU Session management & Gemini Live Agent coordination  │
- └───────────────────────────────────┬──────────────────────────────────┘
-                                     │ ZeroMQ (Control: 5555, Frames: 5556)
-                                     │ + POSIX Shared Memory (float_frame_ring)
-                                     ▼
- ┌──────────────────────────────────────────────────────────────────────┐
- │ Process 1: Dedicated GPU Inference Worker                           │
- │  - Zero-copy shared memory frame exchange                           │
- │  - FLOAT Flow Matching ODE Solver + Style Latent Generator           │
- │  - Batched Latent Decoding (VRAM Auto-Tuned / TensorRT / CUDA)      │
- └──────────────────────────────────────────────────────────────────────┘
+    subgraph P2["Process 2 · Streaming backend"]
+        API["FastAPI + Hypercorn<br/>/generate · /stream · /ws/stream · WebRTC signaling"]
+        LK["LiveKit session manager<br/>+ Gemini Live agent"]
+    end
+
+    subgraph P1["Process 1 · GPU inference worker"]
+        W["FLOAT flow-matching ODE solver<br/>+ style latent generator"]
+        D["Batched latent decoding<br/>VRAM auto-tuned · TensorRT / CUDA"]
+        W --> D
+    end
+
+    API <-->|"ZeroMQ control :5555 / frames :5556<br/>+ POSIX shared memory (float_frame_ring)"| W
+    LK <--> API
 ```
-
----
 
 ## Tech Stack
 
-| Layer | Technology | Details |
-|---|---|---|
-| **Runtime & Language** | Python 3.10, JavaScript (ESNext / JSX) | Pinned via `.python-version` and `pyproject.toml` |
-| **Backend & Serving** | FastAPI, Hypercorn, Uvicorn, ZeroMQ | Async REST, WebSockets, ZeroMQ IPC control |
-| **Deep Learning** | PyTorch 2.7.1 (CUDA 12.6), ONNX Runtime GPU 1.23, TensorRT 10.9 | Hardware-accelerated flow matching and decoding |
-| **Real-time Media** | LiveKit SFU, LiveKit Agents, aiortc (WebRTC), PyAV | WebRTC tracks, live microphone streaming |
-| **Frontend Studio** | React 19, Vite 8, Lucide Icons | Responsive glassmorphism interface |
-| **Package Management** | `uv`, `pnpm` | Fast, deterministic dependency management |
+| Layer | Technology |
+|---|---|
+| Language | Python 3.10, JavaScript (ESNext / JSX) |
+| Serving | FastAPI, Hypercorn, Uvicorn, ZeroMQ |
+| Deep learning | PyTorch 2.7.1 (CUDA 12.6), ONNX Runtime GPU 1.23, TensorRT 10.9 |
+| Real-time media | LiveKit SFU & Agents, aiortc (WebRTC), PyAV |
+| Frontend | React 19, Vite 8, Lucide Icons |
+| Tooling | `uv`, `pnpm`, Ruff, pytest, pre-commit |
 
 ---
 
-## Project Structure
+## Quick Start
 
-```text
-float-fast/
-├── .gitattributes          # Line-ending and binary tracking configuration
-├── .github/                # GitHub Actions CI/CD workflows
-├── assets/                 # Branding assets, logo, sample media
-├── config/
-│   ├── api.json            # API endpoint URLs and settings
-│   ├── backends.yaml       # Hardware backend dispatch configuration
-│   └── logging.json        # Structured multi-process logging configuration
-├── docs/                   # Architectural specs, guides, and documentation
-├── fast_float/             # Main Python application package
-│   ├── cli.py              # CLI entry point (`fast-float` supervisor)
-│   ├── core/               # Video generation orchestrator and pipeline logic
-│   ├── ipc/                # ZeroMQ client/server and shared memory ring buffers
-│   ├── livekit/            # LiveKit integration and Gemini Live agent worker
-│   ├── models/             # PyTorch neural network architectures (FLOAT, FMT, Wav2Vec2)
-│   ├── onnx/               # ONNX export, TensorRT runtimes & backend dispatch
-│   ├── routers/            # FastAPI endpoint routers (generation, livekit, webrtc, health)
-│   ├── streaming/          # Frame dispatcher, tap queues & live transports
-│   ├── utils/              # GPU tracking, video optimizers & logger
-│   ├── workers/            # Dedicated GPU inference worker
-│   └── main.py             # FastAPI entrypoint with lifespan management
-├── frontend/               # React 19 + Vite studio application
-│   ├── src/
-│   │   ├── components/     # Studio & Live mode UI components
-│   │   ├── services/       # API clients, audio streaming & telemetry
-│   │   ├── App.jsx         # App root & mode switcher
-│   │   └── App.css         # Glassmorphism design system & layouts
-│   └── package.json        # Frontend dependencies
-├── scripts/                # Automation, setup, and runner scripts
-│   ├── setup.sh            # Automated system setup (uv, dependencies, weights)
-│   ├── run_dual_process.sh # Production dual-process runner (Worker + API + UI)
-│   ├── run_all.sh          # All-in-one dev launcher (Backend + Frontend)
-│   ├── run_api.sh          # FastAPI backend launcher
-│   ├── run_frontend.sh     # React Vite frontend launcher
-│   ├── run_gemini_agent.sh # Gemini Live worker launcher
-│   └── download_checkpoints.sh # Weight downloader
-├── tests/                  # Pytest unit and integration test suites
-├── Dockerfile              # Multi-stage CUDA 12.6 container
-├── LICENSE                 # Project MIT license
-├── pyproject.toml          # Python project metadata and uv configuration
-├── README.md               # Project documentation
-└── uv.lock                 # Pinned dependencies lockfile
+```bash
+git clone https://github.com/mohamed-em2m/float-fast.git
+cd float-fast
+
+./scripts/setup.sh        # one-time: dependencies, ONNX/TensorRT, checkpoints
+./scripts/run_dual_process.sh
 ```
 
----
+Then open:
 
-## Getting Started
+| Service | URL |
+|---|---|
+| Studio | <http://localhost:3000> |
+| API + Swagger UI | <http://localhost:8000/docs> |
+
+The first boot warms up for roughly 1–5 minutes (weights, ONNX/TensorRT sessions, decode auto-tuning). Results are cached in `~/.cache/fast_float/`.
+
+## Installation
 
 ### Prerequisites
 
-- **OS**: Linux or Windows (Linux recommended for CUDA NVENC, TensorRT, and POSIX SHM)
-- **GPU**: NVIDIA GPU (CUDA 12.6 compatible driver)
-- **Python**: 3.10 managed by [`uv`](https://docs.astral.sh/uv/)
-- **Node.js**: Node 20.19+ or Node 22.12+ with [`pnpm`](https://pnpm.io/)
-- **System Tools**: `ffmpeg`, `git`, `curl`
+| Requirement | Details |
+|---|---|
+| OS | Linux recommended (NVENC, TensorRT, POSIX shared memory). Windows is supported with limitations. |
+| GPU | NVIDIA GPU with a CUDA 12.6-compatible driver |
+| Python | 3.10, managed by [`uv`](https://docs.astral.sh/uv/) |
+| Node.js | 20.19+ or 22.12+ with [`pnpm`](https://pnpm.io/) |
+| System tools | `ffmpeg`, `git`, `curl` |
 
----
-
-### One-Command Automated Setup (`scripts/setup.sh`)
-
-The easiest way to bootstrap the full system (system dependencies, `uv`, Python 3.10 virtual environment, PyTorch CUDA 12.6 wheels, frontend dependencies with `pnpm`, ONNX/TensorRT tools, and checkpoints) is:
+### Option A — Automated (recommended)
 
 ```bash
 chmod +x scripts/setup.sh
 ./scripts/setup.sh
 ```
 
-What `scripts/setup.sh` handles automatically:
+The script installs system packages, `uv` and Python 3.10, Node 22 and `pnpm`, frontend dependencies, the pinned CUDA 12.6 PyTorch stack (`uv sync --inexact`), ONNX Runtime GPU and TensorRT, optionally starts a local LiveKit SFU via Docker Compose, and downloads the checkpoints (`float.pth`, Wav2Vec2, speech-emotion model).
 
-1. Installs system packages (`ffmpeg`, `git`, `wget`, `curl`, `build-essential`).
-2. Installs `uv` and provisions Python 3.10 matching `.python-version`.
-3. Verifies and installs Node 22 (via NodeSource) and activates `pnpm`.
-4. Installs frontend dependencies in `frontend/`.
-5. Syncs pinned PyTorch CUDA 12.6 dependencies into `.venv` via `uv sync --inexact`.
-6. Sets up the ONNX Runtime GPU and TensorRT execution providers.
-7. Starts the local LiveKit SFU container via Docker Compose (if Docker is present).
-8. Downloads model weights (`float.pth`, Wav2Vec2, speech emotion model) via `scripts/download_checkpoints.sh`.
-
----
-
-### Manual Installation
-
-If you prefer step-by-step setup:
+### Option B — Manual
 
 ```bash
-# 1. Clone repository
 git clone https://github.com/mohamed-em2m/float-fast.git
 cd float-fast
 
-# 2. Sync Python virtual environment with pinned CUDA 12.6 wheels
-uv sync --frozen
-
-# 3. Download model checkpoints
+uv sync --frozen                                   # Python environment
 chmod +x scripts/download_checkpoints.sh
-./scripts/download_checkpoints.sh
+./scripts/download_checkpoints.sh                  # model weights
 
-# 4. Install frontend dependencies
-cd frontend
-pnpm install
-cd ..
+cd frontend && pnpm install && cd ..              # Studio dependencies
 ```
+
+> [!NOTE]
+> On a CUDA machine, prefer `./scripts/setup.sh` over a plain `uv sync`. Setup layers `onnxruntime-gpu` and TensorRT 10.9 on top of the lockfile; a plain `uv sync` / `uv run` reverts to the CPU `onnxruntime`, and the server boots with only `AzureExecutionProvider` and `CPUExecutionProvider`. All launchers therefore use `uv run --frozen --no-sync`.
+
+### Docker
+
+A multi-stage CUDA 12.6 `Dockerfile` is included at the repository root.
+
+---
+
+## Secrets & Configuration
+
+Settings are resolved in this order (highest priority first):
+
+1. Environment variables
+2. `fast_float/config/secerts.toml` — git-ignored, machine-local secrets *(the filename's spelling is intentional)*
+3. `fast_float/config/settings.toml` — committed, non-secret defaults
+4. `.env` at the repo root — optional fallback (see `.env.example`)
+
+```toml
+# fast_float/config/secerts.toml  (never commit this file)
+[livekit]
+url        = "wss://<your-project>.livekit.cloud"  # or "ws://127.0.0.1:7880" for local Docker
+api_key    = "<LIVEKIT_API_KEY>"
+api_secret = "<LIVEKIT_API_SECRET>"
+
+[gemini]
+api_key = "<GOOGLE_API_KEY>"   # GOOGLE_API_KEY / GEMINI_API_KEY env vars also work
+```
+
+The same file is read by the API and the Gemini worker, so a single key serves both. If you have no LiveKit project and no local Docker, leave `[livekit].url` empty: live transports fall back to WebRTC, then WebSocket/MP4.
+
+### Environment variables
+
+| Variable | Description | Default |
+|---|---|---|
+| `PORT` | API server port | `8000` |
+| `FRONTEND_PORT` | Studio dev-server port | `3000` |
+| `FLOAT_IPC_ENABLED` | Enable dual-process ZeroMQ/SHM mode | `true` |
+| `FLOAT_ZMQ_CONTROL_PORT` | ZeroMQ control port (API ↔ worker) | `5555` |
+| `FLOAT_ZMQ_FRAMES_PORT` | ZeroMQ frame-publishing port | `5556` |
+| `FLOAT_SHM_NAME` | Shared-memory ring buffer name | `float_frame_ring` |
+| `FLOAT_SHM_SLOTS` | Ring buffer capacity (frame slots) | `64` |
+| `WARMUP_WAIT_TIMEOUT_S` | Max seconds `/generate` waits for warmup | `600` |
+| `LIVEKIT_URL` | LiveKit SFU WebSocket endpoint | set in `settings.toml` |
+| `LIVEKIT_API_KEY` | LiveKit API key | `devkey` (local dev only) |
+| `LIVEKIT_API_SECRET` | LiveKit API secret | `secret` (local dev only) |
+| `GEMINI_API_KEY` | Gemini key for the voice agent | — |
+
+> [!WARNING]
+> `devkey` / `secret` are development defaults for a local LiveKit server. Always set your own credentials before exposing the service publicly.
 
 ---
 
 ## Running the System
 
-### 1. High-Performance Dual-Process Architecture (`scripts/run_dual_process.sh`)
-
-For optimal performance and maximum responsiveness, run the dual-process architecture. This launches the dedicated GPU worker in an isolated CUDA process and connects it to the FastAPI backend and React frontend:
+### Dual-process mode (production)
 
 ```bash
-chmod +x scripts/run_dual_process.sh
 ./scripts/run_dual_process.sh
-```
 
-**Environment overrides:**
-
-```bash
-# Custom ports and GPU configuration
+# Overrides
 PORT=8000 FRONTEND_PORT=3000 NGPUS=1 ./scripts/run_dual_process.sh
-
-# Custom ZeroMQ IPC ports
 FLOAT_ZMQ_CONTROL_PORT=5555 FLOAT_ZMQ_FRAMES_PORT=5556 ./scripts/run_dual_process.sh
 ```
 
-- **Backend API**: `http://localhost:8000` (Swagger UI: `http://localhost:8000/docs`)
-- **React Studio**: `http://localhost:3000`
-- **Logs**: `logs/worker.log`, `logs/api.log`, `logs/combined.log`
+Logs are written to `logs/worker.log`, `logs/api.log`, and `logs/combined.log`.
 
----
-
-### 2. All-in-One Dev Runner (`scripts/run_all.sh`)
-
-To launch the backend API and frontend dev server together in a single process setup:
+### All-in-one dev runner
 
 ```bash
-chmod +x scripts/run_all.sh
-./scripts/run_all.sh
+./scripts/run_all.sh      # single-process API + Studio (no ZeroMQ worker)
+```
+
+### `fast-float` CLI
+
+```bash
+# Full supervised stack: worker + backend + frontend
+uv run --frozen --no-sync fast-float serve --port 8000 --dual-process --frontend
+
+# Single-process API + Studio
+uv run --frozen --no-sync fast-float serve --port 8000 --no-dual-process --frontend
+
+# Individual components
+uv run --frozen --no-sync fast-float worker --control-port 5555 --frames-port 5556
+uv run --frozen --no-sync fast-float ui --port 3000
+uv run --frozen --no-sync fast-float agent
+```
+
+### Individual scripts
+
+| Component | Command |
+|---|---|
+| FastAPI backend | `./scripts/run_api.sh` or `uv run --frozen --no-sync hypercorn fast_float.main:app --bind 0.0.0.0:8000` |
+| React Studio | `./scripts/run_frontend.sh` or `cd frontend && pnpm dev` |
+| Gemini Live worker | `./scripts/run_gemini_agent.sh` |
+| Gradio batch UI | `./scripts/run_gradio.sh` |
+| Gradio live audio UI | `./scripts/run_live.sh` |
+
+### Verify the boot
+
+```bash
+curl http://localhost:8000/health
+# {"model_loaded": true, ..., "warming_up": false}  → ready
 ```
 
 ---
 
-### 3. CLI Supervisor (`fast-float`)
+## API
 
-The repository installs the `fast-float` CLI script defined in `pyproject.toml` (`[project.scripts]`):
+Interactive docs are served at `http://localhost:8000/docs`.
 
-```bash
-# Launch the full supervised stack (Worker + Backend + Frontend)
-uv run --no-sync fast-float serve --frontend
-
-# Run only the GPU inference worker
-uv run --no-sync fast-float worker --control-port 5555 --frames-port 5556
-
-# Run only the Studio frontend UI
-uv run --no-sync fast-float ui --port 3000
-
-# Run only the Gemini Live agent
-uv run --no-sync fast-float agent
-```
-
----
-
-### 4. Running Individual Components
-
-**FastAPI Backend Server:**
-
-```bash
-uv run --frozen --no-sync hypercorn fast_float.main:app --bind 0.0.0.0:8000 --log-level info
-# or
-./scripts/run_api.sh
-```
-
-**React Studio Frontend:**
-
-```bash
-cd frontend && pnpm dev
-# or
-./scripts/run_frontend.sh
-```
-
-**Gemini Live Voice Worker:**
-
-```bash
-./scripts/run_gemini_agent.sh
-```
-
-**Gradio Batch Web Interface:**
-
-```bash
-./scripts/run_gradio.sh
-```
-
-**Gradio Live Audio Interface:**
-
-```bash
-./scripts/run_live.sh
-```
-
----
-
-## API Usage
-
-### REST Endpoint Example
-
-Submit audio and reference image to `/generate`:
+### `POST /generate`
 
 ```bash
 curl -X POST http://localhost:8000/generate \
   -H "Content-Type: application/json" \
   -d '{
     "audio_base64": "<BASE64_PCM_OR_WAV>",
-    "image_base64": "<BASE64_IMAGE_DATA>",
+    "image_base64": "<BASE64_IMAGE>",
     "emotion": "S2E",
     "nfe": 10,
     "quality": "balanced",
@@ -344,137 +286,179 @@ curl -X POST http://localhost:8000/generate \
   }'
 ```
 
-### Python Client Example
+| Field | Description |
+|---|---|
+| `audio_base64` | Base64-encoded PCM or WAV speech |
+| `image_base64` | Base64-encoded reference portrait |
+| `emotion` | Emotion mode (e.g. `S2E`, speech-to-emotion) |
+| `nfe` | Number of function evaluations for the ODE solver |
+| `quality` | Quality preset (e.g. `balanced`) |
+| `live` | Enable live frame streaming while generating |
+
+### Python client
 
 ```python
 import base64
 import requests
 
-# Load reference portrait and speech audio
-with open("portrait.jpg", "rb") as f:
-    img_b64 = base64.b64encode(f.read()).decode("utf-8")
 
-with open("voice.wav", "rb") as f:
-    aud_b64 = base64.b64encode(f.read()).decode("utf-8")
+def b64(path: str) -> str:
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
 
-# Request video synthesis
+
 response = requests.post(
     "http://localhost:8000/generate",
     json={
-        "image_base64": img_b64,
-        "audio_base64": aud_b64,
+        "image_base64": b64("portrait.jpg"),
+        "audio_base64": b64("voice.wav"),
         "emotion": "S2E",
         "nfe": 10,
         "quality": "balanced",
     },
+    timeout=600,
 )
-
+response.raise_for_status()
 result = response.json()
-print("Generation Time:", result["performance"]["total_time"], "s")
+
+print("Generation time:", result["performance"]["total_time"], "s")
 print("Stream URL:     ", result["stream_url"])
 print("Download URL:   ", result["download_url"])
 ```
 
 ---
 
-## Configuration
+## Hardware Acceleration (ONNX / TensorRT)
 
-Core runtime settings are managed via environment variables or `fast_float/config/settings.toml`:
-
-| Variable | Description | Default |
-|---|---|---|
-| `PORT` | FastAPI server listening port | `8000` |
-| `FRONTEND_PORT` | React Studio Vite development port | `3000` |
-| `FLOAT_IPC_ENABLED` | Enable dual-process ZeroMQ/SHM worker mode | `true` |
-| `FLOAT_ZMQ_CONTROL_PORT` | ZeroMQ control port between API and Worker | `5555` |
-| `FLOAT_ZMQ_FRAMES_PORT` | ZeroMQ frame publishing port | `5556` |
-| `FLOAT_SHM_NAME` | POSIX shared memory ring buffer name | `float_frame_ring` |
-| `FLOAT_SHM_SLOTS` | Ring buffer frame capacity slots | `64` |
-| `WARMUP_WAIT_TIMEOUT_S` | Maximum seconds `/generate` waits for boot warmup | `600` |
-| `LIVEKIT_URL` | LiveKit SFU WebSocket endpoint | `ws://localhost:7880` |
-| `LIVEKIT_API_KEY` | LiveKit API Key | `devkey` |
-| `LIVEKIT_API_SECRET` | LiveKit API Secret | `secret` |
-| `GEMINI_API_KEY` | Google Gemini API key for real-time speech agent | — |
-
----
-
-## Hardware Acceleration & ONNX/TensorRT
-
-Convert individual units (FMT, Wav2Vec2, Style Decoder) to ONNX or TensorRT:
+Convert individual units (FMT, Wav2Vec2, Style Decoder) to ONNX/TensorRT:
 
 ```bash
-# Automatically convert all supported units and run the backend selector
-./scripts/convert_to_onnx.sh
-
-# Convert individual modules
-./scripts/convert_fmt_to_onnx.sh
-./scripts/convert_wav2vec_to_onnx.sh
+./scripts/convert_to_onnx.sh             # convert all units and run the backend selector
+./scripts/convert_fmt_to_onnx.sh         # FMT only
+./scripts/convert_wav2vec_to_onnx.sh     # Wav2Vec2 only
 ```
 
-Backends can be configured in `config/backends.yaml` to specify `eager`, `compile`, or `onnx` (TensorRT → CUDA → CPU) per component.
+Choose a backend per component in `config/backends.yaml`:
+
+| Backend | Behavior |
+|---|---|
+| `eager` | Standard PyTorch |
+| `compile` | `torch.compile` |
+| `onnx` | ONNX Runtime with TensorRT → CUDA → CPU fallback |
+
+## Remote & Colab Usage
+
+`examples/fast_float.ipynb` is the tested end-to-end path for a fresh GPU machine (verified on Colab T4). On a remote box with no public URL, expose the **Studio** (port 3000, not the API) over HTTPS; browsers require a secure context for microphone access.
+
+```bash
+uv run --frozen --no-sync fast-float serve --port 8000 --dual-process --frontend
+
+# second shell
+./scripts/run_tunnel.sh          # prints https://<id>.trycloudflare.com
+./scripts/run_tunnel.sh url      # re-print the URL
+./scripts/run_tunnel.sh stop     # stop the tunnel
+```
+
+If `cloudflared` is missing:
+
+```bash
+curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
+sudo dpkg -i /tmp/cloudflared.deb
+```
 
 ---
 
-## Testing & Quality Checks
+## Project Structure
 
-Run the verification test suites and code linters:
+```text
+float-fast/
+├── assets/                  # Logo and sample media
+├── config/                  # api.json, backends.yaml, logging.json
+├── docs/                    # Guides and specifications
+├── fast_float/              # Python package
+│   ├── cli.py               # `fast-float` supervisor CLI
+│   ├── core/                # Generation orchestrator and pipeline
+│   ├── ipc/                 # ZeroMQ client/server, shared-memory ring buffers
+│   ├── livekit/             # LiveKit integration, Gemini Live agent
+│   ├── models/              # FLOAT, FMT, Wav2Vec2 architectures
+│   ├── onnx/                # ONNX export, TensorRT runtimes, backend dispatch
+│   ├── routers/             # generation, livekit, webrtc, health
+│   ├── streaming/           # Frame dispatcher, tap queues, live transports
+│   ├── utils/               # GPU tracking, video optimizers, logging
+│   ├── workers/             # Dedicated GPU inference worker
+│   └── main.py              # FastAPI entrypoint
+├── frontend/                # React 19 + Vite Studio
+├── scripts/                 # setup, run_*, convert_*, download_checkpoints
+├── tests/                   # pytest suites
+├── Dockerfile               # Multi-stage CUDA 12.6 image
+├── pyproject.toml
+└── uv.lock
+```
+
+## Testing
 
 ```bash
-# Python lint and style format checks
 uv run ruff check .
 uv run ruff format --check .
-
-# Python test suite
 uv run pytest tests/
-
-# Frontend test suite
-cd frontend && pnpm test
-
-# Pre-commit hook checks across all files
+(cd frontend && pnpm test)
 uv run pre-commit run --all-files
 ```
 
----
+## Troubleshooting
+
+| Symptom | Likely cause and fix |
+|---|---|
+| Server lists only `AzureExecutionProvider` / `CPUExecutionProvider` | A plain `uv sync` replaced `onnxruntime-gpu`. Re-run `./scripts/setup.sh` and launch with `uv run --frozen --no-sync`. |
+| `/generate` hangs right after startup | The model is still warming up. Check `/health` for `"warming_up": false` (timeout: `WARMUP_WAIT_TIMEOUT_S`). |
+| Microphone does not work remotely | `getUserMedia` needs HTTPS. Tunnel the Studio on port 3000, not the API. |
+| No live LiveKit stream | Leave `[livekit].url` empty to fall back to WebRTC/WebSocket, or verify your keys in `secerts.toml`. |
+| Shared-memory errors | Another instance may hold `float_frame_ring`. Stop it or change `FLOAT_SHM_NAME`. |
 
 ## Roadmap
 
-- [x] High-performance FastAPI server with NVENC hardware acceleration
-- [x] Dual-process ZeroMQ + Shared Memory architecture for GPU isolation
-- [x] Real-time live frame taps via WebSocket, WebRTC, and LiveKit
-- [x] LiveKit conversational avatar integration with Gemini Live voice agent
-- [x] Per-component ONNX & TensorRT automated backend selector
-- [x] Synchronized React 19 Studio with dual Studio and Live Audio modes
-- [x] One-command automated environment setup script (`scripts/setup.sh`)
-- [ ] Multi-speaker audio separation and diarization support
-- [ ] Multi-face portrait animation and scene background stabilization
-
----
+- [x] FastAPI server with NVENC hardware acceleration
+- [x] Dual-process ZeroMQ + shared-memory GPU isolation
+- [x] Real-time frame taps over WebSocket, WebRTC, and LiveKit
+- [x] LiveKit conversational avatar with Gemini Live
+- [x] Per-component ONNX / TensorRT backend selector
+- [x] React 19 Studio with Studio and Live Audio modes
+- [x] One-command setup (`scripts/setup.sh`)
+- [ ] Multi-speaker audio separation and diarization
+- [ ] Multi-face portrait animation and background stabilization
 
 ## Contributing
 
-Contributions are welcome!
+Contributions are welcome.
 
 1. Fork the repository
-2. Create your feature branch: `git checkout -b feature/amazing-feature`
-3. Commit your changes: `git commit -m "feat(scope): add amazing feature"`
-4. Push to the branch: `git push origin feature/amazing-feature`
+2. Create a branch: `git checkout -b feature/amazing-feature`
+3. Commit using [Conventional Commits](https://www.conventionalcommits.org/): `git commit -m "feat(scope): add amazing feature"`
+4. Push: `git push origin feature/amazing-feature`
 5. Open a Pull Request
 
-Please ensure code complies with the project style guidelines (`uv run ruff check .`) and pre-commit checks pass (`uv run pre-commit run --all-files`).
-
----
+Before submitting, make sure `uv run ruff check .` and `uv run pre-commit run --all-files` pass.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+Released under the [MIT License](LICENSE). The upstream FLOAT checkpoints and research materials are governed by their own [license](https://github.com/deepbrainai-research/float/blob/main/LICENSE).
 
-> [!NOTE]
-> Please refer to the upstream [FLOAT repository](https://github.com/deepbrainai-research/float) to review its license terms regarding original checkpoints and research materials.
+## Citation & Acknowledgments
 
----
+This project builds on the work of the FLOAT authors. If you use it in research, please cite the original paper:
+
+```bibtex
+@inproceedings{ki2025float,
+  title     = {FLOAT: Generative Motion Latent Flow Matching for Audio-driven Talking Portrait},
+  author    = {Ki, Taekyung and Min, Dongchan and Chae, Gyeongsu},
+  booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},
+  year      = {2025}
+}
+```
+
+Thanks to the teams behind [FLOAT](https://github.com/deepbrainai-research/float), [LiveKit](https://livekit.io/), [FastAPI](https://fastapi.tiangolo.com/), and [PyTorch](https://pytorch.org/).
 
 ## Contact
 
-Mohamed Emam · [GitHub Profile](https://github.com/mohamed-em2m)
-
-Project Link: [https://github.com/mohamed-em2m/float-fast](https://github.com/mohamed-em2m/float-fast)
+**Mohamed Emam** · [@mohamed-em2m](https://github.com/mohamed-em2m)
+Project: <https://github.com/mohamed-em2m/float-fast>
