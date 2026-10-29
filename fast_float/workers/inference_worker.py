@@ -120,6 +120,7 @@ class _ShmFrameDispatcher(FrameDispatcher):
         audio_pcm_int16: np.ndarray | None = None,  # full audio for A/V pairing
         sample_rate: int = SAMPLE_RATE,
         fps: float = FPS,
+        initial_slot: int = 0,
     ) -> None:
         super().__init__()
         self._ring = ring
@@ -131,7 +132,7 @@ class _ShmFrameDispatcher(FrameDispatcher):
         self._audio = audio_pcm_int16
         self._sample_rate = sample_rate
         self._fps = fps
-        self._slot_counter = 0
+        self._slot_counter = int(initial_slot)
         self._frame_total = 0
 
     # ---- hooks ----------------------------------------------------------
@@ -267,6 +268,7 @@ class InferenceWorker:
         # Keep the last ref image + audio so prepare_silence can reuse them.
         self._last_ref_path: str = ""
         self._last_audio_pcm: np.ndarray | None = None
+        self._slot_counter: int = 0
 
     # ------------------------------------------------------------------
     # Public interface
@@ -430,6 +432,7 @@ class InferenceWorker:
                 audio_pcm_int16=pcm_int16,
                 sample_rate=req.sample_rate,
                 fps=getattr(self._cfg, "fps", FPS),
+                initial_slot=self._slot_counter,
             )
 
             t0 = time.perf_counter()
@@ -445,6 +448,7 @@ class InferenceWorker:
             except _Cancelled:
                 logger.info("[worker] inference interrupted (session=%s)", req.session_id)
                 dispatcher.shutdown(timeout=1.0)
+                self._slot_counter = dispatcher._slot_counter
                 return IPCResponse(
                     status="interrupted",
                     req_id=req.req_id,
@@ -453,6 +457,7 @@ class InferenceWorker:
                 )
             finally:
                 dispatcher.shutdown(timeout=2.0)
+                self._slot_counter = dispatcher._slot_counter
 
             elapsed = time.perf_counter() - t0
             audio_dur = len(pcm_int16) / req.sample_rate
@@ -509,6 +514,7 @@ class InferenceWorker:
                 gen=req.gen,
                 interrupt_event=self._interrupt,
                 audio_pcm_int16=silence_pcm,
+                initial_slot=self._slot_counter,
             )
             try:
                 self._agent.run_inference(
@@ -523,6 +529,7 @@ class InferenceWorker:
                 pass
             finally:
                 dispatcher.shutdown(timeout=2.0)
+                self._slot_counter = dispatcher._slot_counter
 
             return IPCResponse(
                 status="ok",
