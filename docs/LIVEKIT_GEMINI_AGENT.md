@@ -208,6 +208,36 @@ Rules that keep the stack honest:
   `model` goes through the same function as the Studio override: use the
   bare id, e.g. `gemini-3.8-live`.
 
+### Session lifetime: idle refresh and reconnects
+
+Google closes an idle Live session after roughly two minutes without turn
+activity, usually without a `goAway`, and the next utterance then lands on a
+dead socket (the plugin reconnects, discarding the audio already queued for
+it). The worker therefore refreshes the session itself after ~60 s of silence,
+*while* a response is not streaming, so the reconnect happens between turns:
+
+```
+idle 60 s ──▶ _session_should_close ──▶ close socket ──▶ reconnect with handle
+```
+
+That reconnect races Google's teardown. The server can still consider the old
+client connected and answer the connect with
+`1008 … BidiGenerateContent session is already connected to an existing client`.
+Because it happens during connect (no session exists yet), the plugin calls it
+fatal, which used to close the whole `AgentSession` — a self-inflicted crash
+after a long pause. `_resilient_session_class` now retries instead:
+
+| attempt | handle | why |
+| --- | --- | --- |
+| 1st retry (+0.5 s) | kept | a cleanly closed socket is usually released in well under a second, so the conversation context survives |
+| later retries (+1 s, +2 s, +4 s) | dropped | the server still holds the old client, so the retry starts a fresh session; the plugin replays the chat context |
+| budget spent | dropped | the error is re-emitted as **non-recoverable** and the session ends (so a real misconfiguration still fails) |
+
+A `session not found or expired` (or 1011) handle is dropped on the very first
+retry — a dead handle can never be resumed. While a retry is pending the error
+is reported as *recoverable*, because livekit-agents closes the `AgentSession`
+on the first non-recoverable one and the retry would never get to run.
+
 ### Dispatch lifecycle (and why "NO job" appears)
 
 LiveKit explicit dispatch is one queued entry per room, consumed by the

@@ -106,9 +106,7 @@ def test_segment_loop_pauses_idle_while_draining_playout():
         class Receiver:
             agent_identity = "agent-1"
 
-            async def notify_playback_finished(
-                self, *, playback_position: float, interrupted: bool
-            ) -> None:
+            async def notify_playback_finished(self, *, playback_position: float, interrupted: bool) -> None:
                 events.append(("finished", interrupted))
 
         gen = Gen()
@@ -261,3 +259,137 @@ def test_gemini_idle_refresh_waits_for_activity_to_settle(monkeypatch):
                 await task
 
     asyncio.run(_test())
+
+
+# ---------------------------------------------------------------------------
+# Gemini reconnect races
+#
+# The idle refresh closes the socket and immediately reconnects with the
+# resumption handle. Google can still consider the old client connected and
+# answer 1008 "BidiGenerateContent session is already connected to an existing
+# client"; the plugin treats a connect-time error as fatal, which used to end
+# the whole AgentSession. The resilient session retries instead.
+# ---------------------------------------------------------------------------
+
+_HELD_SESSION_ERROR = (
+    "Failed to connect to Gemini Live (caused by APIError: 1008 None. "
+    "BidiGenerateContent session is already connected to an existing client)"
+)
+_EXPIRED_HANDLE_ERROR = (
+    "Failed to connect to Gemini Live (caused by APIError: 1008 None. BidiGenerateContent session not found or expired)"
+)
+
+
+class _FakeChan:
+    closed = False
+
+
+def _reconnect_session(failures: int, make_error):
+    """A resilient session over a fake base whose connect fails ``failures`` times."""
+    from fast_float.livekit.gemini import agent as gemini_agent
+
+    class _Base:
+        def __init__(self) -> None:
+            self._session_should_close = asyncio.Event()
+            self._current_generation = None
+            self._session_resumption_handle: str | None = "handle-1"
+            self._resumption_chat_ctx: object | None = object()
+            self._msg_ch = _FakeChan()
+            self._num_retries = 0
+            self.attempts = 0
+            self.handles: list[str | None] = []
+            self.errors: list[tuple[str, bool]] = []
+            self._failures = failures
+
+        def _start_new_generation(self) -> None:
+            pass
+
+        def _mark_current_generation_done(self) -> None:
+            pass
+
+        def _handle_input_speech_started(self) -> None:
+            pass
+
+        def _handle_input_speech_stopped(self) -> None:
+            pass
+
+        def _mark_restart_needed(self, on_error: bool = False) -> None:
+            pass
+
+        def _emit_error(self, error: Exception, recoverable: bool) -> None:
+            self.errors.append((str(error), recoverable))
+
+        async def _main_task(self) -> None:
+            self.attempts += 1
+            self.handles.append(self._session_resumption_handle)
+            if self.attempts <= self._failures:
+                exc = make_error()
+                # The stock loop reports a connect failure as non-recoverable.
+                self._emit_error(exc, recoverable=False)
+                raise exc
+
+    return gemini_agent._resilient_session_class(_Base)()
+
+
+def test_gemini_reconnect_race_retries_instead_of_ending_the_session(monkeypatch):
+    from fast_float.livekit.gemini import agent as gemini_agent
+
+    monkeypatch.setattr(gemini_agent, "_CONNECT_RETRY_DELAYS_SEC", (0.01,))
+
+    sess = _reconnect_session(1, lambda: RuntimeError(_HELD_SESSION_ERROR))
+    asyncio.run(asyncio.wait_for(sess._main_task(), 2.0))
+
+    assert sess.attempts == 2
+    # Reported as recoverable so livekit-agents keeps the AgentSession open.
+    assert [recoverable for _, recoverable in sess.errors] == [True]
+    # The first retry keeps the handle: the server only needs a moment.
+    assert sess.handles == ["handle-1", "handle-1"]
+    assert sess._session_resumption_handle == "handle-1"
+
+
+def test_gemini_reconnect_drops_a_dead_handle_immediately(monkeypatch):
+    from fast_float.livekit.gemini import agent as gemini_agent
+
+    monkeypatch.setattr(gemini_agent, "_CONNECT_RETRY_DELAYS_SEC", (0.01,))
+
+    sess = _reconnect_session(1, lambda: RuntimeError(_EXPIRED_HANDLE_ERROR))
+    asyncio.run(asyncio.wait_for(sess._main_task(), 2.0))
+
+    # A dead handle can never be resumed, so the retry must start fresh.
+    assert sess.handles == ["handle-1", None]
+    assert sess._session_resumption_handle is None
+    assert sess._resumption_chat_ctx is None
+
+
+def test_gemini_reconnect_goes_fresh_then_gives_up(monkeypatch):
+    import pytest
+
+    from fast_float.livekit.gemini import agent as gemini_agent
+
+    monkeypatch.setattr(gemini_agent, "_CONNECT_RETRY_DELAYS_SEC", (0.01, 0.01))
+
+    sess = _reconnect_session(99, lambda: RuntimeError(_HELD_SESSION_ERROR))
+    with pytest.raises(RuntimeError):
+        asyncio.run(sess._main_task())
+
+    # initial connect + two retries, then the failure is final
+    assert sess.attempts == 3
+    assert sess.handles == ["handle-1", "handle-1", None]
+    # Only the last one is reported as unrecoverable, so a bounded retry never
+    # closes the AgentSession but a genuinely broken connect still does.
+    assert [recoverable for _, recoverable in sess.errors] == [True, True, True, False]
+
+
+def test_gemini_non_connect_error_is_not_retried(monkeypatch):
+    import pytest
+
+    from fast_float.livekit.gemini import agent as gemini_agent
+
+    monkeypatch.setattr(gemini_agent, "_CONNECT_RETRY_DELAYS_SEC", (0.01,))
+
+    sess = _reconnect_session(99, lambda: RuntimeError("boom"))
+    with pytest.raises(RuntimeError):
+        asyncio.run(sess._main_task())
+
+    assert sess.attempts == 1
+    assert sess.errors == [("boom", False)]

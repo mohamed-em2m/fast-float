@@ -29,6 +29,7 @@ import contextlib
 import logging
 import os
 import ssl
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -214,6 +215,21 @@ async def _genai_ssl_context() -> ssl.SSLContext:
 # into the new connection, so only the dead handle is lost.
 _STALE_SESSION_MARKERS = ("1011", "1008", "session not found or expired")
 
+# Google keeps a session bound to the client that opened it and releases it a
+# moment *after* the socket closes (and not at all when the close never reached
+# it). A reconnect that carries the resumption handle is then refused with 1008
+# "BidiGenerateContent session is already connected to an existing client" —
+# and because that happens during connect (`session is None`), the plugin calls
+# it fatal: a self-inflicted idle refresh would end the whole conversation.
+# The handle itself is still good; the server just needs a moment, or a session
+# that does not have to take the old one over. So retry instead of giving up:
+# the first attempt keeps the handle (a cleanly closed socket is usually
+# released in well under a second), later attempts drop it and let the plugin
+# replay the chat context into a brand-new session.
+_HELD_SESSION_MARKERS = ("already connected to an existing client",)
+_EXPIRED_HANDLE_MARKERS = ("not found", "expired")
+_CONNECT_RETRY_DELAYS_SEC = (0.5, 1.0, 2.0, 4.0)
+
 # Google closes an idle Live session after ~2 minutes without turn activity,
 # usually without sending a `goAway` first. The next utterance then hits a dead
 # socket: the plugin reconnects, dropping any audio already queued for it, and
@@ -223,28 +239,84 @@ _IDLE_REFRESH_SEC = 60.0
 _IDLE_REFRESH_TICK_SEC = 5.0
 
 
+def _error_chain(error: BaseException | None) -> Iterator[BaseException]:
+    """Yield ``error`` and every cause/context behind it (cycle-safe)."""
+    seen: set[int] = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _message_matches(error: BaseException | None, markers: tuple[str, ...]) -> bool:
+    """True when any exception in ``error``'s chain mentions one of ``markers``."""
+    for err in _error_chain(error):
+        message = str(err).lower()
+        if any(marker in message for marker in markers):
+            return True
+    return False
+
+
 def _is_stale_session_error(error: BaseException | None) -> bool:
     """True when ``error`` means the resumption handle can no longer be used."""
     if error is None:
         return False
-    if getattr(error, "code", None) in (1008, 1011):
-        return True
-    message = str(error).lower()
-    return any(marker in message for marker in _STALE_SESSION_MARKERS)
+    for err in _error_chain(error):
+        if getattr(err, "code", None) in (1008, 1011):
+            return True
+        message = str(err).lower()
+        if any(marker in message for marker in _STALE_SESSION_MARKERS):
+            return True
+    return False
+
+
+def _is_session_held_error(error: BaseException | None) -> bool:
+    """True when Google still has the previous connection registered."""
+    return _message_matches(error, _HELD_SESSION_MARKERS)
+
+
+def _is_retryable_connect_error(error: BaseException | None) -> bool:
+    """True when a *failed connect* is a teardown race, not a bad configuration.
+
+    Both 1008 flavours qualify: the previous client has not been released yet
+    ("already connected to an existing client") or its handle has gone stale
+    ("session not found or expired"). Neither is caused by the connect config,
+    and both are cured by reconnecting — fresh, if the handle is dead.
+    """
+    return _is_session_held_error(error) or _is_stale_session_error(error)
 
 
 def _resilient_session_class(base: type) -> type:
     class _FreshRetryRealtimeSession(base):
+        # ----------------------------------------------------- handle hygiene
+
+        def _drop_resumption_handle(self, reason: str) -> None:
+            """Forget the resumption handle so the next connect starts fresh."""
+            had_handle = getattr(self, "_session_resumption_handle", None) is not None
+            self._session_resumption_handle = None
+            self._resumption_chat_ctx = None
+            if had_handle:
+                logger.warning(
+                    "Gemini Live %s; discarding the resumption handle and reconnecting "
+                    "with a fresh session (the chat context is replayed)",
+                    reason,
+                )
+
         def _mark_restart_needed(self, on_error: bool = False) -> None:
             if on_error and _is_stale_session_error(getattr(self, "_session_error", None)):
-                logger.warning(
-                    "Gemini Live session expired (%s); discarding its resumption handle "
-                    "and reconnecting with a fresh session",
-                    self._session_error,
-                )
-                self._session_resumption_handle = None
-                self._resumption_chat_ctx = None
+                self._drop_resumption_handle(f"session expired ({self._session_error})")
             super()._mark_restart_needed(on_error)
+
+        def _emit_error(self, error: Exception, recoverable: bool) -> None:
+            # The stock loop reports a failed connect as non-recoverable, and
+            # livekit-agents closes the AgentSession on the first one — which
+            # would defeat the retry in `_main_task_with_connect_retry`. Report
+            # it as recoverable while a retry is still available; that method
+            # re-emits it as final once the budget is spent.
+            if not recoverable and _is_retryable_connect_error(error):
+                recoverable = True
+            super()._emit_error(error, recoverable)
 
         # -------------------------------------------------- idle refresh
         def _note_turn_activity(self) -> None:
@@ -278,11 +350,65 @@ def _resilient_session_class(base: type) -> type:
             self._note_turn_activity()
             watchdog = asyncio.create_task(self._idle_refresh_watchdog(), name="gemini-idle-refresh")
             try:
-                await super()._main_task()
+                await self._main_task_with_connect_retry()
             finally:
                 watchdog.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await watchdog
+
+        async def _main_task_with_connect_retry(self) -> None:
+            """Run the stock loop, surviving a reconnect that races the teardown.
+
+            The stock `_main_task` treats *any* connect failure as fatal (there
+            is no session yet, so it cannot retry), and our own idle refresh can
+            provoke exactly that: Google still holds the socket we just closed.
+            Retrying keeps the conversation alive instead of tearing down the
+            AgentSession; after `_CONNECT_RETRY_DELAYS_SEC` attempts the error is
+            final and is reported as non-recoverable.
+            """
+            attempt = 0
+            while True:
+                try:
+                    await super()._main_task()
+                    if attempt:
+                        logger.info("Gemini Live session reconnected after %d retries", attempt)
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if getattr(getattr(self, "_msg_ch", None), "closed", True):
+                        raise
+                    if not _is_retryable_connect_error(exc):
+                        raise
+                    if attempt >= len(_CONNECT_RETRY_DELAYS_SEC):
+                        logger.error(
+                            "Gemini Live could not reconnect after %d retries (%s); ending the session",
+                            attempt,
+                            exc,
+                        )
+                        # `_emit_error` downgraded the stock reports so the
+                        # retries could run; this one is final, so report it so.
+                        super()._emit_error(exc, recoverable=False)
+                        raise
+                    delay = _CONNECT_RETRY_DELAYS_SEC[attempt]
+                    attempt += 1
+                    # A dead handle can never be resumed, and a session the
+                    # server still holds cannot be taken over: both need a
+                    # fresh connection. Only the first retry keeps the handle.
+                    if attempt > 1 or _message_matches(exc, _EXPIRED_HANDLE_MARKERS):
+                        self._drop_resumption_handle(f"reconnect refused ({exc})")
+                    if hasattr(self, "_num_retries"):
+                        # The stock retry budget applies per connect attempt;
+                        # give the next one a full budget of its own.
+                        self._num_retries = 0
+                    logger.warning(
+                        "Gemini Live connect failed (%s); retrying in %.1fs (attempt %d/%d)",
+                        exc,
+                        delay,
+                        attempt,
+                        len(_CONNECT_RETRY_DELAYS_SEC),
+                    )
+                    await asyncio.sleep(delay)
 
         async def _idle_refresh_watchdog(self) -> None:
             loop = asyncio.get_running_loop()
