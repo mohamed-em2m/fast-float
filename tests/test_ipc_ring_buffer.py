@@ -73,3 +73,57 @@ def test_shm_ring_buffer_write_read():
         ring_read.close()
         ring_write.close()
         ring_write.unlink()
+
+
+def test_ring_flow_control_waits_for_consumer():
+    """A slot that has not been read must not be overwritten.
+
+    The ring is round-robin, so a writer that outruns the reader silently
+    replaces unread frames: the consumer then plays a *newer* frame's picture
+    and audio at an older index, which is heard as the avatar jumping forward
+    mid-sentence (and, because each chunk restarts the slot counter at 0, as
+    the next chunk's audio landing on the previous chunk's unread tail).
+    """
+    import threading
+    import time
+
+    shm_name = "test_shm_float_flow"
+    w, h = 64, 64
+    ring_write = FrameRingBuffer(name=shm_name, num_slots=4, width=w, height=h, create=True)
+    ring_read = FrameRingBuffer(name=shm_name, num_slots=4, width=w, height=h, create=False)
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+
+    try:
+        ring_write.write_frame(0, 0, 0.0, img, b"\x01\x02")
+        # Slot 0 is busy: a write with a timeout must refuse (and report it)
+        # rather than clobbering the unread frame.
+        assert ring_write.write_frame(0, 99, 0.0, img, b"", wait_s=0.05) is False
+        assert ring_write.forced_overwrites == 1
+
+        # Once the consumer has taken that frame the slot is free again.
+        assert ring_read.read_frame(0)[0] == 99
+        assert ring_write.write_frame(0, 7, 40.0, img, b"\x03\x04", wait_s=1.0) is True
+        idx, _pts, _arr, audio = ring_read.read_frame(0)
+        assert idx == 7
+        assert audio == b"\x03\x04"
+        assert ring_write.write_frame(0, 8, 80.0, img, b"", wait_s=0.05) is True
+
+        # A consumer that releases a skipped slot unblocks a waiting writer.
+        ring_write.write_frame(1, 1, 40.0, img, b"")
+        done = threading.Event()
+
+        def _write():
+            ring_write.write_frame(1, 2, 80.0, img, b"", wait_s=2.0)
+            done.set()
+
+        thread = threading.Thread(target=_write, daemon=True)
+        thread.start()
+        time.sleep(0.1)
+        assert not done.is_set()  # blocked on the unread slot
+        ring_read.release_slot(1)
+        assert done.wait(1.0)
+        thread.join(1.0)
+    finally:
+        ring_read.close()
+        ring_write.close()
+        ring_write.unlink()

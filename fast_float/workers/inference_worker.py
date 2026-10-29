@@ -102,11 +102,20 @@ class _ShmFrameDispatcher(FrameDispatcher):
 
     Policy: ``live`` mode, no max-lag drop (the consumer is on the same
     machine and reads from SHM; it should never be slower than inference).
+
+    ``dispatch`` legitimately blocks: ``FrameRingBuffer.write_frame`` waits for
+    the consumer to release the slot it is about to reuse, which is the only
+    thing keeping the ring from lapping the reader (the old code overwrote
+    unread frames, so the consumer played the tail of a chunk at the start of
+    it, and the next chunk's frames landed on the previous chunk's unread
+    tail). ``max_dispatch_ms`` is therefore raised — the default 250 ms would
+    flag that pacing as a stall and abort the chunk.
     """
 
     mode = "live"
     max_queue_frames = 128  # generous — SHM slots are pre-allocated
     max_lag_ms = 0.0  # disable lag-based drops
+    max_dispatch_ms = 10_000.0  # dispatch waits on the consumer by design
     abort_on_error = True  # stop inference on dispatch error
 
     def __init__(
@@ -133,6 +142,10 @@ class _ShmFrameDispatcher(FrameDispatcher):
         self._fps = fps
         self._slot_counter = 0
         self._frame_total = 0
+        # Once the consumer has missed a slot's release (it died, or its
+        # notifications were dropped), stop waiting for every following slot:
+        # each wait would cost the full timeout and the GPU would crawl.
+        self._flow_control = True
 
     # ---- hooks ----------------------------------------------------------
 
@@ -162,7 +175,24 @@ class _ShmFrameDispatcher(FrameDispatcher):
             img = frames[i]  # [H, W, C]
             h, w = img.shape[0], img.shape[1]
 
-            self._ring.write_frame(slot_idx, frame_idx, frame_pts, img, audio_bytes)
+            # Blocks until the consumer released this slot, so the ring can
+            # never lap the reader. See FrameRingBuffer's module docstring.
+            clean = self._ring.write_frame(
+                slot_idx,
+                frame_idx,
+                frame_pts,
+                img,
+                audio_bytes,
+                wait_s=None if self._flow_control else 0.0,
+            )
+            if not clean and self._flow_control:
+                self._flow_control = False
+                logger.warning(
+                    "[worker] consumer is not releasing SHM slots (session=%s gen=%d): "
+                    "frame pacing disabled for the rest of this chunk; frames may be skipped",
+                    self._session_id,
+                    self._gen,
+                )
 
             notif = IPCFrameNotification(
                 session_id=self._session_id,
@@ -176,6 +206,23 @@ class _ShmFrameDispatcher(FrameDispatcher):
                 is_last=False,  # set on the very last frame in close()
             )
             self._pub.send_string(notif.to_json())
+
+    def gap(self, start: int, end: int, reason: str) -> None:
+        """Frames the delivery queue dropped.
+
+        The base hook is a no-op, so a dropped batch used to vanish without a
+        trace: the consumer simply never received those indices and their audio
+        was never played (the avatar skipped ahead mid-sentence). The policy
+        above makes this a last resort; report it loudly when it still happens.
+        """
+        logger.warning(
+            "[worker] dropped %d frame(s) [%d, %d) from gen=%d (%s) — playback will jump",
+            max(0, end - start),
+            start,
+            end,
+            self._gen,
+            reason,
+        )
 
     def close(self) -> None:
         """Send a final notification with ``is_last=True``."""

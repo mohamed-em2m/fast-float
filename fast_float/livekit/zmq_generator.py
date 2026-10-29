@@ -175,6 +175,7 @@ class ZmqFloatVideoGenerator:
         # Audio accumulation
         self._audio_buf: list[bytes] = []
         self._audio_samples: int = 0
+        self._audio_submitted_samples: int = 0
         self._chunk_samples = int(SAMPLE_RATE * chunk_sec)
         self._first_chunk_samples = int(SAMPLE_RATE * first_chunk_sec)
         self._first_chunk_done = False
@@ -205,6 +206,13 @@ class ZmqFloatVideoGenerator:
         self._valid_frames: dict[int, int] = {}
         # Frames dropped because the consumer could not keep up (diagnostics).
         self._dropped_frames = 0
+        # Slots whose contents no longer match their notification (the writer
+        # lapped the reader). Should stay 0 — see ``_read_frame_pair``.
+        self._stale_reads = 0
+        # Per-generation frame accounting, summarised on the ``is_last``
+        # sentinel so a mid-sentence gap is visible in one line instead of
+        # being heard as a jump and never explained.
+        self._gen_stats: dict[int, dict[str, int]] = {}
 
         # Chunk audio that has been cut out of the input buffer but not sent to
         # the worker yet: production is paced to playout (see ``_pump``).
@@ -466,12 +474,21 @@ class ZmqFloatVideoGenerator:
         """Send a buffered chunk to the worker as the next generation."""
         self._gen += 1
         n_samples = len(chunk_bytes) // 2
+        self._audio_submitted_samples += n_samples
         # Frames covering real audio. Anything past this index is FLOAT's
         # replicate-pad tail for the last 2 s window: silence over a still
         # face. ``frame_idx`` is 0-based per chunk (each request gets its own
         # FrameDispatcher, whose cursor starts at ``StreamMeta.first_idx`` = 0).
         self._valid_frames[self._gen] = math.ceil(n_samples / SAMPLES_PER_FRAME) if n_samples else 0
         self._idle_event.clear()  # work now outstanding for the runner
+        logger.debug(
+            "[zmq-gen] gen=%d audio=%.2fs offset=%.2fs pending=%d qsize=%d",
+            self._gen,
+            n_samples / SAMPLE_RATE,
+            self._audio_submitted_samples / SAMPLE_RATE,
+            len(self._pending),
+            self._frame_queue.qsize(),
+        )
 
         try:
             loop = asyncio.get_running_loop()
@@ -627,6 +644,8 @@ class ZmqFloatVideoGenerator:
 
     def clear_buffer(self) -> None:
         """Discard buffered audio and abandon the in-flight generation."""
+        buffered_s = self._audio_samples / SAMPLE_RATE
+        pending_chunks = len(self._pending)
         self._audio_buf.clear()
         self._audio_samples = 0
         self._first_chunk_done = False
@@ -649,10 +668,15 @@ class ZmqFloatVideoGenerator:
             self._pump_retry.cancel()
             self._pump_retry = None
         dropped = self._drain_frames()
-        if dropped:
+        if dropped or buffered_s > 0 or pending_chunks:
+            # Always report it: a barge-in mid-sentence is the other way this
+            # path loses audio, and it must be distinguishable from a render
+            # bug in the log.
             logger.info(
-                "[zmq-gen] barge-in: dropped %d queued frames (gen<=%d)",
+                "[zmq-gen] barge-in: dropped %d queued frames, %.2fs buffered audio, %d pending chunk(s) (gen<=%d)",
                 dropped,
+                buffered_s,
+                pending_chunks,
                 self._cleared_gen,
             )
         # The abandoned generations will never deliver a usable sentinel, so
@@ -698,15 +722,55 @@ class ZmqFloatVideoGenerator:
     # ------------------------------------------------------------------
 
     def _read_frame_pair(self, notif: IPCFrameNotification) -> tuple[Any, Any] | None:
-        """Load a (VideoFrame, AudioFrame) pair for a notification from SHM."""
+        """Load a (VideoFrame, AudioFrame) pair for a notification from SHM.
+
+        Validates that the slot still holds the frame the notification
+        announced. The ring is a round-robin buffer, so a writer that laps the
+        reader makes the consumer play a *newer* frame's picture and audio at an
+        older index — the middle of a sentence jumps forward and the next
+        chunk's audio lands on top of the previous one. ``write_frame`` now
+        waits for the slot to be released, so this is a safety net that makes a
+        regression loud instead of silent.
+        """
         if self._ring is None:
             return None
-        _, _, img_arr, audio_bytes = self._ring.read_frame(notif.slot_idx)
+        stored_idx, _, img_arr, audio_bytes = self._ring.read_frame(notif.slot_idx)
+        if stored_idx != notif.frame_idx:
+            self._stale_reads += 1
+            if self._stale_reads == 1 or self._stale_reads % 25 == 0:
+                logger.warning(
+                    "[zmq-gen] stale slot read: slot %d holds frame %d, notif says %d "
+                    "(%d total) — the writer lapped the reader",
+                    notif.slot_idx,
+                    stored_idx,
+                    notif.frame_idx,
+                    self._stale_reads,
+                )
+            return None
         vf = _make_video_frame(img_arr)
         af = _make_audio_frame(audio_bytes)
         if vf is None or af is None:
             return None
         return vf, af
+
+    def _release_slot(self, slot_idx: int) -> None:
+        """Hand a slot back to the worker without reading it (skipped frame)."""
+        if self._ring is None or slot_idx < 0:
+            return
+        with contextlib.suppress(Exception):
+            self._ring.release_slot(slot_idx)
+
+    def _bump(self, gen: int, key: str) -> None:
+        stats = self._gen_stats.get(gen)
+        if stats is None:
+            stats = self._gen_stats[gen] = {
+                "recv": 0,
+                "trimmed": 0,
+                "stale": 0,
+                "unreadable": 0,
+                "overflow": 0,
+            }
+        stats[key] += 1
 
     def _is_live_frame(self, notif: IPCFrameNotification) -> bool:
         """True when ``notif`` carries a frame of the current, unabandoned chunk.
@@ -768,25 +832,52 @@ class ZmqFloatVideoGenerator:
                 # the iterator, which re-runs while the consumer paces).
                 self._sentinel_gen = max(self._sentinel_gen, notif.gen)
                 self._valid_frames.pop(notif.gen, None)
+                stats = self._gen_stats.pop(notif.gen, None)
+                if stats is not None:
+                    # ``frame_idx`` on the sentinel is the worker's frame count,
+                    # so any gap between it and what this session accounted for
+                    # is audio that will never be played.
+                    rendered = int(notif.frame_idx)
+                    accounted = stats["recv"] + stats["trimmed"] + stats["stale"] + stats["unreadable"]
+                    missing = max(0, rendered - accounted)
+                    log = logger.warning if missing else logger.info
+                    log(
+                        "[zmq-gen] gen=%d frames: rendered=%d recv=%d trimmed=%d stale=%d "
+                        "unreadable=%d overflow=%d missing=%d",
+                        notif.gen,
+                        rendered,
+                        stats["recv"],
+                        stats["trimmed"],
+                        stats["stale"],
+                        stats["unreadable"],
+                        stats["overflow"],
+                        missing,
+                    )
                 self._refresh_idle()
                 continue
 
             # Stale (barge-in) frames and the padded tail of a chunk never
-            # reach the playout queue.
+            # reach the playout queue — but their slots must go back to the
+            # worker, or the writer stalls waiting for them.
             if not self._is_live_frame(notif):
+                self._bump(notif.gen, "stale" if notif.gen <= self._cleared_gen else "trimmed")
+                self._release_slot(notif.slot_idx)
                 continue
 
             pair = self._read_frame_pair(notif)
             if pair is None:
+                self._bump(notif.gen, "unreadable")
                 continue
 
             try:
                 self._frame_queue.put_nowait(pair)
+                self._bump(notif.gen, "recv")
             except asyncio.QueueFull:
                 # Drop the oldest to maintain latency.
                 with contextlib.suppress(asyncio.QueueEmpty):
                     self._frame_queue.get_nowait()
                 self._dropped_frames += 1
+                self._bump(notif.gen, "overflow")
                 if self._dropped_frames % 25 == 1:
                     logger.warning(
                         "[zmq-gen] consumer behind; dropped %d frames total",

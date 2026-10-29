@@ -592,3 +592,87 @@ def test_clear_buffer_drops_pending_chunks():
         gen._dispatch_infer.assert_not_called()
 
     asyncio.run(_test())
+
+
+def test_stale_slot_read_is_skipped_not_played():
+    """A slot the writer lapped must never be played under the old index.
+
+    The SHM ring is round-robin, so a writer that outruns the reader replaces
+    unread frames. Reading it anyway paired an older frame index with a *newer*
+    picture and audio — heard as the count jumping forward mid-sentence, and,
+    because every chunk restarts the slot counter at 0, as the next chunk's
+    audio landing on the previous chunk's unread tail.
+    """
+
+    async def _test():
+        from fast_float.ipc.shm_buffer import FrameRingBuffer
+
+        ring = FrameRingBuffer(name="test_shm_stale_read", num_slots=4, width=2, height=2, create=True)
+        try:
+            gen = ZmqFloatVideoGenerator(shm_name="test_shm_stale_read", shm_slots=4)
+            gen._ring = ring
+
+            img = np.zeros((2, 2, 3), dtype=np.uint8)
+            # The worker wrote frame 7 into slot 1 after the notification for
+            # frame 1 was sent: slot 1 no longer holds what notif announced.
+            ring.write_frame(1, 7, 280.0, img, b"\x00\x00" * 640)
+
+            notif = IPCFrameNotification(
+                session_id="sess",
+                gen=1,
+                slot_idx=1,
+                frame_idx=1,
+                pts_ms=40.0,
+                width=2,
+                height=2,
+                audio_bytes_len=1280,
+            )
+            assert gen._read_frame_pair(notif) is None
+            assert gen._stale_reads == 1
+            # The slot is handed back, so the writer can never stall on it.
+            assert ring._slot_state(1) == 0
+        finally:
+            ring.close()
+            ring.unlink()
+
+    asyncio.run(_test())
+
+
+def test_skipped_frames_release_their_slots():
+    """Trimmed/stale frames must free their ring slot, or the writer stalls."""
+
+    async def _test():
+        from fast_float.ipc.shm_buffer import FrameRingBuffer
+
+        ring = FrameRingBuffer(name="test_shm_release", num_slots=4, width=2, height=2, create=True)
+        try:
+            gen = ZmqFloatVideoGenerator(shm_name="test_shm_release", shm_slots=4)
+            gen._ring = ring
+            gen._valid_frames[1] = 2  # only 2 real frames of audio
+            gen._cleared_gen = 0
+
+            img = np.zeros((2, 2, 3), dtype=np.uint8)
+            ring.write_frame(0, 0, 0.0, img, b"")
+            ring.write_frame(1, 5, 200.0, img, b"")  # padded tail
+            assert ring._slot_state(1) == 1
+
+            # The trimmed frame is refused and its slot released.
+            assert not gen._is_live_frame(
+                IPCFrameNotification(
+                    session_id="sess",
+                    gen=1,
+                    slot_idx=1,
+                    frame_idx=5,
+                    pts_ms=200.0,
+                    width=2,
+                    height=2,
+                    audio_bytes_len=0,
+                )
+            )
+            gen._release_slot(1)
+            assert ring._slot_state(1) == 0
+        finally:
+            ring.close()
+            ring.unlink()
+
+    asyncio.run(_test())

@@ -55,11 +55,13 @@ To eliminate event-loop latency, isolate PyTorch CUDA memory and context, and av
 
 - Built on `multiprocessing.shared_memory.SharedMemory`.
 - **Slot Structure**:
-  - `Header` (24 bytes): `frame_idx` (int64), `pts_ms` (float64), `width` (int32), `height` (int32), `audio_len` (int32)
+  - `Header` (32 bytes): `frame_idx` (int64), `pts_ms` (float64), `width` (int32), `height` (int32), `audio_len` (int32), `state` (int32)
   - `Audio Data` (2048 bytes): up to 1024 16-bit mono samples (64 ms @ 16 kHz)
   - `Image Data` (786,432 bytes): 512×512×3 RGB24 raw bytes
 - **Total Slot Size**: ~788 KB.
 - **Default Ring Size**: 64 slots (~50 MB total RAM, ~2.56 seconds of video/audio headroom at 25 fps).
+- **Flow control (required — do not remove)**: `state` is `0` when the consumer has read the slot and `1` while it holds an unread frame. `write_frame` waits (bounded, 2 s) for the slot it is about to reuse to be `0`; `read_frame`/`release_slot` set it back. Without that handshake the writer laps the reader: the consumer copies every frame into Python objects on the event loop and is several times slower than the writer, so a chunk longer than ~64 frames (2.5 s) is overwritten before it is read, and because each chunk restarts the slot counter at `0`, the next chunk's frames land on the previous chunk's unread tail. The consumer then plays a *newer* frame's picture and audio at an older index — heard as the avatar jumping forward mid-sentence ("1, 2, 3 … 13") or as one chunk talking over the previous one. A writer that times out (dead/slow consumer) forces the write, logs it and disables the wait for the rest of that chunk, so a wedged consumer can never stall the GPU. The consumer also validates `read_frame`'s stored `frame_idx` against the notification and drops the frame if they differ, so a regression here is loud instead of silent.
+- **Layout guard**: `FrameRingBuffer` refuses a segment smaller than the layout it expects, so an API restarted against an older worker fails with a readable error instead of misreading every frame.
 - **Windows Detached Copy**: Readers copy memory slices before returning numpy arrays to avoid Windows `BufferError: cannot close exported pointers exist` when closing/unlinking.
 
 ---
@@ -133,7 +135,16 @@ When `enabled = true`:
      the chunk in `_pending` until the queue has room for it (one chunk of
      headroom), exactly like `FloatVideoGenerator._pump`. The backlog still
      drains in time because a chunk renders faster than it plays.
-5. **Chunk Batching & Internal Windowing**:
+5. **Ring flow control + frame accounting**:
+   - The SHM ring is only safe with the slot handshake described in §2:
+     `write_frame` waits for the consumer to release the slot, so the writer
+     cannot lap the reader (the cause of the mid-sentence jump and of the next
+     chunk talking over the previous one). The consumer also validates the
+     stored `frame_idx` and, once per chunk, logs
+     `[zmq-gen] gen=N frames: rendered=… recv=… trimmed=… stale=… missing=…`
+     (WARNING when `missing > 0`), so a gap is explained in one line instead of
+     being heard as a jump.
+6. **Chunk Batching & Internal Windowing**:
    - Audio is buffered up to `chunk_sec` (e.g. 5.0s) and passed directly to FLOAT.
 
 ### Is a Priority-Ordered Scheduler implemented?
