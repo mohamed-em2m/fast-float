@@ -10,6 +10,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+if sys.platform == "win32":
+    import asyncio
+
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 
 # Variables that fast_float.livekit.gemini.config.AgentConfig.from_env() exports
 # into the real process environment, because livekit-agents (LIVEKIT_*) and

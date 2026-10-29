@@ -13,7 +13,10 @@ try:
     print("Using uvloop (C-accelerated event loop) for maximum event loop performance.")
 except (ImportError, AttributeError):
     # uvloop isn't installed or not supported on Windows
-    pass
+    import sys
+
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 

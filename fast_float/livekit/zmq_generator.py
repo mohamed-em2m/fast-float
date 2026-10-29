@@ -177,6 +177,14 @@ class ZmqFloatVideoGenerator:
         self._first_chunk_samples = int(SAMPLE_RATE * first_chunk_sec)
         self._first_chunk_done = False
 
+        # Production pacing & backpressure
+        self._inference_running = False
+        self._flush_requested = False
+        self._max_chunk_frames = int(np.ceil(self._chunk_samples / SAMPLES_PER_FRAME))
+        self._pump_retry: asyncio.TimerHandle | None = None
+        self._queue_retry_s = 0.04
+        self._loop: asyncio.AbstractEventLoop | None = None
+
         # Generation counter — incremented each push cycle; `_sentinel_gen` is
         # the last generation the worker finished (its ``is_last`` sentinel).
         # The idle event mirrors FloatVideoGenerator: it starts set ("nothing
@@ -233,6 +241,16 @@ class ZmqFloatVideoGenerator:
         """
         if self._zmq_ctx is not None:
             return
+
+        import sys
+
+        if sys.platform == "win32":
+            with contextlib.suppress(Exception):
+                if not isinstance(asyncio.get_event_loop_policy(), asyncio.WindowsSelectorEventLoopPolicy):
+                    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+        with contextlib.suppress(RuntimeError):
+            self._loop = asyncio.get_running_loop()
 
         ctx = azmq.Context()
         req = sub = None
@@ -375,33 +393,84 @@ class ZmqFloatVideoGenerator:
         When enough audio is accumulated (``chunk_sec`` threshold), an async
         infer request is queued.
         """
+        if self._stopped:
+            return
         pcm_bytes = self._to_pcm16_mono(audio)
         self._audio_buf.append(pcm_bytes)
         self._audio_samples += len(pcm_bytes) // 2  # int16 → samples
+        self._pump()
+        self._refresh_idle()
+
+    def _schedule_pump_retry(self) -> None:
+        if self._pump_retry is not None or self._stopped:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = self._loop
+        if loop and loop.is_running():
+            self._pump_retry = loop.call_later(self._queue_retry_s, self._on_pump_retry)
+
+    def _on_pump_retry(self) -> None:
+        self._pump_retry = None
+        self._pump()
+
+    def _pump(self) -> None:
+        """Send the next audio chunk to the worker if threshold/flush is met and queue has space."""
+        if self._stopped or self._inference_running:
+            return
+
+        if self._audio_samples == 0:
+            self._flush_requested = False
+            self._refresh_idle()
+            return
 
         threshold = self._first_chunk_samples if not self._first_chunk_done else self._chunk_samples
+        if self._audio_samples < threshold and not self._flush_requested:
+            self._refresh_idle()
+            return
 
-        if self._audio_samples >= threshold:
-            chunk_bytes = b"".join(self._audio_buf)
-            self._audio_buf.clear()
-            self._audio_samples = 0
-            self._first_chunk_done = True
-            self._submit_chunk(chunk_bytes)
+        # Backpressure: don't let production outrun playout. Queuing the whole
+        # utterance at inference speed overflows the frame queue, which then
+        # drops the oldest frames — causing speech chunks in the middle of long
+        # responses (e.g. counting 1 to 20) to overlap or skip ahead.
+        maxsize = self._frame_queue.maxsize
+        if maxsize >= self._max_chunk_frames:
+            headroom = self._max_chunk_frames + 10
+            if self._frame_queue.qsize() + headroom > maxsize:
+                self._schedule_pump_retry()
+                return
+
+        chunk_bytes = b"".join(self._audio_buf)
+        self._audio_buf.clear()
+        self._audio_samples = 0
+        self._first_chunk_done = True
+        self._submit_chunk(chunk_bytes)
 
     def _submit_chunk(self, chunk_bytes: bytes) -> None:
         """Send a buffered chunk to the worker as the next generation."""
         self._gen += 1
+        gen = self._gen
+        self._inference_running = True
         self._idle_event.clear()  # work now outstanding for the runner
 
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            loop = asyncio.get_event_loop()
+            loop = self._loop or asyncio.get_event_loop()
+
+        async def _run() -> None:
+            try:
+                await self._dispatch_infer(chunk_bytes, gen)
+            finally:
+                self._inference_running = False
+                self._pump()
+                self._refresh_idle()
 
         if loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._dispatch_infer(chunk_bytes, self._gen), loop)
+            asyncio.run_coroutine_threadsafe(_run(), loop)
         else:
-            task = loop.create_task(self._dispatch_infer(chunk_bytes, self._gen))
+            task = loop.create_task(_run())
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
 
@@ -413,11 +482,9 @@ class ZmqFloatVideoGenerator:
         """
         if self._stopped or not self._audio_buf:
             return
-        chunk_bytes = b"".join(self._audio_buf)
-        self._audio_buf.clear()
-        self._audio_samples = 0
-        self._first_chunk_done = True
-        self._submit_chunk(chunk_bytes)
+        self._flush_requested = True
+        self._pump()
+        self._refresh_idle()
 
     def _to_pcm16_mono(self, audio: Any) -> bytes:
         """Normalize an inbound audio item to 16 kHz mono PCM16 bytes.
@@ -507,9 +574,7 @@ class ZmqFloatVideoGenerator:
             if rtf > 0:
                 self._record_rtf(rtf)
         else:
-            logger.warning(
-                "[zmq-gen] infer failed (gen=%d): %s", gen, resp.error_msg
-            )
+            logger.warning("[zmq-gen] infer failed (gen=%d): %s", gen, resp.error_msg)
 
     def _record_rtf(self, rtf: float) -> None:
         """Remember the worker's measured render speed and report capacity once.
@@ -542,13 +607,27 @@ class ZmqFloatVideoGenerator:
 
     def clear_buffer(self) -> None:
         """Discard buffered audio and interrupt any in-flight inference."""
+        self._gen += 1
+        self._sentinel_gen = self._gen
         self._audio_buf.clear()
         self._audio_samples = 0
         self._first_chunk_done = False
+        self._flush_requested = False
+        self._inference_running = False
+        if self._pump_retry is not None:
+            self._pump_retry.cancel()
+            self._pump_retry = None
+        while True:
+            try:
+                self._frame_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._refresh_idle()
+
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            loop = asyncio.get_event_loop()
+            loop = self._loop or asyncio.get_event_loop()
 
         if loop.is_running():
             asyncio.run_coroutine_threadsafe(self._send_interrupt(), loop)
@@ -698,6 +777,12 @@ class ZmqFloatVideoGenerator:
             # Try to get a live frame (non-blocking).
             try:
                 pair = self._frame_queue.get_nowait()
+                if self._pump_retry is not None:
+                    maxsize = self._frame_queue.maxsize
+                    if self._frame_queue.qsize() + self._max_chunk_frames + 10 <= maxsize:
+                        self._pump_retry.cancel()
+                        self._pump_retry = None
+                        self._pump()
                 yield pair
                 continue
             except asyncio.QueueEmpty:
@@ -728,6 +813,9 @@ class ZmqFloatVideoGenerator:
     async def close(self) -> None:
         """Shut down sockets and release shared memory."""
         self._stopped = True
+        if self._pump_retry is not None:
+            self._pump_retry.cancel()
+            self._pump_retry = None
         if self._listener_task is not None:
             self._listener_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
