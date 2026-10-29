@@ -34,6 +34,7 @@ import asyncio
 import base64
 import functools
 import logging
+import math
 import os
 import uuid
 from collections.abc import AsyncIterator
@@ -186,6 +187,23 @@ class ZmqFloatVideoGenerator:
         self._idle_event = asyncio.Event()
         self._idle_event.set()  # nothing outstanding
         self._stopped = False
+
+        # Highest generation abandoned by ``clear_buffer()`` (barge-in). The
+        # worker only reads the interrupt once the chunk it is *already*
+        # rendering is done (its REP loop is blocked inside that infer), so the
+        # cancelled chunk's frames keep arriving; they must never reach the
+        # playout queue or the interrupted sentence keeps talking over the next
+        # reply.
+        self._cleared_gen = 0
+        # Frames a generation really covers. The worker renders whole windows
+        # (``wav2vec_sec * fps`` frames), so a chunk is padded up to the next
+        # window boundary with silence; the in-process generator trims those
+        # with ``valid_samples`` and this path has to do the same, or every
+        # chunk ends with up to 2 s of silent video and the avatar drifts
+        # behind the conversation.
+        self._valid_frames: dict[int, int] = {}
+        # Frames dropped because the consumer could not keep up (diagnostics).
+        self._dropped_frames = 0
 
         # Frame output queue (filled by _frame_listener_task).
         self._frame_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=256)
@@ -391,6 +409,12 @@ class ZmqFloatVideoGenerator:
     def _submit_chunk(self, chunk_bytes: bytes) -> None:
         """Send a buffered chunk to the worker as the next generation."""
         self._gen += 1
+        n_samples = len(chunk_bytes) // 2
+        # Frames covering real audio. Anything past this index is FLOAT's
+        # replicate-pad tail for the last 2 s window: silence over a still
+        # face. ``frame_idx`` is 0-based per chunk (each request gets its own
+        # FrameDispatcher, whose cursor starts at ``StreamMeta.first_idx`` = 0).
+        self._valid_frames[self._gen] = math.ceil(n_samples / SAMPLES_PER_FRAME) if n_samples else 0
         self._idle_event.clear()  # work now outstanding for the runner
 
         try:
@@ -473,6 +497,13 @@ class ZmqFloatVideoGenerator:
         pcm_b64 = base64.b64encode(pcm_bytes).decode()
         n_samples = len(pcm_bytes) // 2
 
+        if gen <= self._cleared_gen:
+            # A barge-in landed while this chunk was waiting for the control
+            # socket: its audio belongs to the interrupted sentence, so there is
+            # nothing to render (and its frames would be dropped anyway).
+            logger.debug("[zmq-gen] dropping stale infer (gen=%d)", gen)
+            return
+
         req = IPCRequest(
             cmd="infer",
             session_id=self._session_id,
@@ -507,9 +538,7 @@ class ZmqFloatVideoGenerator:
             if rtf > 0:
                 self._record_rtf(rtf)
         else:
-            logger.warning(
-                "[zmq-gen] infer failed (gen=%d): %s", gen, resp.error_msg
-            )
+            logger.warning("[zmq-gen] infer failed (gen=%d): %s", gen, resp.error_msg)
 
     def _record_rtf(self, rtf: float) -> None:
         """Remember the worker's measured render speed and report capacity once.
@@ -541,10 +570,36 @@ class ZmqFloatVideoGenerator:
         self._refresh_idle()
 
     def clear_buffer(self) -> None:
-        """Discard buffered audio and interrupt any in-flight inference."""
+        """Discard buffered audio and abandon the in-flight generation."""
         self._audio_buf.clear()
         self._audio_samples = 0
         self._first_chunk_done = False
+
+        # A barge-in abandons every generation submitted so far: those frames
+        # belong to the interrupted sentence. The worker cannot be stopped
+        # mid-chunk (its REP loop is blocked inside the infer it is already
+        # running, so ``interrupt`` is only read once that chunk is done), hence
+        # the frames still arrive — mark the watermark so the listener drops
+        # them, and drain what is already queued. Without this the interrupted
+        # reply kept playing for up to ~10 s while the next reply's frames
+        # queued up behind it, which sounds like two chunks overlapping.
+        self._cleared_gen = self._gen
+        for gen in [g for g in self._valid_frames if g <= self._cleared_gen]:
+            del self._valid_frames[gen]
+        dropped = self._drain_frames()
+        if dropped:
+            logger.info(
+                "[zmq-gen] barge-in: dropped %d queued frames (gen<=%d)",
+                dropped,
+                self._cleared_gen,
+            )
+        # The abandoned generations will never deliver a usable sentinel, so
+        # account them as finished: ``wait_until_idle`` would otherwise stall
+        # for its full timeout after every barge-in, and the segment watcher
+        # would never report playback_finished to the agent.
+        self._sentinel_gen = max(self._sentinel_gen, self._cleared_gen)
+        self._refresh_idle()
+
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -556,6 +611,16 @@ class ZmqFloatVideoGenerator:
             task = loop.create_task(self._send_interrupt())
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+
+    def _drain_frames(self) -> int:
+        """Drop every queued (video, audio) pair; returns how many were dropped."""
+        dropped = 0
+        while True:
+            try:
+                self._frame_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return dropped
+            dropped += 1
 
     async def _send_interrupt(self) -> None:
         await self._ensure_connected()
@@ -580,6 +645,23 @@ class ZmqFloatVideoGenerator:
         if vf is None or af is None:
             return None
         return vf, af
+
+    def _is_live_frame(self, notif: IPCFrameNotification) -> bool:
+        """True when ``notif`` carries a frame of the current, unabandoned chunk.
+
+        Mirrors ``FloatVideoGenerator``'s two guards:
+
+        * ``_cleared_gen`` — a barge-in abandons every generation submitted
+          before it. The worker finishes the chunk it is already rendering, so
+          its frames still arrive and must not be played over the new reply.
+        * ``_valid_frames`` — the tail of a chunk past the real audio is
+          FLOAT's replicate-pad silence and is trimmed exactly like the
+          in-process bridge's ``valid_samples`` cut.
+        """
+        if notif.gen > 0 and notif.gen <= self._cleared_gen:
+            return False
+        limit = self._valid_frames.get(notif.gen)
+        return limit is None or notif.frame_idx < limit
 
     async def _frame_listener(self) -> None:
         """Receive IPCFrameNotifications from the PUB socket and enqueue frames.
@@ -623,7 +705,13 @@ class ZmqFloatVideoGenerator:
                 # when the live queue has drained too (checked here and from
                 # the iterator, which re-runs while the consumer paces).
                 self._sentinel_gen = max(self._sentinel_gen, notif.gen)
+                self._valid_frames.pop(notif.gen, None)
                 self._refresh_idle()
+                continue
+
+            # Stale (barge-in) frames and the padded tail of a chunk never
+            # reach the playout queue.
+            if not self._is_live_frame(notif):
                 continue
 
             pair = self._read_frame_pair(notif)
@@ -636,6 +724,12 @@ class ZmqFloatVideoGenerator:
                 # Drop the oldest to maintain latency.
                 with contextlib.suppress(asyncio.QueueEmpty):
                     self._frame_queue.get_nowait()
+                self._dropped_frames += 1
+                if self._dropped_frames % 25 == 1:
+                    logger.warning(
+                        "[zmq-gen] consumer behind; dropped %d frames total",
+                        self._dropped_frames,
+                    )
                 self._frame_queue.put_nowait(pair)
 
     # ------------------------------------------------------------------

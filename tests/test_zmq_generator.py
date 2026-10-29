@@ -7,11 +7,11 @@ from unittest.mock import AsyncMock, patch
 import numpy as np
 import pytest
 
-from fast_float.ipc.messages import IPCRequest
+from fast_float.ipc.messages import IPCFrameNotification, IPCRequest
 from fast_float.livekit.zmq_generator import ZmqFloatVideoGenerator
 
 try:
-    from livekit import rtc
+    from livekit import rtc  # noqa: F401  (probe: the generator needs it at runtime)
 
     RTC_AVAILABLE = True
 except ImportError:
@@ -99,8 +99,8 @@ def test_prepare_silence_collects_worker_frames():
     import zmq
 
     from fast_float.ipc.messages import IPCFrameNotification, IPCResponse
-    from fast_float.livekit.generator import FloatVideoGenerator  # noqa: F401  (import sanity)
     from fast_float.ipc.shm_buffer import FrameRingBuffer
+    from fast_float.livekit.generator import FloatVideoGenerator  # noqa: F401  (import sanity)
 
     async def _test():
         ring = FrameRingBuffer("test_zmq_silence_ring", num_slots=8, create=True)
@@ -175,7 +175,8 @@ def test_prepare_silence_collects_worker_frames():
 
             await gen.prepare_silence(duration_sec=2.0)
 
-            assert captured_reqs and captured_reqs[0].duration_sec == 2.0
+            assert captured_reqs
+            assert captured_reqs[0].duration_sec == 2.0
             assert gen._collecting is False
             assert gen._silence_ready.is_set()
             expected = 4 if RTC_AVAILABLE else 0  # frames need livekit RTC to wrap
@@ -207,8 +208,9 @@ def test_push_audio_accepts_bytes_and_frames():
 
     async def _test():
         pytest.importorskip("zmq")
-        from fast_float.livekit.zmq_generator import SAMPLE_RATE
         from livekit import rtc
+
+        from fast_float.livekit.zmq_generator import SAMPLE_RATE
 
         gen = ZmqFloatVideoGenerator(
             ref_image_path="ref.png",
@@ -286,7 +288,8 @@ def test_flush_dispatches_buffered_tail():
         args = gen._dispatch_infer.await_args.args
         assert args[0] == b"\x00\x00" * 8000
         assert args[1] == 1  # generation 1
-        assert gen._audio_samples == 0 and not gen._audio_buf
+        assert gen._audio_samples == 0
+        assert not gen._audio_buf
         assert gen._first_chunk_done is True
         # Work is outstanding: idle cleared until the worker's sentinel…
         assert not gen._idle_event.is_set()
@@ -404,5 +407,114 @@ def test_failed_infer_keeps_idle_accounting_consistent():
         assert gen._sentinel_gen == 1
         assert gen._idle_event.is_set()
         assert await gen.wait_until_idle(timeout=0.1) is True
+
+    asyncio.run(_test())
+
+
+def _frame_notif(gen: int, frame_idx: int, *, is_last: bool = False) -> IPCFrameNotification:
+    return IPCFrameNotification(
+        session_id="sess",
+        gen=gen,
+        slot_idx=0,
+        frame_idx=frame_idx,
+        pts_ms=frame_idx * 40.0,
+        width=2,
+        height=2,
+        audio_bytes_len=1280,
+        is_last=is_last,
+    )
+
+
+def test_clear_buffer_abandons_in_flight_frames():
+    """A barge-in must drop the interrupted chunk, queued and still in flight.
+
+    The worker only reads ``interrupt`` after the chunk it is already rendering
+    is done (its REP loop is blocked inside that infer), so a cleared chunk's
+    frames keep arriving. Without a generation watermark they were played over
+    the next reply — "a chunk comes over the old one".
+    """
+
+    async def _test():
+        gen = ZmqFloatVideoGenerator(shm_name="test_shm_clear", shm_slots=4)
+        gen._send_interrupt = AsyncMock()
+
+        # Two chunks submitted; the first one's frames are already queued.
+        gen._gen = 2
+        gen._valid_frames = {1: 50, 2: 50}
+        gen._frame_queue.put_nowait(("video", "audio"))
+        gen._frame_queue.put_nowait(("video", "audio"))
+        gen._idle_event.clear()  # work outstanding
+        assert not gen._idle_event.is_set()
+
+        gen.clear_buffer()
+
+        # Queued frames of the interrupted sentence are gone.
+        assert gen._frame_queue.empty()
+        # Frames of both submitted generations are refused from now on.
+        assert gen._cleared_gen == 2
+        assert not gen._is_live_frame(_frame_notif(1, 0))
+        assert not gen._is_live_frame(_frame_notif(2, 49))
+        # The next chunk (gen 3) still plays.
+        gen._valid_frames[3] = 50
+        assert gen._is_live_frame(_frame_notif(3, 0))
+
+        # Cancelled generations are accounted as finished, so the segment
+        # watcher does not stall on wait_until_idle after every barge-in.
+        assert gen._sentinel_gen == 2
+        assert gen._idle_event.is_set()
+        assert await gen.wait_until_idle(timeout=0.1) is True
+
+    asyncio.run(_test())
+
+
+def test_padded_tail_frames_are_trimmed():
+    """FLOAT renders whole 2 s windows: the silent tail must not be played."""
+
+    async def _test():
+        gen = ZmqFloatVideoGenerator(
+            ref_image_path="ref.png",
+            nfe=5,
+            chunk_sec=1.0,
+            first_chunk_sec=1.0,
+            shm_name="test_shm_tail",
+            shm_slots=4,
+        )
+        gen._ensure_connected = AsyncMock()
+        gen._dispatch_infer = AsyncMock()
+
+        # 1.76 s of audio = 44 frames, padded by the sampler to a 2 s window.
+        n_samples = 44 * 640
+        gen.push_audio(b"\x00\x00" * n_samples)
+        assert gen._gen == 1
+        assert gen._valid_frames[1] == 44
+
+        assert gen._is_live_frame(_frame_notif(1, 0))
+        assert gen._is_live_frame(_frame_notif(1, 43))
+        assert not gen._is_live_frame(_frame_notif(1, 44))
+        assert not gen._is_live_frame(_frame_notif(1, 49))
+
+        # The sentinel releases the bookkeeping for that generation.
+        gen._valid_frames.pop(1, None)
+        assert 1 not in gen._valid_frames
+
+    asyncio.run(_test())
+
+
+def test_dispatch_infer_skips_cleared_generation():
+    """A chunk that lost the race against a barge-in must not be rendered."""
+
+    async def _test():
+        gen = ZmqFloatVideoGenerator(shm_name="test_shm_stale", shm_slots=4)
+        gen._ensure_connected = AsyncMock()
+        gen._send_request = AsyncMock()
+        gen._gen = 2
+        gen.clear_buffer()  # abandon gen 1 and 2
+        gen._send_interrupt = AsyncMock()
+
+        await gen._dispatch_infer(b"\x00\x00" * 640, 2)
+        gen._send_request.assert_not_called()
+
+        await gen._dispatch_infer(b"\x00\x00" * 640, 3)
+        gen._send_request.assert_called_once()
 
     asyncio.run(_test())

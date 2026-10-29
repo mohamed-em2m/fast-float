@@ -101,10 +101,31 @@ When `enabled = true`:
 
 1. **Synchronous REQ/REP Request-Response**:
    - The worker handles requests sequentially as they arrive over the ZeroMQ `REP` socket.
-2. **Immediate Interruption (`cmd="interrupt"`)**:
-   - When a user speaks or an interruption event occurs, the backend issues an `interrupt` command.
-   - An internal `threading.Event` is set in the worker, causing `_ShmFrameDispatcher` to raise `_Cancelled` and immediately abort the active inference pass on the GPU.
-3. **Chunk Batching & Internal Windowing**:
+2. **Interruption (`cmd="interrupt"`)**:
+   - When a user speaks or an interruption event occurs, the backend issues an
+     `interrupt` command.
+   - An internal `threading.Event` is set in the worker, causing
+     `_ShmFrameDispatcher` to raise `_Cancelled` and abort the active inference
+     pass on the GPU — **but only once the REP loop reads the command**, and
+     that loop is blocked inside `_handle_infer` for the whole chunk. So the
+     chunk that is already rendering is never preempted; the interrupt only
+     stops the *next* dispatch inside that same chunk (and, because
+     `_handle_infer` clears the event at entry, the next request runs normally).
+   - Playback correctness therefore cannot depend on the worker: the consumer
+     (`ZmqFloatVideoGenerator.clear_buffer`) bumps a generation watermark,
+     drains the playout queue, drops in-flight frames of every abandoned
+     generation and skips queued infer requests. Without that watermark the
+     interrupted sentence kept playing for up to the queue depth (~10 s) while
+     the next reply's frames queued behind it, which is heard as two chunks
+     overlapping.
+3. **Padded-tail trimming**:
+   - FLOAT renders whole windows (`wav2vec_sec * fps` frames), so a chunk is
+     padded with silence up to the next window boundary. The in-process
+     generator trims those frames with `valid_samples`; the ZMQ generator does
+     the same with a per-generation `valid_frames` limit, so a chunk's media
+     duration equals its audio duration instead of ending in up to 2 s of
+     silent video.
+4. **Chunk Batching & Internal Windowing**:
    - Audio is buffered up to `chunk_sec` (e.g. 5.0s) and passed directly to FLOAT.
 
 ### Is a Priority-Ordered Scheduler implemented?
