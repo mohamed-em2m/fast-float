@@ -17,8 +17,8 @@ Built on [FLOAT](https://github.com/deepbrainai-research/float) (ICCV 2025) · S
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.122-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![React 19](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](frontend/)
 
-[Quick Start](#quick-start) · [Blueprint](docs/blueprint.html) · [Documentation](docs/USAGE.md) · [API](#api) · [Report a Bug](https://github.com/mohamed-em2m/float-fast/issues) · [Request a Feature](https://github.com/mohamed-em2m/float-fast/issues)
-[Demo](https://drive.google.com/file/d/16L0KSuw4XV_S3pxdABC63QAwZbHhHmRF/view?usp=sharing) · [Blueprint](docs/blueprint.html) · [Try it in Colab](https://colab.research.google.com/drive/1iMm8X7O63AAA6kByJ-4qgGA37fwNu2_Z?usp=sharing)
+[Quick Start](#quick-start) · [Blueprint](https://mohamed-em2m.github.io/fast-float/blueprint.html) · [Documentation](docs/USAGE.md) · [API](#api) · [Report a Bug](https://github.com/mohamed-em2m/float-fast/issues) · [Request a Feature](https://github.com/mohamed-em2m/float-fast/issues)
+[Demo](https://drive.google.com/file/d/16L0KSuw4XV_S3pxdABC63QAwZbHhHmRF/view?usp=sharing) · [Blueprint](https://mohamed-em2m.github.io/fast-float/blueprint.html) · [Try it in Colab](https://colab.research.google.com/drive/1iMm8X7O63AAA6kByJ-4qgGA37fwNu2_Z?usp=sharing)
 
 </div>
 <p align="center">
@@ -84,7 +84,7 @@ Talking-head models such as FLOAT produce impressive results, but they are heavy
 ## Architecture
 
 <p align="center">
-  <a href="docs/blueprint.html">
+  <a href="https://mohamed-em2m.github.io/fast-float/blueprint.html">
     <img src="assets/Animation.gif" alt="FLOAT Fast architecture animation" width="80%" />
   </a>
 </p>
@@ -300,6 +300,9 @@ curl http://localhost:8000/health
 ## API
 
 Interactive docs are served at `http://localhost:8000/docs`.
+The architecture blueprint is published at
+<https://mohamed-em2m.github.io/fast-float/blueprint.html> by the GitHub Pages
+workflow.
 
 ### `POST /generate`
 
