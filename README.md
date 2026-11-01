@@ -2,6 +2,7 @@
 
 <img src="assets/logo.png" alt="FLOAT Fast logo" width="55%" />
 
+
 # FLOAT Fast
 
 **Real-time, GPU-accelerated serving stack for audio-driven talking portraits.**
@@ -16,9 +17,8 @@ Built on [FLOAT](https://github.com/deepbrainai-research/float) (ICCV 2025) · S
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.122-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
 [![React 19](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](frontend/)
 
-[Quick Start](#quick-start) · [Documentation](docs/USAGE.md) · [API](#api) · [Report a Bug](https://github.com/mohamed-em2m/float-fast/issues) · [Request a Feature](https://github.com/mohamed-em2m/float-fast/issues) .
-[demo](https://drive.google.com/file/d/16L0KSuw4XV_S3pxdABC63QAwZbHhHmRF/view?usp=sharing)
- . [Try it in colab](https://colab.research.google.com/drive/1iMm8X7O63AAA6kByJ-4qgGA37fwNu2_Z?usp=sharing)
+[Quick Start](#quick-start) · [Blueprint](docs/blueprint.html) · [Documentation](docs/USAGE.md) · [API](#api) · [Report a Bug](https://github.com/mohamed-em2m/float-fast/issues) · [Request a Feature](https://github.com/mohamed-em2m/float-fast/issues)
+[Demo](https://drive.google.com/file/d/16L0KSuw4XV_S3pxdABC63QAwZbHhHmRF/view?usp=sharing) · [Blueprint](docs/blueprint.html) · [Try it in Colab](https://colab.research.google.com/drive/1iMm8X7O63AAA6kByJ-4qgGA37fwNu2_Z?usp=sharing)
 
 </div>
 <p align="center">
@@ -26,8 +26,7 @@ Built on [FLOAT](https://github.com/deepbrainai-research/float) (ICCV 2025) · S
     <img src="https://img.youtube.com/vi/Zk54YsqGwMs/hqdefault.jpg" alt="demo of project" width="70%">
   </a>
 </p>
-<!-- TODO: add a demo GIF or screenshot of the Studio here -->
-<!-- <p align="center"><img src="assets/demo.gif" alt="FLOAT Fast Studio demo" width="800" /></p> -->
+
 
 ---
 
@@ -83,6 +82,12 @@ Talking-head models such as FLOAT produce impressive results, but they are heavy
 | 🧪 | **Dual-process IPC** *(experimental, disabled)* | Optional ZeroMQ + shared-memory split. Currently not supported — see the notice above. |
 
 ## Architecture
+
+<p align="center">
+  <a href="docs/blueprint.html">
+    <img src="assets/Animation.gif" alt="FLOAT Fast architecture animation" width="80%" />
+  </a>
+</p>
 
 ```mermaid
 flowchart TB

@@ -1,0 +1,1858 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <title>Fast-FLOAT Architecture — Interactive Explorer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <style>
+    /* --------------------------------------------------
+       1. THEME TOKENS & VARIABLES
+       -------------------------------------------------- */
+    :root {
+      --bg: #f4f6f9;
+      --surface: #ffffff;
+      --surface-elevated: #ffffff;
+      --surface-subtle: #eef1f6;
+      --surface-hover: #f8fafc;
+      --text: #0f172a;
+      --text-secondary: #334155;
+      --text-muted: #64748b;
+      --border: #d8dee9;
+      --border-subtle: #e2e8f0;
+      
+      --accent: #2563eb;
+      --accent-hover: #1d4ed8;
+      --accent-soft: #eff6ff;
+      --accent-border: #bfdbfe;
+      
+      --success: #059669;
+      --success-soft: #ecfdf5;
+      --warning: #d97706;
+      --warning-soft: #fffbeb;
+      --warning-border: #fde68a;
+
+      --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.04);
+      --shadow-md: 0 4px 12px rgba(15, 23, 42, 0.06);
+      --radius-lg: 14px;
+      --radius-md: 10px;
+      --radius-sm: 6px;
+
+      color-scheme: light dark;
+      box-sizing: border-box;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root[data-theme="auto"] {
+        --bg: #090d16;
+        --surface: #111827;
+        --surface-elevated: #1a2234;
+        --surface-subtle: #0d1320;
+        --surface-hover: #1e293b;
+        --text: #f1f5f9;
+        --text-secondary: #cbd5e1;
+        --text-muted: #94a3b8;
+        --border: #263248;
+        --border-subtle: #1e293b;
+        
+        --accent: #60a5fa;
+        --accent-hover: #93c5fd;
+        --accent-soft: rgba(59, 130, 246, 0.15);
+        --accent-border: rgba(96, 165, 250, 0.35);
+        
+        --success: #34d399;
+        --success-soft: rgba(16, 185, 129, 0.14);
+        --warning: #fbbf24;
+        --warning-soft: rgba(245, 158, 11, 0.14);
+        --warning-border: rgba(251, 191, 36, 0.35);
+
+        --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+        --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.4);
+      }
+    }
+
+    :root[data-theme="dark"] {
+      --bg: #090d16;
+      --surface: #111827;
+      --surface-elevated: #1a2234;
+      --surface-subtle: #0d1320;
+      --surface-hover: #1e293b;
+      --text: #f1f5f9;
+      --text-secondary: #cbd5e1;
+      --text-muted: #94a3b8;
+      --border: #263248;
+      --border-subtle: #1e293b;
+      
+      --accent: #60a5fa;
+      --accent-hover: #93c5fd;
+      --accent-soft: rgba(59, 130, 246, 0.15);
+      --accent-border: rgba(96, 165, 250, 0.35);
+      
+      --success: #34d399;
+      --success-soft: rgba(16, 185, 129, 0.14);
+      --warning: #fbbf24;
+      --warning-soft: rgba(245, 158, 11, 0.14);
+      --warning-border: rgba(251, 191, 36, 0.35);
+
+      --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+      --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.4);
+      color-scheme: dark;
+    }
+
+    :root[data-theme="light"] {
+      color-scheme: light;
+    }
+
+    *, *::before, *::after {
+      box-sizing: inherit;
+    }
+
+    /* --------------------------------------------------
+       2. BASE & TYPOGRAPHY
+       -------------------------------------------------- */
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14.5px/1.55 Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      transition: background-color 0.2s ease, color 0.2s ease;
+    }
+
+    main {
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 28px 20px 56px;
+    }
+
+    .top-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 16px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+
+    h1 {
+      font: 700 clamp(24px, 3vw, 30px)/1.2 Inter, ui-sans-serif, system-ui, sans-serif;
+      letter-spacing: -0.025em;
+      margin: 0 0 6px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .version-pill {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      border: 1px solid var(--accent-border);
+      letter-spacing: 0.02em;
+    }
+
+    h2 {
+      font: 600 18px/1.3 Inter, ui-sans-serif, system-ui, sans-serif;
+      letter-spacing: -0.01em;
+      margin: 0 0 4px;
+    }
+
+    .text-muted { color: var(--text-muted); }
+    .lead-text { margin: 0; max-width: 68ch; font-size: 15px; }
+
+    .cta-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 16px 0 18px;
+    }
+
+    .cta-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-radius: 10px;
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow-sm);
+      text-decoration: none;
+      font-weight: 600;
+      transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+    }
+
+    .cta-link:hover {
+      background: var(--surface-hover);
+      border-color: var(--border-subtle);
+      transform: translateY(-1px);
+    }
+
+    :focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    kbd {
+      font: 500 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+      background: var(--surface-subtle);
+      border: 1px solid var(--border);
+      border-bottom-width: 2px;
+      border-radius: 4px;
+      padding: 1px 5px;
+      color: var(--text-secondary);
+    }
+
+    /* --------------------------------------------------
+       3. TOOLBAR & SEGMENTED CONTROLS
+       -------------------------------------------------- */
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+      align-items: center;
+    }
+
+    .segmented-group {
+      display: inline-flex;
+      background: var(--surface-subtle);
+      padding: 3px;
+      border-radius: var(--radius-md);
+      border: 1px solid var(--border);
+    }
+
+    .segmented-group button {
+      border: none;
+      background: transparent;
+      padding: 6px 13px;
+      border-radius: 7px;
+      font: 500 13px inherit;
+      color: var(--text-muted);
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+
+    .segmented-group button:hover {
+      color: var(--text);
+    }
+
+    .segmented-group button[aria-pressed="true"] {
+      background: var(--surface);
+      color: var(--accent);
+      font-weight: 600;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font: 500 13px inherit;
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      padding: 7px 13px;
+      cursor: pointer;
+      box-shadow: var(--shadow-sm);
+      transition: all 0.15s ease;
+    }
+
+    .btn:hover {
+      border-color: var(--accent);
+      background: var(--surface-hover);
+    }
+
+    .btn[aria-pressed="true"] {
+      background: var(--warning-soft);
+      border-color: var(--warning-border);
+      color: var(--warning);
+      font-weight: 600;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #ffffff;
+      border-color: var(--accent);
+    }
+    :root[data-theme="dark"] .btn-primary { color: #090d16; font-weight: 600; }
+    @media (prefers-color-scheme: dark) {
+      :root[data-theme="auto"] .btn-primary { color: #090d16; font-weight: 600; }
+    }
+
+    .btn-primary:hover {
+      background: var(--accent-hover);
+      border-color: var(--accent-hover);
+    }
+
+    .btn-icon {
+      padding: 7px 9px;
+    }
+
+    .toolbar-spacer {
+      margin-left: auto;
+    }
+
+    .trace-controls {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    /* --------------------------------------------------
+       4. MAIN LAYOUT GRID & CARDS
+       -------------------------------------------------- */
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 370px;
+      gap: 18px;
+      align-items: start;
+    }
+
+    @media (max-width: 1024px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-sm);
+      overflow: hidden;
+    }
+
+    /* --------------------------------------------------
+       5. DIAGRAM SVG & ANIMATIONS
+       -------------------------------------------------- */
+    .svg-scroll-container {
+      overflow-x: auto;
+      background: radial-gradient(circle at 1px 1px, var(--border-subtle) 1px, transparent 0);
+      background-size: 20px 20px;
+      padding: 4px 0;
+    }
+
+    svg#diagram {
+      display: block;
+      min-width: 820px;
+      width: 100%;
+      height: auto;
+      user-select: none;
+    }
+
+    .zone {
+      fill: color-mix(in srgb, var(--surface-subtle) 82%, transparent);
+      stroke: var(--border);
+      stroke-width: 1.2;
+      stroke-dasharray: 5 4;
+      rx: 12;
+    }
+
+    .zone-title {
+      fill: var(--text-muted);
+      font: 700 10.5px Inter, ui-sans-serif, sans-serif;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    /* Nodes */
+    .node {
+      cursor: pointer;
+      transition: opacity 0.25s ease, transform 0.15s ease;
+    }
+
+    .node .shape {
+      fill: var(--surface-elevated);
+      stroke: var(--border);
+      stroke-width: 1.5;
+      transition: stroke 0.15s ease, filter 0.2s ease, fill 0.15s ease;
+    }
+
+    .node .shape.subtle-fill {
+      fill: var(--surface-subtle);
+    }
+
+    .node:hover .shape,
+    .node:focus .shape {
+      stroke: var(--accent);
+      filter: drop-shadow(0 3px 8px color-mix(in srgb, var(--accent) 18%, transparent));
+    }
+
+    .node.is-selected .shape {
+      stroke: var(--accent);
+      stroke-width: 2.4;
+      filter: drop-shadow(0 4px 14px color-mix(in srgb, var(--accent) 35%, transparent));
+    }
+
+    .node-title {
+      fill: var(--text);
+      font: 600 13px Inter, ui-sans-serif, sans-serif;
+    }
+
+    .node-subtitle {
+      fill: var(--text-muted);
+      font: 11px Inter, ui-sans-serif, sans-serif;
+    }
+
+    .node-decoration {
+      stroke: var(--text-muted);
+      fill: none;
+      stroke-width: 1.2;
+      opacity: 0.7;
+    }
+
+    .status-dot { fill: var(--success); }
+    .status-dot.optional { fill: var(--warning); }
+    .status-dot.actor { fill: var(--accent); }
+
+    /* Edges */
+    .edge {
+      stroke: var(--text-muted);
+      stroke-width: 1.5;
+      fill: none;
+      marker-end: url(#arrowhead);
+      opacity: 0.65;
+      transition: stroke 0.2s ease, stroke-width 0.2s ease, opacity 0.2s ease;
+    }
+
+    .edge.is-optional {
+      stroke-dasharray: 5 4;
+    }
+
+    .edge.is-highlighted {
+      stroke: var(--accent);
+      stroke-width: 2.6;
+      opacity: 1;
+      marker-end: url(#arrowhead-active);
+      stroke-dasharray: 8 4;
+      animation: dashFlow 0.7s linear infinite;
+    }
+
+    @keyframes dashFlow {
+      to { stroke-dashoffset: -12; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .edge.is-highlighted {
+        stroke-dasharray: none;
+        animation: none;
+      }
+    }
+
+    .edge-hit-area {
+      stroke: transparent;
+      stroke-width: 18;
+      fill: none;
+      cursor: pointer;
+    }
+
+    /* Packets */
+    .packet {
+      transition: opacity 0.25s ease;
+    }
+
+    .packet rect {
+      fill: var(--surface);
+      stroke: var(--accent-border);
+      stroke-width: 1.2;
+      filter: drop-shadow(0 1px 2px rgba(0,0,0,0.08));
+    }
+
+    .packet text {
+      fill: var(--accent);
+      font: 600 9.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+      text-anchor: middle;
+    }
+
+    .icon {
+      fill: none;
+      stroke: var(--accent);
+      stroke-width: 1.8;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      pointer-events: none;
+    }
+
+    /* Optimization Badges */
+    .opt-badge {
+      cursor: pointer;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s ease, transform 0.2s ease;
+    }
+
+    .show-optimizations .opt-badge {
+      opacity: 1;
+      pointer-events: auto;
+    }
+
+    .opt-badge circle {
+      fill: var(--warning);
+      stroke: var(--surface);
+      stroke-width: 2;
+    }
+
+    .opt-badge text {
+      fill: #ffffff;
+      font: 700 11px sans-serif;
+      text-anchor: middle;
+    }
+
+    .is-dimmed {
+      opacity: 0.14 !important;
+    }
+
+    /* --------------------------------------------------
+       6. DIAGRAM FOOTER: PROGRESS, TICKER & LEGEND
+       -------------------------------------------------- */
+    .trace-progress-track {
+      height: 3px;
+      background: var(--surface-subtle);
+      width: 100%;
+      overflow: hidden;
+    }
+
+    .trace-progress-fill {
+      height: 100%;
+      width: 0%;
+      background: var(--accent);
+      transition: width 0.3s ease;
+    }
+
+    .ticker-bar {
+      padding: 12px 18px;
+      border-top: 1px solid var(--border-subtle);
+      background: var(--surface-subtle);
+      font-size: 13px;
+      min-height: 48px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .ticker-step-badge {
+      font: 600 11px ui-monospace, monospace;
+      background: var(--accent-soft);
+      color: var(--accent);
+      padding: 2px 8px;
+      border-radius: 99px;
+      white-space: nowrap;
+    }
+
+    .legend-bar {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      padding: 10px 18px;
+      border-top: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--text-muted);
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .legend-items {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .legend-item {
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .legend-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+    }
+
+    /* --------------------------------------------------
+       7. DETAILS SIDEBAR (INSPECTOR)
+       -------------------------------------------------- */
+    aside.inspector {
+      padding: 20px;
+      position: sticky;
+      top: 16px;
+    }
+
+    .inspector-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .badge-status {
+      font-size: 11.5px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 2px 8px;
+      border-radius: 99px;
+      margin: 6px 0 10px;
+    }
+
+    .detail-group {
+      margin-top: 15px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border-subtle);
+    }
+
+    .detail-label {
+      font-size: 10.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+
+    .io-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .io-box {
+      background: var(--surface-subtle);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      padding: 8px 10px;
+    }
+
+    .io-box .io-val {
+      font: 500 12px ui-monospace, Menlo, monospace;
+      color: var(--accent);
+      word-break: break-word;
+    }
+
+    .chip {
+      display: inline-block;
+      background: var(--surface-subtle);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      border-radius: var(--radius-sm);
+      padding: 2px 8px;
+      font: 500 11.5px ui-monospace, Menlo, monospace;
+      margin: 0 4px 5px 0;
+    }
+
+    .inspector ul {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--text-secondary);
+    }
+
+    .inspector li {
+      margin: 5px 0;
+      font-size: 13.5px;
+    }
+
+    .callout-box {
+      margin-top: 14px;
+      padding: 11px 13px;
+      background: var(--warning-soft);
+      border: 1px solid var(--warning-border);
+      border-left: 3.5px solid var(--warning);
+      border-radius: var(--radius-sm);
+      font-size: 13px;
+      color: var(--text);
+    }
+
+    /* Overview Quick Cards */
+    .quick-picks {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .quick-card {
+      text-align: left;
+      background: var(--surface-subtle);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 10px 12px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .quick-card:hover {
+      border-color: var(--accent);
+      background: var(--surface-hover);
+    }
+
+    .quick-card strong {
+      display: block;
+      font-size: 13px;
+      color: var(--text);
+    }
+
+    .quick-card span {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .sidebar-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border-subtle);
+    }
+
+    /* --------------------------------------------------
+       8. BENCHMARK AUTO-TUNER SECTION
+       -------------------------------------------------- */
+    .benchmark-section {
+      margin-top: 32px;
+    }
+
+    .benchmark-grid {
+      display: grid;
+      grid-template-columns: 1fr 340px;
+      gap: 18px;
+      margin-top: 12px;
+      align-items: stretch;
+    }
+
+    @media (max-width: 900px) {
+      .benchmark-grid { grid-template-columns: 1fr; }
+    }
+
+    .chart-card {
+      padding: 22px 24px 36px;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+    }
+
+    .chart {
+      display: flex;
+      align-items: flex-end;
+      gap: 18px;
+      height: 160px;
+      margin-top: 24px;
+      position: relative;
+      padding-top: 12px;
+    }
+
+    .chart-col-group {
+      flex: 1;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      align-items: center;
+      cursor: pointer;
+      position: relative;
+    }
+
+    .chart-bar {
+      width: 100%;
+      max-width: 68px;
+      background: color-mix(in srgb, var(--accent) 45%, var(--surface-subtle));
+      border: 1px solid var(--accent-border);
+      border-radius: 6px 6px 2px 2px;
+      position: relative;
+      transition: all 0.2s ease;
+    }
+
+    .chart-col-group:hover .chart-bar,
+    .chart-col-group:focus .chart-bar,
+    .chart-col-group.is-active .chart-bar {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+
+    .chart-col-group.is-chosen .chart-bar {
+      outline: 2px solid var(--warning);
+      outline-offset: 2px;
+    }
+
+    .bar-val {
+      position: absolute;
+      top: -22px;
+      inset-inline: 0;
+      text-align: center;
+      font: 700 11.5px ui-monospace, monospace;
+      color: var(--text);
+    }
+
+    .bar-label {
+      position: absolute;
+      bottom: -24px;
+      inset-inline: 0;
+      text-align: center;
+      font: 600 11px ui-monospace, monospace;
+      color: var(--text-muted);
+    }
+
+    .chart-threshold-line {
+      position: absolute;
+      inset-inline: 0;
+      border-top: 1.5px dashed var(--warning);
+      font: 600 11px ui-monospace, monospace;
+      color: var(--warning);
+      pointer-events: none;
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    .chart-threshold-line span {
+      background: var(--surface);
+      padding: 0 6px;
+      transform: translateY(-55%);
+    }
+
+    .tuner-stats-card {
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+
+    .stat-metric-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin: 14px 0;
+    }
+
+    .stat-pill {
+      background: var(--surface-subtle);
+      border: 1px solid var(--border-subtle);
+      padding: 10px 12px;
+      border-radius: var(--radius-md);
+    }
+
+    .stat-pill .num {
+      font: 700 20px/1.2 ui-monospace, monospace;
+      color: var(--text);
+    }
+
+    .stat-pill .lbl {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <!-- Header -->
+    <header class="top-header">
+      <div>
+        <h1>
+          Fast-FLOAT Architecture
+          <span class="version-pill">Single-Process Pipeline</span>
+        </h1>
+        <p class="text-muted lead-text">
+          Interactive blueprint showing how one portrait and speech stream become a 25 fps lip-synced video.
+        </p>
+      </div>
+
+      <!-- Theme Switcher -->
+      <div class="segmented-group" role="group" aria-label="Color Theme">
+        <button type="button" data-set-theme="auto" aria-pressed="true">Auto</button>
+        <button type="button" data-set-theme="light" aria-pressed="false">Light</button>
+        <button type="button" data-set-theme="dark" aria-pressed="false">Dark</button>
+      </div>
+    </header>
+
+    <div class="cta-row" aria-label="Project quick links">
+      <a class="cta-link" href="http://localhost:3000" target="_blank" rel="noreferrer">▶ Open Demo</a>
+      <a class="cta-link" href="https://colab.research.google.com/github/mohamed-em2m/float-fast" target="_blank" rel="noreferrer">▶ Open Colab</a>
+      <a class="cta-link" href="../README.md" target="_blank" rel="noreferrer">📘 Project Overview</a>
+    </div>
+
+    <!-- Toolbar Controls -->
+    <div class="toolbar" role="toolbar" aria-label="Pipeline Controls">
+      <div class="segmented-group" role="group" aria-label="Pipeline Path Filter">
+        <button id="btnPathBatch" aria-pressed="true">Batch Pipeline</button>
+        <button id="btnPathLive" aria-pressed="false">Live Avatar</button>
+        <button id="btnPathAll" aria-pressed="false">All Blocks</button>
+      </div>
+
+      <button class="btn" id="btnToggleOpt" aria-pressed="false" title="Shortcut: O">
+        ⚡ Optimizations
+      </button>
+
+      <span class="toolbar-spacer"></span>
+
+      <!-- Trace Stepper Suite -->
+      <div class="trace-controls">
+        <button class="btn btn-icon" id="btnStepPrev" title="Previous trace step (←)" aria-label="Previous trace step">◀</button>
+        <button class="btn btn-primary" id="btnPlayTrace" title="Play/Pause data flow trace (Space)">▶ Trace Data Flow</button>
+        <button class="btn btn-icon" id="btnStepNext" title="Next trace step (→)" aria-label="Next trace step">▶</button>
+      </div>
+    </div>
+
+    <!-- Main Interactive Grid -->
+    <div class="grid">
+      <!-- Diagram Card -->
+      <section class="card" id="diagramCard">
+        <div class="svg-scroll-container">
+          <svg id="diagram" viewBox="0 0 960 480" role="img" aria-label="Fast-FLOAT system architecture diagram">
+            <defs>
+              <marker id="arrowhead" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                <path d="M0,0.5 L7.5,4 L0,7.5 z" fill="var(--text-muted)" />
+              </marker>
+              <marker id="arrowhead-active" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                <path d="M0,0.5 L7.5,4 L0,7.5 z" fill="var(--accent)" />
+              </marker>
+            </defs>
+            <g id="groupZones"></g>
+            <g id="groupEdges"></g>
+            <g id="groupNodes"></g>
+            <g id="groupPackets"></g>
+          </svg>
+        </div>
+
+        <!-- Progress bar for Trace -->
+        <div class="trace-progress-track">
+          <div class="trace-progress-fill" id="traceProgressBar"></div>
+        </div>
+
+        <!-- Live Ticker Bar -->
+        <div class="ticker-bar" id="ticker" aria-live="polite">
+          <span class="text-muted">Click any block or connector to inspect tensors, or press <strong>Trace Data Flow</strong>.</span>
+          <span class="ticker-step-badge" id="tickerBadge" style="display:none;"></span>
+        </div>
+
+        <!-- Legend & Keyboard Hints -->
+        <div class="legend-bar">
+          <div class="legend-items">
+            <span class="legend-item"><i class="legend-dot" style="background:var(--accent)"></i>Actor</span>
+            <span class="legend-item"><i class="legend-dot" style="background:var(--success)"></i>Implemented</span>
+            <span class="legend-item"><i class="legend-dot" style="background:var(--warning)"></i>Optional Integration</span>
+          </div>
+          <div class="keyboard-hint">
+            <kbd>Space</kbd> Trace &nbsp; <kbd>←</kbd><kbd>→</kbd> Step &nbsp; <kbd>O</kbd> Opts &nbsp; <kbd>Esc</kbd> Reset
+          </div>
+        </div>
+      </section>
+
+      <!-- Sidebar Inspector -->
+      <aside class="card inspector" id="inspector" aria-live="polite"></aside>
+    </div>
+
+    <!-- Decode Benchmark Section -->
+    <section class="benchmark-section">
+      <h2>Why Decode Batch Size is Measured, Not Guessed</h2>
+      <p class="text-muted" style="margin: 0; max-width: 72ch;">
+        The <code>DecodeAutoTuner</code> profiles throughput at startup and picks the smallest batch size within 93% of peak FPS to save transient VRAM.
+      </p>
+
+      <div class="benchmark-grid">
+        <div class="card chart-card">
+          <div class="chart" id="tunerChart"></div>
+        </div>
+
+        <div class="card tuner-stats-card" id="tunerDetails"></div>
+      </div>
+
+      <p class="text-muted" style="margin-top: 14px; font-size: 12px;">
+        Built strictly from Fast-FLOAT documentation. Dual-process IPC (ZeroMQ + shared memory) is omitted because the README marks it disabled while secondary docs describe it as optional.
+      </p>
+    </section>
+  </main>
+
+  <!-- --------------------------------------------------
+       APPLICATION SCRIPT
+       -------------------------------------------------- -->
+  <script>
+    'use strict';
+
+    /* --- 1. Architecture Dataset --- */
+    const LAYOUT = {
+      nodeWidth: 152,
+      nodeHeight: 76,
+      cols: [30, 270, 510, 750],
+      rows: [60, 210, 370]
+    };
+
+    const STATUS_MAP = {
+      a: { label: 'Actor', color: 'var(--accent)', bg: 'var(--accent-soft)' },
+      i: { label: 'Implemented', color: 'var(--success)', bg: 'var(--success-soft)' },
+      o: { label: 'Optional Integration', color: 'var(--warning)', bg: 'var(--warning-soft)' }
+    };
+
+    const NODES = [
+      {
+        id: 'u', col: 0, row: 1, kind: 'person',
+        title: 'User', subtitle: 'speaks · views', status: 'a',
+        role: 'Supplies the reference portrait and speech clip, or converses live with the avatar.',
+        inputs: 'Voice / Portrait',
+        outputs: 'Synced playback',
+        tech: ['Microphone', 'File Upload', 'Sample Presets'],
+        inside: [
+          'Records speech with live waveform feedback or uploads WAV / MP3 / AAC',
+          'Drops a portrait (PNG, JPG, WebP) or selects a built-in preset',
+          'In live mode, speaking over the avatar triggers barge-in interruption'
+        ],
+        optimization: null
+      },
+      {
+        id: 'c', col: 0, row: 0, kind: 'screen',
+        title: 'Studio UI', subtitle: 'React 19 + Vite', status: 'i',
+        role: 'Browser interface controlling generation parameters, progress polling, and media playback.',
+        inputs: 'Portrait, mic/file, NFE',
+        outputs: 'Video + audio playback',
+        tech: ['React 19', 'Vite 8', 'livekit-client'],
+        inside: [
+          'Configures portrait, audio clip, NFE steps, random seed, and CFG scales',
+          'Polls /progress every second during batch synthesis',
+          'Plays progressive MP4 via HTTP range requests or subscribes to WebRTC tracks'
+        ],
+        optimization: null
+      },
+      {
+        id: 'a', col: 1, row: 0, kind: 'rack',
+        title: 'API Server', subtitle: 'FastAPI · Hypercorn', status: 'i',
+        role: 'Ingests HTTP requests, manages the GPU in single-process mode, and orchestrates generation.',
+        inputs: 'JSON: image + audio',
+        outputs: '16kHz PCM + tensor',
+        tech: ['FastAPI', 'Hypercorn', 'PyAV', 'FFmpeg'],
+        inside: [
+          'Transcodes arbitrary uploaded audio containers to 16 kHz mono PCM',
+          'Splits long clips into overlapping temporal chunks',
+          'Attaches correlation request & session IDs across structured logs'
+        ],
+        optimization: 'Correlation IDs allow a single request to be traced across API, GPU worker, and LiveKit agent logs.'
+      },
+      {
+        id: 'e', col: 2, row: 0, kind: 'enc',
+        title: 'Condition Encoders', subtitle: '4 units · wav2vec2', status: 'i',
+        role: 'Extracts identity features, emotion vectors, and per-chunk audio embeddings.',
+        inputs: 'Portrait, 16kHz PCM',
+        outputs: 'feats, s_r, s_r_feats',
+        tech: ['refenc', 'direction', 'emotion (S2E)', 'wav2vec2'],
+        inside: [
+          'refenc, direction, and emotion execute once per portrait identity',
+          'wav2vec2 audio encoder runs per 2 s chunk (50 frames @ 25 fps)',
+          'Each unit selects eager PyTorch, torch.compile, or ONNX / TensorRT'
+        ],
+        optimization: 'Auto-converter benchmarks each unit per GPU; compiled backends must pass numerical parity and beat eager by ≥10%.'
+      },
+      {
+        id: 'f', col: 3, row: 0, kind: 'ode',
+        title: 'ODE Sampler', subtitle: 'Flow-Matching Transformer', status: 'i',
+        role: 'Integrates the flow-matching ODE to synthesize per-frame 512-d motion latents.',
+        inputs: 'feats, s_r, emotion',
+        outputs: 'Latents [N, 512]',
+        tech: ['FMT', 'CFG Batch 3', 'NFE 5–25'],
+        inside: [
+          'Executes one vector-field transformer pass per NFE step',
+          'Classifier-free guidance combine & chunk autoregression stay in Python',
+          'Runs asynchronously inside the dedicated sampler_producer thread'
+        ],
+        optimization: 'Primary compute hotspot (NFE × chunks). Coalesces latents with a 15 ms flush timer so the decoder receives full micro-batches.'
+      },
+      {
+        id: 'd', col: 3, row: 1, kind: 'dec',
+        title: 'Batched Decoder', subtitle: 'Synthesis · AutoTuner', status: 'i',
+        role: 'Warps and renders reference StyleGAN features into final 512×512 RGB video frames.',
+        inputs: 'Latents + s_r_feats',
+        outputs: 'uint8 RGB [B,3,512,512]',
+        tech: ['Synthesis Net', 'DecodeAutoTuner', 'CUDA Streams'],
+        inside: [
+          'Renders micro-batches between 1 and 16 frames concurrently',
+          'Batch size calibrated by VRAM tier and empirical startup benchmark',
+          'Supports multi-GPU decode worker distribution when extra GPUs exist'
+        ],
+        optimization: 'In-place uint8 tensor conversion cuts GPU allocations from 5 to 2; AutoTuner selects the lowest-VRAM batch on the peak FPS plateau.'
+      },
+      {
+        id: 'w', col: 2, row: 1, kind: 'chip',
+        title: 'Video Writer', subtitle: 'FFmpeg + HW Encode', status: 'i',
+        role: 'Reorders multi-stream decoded frames and pipes them to hardware video encoders.',
+        inputs: 'uint8 frames + PCM',
+        outputs: 'MP4 / raw RGB tap',
+        tech: ['FFmpeg', 'NVENC', 'QSV', 'AMF'],
+        inside: [
+          'Sliding reorder window restores strict frame sequence order',
+          'Asynchronous GPU→Host pinned transfer into FFmpeg stdin pipe',
+          'Supports fast, balanced, and high quality encoding presets'
+        ],
+        optimization: 'Offloads H.264 compression to NVENC / QSV / AMF hardware blocks instead of saturating CPU cores.'
+      },
+      {
+        id: 'o', col: 1, row: 1, kind: 'send',
+        title: 'Transport Ladder', subtitle: 'LiveKit · WebRTC · WS · MP4', status: 'i',
+        role: 'Streams generated frames to the browser with graceful protocol fallback.',
+        inputs: 'Encoded / raw frames',
+        outputs: 'Playable media stream',
+        tech: ['LiveKit', 'aiortc', 'WebSocket', 'HTTP Range'],
+        inside: [
+          'Fallback order: LiveKit SFU → raw WebRTC → WebSocket → HTTP MP4',
+          'Pushes completed frames downstream while later chunks still sample',
+          'Python LiveKit publisher handles real-time track packetization'
+        ],
+        optimization: 'Progressive streaming begins playback long before the full speech clip finishes rendering.'
+      },
+      {
+        id: 'g', col: 0, row: 2, kind: 'hex',
+        title: 'Gemini Live', subtitle: 'LiveKit Agents Worker', status: 'o',
+        role: 'Optional speech-to-speech AI agent that listens to the user and replies with voice PCM.',
+        inputs: 'User room audio',
+        outputs: 'Agent reply PCM',
+        tech: ['livekit-agents', 'Gemini Live API'],
+        inside: [
+          'Runs as a lightweight separate OS process requiring zero GPU memory',
+          'Exposes function tools: float_health, gpu_status, end_conversation',
+          'User barge-in immediately flushes queued avatar speech frames'
+        ],
+        optimization: null
+      },
+      {
+        id: 'l', col: 1, row: 2, kind: 'ell',
+        title: 'LiveKit SFU', subtitle: 'Self-hosted WebRTC room', status: 'o',
+        role: 'Low-latency selective forwarding unit routing tracks among browser, agent, and avatar.',
+        inputs: 'Mic, PCM, avatar A/V',
+        outputs: 'Synced WebRTC tracks',
+        tech: ['LiveKit Server', 'Docker Compose'],
+        inside: [
+          'Multiplexes user mic audio, Gemini voice stream, and avatar video',
+          'Avatar worker joins room as an AGENT-kind participant',
+          'API server dispatches agent jobs dynamically on room creation'
+        ],
+        optimization: null
+      },
+      {
+        id: 'v', col: 2, row: 2, kind: 'proc',
+        title: 'Live Generator', subtitle: 'FloatVideoGenerator', status: 'i',
+        role: 'Accumulates live agent PCM into windows, invokes FLOAT, and paces 25 fps output.',
+        inputs: 'Agent PCM stream',
+        outputs: '25fps Video + 40ms PCM',
+        tech: ['generator.py', 'receiver.py', 'AgentAvatarRunner'],
+        inside: [
+          'Triggers first synthesis at 1 s of buffered audio, then 2 s windows',
+          'Flushes remaining tail audio after 0.25 s of silence',
+          'Bounded 128-frame queue smooths GPU bursts into steady 40 ms ticks'
+        ],
+        optimization: 'Keeps Real-Time Factor (RTF) < 1.0 using livekit_nfe = 6 default (tunable 5–25).'
+      },
+      {
+        id: 'i', col: 3, row: 2, kind: 'cache',
+        title: 'Silence Loop', subtitle: 'Cached Idle Frames', status: 'i',
+        role: 'Keeps the avatar naturally animated without touching the GPU while nobody speaks.',
+        inputs: 'Portrait + zero audio',
+        outputs: 'Looped idle frames',
+        tech: ['prepare_silence()'],
+        inside: [
+          'Pre-synthesizes a 2 s neutral clip at session initialization',
+          'Cycles frames round-robin at 25 fps during silent gaps',
+          'Yields immediately on the exact frame new speech arrives'
+        ],
+        optimization: 'Reduces idle conversational GPU compute utilization to 0%.'
+      }
+    ];
+
+    const EDGES = [
+      { from: 'c', to: 'a', payload: 'JSON request', content: 'image_base64 · audio_base64 · emotion · nfe · seed · cfg scales', transport: 'POST /generate over HTTP', path: 'M182,98 L270,98' },
+      { from: 'a', to: 'e', payload: 'PCM + image', content: '16 kHz mono PCM waveform + decoded reference portrait tensor', transport: 'In-process PyTorch tensors', path: 'M422,98 L510,98' },
+      { from: 'e', to: 'f', payload: 'feats [1,T,512]', content: 'wav2vec2 audio features · identity latent s_r · emotion [1,7]', transport: 'GPU tensor pass per chunk', path: 'M662,98 L750,98' },
+      { from: 'e', to: 'd', payload: 's_r_feats', content: 'Multi-scale StyleGAN feature maps of reference portrait', transport: 'Cached per identity; zero-copy batch view', path: 'M662,125 L705,125 L705,230 L750,230' },
+      { from: 'f', to: 'd', payload: 'latents [N,512]', content: 'Synthesized 512-d facial motion latent per video frame', transport: 'Coalesced queue (full batch or 15 ms timeout)', path: 'M826,136 L826,210' },
+      { from: 'd', to: 'w', payload: 'uint8 frames', content: 'Rendered [B, 3, 512, 512] uint8 RGB frames', transport: 'CUDA stream async GPU→Host copy', path: 'M750,248 L662,248' },
+      { from: 'w', to: 'o', payload: 'MP4 / RGB tap', content: 'Hardware-encoded MP4 stream or tapped raw RGB frames', transport: 'FFmpeg pipe or in-memory frame tap', path: 'M510,248 L422,248' },
+      { from: 'o', to: 'c', payload: 'MP4 / WS / RTC', content: 'HTTP range MP4 playback or real-time WebSocket / WebRTC stream', transport: 'Direct browser fallback ladder', path: 'M270,236 L232,236 L232,124 L182,124' },
+      { from: 'o', to: 'l', payload: 'publish tracks', content: 'Generated video/audio tracks published into LiveKit room', transport: '/livekit/publish/{id} primary rung', path: 'M346,286 L346,370' },
+      { from: 'l', to: 'c', payload: 'avatar tracks', content: 'Synchronized avatar_video + avatar_audio WebRTC media', transport: 'livekit-client room subscription', path: 'M300,378 L300,362 L246,362 L246,112 L182,112' },
+      { from: 'c', to: 'l', payload: 'mic track', content: 'Live user microphone audio captured in browser', transport: 'WebRTC publish_mic track', path: 'M182,132 L215,132 L215,344 L320,344 L320,372' },
+      { from: 'g', to: 'l', payload: 'reply PCM', content: 'Synthesized Gemini voice response stream', transport: 'lk.audio_stream LiveKit DataStream', path: 'M182,408 L270,408' },
+      { from: 'l', to: 'g', payload: 'room audio', content: 'Forwarded user microphone audio stream', transport: 'LiveKit Agents room input subscriber', path: 'M281,388 L176,388' },
+      { from: 'l', to: 'v', payload: 'PCM segments', content: 'Segmented agent reply PCM chunks', transport: 'DataStream receiver feeding FloatVideoGenerator', path: 'M422,408 L510,408' },
+      { from: 'v', to: 'e', payload: '2s PCM window', content: '16 kHz PCM16 slice (640 audio samples per 25 fps video frame)', transport: 'Direct engine inference call per chunk', path: 'M510,384 L478,384 L478,118 L510,118' },
+      { from: 'd', to: 'v', payload: 'decoded frames', content: 'RGB frames tapped directly from decoder (bypasses FFmpeg MP4)', transport: 'In-process Python queue', path: 'M902,262 L932,262 L932,352 L586,352 L586,370' },
+      { from: 'v', to: 'l', payload: 'video + audio', content: 'rtc.VideoFrame @ 25 fps paired with 40 ms PCM frames', transport: 'AgentAvatarRunner WebRTC publisher', path: 'M510,430 L408,430' },
+      { from: 'i', to: 'v', payload: 'cached frames', content: 'Pre-rendered neutral portrait frames', transport: 'Round-robin memory buffer read', path: 'M750,408 L662,408' },
+      { from: 'u', to: 'c', payload: 'photo + speech', content: 'Reference portrait image + recorded/uploaded speech + settings', transport: 'Browser File & MediaStream APIs', path: 'M75,210 L75,136' },
+      { from: 'c', to: 'u', payload: 'video + audio', content: 'Lip-synced avatar video and synchronized speech audio', transport: 'HTML5 Video & WebAudio output', path: 'M135,136 L135,210' }
+    ];
+
+    const PIPELINE_MODES = {
+      BATCH: ['u', 'c', 'a', 'e', 'f', 'd', 'w', 'o', 'l'],
+      LIVE: ['u', 'c', 'g', 'l', 'v', 'i', 'e', 'f', 'd']
+    };
+
+    const TRACE_SEQUENCES = {
+      BATCH: ['u>c', 'c>a', 'a>e', 'e>f', 'e>d', 'f>d', 'd>w', 'w>o', 'o>c', 'c>u'],
+      LIVE: ['u>c', 'c>l', 'l>g', 'g>l', 'l>v', 'v>e', 'e>f', 'e>d', 'f>d', 'd>v', 'v>l', 'l>c', 'c>u']
+    };
+
+    const BENCHMARK_DATA = [
+      { batchSize: 1, fps: 32.0, vram: 0.15, tag: 'Under-utilized', desc: 'Kernel launch overhead dominates; GPU SMs sit partially idle.' },
+      { batchSize: 2, fps: 39.5, vram: 0.31, tag: 'Below Plateau', desc: 'Throughput improves +23%, but still shy of the 93% target threshold.' },
+      { batchSize: 4, fps: 44.4, vram: 0.61, chosen: true, tag: '✓ Auto-Tuner Winner', desc: 'Sweet spot: hits 99.8% of peak speed while using 4× less VRAM than batch 16.' },
+      { batchSize: 8, fps: 44.5, vram: 1.23, tag: 'Diminishing Returns', desc: 'Negligible +0.1 FPS gain over batch 4 while doubling transient VRAM.' },
+      { batchSize: 16, fps: 43.9, vram: 2.46, tag: 'Memory Pressure', desc: 'Cache thrashing slightly degrades FPS while consuming 2.46 GiB VRAM.' }
+    ];
+
+    /* --- 2. SVG Shapes & Icons --- */
+    const SVG_SHAPES = {
+      screen: (x, y, w, h) => `
+        <rect class="shape" x="${x}" y="${y}" width="${w}" height="${h}" rx="9" />
+        <path class="node-decoration" d="M${x},${y+16} H${x+w}" />
+        <circle cx="${x+11}" cy="${y+8.5}" r="2" fill="var(--text-muted)" />
+        <circle cx="${x+19}" cy="${y+8.5}" r="2" fill="var(--text-muted)" />`,
+      rack: (x, y, w, h) => `
+        <rect class="shape" x="${x}" y="${y}" width="${w}" height="${h}" rx="7" />
+        <path class="node-decoration" d="M${x+11},${y+10} V${y+h-10} M${x+6},${y+16} h10 M${x+6},${y+h/2} h10 M${x+6},${y+h-16} h10" />`,
+      enc: (x, y, w, h) => `
+        <path class="shape" d="M${x},${y} L${x+w},${y+13} V${y+h-13} L${x},${y+h} Z" />`,
+      ode: (x, y, w, h) => `
+        <rect class="shape" x="${x}" y="${y}" width="${w}" height="${h}" rx="${h/2}" />`,
+      dec: (x, y, w, h) => `
+        <path class="shape" d="M${x},${y+13} L${x+w},${y} V${y+h} L${x},${y+h-13} Z" />`,
+      chip: (x, y, w, h) => {
+        let pins = '';
+        for (let i = 0; i < 4; i++) {
+          const py = y + 13 + i * 16.5;
+          pins += `<path class="node-decoration" d="M${x-6},${py} H${x} M${x+w},${py} H${x+w+6}" />`;
+        }
+        return pins + `<rect class="shape" x="${x}" y="${y}" width="${w}" height="${h}" rx="5" />`;
+      },
+      send: (x, y, w, h) => `
+        <path class="shape" d="M${x},${y} H${x+w-18} L${x+w},${y+h/2} L${x+w-18},${y+h} H${x} Z" />`,
+      hex: (x, y, w, h) => `
+        <path class="shape" style="stroke-dasharray:5 4" d="M${x+14},${y} H${x+w-14} L${x+w},${y+h/2} L${x+w-14},${y+h} H${x+14} L${x},${y+h/2} Z" />`,
+      ell: (x, y, w, h) => `
+        <ellipse class="shape" style="stroke-dasharray:5 4" cx="${x+w/2}" cy="${y+h/2}" rx="${w/2}" ry="${h/2}" />`,
+      proc: (x, y, w, h) => `
+        <path class="shape" d="M${x+12},${y} H${x+w-12} L${x+w},${y+12} V${y+h-12} L${x+w-12},${y+h} H${x+12} L${x},${y+h-12} V${y+12} Z" />`,
+      cache: (x, y, w, h) => `
+        <path class="shape" d="M${x},${y+10} V${y+h-10} A${w/2},10 0 0 0 ${x+w},${y+h-10} V${y+10} A${w/2},10 0 0 0 ${x},${y+10} Z" />
+        <ellipse class="shape subtle-fill" cx="${x+w/2}" cy="${y+10}" rx="${w/2}" ry="10" />`,
+      person: (x, y, w, h) => `
+        <rect style="fill:transparent;stroke:none" x="${x}" y="${y}" width="${w}" height="${h}" />
+        <circle class="shape" cx="${x+30}" cy="${y+22}" r="12" />
+        <path class="shape" d="M${x+6},${y+h-4} q0,-26 24,-26 t24,26 z" />
+        <path class="node-decoration" d="M${x+54},${y+14} q8,8 0,16 M${x+60},${y+9} q13,13 0,26" />`
+    };
+
+    const SVG_ICONS = {
+      screen: '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>',
+      rack: '<rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/>',
+      enc: '<path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/>',
+      ode: '<path d="M2 12c3-8 6-8 9 0s6 8 9 0"/>',
+      dec: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.5"/><path d="M21 16l-5-5-8 9"/>',
+      chip: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M8 4v16M16 4v16M3 9h5M3 15h5M16 9h5M16 15h5"/>',
+      send: '<path d="M3 11l18-8-8 18-2-8z"/>',
+      hex: '<path d="M12 3l2 6 6 3-6 3-2 6-2-6-6-3 6-3z"/>',
+      ell: '<circle cx="12" cy="12" r="2"/><path d="M7.8 7.8a6 6 0 000 8.4M16.2 7.8a6 6 0 010 8.4M4.9 4.9a10 10 0 000 14.2M19.1 4.9a10 10 0 010 14.2"/>',
+      proc: '<circle cx="12" cy="12" r="9"/><path d="M10 8l6 4-6 4z"/>',
+      cache: '<path d="M17 2l4 4-4 4"/><path d="M3 11V9a3 3 0 013-3h15"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v2a3 3 0 01-3 3H3"/>',
+      person: '<circle cx="12" cy="8" r="4"/><path d="M4 21c0-5 4-7 8-7s8 2 8 7"/>'
+    };
+
+    const renderIcon = (kind, x, y, sc = 1) =>
+      SVG_ICONS[kind] ? `<g class="icon" transform="translate(${x},${y}) scale(${sc})">${SVG_ICONS[kind]}</g>` : '';
+
+    /* --- 3. DOM Cache & State --- */
+    const el = {
+      zonesGroup: document.getElementById('groupZones'),
+      edgesGroup: document.getElementById('groupEdges'),
+      nodesGroup: document.getElementById('groupNodes'),
+      packetsGroup: document.getElementById('groupPackets'),
+      diagramCard: document.getElementById('diagramCard'),
+      ticker: document.getElementById('ticker'),
+      tickerBadge: document.getElementById('tickerBadge'),
+      progressBar: document.getElementById('traceProgressBar'),
+      inspector: document.getElementById('inspector'),
+      tunerChart: document.getElementById('tunerChart'),
+      tunerDetails: document.getElementById('tunerDetails'),
+      btnBatch: document.getElementById('btnPathBatch'),
+      btnLive: document.getElementById('btnPathLive'),
+      btnAll: document.getElementById('btnPathAll'),
+      btnOpt: document.getElementById('btnToggleOpt'),
+      btnTrace: document.getElementById('btnPlayTrace'),
+      btnStepPrev: document.getElementById('btnStepPrev'),
+      btnStepNext: document.getElementById('btnStepNext')
+    };
+
+    const state = {
+      pathMode: 'BATCH',
+      selectedNodeId: null,
+      selectedEdgeIndex: null,
+      traceTimer: null,
+      traceStep: -1,
+      showOptimizations: false,
+      reducedMotion: window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    };
+
+    const nodeById = Object.fromEntries(NODES.map(n => [n.id, n]));
+
+    /* --- 4. Render Diagram --- */
+    function buildDiagram() {
+      const zones = [
+        { x: 14, y: 38, w: 198, h: 262, title: 'User & Browser' },
+        { x: 256, y: 34, w: 694, h: 272, title: 'FLOAT API & GPU Process' },
+        { x: 14, y: 332, w: 936, h: 134, title: 'Real-Time Conversation Layer (Optional)' }
+      ];
+
+      el.zonesGroup.innerHTML = zones.map(z => `
+        <rect class="zone" x="${z.x}" y="${z.y}" width="${z.w}" height="${z.h}" />
+        <text class="zone-title" x="${z.x + 14}" y="${z.y + 17}">${z.title}</text>
+      `).join('');
+
+      el.edgesGroup.innerHTML = EDGES.map((e, i) => {
+        const isOpt = nodeById[e.from].status === 'o' || nodeById[e.to].status === 'o';
+        return `
+          <path id="edge-${i}" class="edge ${isOpt ? 'is-optional' : ''}" data-from="${e.from}" data-to="${e.to}" d="${e.path}" />
+          <path class="edge-hit-area" data-edge-index="${i}" d="${e.path}">
+            <title>${nodeById[e.from].title} → ${nodeById[e.to].title}: ${e.payload}</title>
+          </path>
+        `;
+      }).join('');
+
+      const textOffsets = { rack: 21, ode: 24, ell: 24, hex: 20, person: 68, enc: 12 };
+
+      el.nodesGroup.innerHTML = NODES.map(n => {
+        const nx = LAYOUT.cols[n.col];
+        const ny = LAYOUT.rows[n.row];
+        const tx = nx + (textOffsets[n.kind] || 13);
+        const dotX = nx + LAYOUT.nodeWidth - (n.kind === 'dec' ? 9 : 26);
+        const iconX = nx + (n.kind === 'dec' ? LAYOUT.nodeWidth - 34 : (textOffsets[n.kind] || 13));
+        const iconY = ny + (n.kind === 'dec' ? 6 : n.kind === 'cache' ? 10 : 8);
+
+        return `
+          <g class="node" data-id="${n.id}" tabindex="0" role="button" aria-label="${n.title} (${n.subtitle})">
+            ${SVG_SHAPES[n.kind](nx, ny, LAYOUT.nodeWidth, LAYOUT.nodeHeight)}
+            <text class="node-title" x="${tx}" y="${ny + 39}">${n.title}</text>
+            <text class="node-subtitle" x="${tx}" y="${ny + 56}">${n.subtitle}</text>
+            <circle class="status-dot ${n.status === 'o' ? 'optional' : n.status === 'a' ? 'actor' : ''}" cx="${dotX}" cy="${ny + 14}" r="4" />
+            ${n.kind !== 'person' ? renderIcon(n.kind, iconX, iconY, 0.75) : ''}
+            ${n.optimization ? `
+              <g class="opt-badge" data-opt-id="${n.id}" role="button" aria-label="Optimization details for ${n.title}">
+                <circle cx="${nx + LAYOUT.nodeWidth - 3}" cy="${ny + 3}" r="11" />
+                <text x="${nx + LAYOUT.nodeWidth - 3}" y="${ny + 7}">⚡</text>
+              </g>
+            ` : ''}
+          </g>
+        `;
+      }).join('');
+
+      el.packetsGroup.innerHTML = EDGES.map((e, i) => {
+        const w = e.payload.length * 6.1 + 14;
+        return `
+          <g class="packet" data-from="${e.from}" data-to="${e.to}" pointer-events="none">
+            <rect x="${-w / 2}" y="-9" width="${w}" height="18" rx="9" />
+            <text y="3.3">${e.payload}</text>
+            ${!state.reducedMotion ? `
+              <animateMotion dur="4.8s" begin="${(i % 4) * 0.95}s" repeatCount="indefinite" keyPoints="0;1" keyTimes="0;1" calcMode="linear">
+                <mpath href="#edge-${i}" />
+              </animateMotion>
+            ` : ''}
+          </g>
+        `;
+      }).join('');
+
+      if (state.reducedMotion) {
+        document.querySelectorAll('.packet').forEach((pkt, idx) => {
+          const p = document.getElementById(`edge-${idx}`);
+          const pt = p.getPointAtLength(p.getTotalLength() / 2);
+          pkt.setAttribute('transform', `translate(${pt.x},${pt.y})`);
+        });
+      }
+
+      buildBenchmarkSection();
+    }
+
+    /* --- 5. Visibility & Highlight Helpers --- */
+    function isNodeActive(id) {
+      if (state.pathMode === 'ALL') return true;
+      return PIPELINE_MODES[state.pathMode].includes(id);
+    }
+
+    function applyFilterVisibility() {
+      document.querySelectorAll('.node').forEach(g => {
+        g.classList.toggle('is-dimmed', !isNodeActive(g.dataset.id));
+      });
+      document.querySelectorAll('.edge, .packet').forEach(item => {
+        const show = isNodeActive(item.dataset.from) && isNodeActive(item.dataset.to);
+        item.classList.toggle('is-dimmed', !show);
+      });
+    }
+
+    function highlightEdgesForNode(nodeId) {
+      document.querySelectorAll('.edge').forEach(edge => {
+        const hit = Boolean(nodeId && (edge.dataset.from === nodeId || edge.dataset.to === nodeId));
+        edge.classList.toggle('is-highlighted', hit);
+      });
+    }
+
+    /* --- 6. Inspector Views --- */
+    function renderOverviewInspector() {
+      const modeTitle = state.pathMode === 'LIVE' ? 'Live Conversational Avatar'
+        : state.pathMode === 'BATCH' ? 'Batch Portrait Generation'
+        : 'Complete System Architecture';
+
+      const modeDesc = state.pathMode === 'LIVE'
+        ? 'Streams real-time speech from Gemini Live through a LiveKit room, synthesizing 25 fps chunks with <1.0 RTF and zero-GPU idle loops.'
+        : state.pathMode === 'BATCH'
+        ? 'Transforms an uploaded portrait and audio file into an H.264 stream via progressive chunked ODE flow-matching and hardware encoding.'
+        : 'Showing all 12 blocks and 20 data pathways across batch synthesis and optional LiveKit conversational agents.';
+
+      el.inspector.innerHTML = `
+        <h2>${modeTitle}</h2>
+        <span class="badge-status" style="color:var(--accent);background:var(--accent-soft);">● Architecture Overview</span>
+        <p style="margin: 4px 0 0; color: var(--text-secondary);">${modeDesc}</p>
+
+        <div class="detail-group">
+          <div class="detail-label">Key Hotspots & Highlights</div>
+          <div class="quick-picks">
+            <button type="button" class="quick-card" data-jump="f">
+              <div>
+                <strong>ODE Flow-Matching Sampler</strong>
+                <span>Primary GPU compute hotspot (NFE × chunks)</span>
+              </div>
+              <span>→</span>
+            </button>
+            <button type="button" class="quick-card" data-jump="d">
+              <div>
+                <strong>Auto-Tuned Batched Decoder</strong>
+                <span>In-place uint8 conversion & plateau sizing</span>
+              </div>
+              <span>→</span>
+            </button>
+            <button type="button" class="quick-card" data-jump="e">
+              <div>
+                <strong>4-Unit Condition Encoders</strong>
+                <span>Per-GPU benchmarked ONNX / torch.compile</span>
+              </div>
+              <span>→</span>
+            </button>
+            <button type="button" class="quick-card" data-jump="v">
+              <div>
+                <strong>Live 25 fps Frame Pacer</strong>
+                <span>1 s initial window + 128-frame burst buffer</span>
+              </div>
+              <span>→</span>
+            </button>
+          </div>
+        </div>
+      `;
+
+      el.inspector.querySelectorAll('[data-jump]').forEach(btn => {
+        btn.onclick = () => inspectNode(btn.dataset.jump);
+      });
+    }
+
+    function inspectNode(id, highlightOpt = false) {
+      state.selectedNodeId = id;
+      state.selectedEdgeIndex = null;
+
+      document.querySelectorAll('.node').forEach(g => {
+        g.classList.toggle('is-selected', g.dataset.id === id);
+      });
+      highlightEdgesForNode(id);
+
+      if (!id) {
+        renderOverviewInspector();
+        return;
+      }
+
+      const n = nodeById[id];
+      const st = STATUS_MAP[n.status];
+      const visibleIds = NODES.map(x => x.id).filter(isNodeActive);
+      const idx = visibleIds.indexOf(id);
+
+      el.inspector.innerHTML = `
+        <div class="inspector-header">
+          <h2 style="display:flex;gap:8px;align-items:center;">
+            <svg width="22" height="22" viewBox="0 0 24 24" style="flex-shrink:0;">
+              ${renderIcon(n.kind, 0, 0, 1)}
+            </svg>
+            ${n.title}
+          </h2>
+        </div>
+
+        <span class="badge-status" style="color:${st.color};background:${st.bg};">● ${st.label}</span>
+        <p style="margin: 2px 0 0; color: var(--text-secondary);">${n.role}</p>
+
+        <div class="io-grid">
+          <div class="io-box">
+            <div class="detail-label" style="margin-bottom:3px;">Takes In</div>
+            <div class="io-val">${n.inputs}</div>
+          </div>
+          <div class="io-box">
+            <div class="detail-label" style="margin-bottom:3px;">Passes On</div>
+            <div class="io-val">${n.outputs}</div>
+          </div>
+        </div>
+
+        <div class="detail-group">
+          <div class="detail-label">Stack & Units</div>
+          <div>${n.tech.map(t => `<span class="chip">${t}</span>`).join('')}</div>
+        </div>
+
+        <div class="detail-group">
+          <div class="detail-label">Under the Hood</div>
+          <ul>${n.inside.map(line => `<li>${line}</li>`).join('')}</ul>
+        </div>
+
+        ${n.optimization ? `
+          <div class="callout-box" ${highlightOpt ? 'style="outline:2px solid var(--warning);"' : ''}>
+            <strong>⚡ Optimization:</strong> ${n.optimization}
+          </div>
+        ` : ''}
+
+        <div class="sidebar-actions">
+          <button class="btn btn-icon" id="btnPrevNode" title="Previous block">◀</button>
+          <button class="btn btn-icon" id="btnNextNode" title="Next block">▶</button>
+          <button class="btn" id="btnResetInspector" style="margin-left:auto;">Overview</button>
+        </div>
+      `;
+
+      document.getElementById('btnPrevNode').onclick = () => {
+        const list = visibleIds.length ? visibleIds : NODES.map(x => x.id);
+        const cur = Math.max(0, list.indexOf(id));
+        inspectNode(list[(cur + list.length - 1) % list.length]);
+      };
+      document.getElementById('btnNextNode').onclick = () => {
+        const list = visibleIds.length ? visibleIds : NODES.map(x => x.id);
+        const cur = Math.max(0, list.indexOf(id));
+        inspectNode(list[(cur + 1) % list.length]);
+      };
+      document.getElementById('btnResetInspector').onclick = () => resetSelection();
+    }
+
+    function inspectEdge(edgeIdx) {
+      state.selectedEdgeIndex = edgeIdx;
+      state.selectedNodeId = null;
+
+      const edge = EDGES[edgeIdx];
+      const src = nodeById[edge.from];
+      const dst = nodeById[edge.to];
+
+      document.querySelectorAll('.node').forEach(n => {
+        n.classList.toggle('is-selected', n.dataset.id === edge.from || n.dataset.id === edge.to);
+      });
+      document.querySelectorAll('.edge').forEach((elEdge, idx) => {
+        elEdge.classList.toggle('is-highlighted', idx === edgeIdx);
+      });
+
+      el.inspector.innerHTML = `
+        <h2>${src.title} → ${dst.title}</h2>
+        <span class="badge-status" style="color:var(--accent);background:var(--accent-soft);">● Data Payload in Motion</span>
+
+        <div class="detail-group">
+          <div class="detail-label">Packet Label</div>
+          <span class="chip" style="color:var(--accent);border-color:var(--accent-border);background:var(--accent-soft);">${edge.payload}</span>
+        </div>
+
+        <div class="detail-group">
+          <div class="detail-label">Contents & Tensor Shapes</div>
+          <p style="margin:0;color:var(--text-secondary);">${edge.content}</p>
+        </div>
+
+        <div class="detail-group">
+          <div class="detail-label">Transport Mechanism</div>
+          <p style="margin:0;color:var(--text-secondary);">${edge.transport}</p>
+        </div>
+
+        <div class="sidebar-actions">
+          <button class="btn" data-jump-node="${src.id}">Inspect ${src.title}</button>
+          <button class="btn" data-jump-node="${dst.id}">Inspect ${dst.title}</button>
+          <button class="btn" id="btnEdgeReset" style="margin-left:auto;">Overview</button>
+        </div>
+      `;
+
+      el.inspector.querySelectorAll('[data-jump-node]').forEach(b => {
+        b.onclick = () => { pauseTrace(); inspectNode(b.dataset.jumpNode); };
+      });
+      document.getElementById('btnEdgeReset').onclick = () => resetSelection();
+    }
+
+    function resetSelection() {
+      stopTrace(true);
+      inspectNode(null);
+    }
+
+    /* --- 7. Trace Playback & Stepper --- */
+    function getActiveTraceSequence() {
+      const keys = state.pathMode === 'LIVE' ? TRACE_SEQUENCES.LIVE : TRACE_SEQUENCES.BATCH;
+      return keys.map(k => EDGES.findIndex(e => `${e.from}>${e.to}` === k)).filter(i => i >= 0);
+    }
+
+    function renderTraceStep(stepIdx) {
+      const seq = getActiveTraceSequence();
+      if (!seq.length) return;
+
+      state.traceStep = (stepIdx + seq.length) % seq.length;
+      const edgeIdx = seq[state.traceStep];
+      const edge = EDGES[edgeIdx];
+
+      inspectEdge(edgeIdx);
+
+      const pct = ((state.traceStep + 1) / seq.length) * 100;
+      el.progressBar.style.width = `${pct}%`;
+
+      el.ticker.firstElementChild.innerHTML =
+        `<strong>${nodeById[edge.from].title}</strong> sends <code>${edge.payload}</code> to <strong>${nodeById[edge.to].title}</strong> — ${edge.content}`;
+      el.tickerBadge.style.display = 'inline-block';
+      el.tickerBadge.textContent = `Step ${state.traceStep + 1} / ${seq.length}`;
+    }
+
+    function pauseTrace() {
+      if (state.traceTimer) {
+        clearInterval(state.traceTimer);
+        state.traceTimer = null;
+      }
+      el.btnTrace.textContent = state.traceStep >= 0 ? '▶ Resume Trace' : '▶ Trace Data Flow';
+    }
+
+    function stopTrace(resetTicker = false) {
+      pauseTrace();
+      state.traceStep = -1;
+      el.progressBar.style.width = '0%';
+      el.btnTrace.textContent = '▶ Trace Data Flow';
+      if (resetTicker) {
+        el.ticker.firstElementChild.innerHTML = 'Click any block or connector to inspect tensors, or press <strong>Trace Data Flow</strong>.';
+        el.tickerBadge.style.display = 'none';
+      }
+    }
+
+    function toggleTracePlay() {
+      if (state.traceTimer) {
+        pauseTrace();
+        return;
+      }
+
+      const seq = getActiveTraceSequence();
+      const nextStep = state.traceStep + 1 >= seq.length ? 0 : state.traceStep + 1;
+      renderTraceStep(nextStep);
+      el.btnTrace.textContent = '⏸ Pause Trace';
+
+      state.traceTimer = setInterval(() => {
+        if (state.traceStep + 1 >= seq.length) {
+          pauseTrace();
+          el.btnTrace.textContent = '↻ Replay Trace';
+          return;
+        }
+        renderTraceStep(state.traceStep + 1);
+      }, 2300);
+    }
+
+    /* --- 8. Decode Benchmark Section --- */
+    function buildBenchmarkSection() {
+      const peakFps = 44.5;
+      const thresholdFps = 41.4; // 93% of peak
+
+      let html = `
+        <div class="chart-threshold-line" style="bottom: ${(thresholdFps / 50) * 100}%;">
+          <span>93% plateau threshold: ${thresholdFps} fps</span>
+        </div>
+      `;
+
+      html += BENCHMARK_DATA.map((d, idx) => `
+        <div class="chart-col-group ${d.chosen ? 'is-chosen is-active' : ''}"
+             tabindex="0"
+             role="button"
+             data-bench-idx="${idx}"
+             aria-label="Batch ${d.batchSize}: ${d.fps} FPS, ${d.vram} GiB VRAM">
+          <div class="chart-bar" style="height: ${(d.fps / 50) * 100}%;">
+            <span class="bar-val">${d.fps}</span>
+          </div>
+          <span class="bar-label">Batch ${d.batchSize}</span>
+        </div>
+      `).join('');
+
+      el.tunerChart.innerHTML = html;
+
+      const selectBar = (idx) => {
+        const d = BENCHMARK_DATA[idx];
+        el.tunerChart.querySelectorAll('.chart-col-group').forEach((col, i) => {
+          col.classList.toggle('is-active', i === idx);
+        });
+
+        const badgeColor = d.chosen ? 'var(--warning)' : 'var(--accent)';
+        const badgeBg = d.chosen ? 'var(--warning-soft)' : 'var(--accent-soft)';
+
+        el.tunerDetails.innerHTML = `
+          <div>
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <h3 style="margin:0;font-size:17px;">Micro-Batch Size ${d.batchSize}</h3>
+              <span class="badge-status" style="margin:0;color:${badgeColor};background:${badgeBg};">${d.tag}</span>
+            </div>
+
+            <div class="stat-metric-row">
+              <div class="stat-pill">
+                <div class="num">${d.fps} <small style="font-size:12px;font-weight:500;">fps</small></div>
+                <div class="lbl">${Math.round((d.fps / peakFps) * 100)}% of peak speed</div>
+              </div>
+              <div class="stat-pill">
+                <div class="num">~${d.vram} <small style="font-size:12px;font-weight:500;">GiB</small></div>
+                <div class="lbl">Transient decode VRAM</div>
+              </div>
+            </div>
+
+            <p style="margin:0;font-size:13.5px;color:var(--text-secondary);">${d.desc}</p>
+          </div>
+
+          <div style="font-size:12px;color:var(--text-muted);padding-top:12px;border-top:1px solid var(--border-subtle);">
+            Formula: smallest batch ≥ <code>0.93 × max_fps</code>
+          </div>
+        `;
+      };
+
+      el.tunerChart.querySelectorAll('.chart-col-group').forEach((col, idx) => {
+        col.onclick = () => selectBar(idx);
+        col.onmouseenter = () => selectBar(idx);
+        col.onfocus = () => selectBar(idx);
+        col.onkeydown = (e) => {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectBar(idx); }
+        };
+      });
+
+      selectBar(2); // Default to Batch 4
+    }
+
+    /* --- 9. Event Listeners & Keyboard Shortcuts --- */
+    function bindEvents() {
+      // Theme Switcher
+      document.querySelectorAll('[data-set-theme]').forEach(btn => {
+        btn.onclick = () => {
+          const theme = btn.dataset.setTheme;
+          document.documentElement.setAttribute('data-theme', theme);
+          document.querySelectorAll('[data-set-theme]').forEach(b => {
+            b.setAttribute('aria-pressed', b === btn);
+          });
+        };
+      });
+
+      // Path Filter Buttons
+      const setPathMode = (mode) => {
+        stopTrace(true);
+        state.pathMode = mode;
+        el.btnBatch.setAttribute('aria-pressed', mode === 'BATCH');
+        el.btnLive.setAttribute('aria-pressed', mode === 'LIVE');
+        el.btnAll.setAttribute('aria-pressed', mode === 'ALL');
+        applyFilterVisibility();
+        if (!state.selectedNodeId && state.selectedEdgeIndex === null) {
+          renderOverviewInspector();
+        }
+      };
+
+      el.btnBatch.onclick = () => setPathMode('BATCH');
+      el.btnLive.onclick = () => setPathMode('LIVE');
+      el.btnAll.onclick = () => setPathMode('ALL');
+
+      // Optimizations Toggle
+      const toggleOptimizations = () => {
+        state.showOptimizations = !state.showOptimizations;
+        el.diagramCard.classList.toggle('show-optimizations', state.showOptimizations);
+        el.btnOpt.setAttribute('aria-pressed', state.showOptimizations);
+      };
+      el.btnOpt.onclick = toggleOptimizations;
+
+      // Trace Stepper Controls
+      el.btnTrace.onclick = toggleTracePlay;
+      el.btnStepPrev.onclick = () => {
+        pauseTrace();
+        renderTraceStep(state.traceStep <= 0 ? getActiveTraceSequence().length - 1 : state.traceStep - 1);
+      };
+      el.btnStepNext.onclick = () => {
+        pauseTrace();
+        renderTraceStep(state.traceStep + 1);
+      };
+
+      // SVG Node Interactions
+      el.nodesGroup.addEventListener('click', (ev) => {
+        const nodeElem = ev.target.closest('.node');
+        if (!nodeElem) return;
+        pauseTrace();
+        const fromBadge = Boolean(ev.target.closest('.opt-badge'));
+        inspectNode(nodeElem.dataset.id, fromBadge);
+      });
+
+      el.nodesGroup.addEventListener('mouseover', (ev) => {
+        const nodeElem = ev.target.closest('.node');
+        if (nodeElem && state.selectedEdgeIndex === null) {
+          highlightEdgesForNode(nodeElem.dataset.id);
+        }
+      });
+
+      el.nodesGroup.addEventListener('mouseout', () => {
+        if (state.selectedEdgeIndex === null) {
+          highlightEdgesForNode(state.selectedNodeId);
+        }
+      });
+
+      el.nodesGroup.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter' || ev.key === ' ') {
+          const nodeElem = ev.target.closest('.node');
+          if (nodeElem) {
+            ev.preventDefault();
+            pauseTrace();
+            inspectNode(nodeElem.dataset.id);
+          }
+        }
+      });
+
+      // SVG Edge Interactions
+      el.edgesGroup.addEventListener('click', (ev) => {
+        const hit = ev.target.closest('.edge-hit-area');
+        if (hit) {
+          pauseTrace();
+          inspectEdge(Number(hit.dataset.edgeIndex));
+        }
+      });
+
+      // Global Keyboard Shortcuts
+      document.addEventListener('keydown', (ev) => {
+        if (ev.target.matches('input, textarea, select')) return;
+
+        if (ev.key === 'Escape') {
+          resetSelection();
+        } else if (ev.key === 'o' || ev.key === 'O') {
+          toggleOptimizations();
+        } else if (ev.key === ' ' && document.activeElement === document.body) {
+          ev.preventDefault();
+          toggleTracePlay();
+        } else if (ev.key === 'ArrowRight') {
+          if (state.traceStep >= 0 || state.traceTimer) {
+            pauseTrace();
+            renderTraceStep(state.traceStep + 1);
+          } else if (state.selectedNodeId) {
+            const visible = NODES.map(x => x.id).filter(isNodeActive);
+            const idx = visible.indexOf(state.selectedNodeId);
+            inspectNode(visible[(idx + 1) % visible.length]);
+          }
+        } else if (ev.key === 'ArrowLeft') {
+          if (state.traceStep >= 0 || state.traceTimer) {
+            pauseTrace();
+            renderTraceStep(state.traceStep <= 0 ? getActiveTraceSequence().length - 1 : state.traceStep - 1);
+          } else if (state.selectedNodeId) {
+            const visible = NODES.map(x => x.id).filter(isNodeActive);
+            const idx = visible.indexOf(state.selectedNodeId);
+            inspectNode(visible[(idx + visible.length - 1) % visible.length]);
+          }
+        }
+      });
+    }
+
+    /* --- Initialize --- */
+    buildDiagram();
+    bindEvents();
+    applyFilterVisibility();
+    renderOverviewInspector();
+  </script>
+</body>
+</html>
